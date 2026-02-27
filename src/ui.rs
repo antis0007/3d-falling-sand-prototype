@@ -180,7 +180,8 @@ pub fn draw_fps_overlays(
     sim_speed: f32,
     vp: Mat4,
     viewport: [u32; 2],
-    hit: Option<[i32; 3]>,
+    preview_blocks: &[[i32; 3]],
+    brush: &BrushSettings,
     voxel_size: f32,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -196,24 +197,36 @@ pub fn draw_fps_overlays(
         painter.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
     }
 
-    let speed_pos = egui::pos2(10.0, 10.0);
+    let rect = ctx.screen_rect();
+    let speed_pos = egui::pos2(rect.max.x - 12.0, 12.0);
     painter.text(
         speed_pos,
-        egui::Align2::LEFT_TOP,
+        egui::Align2::RIGHT_TOP,
         format!("{sim_speed:.1}x"),
         egui::FontId::proportional(14.0),
         egui::Color32::WHITE,
     );
 
-    if let Some(block) = hit {
+    let outline_color = if brush.mode == BrushMode::Place {
+        egui::Color32::from_rgb(120, 220, 120)
+    } else {
+        egui::Color32::from_rgb(255, 120, 120)
+    };
+
+    for block in preview_blocks {
         draw_block_outline(
             &painter,
             vp,
             viewport,
             ctx.pixels_per_point(),
-            block,
+            *block,
             voxel_size,
+            outline_color,
         );
+    }
+
+    if !paused {
+        draw_brush_radial_hint(&painter, ctx.screen_rect(), brush);
     }
 }
 
@@ -224,6 +237,7 @@ fn draw_block_outline(
     pixels_per_point: f32,
     block: [i32; 3],
     voxel_size: f32,
+    color: egui::Color32,
 ) {
     let b = Vec3::new(block[0] as f32, block[1] as f32, block[2] as f32) * voxel_size;
     let s = voxel_size;
@@ -256,12 +270,63 @@ fn draw_block_outline(
         .into_iter()
         .map(|c| project(vp, viewport, pixels_per_point, c))
         .collect();
-    let stroke = egui::Stroke::new(2.0, egui::Color32::YELLOW);
+    let stroke = egui::Stroke::new(2.0, color);
     for (a, b) in edges {
         if let (Some(pa), Some(pb)) = (projected[a], projected[b]) {
             painter.line_segment([pa, pb], stroke);
         }
     }
+}
+
+fn draw_brush_radial_hint(painter: &egui::Painter, rect: egui::Rect, brush: &BrushSettings) {
+    let center = rect.center();
+    let radius = 52.0;
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(110)),
+    );
+    painter.circle_stroke(
+        center,
+        radius - 12.0,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+    );
+
+    painter.text(
+        center + egui::vec2(0.0, -radius - 18.0),
+        egui::Align2::CENTER_CENTER,
+        format!("Radius {}", brush.radius),
+        egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(radius + 22.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        format!(
+            "{}",
+            if brush.mode == BrushMode::Place {
+                "Place"
+            } else {
+                "Erase"
+            }
+        ),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(-radius - 26.0, 0.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{:?}", brush.shape),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(0.0, radius + 18.0),
+        egui::Align2::CENTER_CENTER,
+        "Scroll: material | Ctrl+Scroll: radius | Shift+Scroll: range",
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_white_alpha(210),
+    );
 }
 
 fn project(vp: Mat4, viewport: [u32; 2], pixels_per_point: f32, p: Vec3) -> Option<egui::Pos2> {

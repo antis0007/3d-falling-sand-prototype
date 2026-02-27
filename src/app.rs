@@ -6,7 +6,9 @@ use crate::player::{
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
 use crate::ui::{draw, draw_fps_overlays, selected_material, UiState};
-use crate::world::{default_save_path, load_world, save_world, BrushMode, BrushSettings, World};
+use crate::world::{
+    default_save_path, load_world, save_world, BrushMode, BrushSettings, BrushShape, World,
+};
 use anyhow::Context;
 use glam::Vec3;
 use std::time::Instant;
@@ -20,6 +22,12 @@ use winit::window::{CursorGrabMode, WindowBuilder};
 struct EditRuntimeState {
     last_edit_at: Option<Instant>,
     last_edit_mode: Option<BrushMode>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RaycastResult {
+    hit: Option<[i32; 3]>,
+    place: [i32; 3],
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -71,6 +79,20 @@ pub async fn run() -> anyhow::Result<()> {
                                     }
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
+                                    KeyCode::KeyV => {
+                                        brush.mode = if brush.mode == BrushMode::Place {
+                                            BrushMode::Erase
+                                        } else {
+                                            BrushMode::Place
+                                        }
+                                    }
+                                    KeyCode::KeyF => {
+                                        brush.shape = if brush.shape == BrushShape::Sphere {
+                                            BrushShape::Cube
+                                        } else {
+                                            BrushShape::Sphere
+                                        }
+                                    }
                                     KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
@@ -98,25 +120,43 @@ pub async fn run() -> anyhow::Result<()> {
                             ctrl.sensitivity = ui.mouse_sensitivity;
                             ctrl.step(&world, &input, dt, true, start.elapsed().as_secs_f32());
                             if input.wheel.abs() > 0.0 {
-                                let mut s = ui.selected_slot as i32 - input.wheel.signum() as i32;
-                                if s < 0 {
-                                    s += 10;
+                                if input.key(KeyCode::ControlLeft) {
+                                    brush.radius =
+                                        (brush.radius - input.wheel.signum() as i32).clamp(0, 8);
+                                } else if input.key(KeyCode::ShiftLeft) {
+                                    brush.max_distance = (brush.max_distance
+                                        - input.wheel.signum())
+                                    .clamp(2.0, 48.0);
+                                } else {
+                                    let mut s =
+                                        ui.selected_slot as i32 - input.wheel.signum() as i32;
+                                    if s < 0 {
+                                        s += 10;
+                                    }
+                                    ui.selected_slot = (s as usize) % 10;
                                 }
-                                ui.selected_slot = (s as usize) % 10;
                             }
+                        }
+
+                        let raycast = raycast_target(
+                            &world,
+                            ctrl.position,
+                            ctrl.look_dir(),
+                            brush.max_distance,
+                        );
+                        let preview_blocks = preview_blocks(&world, &brush, raycast, brush.mode);
+
+                        if !ui.paused_menu && !egui_c {
                             apply_mouse_edit(
                                 &mut world,
-                                &ctrl,
                                 &brush,
                                 selected_material(ui.selected_slot),
                                 &input,
                                 &mut edit_runtime,
                                 now,
+                                raycast,
                             );
                         }
-
-                        let ray_hit =
-                            raycast_hit(&world, ctrl.position, ctrl.look_dir(), brush.max_distance);
 
                         if sim.running {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
@@ -144,7 +184,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 ui.sim_speed,
                                 cam.view_proj(),
                                 [renderer.config.width, renderer.config.height],
-                                ray_hit,
+                                &preview_blocks,
+                                &brush,
                                 VOXEL_SIZE,
                             );
                             if actions.new_world {
@@ -312,12 +353,12 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
 
 fn apply_mouse_edit(
     world: &mut World,
-    ctrl: &FpsController,
     brush: &BrushSettings,
     mat: u16,
     input: &InputState,
     edit_runtime: &mut EditRuntimeState,
     now: Instant,
+    raycast: RaycastResult,
 ) {
     let requested_mode = if input.just_rmb || input.rmb {
         Some(BrushMode::Erase)
@@ -346,22 +387,92 @@ fn apply_mouse_edit(
         return;
     }
 
-    if let Some(hit) = raycast_hit(world, ctrl.position, ctrl.look_dir(), brush.max_distance) {
-        world.apply_brush(hit, *brush, mat, Some(mode));
-        edit_runtime.last_edit_at = Some(now);
-        edit_runtime.last_edit_mode = Some(mode);
+    let Some(center) = brush_center(*brush, raycast, mode) else {
+        return;
+    };
+    world.apply_brush(center, *brush, mat, Some(mode));
+    edit_runtime.last_edit_at = Some(now);
+    edit_runtime.last_edit_mode = Some(mode);
+}
+
+fn preview_blocks(
+    world: &World,
+    brush: &BrushSettings,
+    raycast: RaycastResult,
+    mode: BrushMode,
+) -> Vec<[i32; 3]> {
+    let Some(center) = brush_center(*brush, raycast, mode) else {
+        return Vec::new();
+    };
+    if brush.radius == 0 {
+        if let Some(hit) = raycast.hit {
+            return vec![hit];
+        }
+        if mode == BrushMode::Place {
+            return vec![raycast.place];
+        }
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let rad = brush.radius.max(0);
+    for dz in -rad..=rad {
+        for dy in -rad..=rad {
+            for dx in -rad..=rad {
+                let include = match brush.shape {
+                    BrushShape::Sphere => (dx * dx + dy * dy + dz * dz) <= rad * rad,
+                    BrushShape::Cube => dx.abs().max(dy.abs()).max(dz.abs()) <= rad,
+                };
+                if !include {
+                    continue;
+                }
+                let p = [center[0] + dx, center[1] + dy, center[2] + dz];
+                if p[0] < 0
+                    || p[1] < 0
+                    || p[2] < 0
+                    || p[0] >= world.dims[0] as i32
+                    || p[1] >= world.dims[1] as i32
+                    || p[2] >= world.dims[2] as i32
+                {
+                    continue;
+                }
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -> Option<[i32; 3]> {
+    if brush.radius == 0 {
+        return match mode {
+            BrushMode::Place => Some(raycast.place),
+            BrushMode::Erase => raycast.hit,
+        };
+    }
+    match mode {
+        BrushMode::Place => Some(raycast.place),
+        BrushMode::Erase => raycast.hit,
     }
 }
 
-fn raycast_hit(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<[i32; 3]> {
+fn raycast_target(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> RaycastResult {
     let d = dir.normalize_or_zero();
     if d.length_squared() == 0.0 {
-        return None;
+        return RaycastResult {
+            hit: None,
+            place: [
+                origin.x.floor() as i32,
+                origin.y.floor() as i32,
+                origin.z.floor() as i32,
+            ],
+        };
     }
 
     let mut x = origin.x.floor() as i32;
     let mut y = origin.y.floor() as i32;
     let mut z = origin.z.floor() as i32;
+    let mut prev = [x, y, z];
 
     let step_x = if d.x >= 0.0 { 1 } else { -1 };
     let step_y = if d.y >= 0.0 { 1 } else { -1 };
@@ -420,8 +531,12 @@ fn raycast_hit(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<
     let mut t = 0.0;
     while t <= max_dist {
         if world.get(x, y, z) != 0 {
-            return Some([x, y, z]);
+            return RaycastResult {
+                hit: Some([x, y, z]),
+                place: prev,
+            };
         }
+        prev = [x, y, z];
         if t_max_x < t_max_y {
             if t_max_x < t_max_z {
                 x += step_x;
@@ -443,5 +558,13 @@ fn raycast_hit(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<
         }
     }
 
-    None
+    let miss = origin + d * max_dist;
+    RaycastResult {
+        hit: None,
+        place: [
+            miss.x.floor() as i32,
+            miss.y.floor() as i32,
+            miss.z.floor() as i32,
+        ],
+    }
 }
