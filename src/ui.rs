@@ -3,6 +3,14 @@ use crate::world::{BrushMode, BrushSettings, BrushShape, MaterialId};
 use glam::{Mat4, Vec2, Vec3};
 use std::path::Path;
 
+pub const HOTBAR_SLOTS: usize = 10;
+
+#[derive(Clone, Copy, Debug)]
+enum DragSource {
+    Hotbar(usize),
+    Palette(MaterialId),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Brush,
@@ -39,6 +47,10 @@ pub struct UiState {
     pub day: bool,
     pub mouse_sensitivity: f32,
     pub sim_speed: f32,
+    pub hotbar: [MaterialId; HOTBAR_SLOTS],
+    pub hovered_palette_material: Option<MaterialId>,
+    drag_source: Option<DragSource>,
+    drag_target_slot: Option<usize>,
 }
 
 impl UiState {
@@ -74,6 +86,10 @@ impl Default for UiState {
             day: true,
             mouse_sensitivity: 0.001,
             sim_speed: 1.0,
+            hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
+            hovered_palette_material: None,
+            drag_source: None,
+            drag_target_slot: None,
         }
     }
 }
@@ -149,7 +165,7 @@ pub fn draw(
                 }
                 ui.label(format!(
                     "Mat: {}",
-                    material(selected_material(ui_state.selected_slot)).name
+                    material(selected_material(ui_state, ui_state.selected_slot)).name
                 ));
                 ui.label(format!("Brush r={}", brush.radius));
                 ui.label(format!("Tool: {}", ui_state.active_tool.label()));
@@ -160,20 +176,27 @@ pub fn draw(
         .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 22)))
         .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                for i in 0..MATERIALS.len() {
-                    let id = selected_material(i);
+                ui_state.drag_target_slot = None;
+                for i in 0..HOTBAR_SLOTS {
+                    let id = selected_material(ui_state, i);
                     let m = material(id);
-                    if draw_material_button(
+                    let response = draw_material_button(
                         ui,
                         [72.0, 44.0],
                         i,
                         m.name,
                         m.color,
                         i == ui_state.selected_slot,
-                    )
-                    .clicked()
-                    {
+                    );
+                    if response.clicked() {
                         ui_state.selected_slot = i;
+                    }
+
+                    if response.drag_started() {
+                        ui_state.drag_source = Some(DragSource::Hotbar(i));
+                    }
+                    if ui_state.drag_source.is_some() && response.hovered() {
+                        ui_state.drag_target_slot = Some(i);
                     }
                 }
             });
@@ -187,21 +210,31 @@ pub fn draw(
             .title_bar(false)
             .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(20, 22, 28)))
             .show(ctx, |ui| {
+                ui_state.hovered_palette_material = None;
                 ui.horizontal_wrapped(|ui| {
                     for i in 0..MATERIALS.len() {
-                        let id = selected_material(i);
+                        let id = MATERIALS[i].id;
                         let m = material(id);
-                        if draw_material_button(
+                        let response = draw_material_button(
                             ui,
                             [120.0, 64.0],
                             i,
                             m.name,
                             m.color,
-                            i == ui_state.selected_slot,
-                        )
-                        .clicked()
-                        {
-                            ui_state.selected_slot = i;
+                            id == selected_material(ui_state, ui_state.selected_slot),
+                        );
+                        if response.clicked() {
+                            if let Some(slot) =
+                                ui_state.hotbar.iter().position(|&slot_id| slot_id == id)
+                            {
+                                ui_state.selected_slot = slot;
+                            }
+                        }
+                        if response.hovered() {
+                            ui_state.hovered_palette_material = Some(id);
+                        }
+                        if response.drag_started() {
+                            ui_state.drag_source = Some(DragSource::Palette(id));
                         }
                     }
                 });
@@ -213,7 +246,33 @@ pub fn draw(
                         .text("Placement distance"),
                 );
                 ui.label("Hold TAB to configure quick brush options");
+                ui.label(
+                    "Drag materials onto hotbar slots, or press 0-9 while hovering a material.",
+                );
             });
+    }
+
+    if ui_state.drag_source.is_some() && ctx.input(|i| i.pointer.any_released()) {
+        if let (Some(source), Some(target)) =
+            (ui_state.drag_source.take(), ui_state.drag_target_slot)
+        {
+            match source {
+                DragSource::Palette(material_id) => {
+                    ui_state.hotbar[target] = material_id;
+                    ui_state.selected_slot = target;
+                }
+                DragSource::Hotbar(from) if from != target => {
+                    ui_state.hotbar.swap(from, target);
+                    if ui_state.selected_slot == from {
+                        ui_state.selected_slot = target;
+                    } else if ui_state.selected_slot == target {
+                        ui_state.selected_slot = from;
+                    }
+                }
+                _ => {}
+            }
+        }
+        ui_state.drag_target_slot = None;
     }
 
     if ui_state.show_brush {
@@ -312,7 +371,7 @@ fn draw_material_button(
     selected: bool,
 ) -> egui::Response {
     let desired = egui::vec2(size[0], size[1]);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -378,8 +437,16 @@ fn draw_material_button(
     response
 }
 
-pub fn selected_material(slot: usize) -> MaterialId {
-    MATERIALS[slot.min(MATERIALS.len() - 1)].id
+pub fn selected_material(ui_state: &UiState, slot: usize) -> MaterialId {
+    ui_state.hotbar[slot.min(HOTBAR_SLOTS - 1)]
+}
+
+pub fn assign_hotbar_slot(ui_state: &mut UiState, slot: usize, material_id: MaterialId) {
+    if slot >= HOTBAR_SLOTS {
+        return;
+    }
+    ui_state.hotbar[slot] = material_id;
+    ui_state.selected_slot = slot;
 }
 
 pub fn draw_fps_overlays(

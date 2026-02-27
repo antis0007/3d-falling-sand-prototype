@@ -6,7 +6,8 @@ use crate::player::{
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
 use crate::ui::{
-    draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind, ToolTextures, UiState,
+    assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
+    ToolTextures, UiState, HOTBAR_SLOTS,
 };
 use crate::world::{
     default_save_path, load_world, save_world, BrushMode, BrushSettings, BrushShape, World,
@@ -25,7 +26,6 @@ const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
-const MATERIAL_SLOTS: usize = crate::sim::MATERIALS.len();
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -125,16 +125,36 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
-                                    KeyCode::Digit0 => ui.selected_slot = 0,
-                                    KeyCode::Digit1 => ui.selected_slot = 1,
-                                    KeyCode::Digit2 => ui.selected_slot = 2,
-                                    KeyCode::Digit3 => ui.selected_slot = 3,
-                                    KeyCode::Digit4 => ui.selected_slot = 4,
-                                    KeyCode::Digit5 => ui.selected_slot = 5,
-                                    KeyCode::Digit6 => ui.selected_slot = 6,
-                                    KeyCode::Digit7 => ui.selected_slot = 7,
-                                    KeyCode::Digit8 => ui.selected_slot = 8,
-                                    KeyCode::Digit9 => ui.selected_slot = 9,
+                                    KeyCode::Digit0 => {
+                                        assign_or_select_hotbar(&mut ui, 0, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit1 => {
+                                        assign_or_select_hotbar(&mut ui, 1, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit2 => {
+                                        assign_or_select_hotbar(&mut ui, 2, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit3 => {
+                                        assign_or_select_hotbar(&mut ui, 3, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit4 => {
+                                        assign_or_select_hotbar(&mut ui, 4, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit5 => {
+                                        assign_or_select_hotbar(&mut ui, 5, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit6 => {
+                                        assign_or_select_hotbar(&mut ui, 6, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit7 => {
+                                        assign_or_select_hotbar(&mut ui, 7, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit8 => {
+                                        assign_or_select_hotbar(&mut ui, 8, input.key(KeyCode::Tab))
+                                    }
+                                    KeyCode::Digit9 => {
+                                        assign_or_select_hotbar(&mut ui, 9, input.key(KeyCode::Tab))
+                                    }
                                     KeyCode::KeyZ => ui.active_tool = ToolKind::Brush,
                                     KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
                                     KeyCode::KeyC => ui.active_tool = ToolKind::DestructorWand,
@@ -183,9 +203,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     let mut s =
                                         ui.selected_slot as i32 - input.wheel.signum() as i32;
                                     if s < 0 {
-                                        s += MATERIAL_SLOTS as i32;
+                                        s += HOTBAR_SLOTS as i32;
                                     }
-                                    ui.selected_slot = (s as usize) % MATERIAL_SLOTS;
+                                    ui.selected_slot = (s as usize) % HOTBAR_SLOTS;
                                 }
                             }
                         }
@@ -205,7 +225,7 @@ pub async fn run() -> anyhow::Result<()> {
                             apply_mouse_edit(
                                 &mut world,
                                 &brush,
-                                selected_material(ui.selected_slot),
+                                selected_material(&ui, ui.selected_slot),
                                 &input,
                                 &mut edit_runtime,
                                 now,
@@ -414,6 +434,16 @@ fn texture_for_active_tool(
 ) -> Option<(egui::TextureId, [usize; 2])> {
     let texture = tool_textures.for_tool(active_tool);
     Some((texture.texture.id(), texture.size))
+}
+
+fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {
+    if tab_palette_held {
+        if let Some(material_id) = ui.hovered_palette_material {
+            assign_hotbar_slot(ui, slot, material_id);
+            return;
+        }
+    }
+    ui.selected_slot = slot.min(HOTBAR_SLOTS - 1);
 }
 
 fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()> {
