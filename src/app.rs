@@ -5,7 +5,7 @@ use crate::player::{
 };
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
-use crate::ui::{draw, draw_fps_overlays, selected_material, UiState};
+use crate::ui::{draw, draw_fps_overlays, selected_material, ToolKind, UiState};
 use crate::world::{
     default_save_path, load_world, save_world, BrushMode, BrushSettings, BrushShape, World,
 };
@@ -17,6 +17,11 @@ use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowBuilder};
+
+const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
+const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
+const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
+const WAND_MAX_BLOCKS: usize = 512;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -79,6 +84,12 @@ pub async fn run() -> anyhow::Result<()> {
                                     }
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
+                                    TOOL_QUICK_MENU_TOGGLE_KEY => {
+                                        ui.show_tool_quick_menu = !ui.show_tool_quick_menu
+                                    }
+                                    RADIAL_MENU_TOGGLE_KEY => {
+                                        ui.show_radial_menu = !ui.show_radial_menu
+                                    }
                                     KeyCode::KeyV => {
                                         brush.mode = if brush.mode == BrushMode::Place {
                                             BrushMode::Erase
@@ -106,6 +117,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::Digit7 => ui.selected_slot = 7,
                                     KeyCode::Digit8 => ui.selected_slot = 8,
                                     KeyCode::Digit9 => ui.selected_slot = 9,
+                                    KeyCode::KeyZ => ui.active_tool = ToolKind::Brush,
+                                    KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
+                                    KeyCode::KeyC => ui.active_tool = ToolKind::DestructorWand,
                                     _ => {}
                                 }
                             }
@@ -122,10 +136,12 @@ pub async fn run() -> anyhow::Result<()> {
                             if input.wheel.abs() > 0.0 {
                                 if input.key(KeyCode::ControlLeft) {
                                     brush.radius =
-                                        (brush.radius - input.wheel.signum() as i32).clamp(0, 8);
-                                } else if input.key(KeyCode::ShiftLeft) {
+                                        (brush.radius + input.wheel.signum() as i32).clamp(0, 8);
+                                } else if input.key(KeyCode::AltLeft)
+                                    || input.key(KeyCode::AltRight)
+                                {
                                     brush.max_distance = (brush.max_distance
-                                        - input.wheel.signum())
+                                        + input.wheel.signum())
                                     .clamp(2.0, 48.0);
                                 } else {
                                     let mut s =
@@ -138,13 +154,10 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        let raycast = raycast_target(
-                            &world,
-                            ctrl.position,
-                            ctrl.look_dir(),
-                            brush.max_distance,
-                        );
-                        let preview_blocks = preview_blocks(&world, &brush, raycast, brush.mode);
+                        let raycast =
+                            target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
+                        let preview_blocks =
+                            preview_blocks(&world, &brush, raycast, brush.mode, ui.active_tool);
 
                         if !ui.paused_menu && !egui_c {
                             apply_mouse_edit(
@@ -155,6 +168,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 &mut edit_runtime,
                                 now,
                                 raycast,
+                                ui.active_tool,
                             );
                         }
 
@@ -186,6 +200,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 [renderer.config.width, renderer.config.height],
                                 &preview_blocks,
                                 &brush,
+                                ui.show_radial_menu,
+                                RADIAL_MENU_TOGGLE_LABEL,
                                 VOXEL_SIZE,
                             );
                             if actions.new_world {
@@ -359,6 +375,7 @@ fn apply_mouse_edit(
     edit_runtime: &mut EditRuntimeState,
     now: Instant,
     raycast: RaycastResult,
+    active_tool: ToolKind,
 ) {
     let requested_mode = if input.just_rmb || input.rmb {
         Some(BrushMode::Erase)
@@ -387,6 +404,27 @@ fn apply_mouse_edit(
         return;
     }
 
+    if brush.radius == 0 && active_tool != ToolKind::Brush {
+        if active_tool == ToolKind::BuildersWand && mode != BrushMode::Place {
+            return;
+        }
+        if active_tool == ToolKind::DestructorWand && mode != BrushMode::Erase {
+            return;
+        }
+        let wand_blocks = preview_wand_blocks(world, raycast, active_tool, WAND_MAX_BLOCKS);
+        let target = if active_tool == ToolKind::BuildersWand {
+            mat
+        } else {
+            0
+        };
+        for p in wand_blocks {
+            world.set(p[0], p[1], p[2], target);
+        }
+        edit_runtime.last_edit_at = Some(now);
+        edit_runtime.last_edit_mode = Some(mode);
+        return;
+    }
+
     let Some(center) = brush_center(*brush, raycast, mode) else {
         return;
     };
@@ -400,15 +438,19 @@ fn preview_blocks(
     brush: &BrushSettings,
     raycast: RaycastResult,
     mode: BrushMode,
+    active_tool: ToolKind,
 ) -> Vec<[i32; 3]> {
     let Some(center) = brush_center(*brush, raycast, mode) else {
         return Vec::new();
     };
     if brush.radius == 0 {
+        if active_tool != ToolKind::Brush {
+            return preview_wand_blocks(world, raycast, active_tool, WAND_MAX_BLOCKS);
+        }
         if let Some(hit) = raycast.hit {
             return vec![hit];
         }
-        if mode == BrushMode::Place {
+        if mode == BrushMode::Place || brush.fixed_distance {
             return vec![raycast.place];
         }
         return Vec::new();
@@ -419,10 +461,7 @@ fn preview_blocks(
     for dz in -rad..=rad {
         for dy in -rad..=rad {
             for dx in -rad..=rad {
-                let include = match brush.shape {
-                    BrushShape::Sphere => (dx * dx + dy * dy + dz * dz) <= rad * rad,
-                    BrushShape::Cube => dx.abs().max(dy.abs()).max(dz.abs()) <= rad,
-                };
+                let include = brush_shape_includes(brush.shape, dx, dy, dz, rad);
                 if !include {
                     continue;
                 }
@@ -444,6 +483,9 @@ fn preview_blocks(
 }
 
 fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -> Option<[i32; 3]> {
+    if brush.fixed_distance {
+        return Some(raycast.place);
+    }
     if brush.radius == 0 {
         return match mode {
             BrushMode::Place => Some(raycast.place),
@@ -454,6 +496,142 @@ fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -
         BrushMode::Place => Some(raycast.place),
         BrushMode::Erase => raycast.hit,
     }
+}
+
+fn target_for_edit(world: &World, origin: Vec3, dir: Vec3, brush: &BrushSettings) -> RaycastResult {
+    if brush.fixed_distance {
+        RaycastResult {
+            hit: None,
+            place: fixed_distance_target(origin, dir, brush.max_distance),
+        }
+    } else {
+        raycast_target(world, origin, dir, brush.max_distance)
+    }
+}
+
+fn fixed_distance_target(origin: Vec3, dir: Vec3, max_dist: f32) -> [i32; 3] {
+    let d = dir.normalize_or_zero();
+    let point = origin + d * max_dist.max(0.0);
+    [
+        point.x.floor() as i32,
+        point.y.floor() as i32,
+        point.z.floor() as i32,
+    ]
+}
+
+fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) -> bool {
+    match shape {
+        BrushShape::Sphere => (dx * dx + dy * dy + dz * dz) <= rad * rad,
+        BrushShape::Cube => dx.abs().max(dy.abs()).max(dz.abs()) <= rad,
+        BrushShape::Torus => {
+            let ring_radius = (rad as f32).max(1.0);
+            let tube_radius = (rad as f32 * 0.5).max(1.0);
+            let q = ((dx * dx + dz * dz) as f32).sqrt() - ring_radius;
+            (q * q + (dy as f32) * (dy as f32)) <= tube_radius * tube_radius
+        }
+        BrushShape::Hemisphere => dy >= 0 && (dx * dx + dy * dy + dz * dz) <= rad * rad,
+        BrushShape::Bowl => {
+            if dy < 0 {
+                return false;
+            }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            let inner = (rad - 1).max(0);
+            r2 <= rad * rad && r2 >= inner * inner
+        }
+        BrushShape::InvertedBowl => {
+            if dy > 0 {
+                return false;
+            }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            let inner = (rad - 1).max(0);
+            r2 <= rad * rad && r2 >= inner * inner
+        }
+    }
+}
+
+fn preview_wand_blocks(
+    world: &World,
+    raycast: RaycastResult,
+    active_tool: ToolKind,
+    max_blocks: usize,
+) -> Vec<[i32; 3]> {
+    if active_tool == ToolKind::Brush {
+        return Vec::new();
+    }
+
+    let Some(hit) = raycast.hit else {
+        return Vec::new();
+    };
+
+    let normal = [
+        raycast.place[0] - hit[0],
+        raycast.place[1] - hit[1],
+        raycast.place[2] - hit[2],
+    ];
+    if normal == [0, 0, 0] {
+        return Vec::new();
+    }
+
+    let source_mat = world.get(hit[0], hit[1], hit[2]);
+    if source_mat == 0 {
+        return Vec::new();
+    }
+
+    let axis = if normal[0] != 0 {
+        0
+    } else if normal[1] != 0 {
+        1
+    } else {
+        2
+    };
+
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut out = Vec::new();
+    queue.push_back(hit);
+    visited.insert(hit);
+
+    while let Some(p) = queue.pop_front() {
+        if out.len() >= max_blocks {
+            break;
+        }
+
+        let target = if active_tool == ToolKind::BuildersWand {
+            [p[0] + normal[0], p[1] + normal[1], p[2] + normal[2]]
+        } else {
+            p
+        };
+
+        if world.get(target[0], target[1], target[2]) == 0
+            || active_tool == ToolKind::DestructorWand
+        {
+            out.push(target);
+        }
+
+        for dir in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ] {
+            if dir[axis] != 0 {
+                continue;
+            }
+            let np = [p[0] + dir[0], p[1] + dir[1], p[2] + dir[2]];
+            if visited.contains(&np) {
+                continue;
+            }
+            if world.get(np[0], np[1], np[2]) != source_mat {
+                continue;
+            }
+            visited.insert(np);
+            queue.push_back(np);
+        }
+    }
+
+    out
 }
 
 fn raycast_target(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> RaycastResult {

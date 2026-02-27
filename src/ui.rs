@@ -2,11 +2,37 @@ use crate::sim::{material, MATERIALS};
 use crate::world::{BrushMode, BrushSettings, BrushShape, MaterialId};
 use glam::{Mat4, Vec2, Vec3};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Brush,
+    BuildersWand,
+    DestructorWand,
+}
+
+impl ToolKind {
+    pub const ALL: [ToolKind; 3] = [
+        ToolKind::Brush,
+        ToolKind::BuildersWand,
+        ToolKind::DestructorWand,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToolKind::Brush => "Brush",
+            ToolKind::BuildersWand => "Builder's Wand",
+            ToolKind::DestructorWand => "Destructor Wand",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UiState {
     pub paused_menu: bool,
     pub show_brush: bool,
     pub selected_slot: usize,
+    pub show_radial_menu: bool,
+    pub show_tool_quick_menu: bool,
+    pub active_tool: ToolKind,
     pub new_world_size: usize,
     pub day: bool,
     pub mouse_sensitivity: f32,
@@ -38,6 +64,9 @@ impl Default for UiState {
             paused_menu: false,
             show_brush: false,
             selected_slot: 3,
+            show_radial_menu: false,
+            show_tool_quick_menu: false,
+            active_tool: ToolKind::Brush,
             new_world_size: 64,
             day: true,
             mouse_sensitivity: 0.001,
@@ -115,6 +144,7 @@ pub fn draw(
                 material(selected_material(ui_state.selected_slot)).name
             ));
             ui.label(format!("Brush r={}", brush.radius));
+            ui.label(format!("Tool: {}", ui_state.active_tool.label()));
         });
     });
 
@@ -144,15 +174,45 @@ pub fn draw(
             ui.add(
                 egui::Slider::new(&mut brush.repeat_interval_s, 0.01..=0.5).text("Hold repeat (s)"),
             );
-            ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut brush.fixed_distance,
+                "Fixed placement distance (always, no raycast collision)",
+            );
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
                 ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
+                ui.selectable_value(&mut brush.shape, BrushShape::Torus, "Torus");
+                ui.selectable_value(&mut brush.shape, BrushShape::Hemisphere, "Hemisphere");
+                ui.selectable_value(&mut brush.shape, BrushShape::Bowl, "Bowl");
+                ui.selectable_value(&mut brush.shape, BrushShape::InvertedBowl, "Inverted Bowl");
             });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut brush.mode, BrushMode::Place, "Place");
                 ui.selectable_value(&mut brush.mode, BrushMode::Erase, "Erase");
             });
         });
+    }
+
+    if ui_state.show_tool_quick_menu && !ui_state.paused_menu {
+        egui::Window::new("Tools")
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 56.0])
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for tool in ToolKind::ALL {
+                        let mut button = egui::Button::new(tool.label());
+                        if tool == ui_state.active_tool {
+                            button = button.fill(egui::Color32::from_rgb(60, 110, 160));
+                        }
+                        if ui.add_sized([140.0, 34.0], button).clicked() {
+                            ui_state.active_tool = tool;
+                            ui_state.show_tool_quick_menu = false;
+                        }
+                    }
+                });
+                ui.label("Press Q to close");
+            });
     }
 
     if ui_state.paused_menu {
@@ -182,6 +242,8 @@ pub fn draw_fps_overlays(
     viewport: [u32; 2],
     preview_blocks: &[[i32; 3]],
     brush: &BrushSettings,
+    show_radial_menu: bool,
+    radial_toggle_key_label: &str,
     voxel_size: f32,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -225,9 +287,14 @@ pub fn draw_fps_overlays(
         );
     }
 
-    if !paused {
-        draw_brush_radial_hint(&painter, ctx.screen_rect(), brush);
-    }
+    draw_brush_radial_hint(
+        ctx,
+        &painter,
+        ctx.screen_rect(),
+        brush,
+        !paused && show_radial_menu,
+        radial_toggle_key_label,
+    );
 }
 
 fn draw_block_outline(
@@ -278,54 +345,71 @@ fn draw_block_outline(
     }
 }
 
-fn draw_brush_radial_hint(painter: &egui::Painter, rect: egui::Rect, brush: &BrushSettings) {
+fn draw_brush_radial_hint(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    brush: &BrushSettings,
+    show_radial_menu: bool,
+    radial_toggle_key_label: &str,
+) {
+    let anim = ctx.animate_bool(egui::Id::new("brush_radial_menu_anim"), show_radial_menu);
+    if anim <= 0.0 {
+        return;
+    }
+
     let center = rect.center();
-    let radius = 52.0;
+    let radius = 52.0 * anim;
+    let primary_alpha = (110.0 * anim) as u8;
+    let secondary_alpha = (70.0 * anim) as u8;
+    let text_alpha = (255.0 * anim) as u8;
+    let hint_alpha = (210.0 * anim) as u8;
+
     painter.circle_stroke(
         center,
         radius,
-        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(110)),
+        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(primary_alpha)),
     );
     painter.circle_stroke(
         center,
-        radius - 12.0,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+        (radius - 12.0 * anim).max(0.0),
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(secondary_alpha)),
     );
 
     painter.text(
-        center + egui::vec2(0.0, -radius - 18.0),
+        center + egui::vec2(0.0, -radius - 18.0 * anim),
         egui::Align2::CENTER_CENTER,
         format!("Radius {}", brush.radius),
         egui::FontId::proportional(13.0),
-        egui::Color32::WHITE,
+        egui::Color32::from_white_alpha(text_alpha),
     );
     painter.text(
-        center + egui::vec2(radius + 22.0, 0.0),
+        center + egui::vec2(radius + 22.0 * anim, 0.0),
         egui::Align2::CENTER_CENTER,
-        format!(
-            "{}",
-            if brush.mode == BrushMode::Place {
-                "Place"
-            } else {
-                "Erase"
-            }
-        ),
+        if brush.mode == BrushMode::Place {
+            "Place"
+        } else {
+            "Erase"
+        },
         egui::FontId::proportional(12.0),
-        egui::Color32::WHITE,
+        egui::Color32::from_white_alpha(text_alpha),
     );
     painter.text(
-        center + egui::vec2(-radius - 26.0, 0.0),
+        center + egui::vec2(-radius - 26.0 * anim, 0.0),
         egui::Align2::CENTER_CENTER,
         format!("{:?}", brush.shape),
         egui::FontId::proportional(12.0),
-        egui::Color32::WHITE,
+        egui::Color32::from_white_alpha(text_alpha),
     );
     painter.text(
-        center + egui::vec2(0.0, radius + 18.0),
+        center + egui::vec2(0.0, radius + 18.0 * anim),
         egui::Align2::CENTER_CENTER,
-        "Scroll: material | Ctrl+Scroll: radius | Shift+Scroll: range",
+        format!(
+            "Scroll: material | Ctrl+Scroll: radius | Alt+Scroll: range | {}: toggle radial",
+            radial_toggle_key_label
+        ),
         egui::FontId::proportional(11.0),
-        egui::Color32::from_white_alpha(210),
+        egui::Color32::from_white_alpha(hint_alpha),
     );
 }
 
