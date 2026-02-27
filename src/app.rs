@@ -89,14 +89,16 @@ pub async fn run() -> anyhow::Result<()> {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => renderer.resize(*size),
-                    WindowEvent::Focused(_) => {
-                        let _ = set_cursor(window, ui.show_tool_quick_menu);
+                    WindowEvent::Focused(focused) => {
+                        let should_unlock = !focused || ui.paused_menu || ui.show_tool_quick_menu;
+                        let _ = set_cursor(window, should_unlock);
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             if event.state == ElementState::Pressed {
                                 match key {
                                     KeyCode::Escape => ui.paused_menu = !ui.paused_menu,
+                                    _ if ui.paused_menu => {}
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
                                     RADIAL_MENU_TOGGLE_KEY => {
@@ -155,7 +157,7 @@ pub async fn run() -> anyhow::Result<()> {
                         if !quick_menu_held {
                             ui.hovered_tool = None;
                         }
-                        let cursor_should_unlock = quick_menu_held;
+                        let cursor_should_unlock = ui.paused_menu || quick_menu_held;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !cursor_should_unlock {
@@ -206,7 +208,7 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                         }
 
-                        if sim.running {
+                        if sim.running && !ui.paused_menu {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
                             while sim.accumulator >= step_dt {

@@ -385,7 +385,7 @@ pub fn draw_fps_overlays(
     using_tool: bool,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
+        egui::Order::Background,
         egui::Id::new("fps_overlays"),
     ));
 
@@ -465,13 +465,13 @@ fn draw_held_tool_sprite(
     };
 
     let pivot = egui::pos2(
-        rect.max.x - 76.0 - swing,
-        rect.max.y - 56.0 + bob + swing * 0.25,
+        rect.max.x - 84.0 - swing,
+        rect.max.y - 64.0 + bob + swing * 0.2,
     );
-    let top_left = egui::pos2(pivot.x - base_w * 0.72, pivot.y - height - 8.0);
-    let top_right = egui::pos2(pivot.x - base_w * 0.04, pivot.y - height * 1.08);
-    let bottom_right = egui::pos2(pivot.x + base_w * 0.20, pivot.y + 8.0);
-    let bottom_left = egui::pos2(pivot.x - base_w * 0.52, pivot.y + 26.0);
+    let top_left = egui::pos2(pivot.x - base_w * 0.66, pivot.y - height - 10.0);
+    let top_right = egui::pos2(pivot.x - base_w * 0.08, pivot.y - height * 1.02);
+    let bottom_right = egui::pos2(pivot.x + base_w * 0.10, pivot.y + 7.0);
+    let bottom_left = egui::pos2(pivot.x - base_w * 0.46, pivot.y + 20.0);
 
     let mut mesh = egui::Mesh::with_texture(texture);
     let tint = if using_tool {
