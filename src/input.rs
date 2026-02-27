@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::world::{World, EMPTY};
+
 #[derive(Default, Clone)]
 pub struct InputState {
     pub pressed: HashSet<KeyCode>,
@@ -105,6 +107,11 @@ impl Default for FpsController {
 }
 
 impl FpsController {
+    const PLAYER_RADIUS: f32 = 0.3;
+    const PLAYER_HALF_HEIGHT: f32 = 0.9;
+    const STEP_HEIGHT: f32 = 0.5;
+    const GROUND_EPSILON: f32 = 0.05;
+
     pub fn look_dir(&self) -> Vec3 {
         Vec3::new(
             self.yaw.cos() * self.pitch.cos(),
@@ -114,7 +121,67 @@ impl FpsController {
         .normalize_or_zero()
     }
 
-    pub fn step(&mut self, input: &InputState, dt: f32, lock_mouse: bool, now_s: f32) {
+    fn collides(world: &World, pos: Vec3) -> bool {
+        let min = pos
+            + Vec3::new(
+                -Self::PLAYER_RADIUS,
+                -Self::PLAYER_HALF_HEIGHT,
+                -Self::PLAYER_RADIUS,
+            );
+        let max = pos
+            + Vec3::new(
+                Self::PLAYER_RADIUS,
+                Self::PLAYER_HALF_HEIGHT,
+                Self::PLAYER_RADIUS,
+            );
+
+        let min_x = min.x.floor() as i32;
+        let min_y = min.y.floor() as i32;
+        let min_z = min.z.floor() as i32;
+        let max_x = (max.x - 1e-4).floor() as i32;
+        let max_y = (max.y - 1e-4).floor() as i32;
+        let max_z = (max.z - 1e-4).floor() as i32;
+
+        for z in min_z..=max_z {
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    if world.get(x, y, z) != EMPTY {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn try_move_axis(&mut self, world: &World, axis_delta: Vec3, allow_step: bool) {
+        if axis_delta.length_squared() <= f32::EPSILON {
+            return;
+        }
+
+        let candidate = self.position + axis_delta;
+        if !Self::collides(world, candidate) {
+            self.position = candidate;
+            return;
+        }
+
+        if allow_step {
+            let raised = self.position + Vec3::Y * Self::STEP_HEIGHT;
+            let stair_candidate = raised + axis_delta;
+            if !Self::collides(world, raised) && !Self::collides(world, stair_candidate) {
+                self.position = stair_candidate;
+            }
+        }
+    }
+
+    pub fn step(
+        &mut self,
+        world: &World,
+        input: &InputState,
+        dt: f32,
+        lock_mouse: bool,
+        now_s: f32,
+    ) {
         if lock_mouse {
             self.yaw += input.mouse_delta.x * self.sensitivity;
             self.pitch -= input.mouse_delta.y * self.sensitivity;
@@ -147,17 +214,27 @@ impl FpsController {
             if input.key(KeyCode::ShiftLeft) {
                 move_dir -= Vec3::Y;
             }
-            self.position += move_dir * self.fly_speed * dt;
+            let fly_delta = move_dir * self.fly_speed * dt;
+            self.try_move_axis(world, Vec3::new(fly_delta.x, 0.0, 0.0), false);
+            self.try_move_axis(world, Vec3::new(0.0, 0.0, fly_delta.z), false);
+            self.try_move_axis(world, Vec3::new(0.0, fly_delta.y, 0.0), false);
         } else {
-            self.position += move_dir * self.move_speed * dt;
-            self.vel_y -= 19.6 * dt;
-            self.position.y += self.vel_y * dt;
-            if self.position.y < 2.4 {
-                self.position.y = 2.4;
-                self.vel_y = 0.0;
-            }
-            if input.key(KeyCode::Space) && self.position.y <= 2.41 {
+            let horizontal = move_dir * self.move_speed * dt;
+            self.try_move_axis(world, Vec3::new(horizontal.x, 0.0, 0.0), true);
+            self.try_move_axis(world, Vec3::new(0.0, 0.0, horizontal.z), true);
+
+            let on_ground = Self::collides(world, self.position - Vec3::Y * Self::GROUND_EPSILON);
+            if input.key(KeyCode::Space) && on_ground {
                 self.vel_y = self.jump_speed;
+            }
+
+            self.vel_y -= 19.6 * dt;
+            let vertical = Vec3::new(0.0, self.vel_y * dt, 0.0);
+            let vertical_candidate = self.position + vertical;
+            if !Self::collides(world, vertical_candidate) {
+                self.position = vertical_candidate;
+            } else {
+                self.vel_y = 0.0;
             }
         }
 
