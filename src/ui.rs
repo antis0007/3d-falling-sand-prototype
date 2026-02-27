@@ -13,6 +13,25 @@ pub struct UiState {
     pub sim_speed: f32,
 }
 
+impl UiState {
+    pub const SIM_SPEED_MIN: f32 = 0.1;
+    pub const SIM_SPEED_MAX: f32 = 4.0;
+    pub const SIM_SPEED_STEP: f32 = 0.1;
+
+    pub fn clamp_quantize_sim_speed(value: f32) -> f32 {
+        let steps = (value / Self::SIM_SPEED_STEP).round();
+        (steps * Self::SIM_SPEED_STEP).clamp(Self::SIM_SPEED_MIN, Self::SIM_SPEED_MAX)
+    }
+
+    pub fn set_sim_speed(&mut self, value: f32) {
+        self.sim_speed = Self::clamp_quantize_sim_speed(value);
+    }
+
+    pub fn adjust_sim_speed(&mut self, delta_steps: i32) {
+        self.set_sim_speed(self.sim_speed + delta_steps as f32 * Self::SIM_SPEED_STEP);
+    }
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -78,7 +97,19 @@ pub fn draw(
                 egui::Slider::new(&mut ui_state.mouse_sensitivity, 0.0002..=0.003)
                     .text("Mouse sensitivity"),
             );
-            ui.add(egui::Slider::new(&mut ui_state.sim_speed, 0.1..=4.0).text("Sim speed"));
+            let changed = ui
+                .add(
+                    egui::Slider::new(
+                        &mut ui_state.sim_speed,
+                        UiState::SIM_SPEED_MIN..=UiState::SIM_SPEED_MAX,
+                    )
+                    .text("Sim speed")
+                    .step_by(UiState::SIM_SPEED_STEP as f64),
+                )
+                .changed();
+            if changed {
+                ui_state.set_sim_speed(ui_state.sim_speed);
+            }
             ui.label(format!(
                 "Mat: {}",
                 material(selected_material(ui_state.selected_slot)).name
@@ -143,6 +174,7 @@ pub fn selected_material(slot: usize) -> MaterialId {
 pub fn draw_fps_overlays(
     ctx: &egui::Context,
     paused: bool,
+    sim_speed: f32,
     vp: Mat4,
     viewport: [u32; 2],
     hit: Option<[i32; 3]>,
@@ -160,6 +192,15 @@ pub fn draw_fps_overlays(
         painter.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
         painter.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
     }
+
+    let speed_pos = egui::pos2(10.0, 10.0);
+    painter.text(
+        speed_pos,
+        egui::Align2::LEFT_TOP,
+        format!("{sim_speed:.1}x"),
+        egui::FontId::proportional(14.0),
+        egui::Color32::WHITE,
+    );
 
     if let Some(block) = hit {
         draw_block_outline(&painter, vp, viewport, block, voxel_size);

@@ -57,6 +57,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     }
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
+                                    KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
+                                    KeyCode::BracketRight => ui.adjust_sim_speed(1),
+                                    KeyCode::Backslash => ui.set_sim_speed(1.0),
                                     KeyCode::Digit0 => ui.selected_slot = 0,
                                     KeyCode::Digit1 => ui.selected_slot = 1,
                                     KeyCode::Digit2 => ui.selected_slot = 2,
@@ -100,7 +103,7 @@ pub async fn run() -> anyhow::Result<()> {
                             raycast_hit(&world, ctrl.position, ctrl.look_dir(), brush.max_distance);
 
                         if sim.running {
-                            let step_dt = (sim.fixed_dt / ui.sim_speed.max(0.1)).max(1e-4);
+                            let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
                             while sim.accumulator >= step_dt {
                                 step(&mut world, &mut sim.rng);
@@ -122,6 +125,7 @@ pub async fn run() -> anyhow::Result<()> {
                             draw_fps_overlays(
                                 ctx,
                                 ui.paused_menu,
+                                ui.sim_speed,
                                 cam.view_proj(),
                                 [renderer.config.width, renderer.config.height],
                                 ray_hit,
