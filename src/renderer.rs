@@ -248,7 +248,7 @@ impl Renderer {
         }
     }
 
-    pub fn render_world<'a>(&'a mut self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+    pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
         self.queue.write_buffer(
             &self.cam_buf,
             0,
