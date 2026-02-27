@@ -664,21 +664,21 @@ pub fn load_tool_textures(ctx: &egui::Context, dir: impl AsRef<Path>) -> ToolTex
     let brush = load_single_tool_texture(
         ctx,
         &dir,
-        "brush.ppm",
+        "brush",
         "tool_brush",
         fallback_tool_texture([130, 180, 240, 255]),
     );
     let builders_wand = load_single_tool_texture(
         ctx,
         &dir,
-        "builders_wand.ppm",
+        "builders_wand",
         "tool_builders_wand",
         fallback_tool_texture([140, 220, 120, 255]),
     );
     let destructor_wand = load_single_tool_texture(
         ctx,
         &dir,
-        "destructor_wand.ppm",
+        "destructor_wand",
         "tool_destructor_wand",
         fallback_tool_texture([240, 140, 140, 255]),
     );
@@ -692,18 +692,36 @@ pub fn load_tool_textures(ctx: &egui::Context, dir: impl AsRef<Path>) -> ToolTex
 fn load_single_tool_texture(
     ctx: &egui::Context,
     dir: &Path,
-    file_name: &str,
+    file_stem: &str,
     egui_name: &str,
     fallback: egui::ColorImage,
 ) -> ToolTexture {
-    let path = dir.join(file_name);
-    let image = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| parse_ppm_image(&bytes))
+    let image = ["png", "ppm"]
+        .iter()
+        .find_map(|ext| {
+            let path = dir.join(format!("{file_stem}.{ext}"));
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| parse_tool_image(&bytes))
+        })
         .unwrap_or(fallback);
     let size = image.size;
     let texture = ctx.load_texture(egui_name.to_string(), image, egui::TextureOptions::NEAREST);
     ToolTexture { texture, size }
+}
+
+fn parse_tool_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+    parse_standard_image(bytes).or_else(|| parse_ppm_image(bytes))
+}
+
+fn parse_standard_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let dyn_img = image::load_from_memory(bytes).ok()?;
+    let rgba = dyn_img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [w as usize, h as usize],
+        rgba.as_raw(),
+    ))
 }
 
 fn parse_ppm_image(bytes: &[u8]) -> Option<egui::ColorImage> {
