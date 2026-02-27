@@ -113,8 +113,9 @@ impl Default for FpsController {
 
 impl FpsController {
     const PLAYER_RADIUS: f32 = 0.3;
-    const PLAYER_HALF_HEIGHT: f32 = 0.9;
-    const STEP_HEIGHT: f32 = 0.5;
+    const EYE_TO_FEET: f32 = 3.2;
+    const EYE_TO_HEAD: f32 = 0.8;
+    const STEP_HEIGHT: f32 = 0.6;
     const GROUND_EPSILON: f32 = 0.05;
 
     pub fn look_dir(&self) -> Vec3 {
@@ -130,15 +131,10 @@ impl FpsController {
         let min = pos
             + Vec3::new(
                 -Self::PLAYER_RADIUS,
-                -Self::PLAYER_HALF_HEIGHT,
+                -Self::EYE_TO_FEET,
                 -Self::PLAYER_RADIUS,
             );
-        let max = pos
-            + Vec3::new(
-                Self::PLAYER_RADIUS,
-                Self::PLAYER_HALF_HEIGHT,
-                Self::PLAYER_RADIUS,
-            );
+        let max = pos + Vec3::new(Self::PLAYER_RADIUS, Self::EYE_TO_HEAD, Self::PLAYER_RADIUS);
 
         let min_x = min.x.floor() as i32;
         let min_y = min.y.floor() as i32;
