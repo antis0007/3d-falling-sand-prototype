@@ -302,8 +302,10 @@ pub fn step(world: &mut World, rng: &mut XorShift32) {
 fn try_move(world: &mut World, from: [i32; 3], to: [i32; 3], id: MaterialId) -> bool {
     let dst = world.get(to[0], to[1], to[2]);
     if dst == EMPTY || material(dst).density < material(id).density {
-        world.set(to[0], to[1], to[2], id);
-        world.set(from[0], from[1], from[2], dst);
+        if !world.set(to[0], to[1], to[2], id) {
+            return false;
+        }
+        let _ = world.set(from[0], from[1], from[2], dst);
         world.activate_neighbors(to[0], to[1], to[2]);
         return true;
     }
@@ -345,29 +347,69 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             if try_move(world, p, [p[0], p[1] - 1, p[2]], id) {
                 return true;
             }
+
+            let current_cohesion = liquid_cohesion_score(world, p, id);
+            let surface_tension = liquid_surface_tension(material(id));
+            let pressure = liquid_pressure_head(world, p, id);
+
             let mut diag = down_diagonals();
             rng.shuffle(&mut diag);
             let lateral_attempts = material(id).flow_speed.max(1) as usize;
+            let mut best_diagonal_move: Option<([i32; 3], i32)> = None;
             for d in diag.into_iter().take(lateral_attempts.min(8)) {
                 let to = [p[0] + d[0], p[1] - 1, p[2] + d[1]];
                 if is_diagonal_blocked(world, p, to) {
                     continue;
                 }
-                if try_move(world, p, to, id) {
-                    return true;
+                if !can_displace(world, to, id) {
+                    continue;
+                }
+                let cohesion = liquid_cohesion_score(world, to, id);
+                best_diagonal_move = match best_diagonal_move {
+                    Some((_, best)) if best >= cohesion => best_diagonal_move,
+                    _ => Some((to, cohesion)),
+                };
+            }
+
+            if let Some((to, cohesion)) = best_diagonal_move {
+                let cohesion_delta = cohesion - current_cohesion;
+                if cohesion_delta >= -1
+                    || rng.chance((1.0 - surface_tension) * 0.5 + pressure * 0.2)
+                {
+                    return try_move(world, p, to, id);
                 }
             }
 
             let cohesion_neighbors = count_same_neighbors(world, p, id);
-            if cohesion_neighbors > 1 && rng.chance(material(id).viscosity.clamp(0.0, 0.95)) {
+            if cohesion_neighbors > 1
+                && rng
+                    .chance((material(id).viscosity * 0.6 + surface_tension * 0.3).clamp(0.0, 0.95))
+            {
                 return false;
             }
 
             let mut side = side_dirs();
             rng.shuffle(&mut side);
+            let mut best_side_move: Option<([i32; 3], i32)> = None;
             for d in side.into_iter().take(lateral_attempts.min(8)) {
-                if try_move(world, p, [p[0] + d[0], p[1], p[2] + d[1]], id) {
-                    return true;
+                let to = [p[0] + d[0], p[1], p[2] + d[1]];
+                if !can_displace(world, to, id) {
+                    continue;
+                }
+                let cohesion = liquid_cohesion_score(world, to, id);
+                best_side_move = match best_side_move {
+                    Some((_, best)) if best >= cohesion => best_side_move,
+                    _ => Some((to, cohesion)),
+                };
+            }
+
+            if let Some((to, cohesion)) = best_side_move {
+                let cohesion_delta = cohesion - current_cohesion;
+                if cohesion_delta >= 0
+                    || (pressure > 0.25 && cohesion_delta >= -1)
+                    || rng.chance((1.0 - surface_tension) * 0.22 + pressure * 0.32)
+                {
+                    return try_move(world, p, to, id);
                 }
             }
             false
@@ -517,6 +559,49 @@ fn is_acid_dissolvable(id: MaterialId) -> bool {
     }
     let mat = material(id);
     matches!(mat.phase, Phase::Solid | Phase::Powder) && !mat.acid_resistant
+}
+
+fn can_displace(world: &World, to: [i32; 3], id: MaterialId) -> bool {
+    let dst = world.get(to[0], to[1], to[2]);
+    dst == EMPTY || material(dst).density < material(id).density
+}
+
+fn liquid_surface_tension(mat: &Material) -> f32 {
+    (0.35 + mat.viscosity * 0.6).clamp(0.1, 0.95)
+}
+
+fn liquid_pressure_head(world: &World, p: [i32; 3], id: MaterialId) -> f32 {
+    let mut depth = 0;
+    while depth < 4 {
+        if world.get(p[0], p[1] + depth, p[2]) != id {
+            break;
+        }
+        depth += 1;
+    }
+    ((depth as f32) - 1.0).max(0.0) / 4.0
+}
+
+fn liquid_cohesion_score(world: &World, p: [i32; 3], id: MaterialId) -> i32 {
+    let mut score = 0;
+
+    for [dx, dz] in side_dirs() {
+        if world.get(p[0] + dx, p[1], p[2] + dz) == id {
+            score += 2;
+        }
+    }
+
+    let below = world.get(p[0], p[1] - 1, p[2]);
+    if below == id {
+        score += 3;
+    } else if below != EMPTY {
+        score += 1;
+    }
+
+    if world.get(p[0], p[1] + 1, p[2]) == id {
+        score += 1;
+    }
+
+    score
 }
 
 fn count_same_neighbors(world: &World, p: [i32; 3], id: MaterialId) -> usize {
