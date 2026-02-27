@@ -11,7 +11,6 @@ pub enum Phase {
 #[derive(Clone, Copy, Debug)]
 pub struct Material {
     // Future hooks: pressure/temperature/reaction coefficients can live here for advanced fluids/gases.
-
     pub id: MaterialId,
     pub name: &'static str,
     pub color: [u8; 4],

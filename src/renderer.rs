@@ -74,6 +74,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
+    depth_texture: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
     meshes: HashMap<usize, ChunkMesh>,
     pub day: bool,
 }
@@ -166,10 +168,18 @@ impl Renderer {
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: Default::default(),
             multiview: None,
         });
+
+        let (depth_texture, depth_view) = create_depth_texture(&device, &config);
 
         Ok(Self {
             surface,
@@ -180,6 +190,8 @@ impl Renderer {
             pipeline,
             cam_buf,
             cam_bg,
+            depth_texture,
+            depth_view,
             meshes: HashMap::new(),
             day: true,
         })
@@ -190,6 +202,7 @@ impl Renderer {
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
+        (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
     }
 
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
@@ -254,6 +267,28 @@ impl Renderer {
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
     }
+}
+
+fn create_depth_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth texture"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth24Plus,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
@@ -341,33 +376,40 @@ fn add_voxel_faces(
         (
             [1, 0, 0],
             [[1., 0., 0.], [1., 1., 0.], [1., 1., 1.], [1., 0., 1.]],
+            0.88,
         ),
         (
             [-1, 0, 0],
             [[0., 0., 1.], [0., 1., 1.], [0., 1., 0.], [0., 0., 0.]],
+            0.73,
         ),
         (
             [0, 1, 0],
             [[0., 1., 1.], [1., 1., 1.], [1., 1., 0.], [0., 1., 0.]],
+            1.0,
         ),
         (
             [0, -1, 0],
             [[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]],
+            0.58,
         ),
         (
             [0, 0, 1],
             [[1., 0., 1.], [1., 1., 1.], [0., 1., 1.], [0., 0., 1.]],
+            0.8,
         ),
         (
             [0, 0, -1],
             [[0., 0., 0.], [0., 1., 0.], [1., 1., 0.], [1., 0., 0.]],
+            0.66,
         ),
     ];
-    for (d, quad) in dirs {
+    for (d, quad, shade) in dirs {
         if world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2]) != EMPTY {
             continue;
         }
         let b = verts.len() as u32;
+        let shaded = shade_color(color, shade);
         for v in quad {
             verts.push(Vertex {
                 pos: [
@@ -375,9 +417,18 @@ fn add_voxel_faces(
                     (p[1] as f32 + v[1]) * VOXEL_SIZE,
                     (p[2] as f32 + v[2]) * VOXEL_SIZE,
                 ],
-                color,
+                color: shaded,
             });
         }
         inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
+}
+
+fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
+    [
+        ((color[0] as f32 * shade).min(255.0)) as u8,
+        ((color[1] as f32 * shade).min(255.0)) as u8,
+        ((color[2] as f32 * shade).min(255.0)) as u8,
+        color[3],
+    ]
 }
