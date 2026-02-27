@@ -89,6 +89,9 @@ pub async fn run() -> anyhow::Result<()> {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => renderer.resize(*size),
+                    WindowEvent::Focused(_) => {
+                        let _ = set_cursor(window, ui.show_tool_quick_menu);
+                    }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             if event.state == ElementState::Pressed {
@@ -152,7 +155,7 @@ pub async fn run() -> anyhow::Result<()> {
                         if !quick_menu_held {
                             ui.hovered_tool = None;
                         }
-                        let cursor_should_unlock = ui.paused_menu || quick_menu_held;
+                        let cursor_should_unlock = quick_menu_held;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !cursor_should_unlock {
