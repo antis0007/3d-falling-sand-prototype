@@ -5,7 +5,9 @@ use crate::player::{
 };
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
-use crate::ui::{draw, draw_fps_overlays, selected_material, ToolKind, UiState};
+use crate::ui::{
+    draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind, ToolTextures, UiState,
+};
 use crate::world::{
     default_save_path, load_world, save_world, BrushMode, BrushSettings, BrushShape, World,
 };
@@ -21,6 +23,7 @@ use winit::window::{CursorGrabMode, WindowBuilder};
 const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
+const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
 
 #[derive(Default)]
@@ -56,6 +59,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut ctrl = FpsController::default();
     let mut ui = UiState::default();
     let mut brush = BrushSettings::default();
+    let tool_textures = load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR);
     let mut edit_runtime = EditRuntimeState::default();
     let mut last = Instant::now();
     let start = Instant::now();
@@ -75,18 +79,12 @@ pub async fn run() -> anyhow::Result<()> {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => renderer.resize(*size),
                     WindowEvent::KeyboardInput { event, .. } => {
-                        if event.state == ElementState::Pressed {
-                            if let PhysicalKey::Code(key) = event.physical_key {
+                        if let PhysicalKey::Code(key) = event.physical_key {
+                            if event.state == ElementState::Pressed {
                                 match key {
-                                    KeyCode::Escape => {
-                                        ui.paused_menu = !ui.paused_menu;
-                                        let _ = set_cursor(window, ui.paused_menu);
-                                    }
+                                    KeyCode::Escape => ui.paused_menu = !ui.paused_menu,
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
-                                    TOOL_QUICK_MENU_TOGGLE_KEY => {
-                                        ui.show_tool_quick_menu = !ui.show_tool_quick_menu
-                                    }
                                     RADIAL_MENU_TOGGLE_KEY => {
                                         ui.show_radial_menu = !ui.show_radial_menu
                                     }
@@ -123,6 +121,13 @@ pub async fn run() -> anyhow::Result<()> {
                                     _ => {}
                                 }
                             }
+                            if key == TOOL_QUICK_MENU_TOGGLE_KEY
+                                && event.state == ElementState::Released
+                            {
+                                if let Some(hovered) = ui.hovered_tool.take() {
+                                    ui.active_tool = hovered;
+                                }
+                            }
                         }
                     }
                     WindowEvent::RedrawRequested => {
@@ -130,7 +135,19 @@ pub async fn run() -> anyhow::Result<()> {
                         let dt = (now - last).as_secs_f32().min(0.05);
                         last = now;
 
-                        if !ui.paused_menu && !egui_c {
+                        let quick_menu_held =
+                            input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
+                        ui.show_tool_quick_menu = quick_menu_held;
+                        if !quick_menu_held {
+                            ui.hovered_tool = None;
+                        }
+                        if quick_menu_held {
+                            center_cursor(window, renderer.config.width, renderer.config.height);
+                        }
+                        let cursor_should_unlock = ui.paused_menu || quick_menu_held;
+                        let _ = set_cursor(window, cursor_should_unlock);
+
+                        if !cursor_should_unlock {
                             ctrl.sensitivity = ui.mouse_sensitivity;
                             ctrl.step(&world, &input, dt, true, start.elapsed().as_secs_f32());
                             if input.wheel.abs() > 0.0 {
@@ -156,10 +173,16 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raycast =
                             target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
-                        let preview_blocks =
-                            preview_blocks(&world, &brush, raycast, brush.mode, ui.active_tool);
+                        let preview_blocks = preview_blocks(
+                            &world,
+                            &brush,
+                            raycast,
+                            brush.mode,
+                            ui.active_tool,
+                            !cursor_should_unlock || !egui_c,
+                        );
 
-                        if !ui.paused_menu && !egui_c {
+                        if !cursor_should_unlock {
                             apply_mouse_edit(
                                 &mut world,
                                 &brush,
@@ -192,6 +215,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,
                             };
+                            let held_tool = texture_for_active_tool(&tool_textures, ui.active_tool);
                             draw_fps_overlays(
                                 ctx,
                                 ui.paused_menu,
@@ -203,6 +227,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 ui.show_radial_menu,
                                 RADIAL_MENU_TOGGLE_LABEL,
                                 VOXEL_SIZE,
+                                held_tool,
+                                start.elapsed().as_secs_f32(),
+                                input.lmb || input.rmb,
                             );
                             if actions.new_world {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
@@ -355,6 +382,21 @@ pub async fn run() -> anyhow::Result<()> {
         .context("event loop")
 }
 
+fn center_cursor(window: &winit::window::Window, width: u32, height: u32) {
+    let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
+        (width / 2) as f64,
+        (height / 2) as f64,
+    ));
+}
+
+fn texture_for_active_tool(
+    tool_textures: &ToolTextures,
+    active_tool: ToolKind,
+) -> Option<(egui::TextureId, [usize; 2])> {
+    let texture = tool_textures.for_tool(active_tool);
+    Some((texture.texture.id(), texture.size))
+}
+
 fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()> {
     window.set_cursor_visible(unlock);
     if unlock {
@@ -439,8 +481,12 @@ fn preview_blocks(
     raycast: RaycastResult,
     mode: BrushMode,
     active_tool: ToolKind,
+    show_hover_hints: bool,
 ) -> Vec<[i32; 3]> {
     let Some(center) = brush_center(*brush, raycast, mode) else {
+        if !show_hover_hints {
+            return Vec::new();
+        }
         return Vec::new();
     };
     if brush.radius == 0 {
@@ -483,6 +529,12 @@ fn preview_blocks(
 }
 
 fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -> Option<[i32; 3]> {
+    if brush.minecraft_style_placement {
+        return match mode {
+            BrushMode::Place => raycast.hit.map(|_| raycast.place),
+            BrushMode::Erase => raycast.hit,
+        };
+    }
     if brush.fixed_distance {
         return Some(raycast.place);
     }
@@ -499,7 +551,7 @@ fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -
 }
 
 fn target_for_edit(world: &World, origin: Vec3, dir: Vec3, brush: &BrushSettings) -> RaycastResult {
-    if brush.fixed_distance {
+    if brush.fixed_distance && !brush.minecraft_style_placement {
         RaycastResult {
             hit: None,
             place: fixed_distance_target(origin, dir, brush.max_distance),
@@ -531,7 +583,7 @@ fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) 
         }
         BrushShape::Hemisphere => dy >= 0 && (dx * dx + dy * dy + dz * dz) <= rad * rad,
         BrushShape::Bowl => {
-            if dy < 0 {
+            if dy > 0 {
                 return false;
             }
             let r2 = dx * dx + dy * dy + dz * dz;
@@ -539,7 +591,7 @@ fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) 
             r2 <= rad * rad && r2 >= inner * inner
         }
         BrushShape::InvertedBowl => {
-            if dy > 0 {
+            if dy < 0 {
                 return false;
             }
             let r2 = dx * dx + dy * dy + dz * dz;
