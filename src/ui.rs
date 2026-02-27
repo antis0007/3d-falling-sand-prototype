@@ -92,6 +92,8 @@ pub fn draw(
     ui_state: &mut UiState,
     sim_running: bool,
     brush: &mut BrushSettings,
+    tool_textures: &ToolTextures,
+    tab_palette_held: bool,
 ) -> UiActions {
     let mut actions = UiActions::default();
     egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -172,8 +174,7 @@ pub fn draw(
         });
     });
 
-    let show_tab_palette = ctx.input(|i| i.key_down(egui::Key::Tab));
-    if show_tab_palette && !ui_state.paused_menu {
+    if tab_palette_held && !ui_state.paused_menu {
         egui::Window::new("Materials (TAB)")
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0])
             .collapsible(false)
@@ -239,26 +240,38 @@ pub fn draw(
 
     if ui_state.show_tool_quick_menu && !ui_state.paused_menu {
         egui::Window::new("Tools")
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 56.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .resizable(false)
+            .title_bar(false)
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for tool in ToolKind::ALL {
-                        let mut button = egui::Button::new(tool.label());
-                        if tool == ui_state.active_tool {
-                            button = button.fill(egui::Color32::from_rgb(60, 110, 160));
+                ui.vertical_centered(|ui| {
+                    ui.heading("Tool Quick Select");
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for tool in ToolKind::ALL {
+                            let texture = tool_textures.for_tool(tool);
+                            let mut button = egui::Button::image_and_text(
+                                egui::Image::new((texture.texture.id(), egui::vec2(32.0, 32.0)))
+                                    .texture_options(egui::TextureOptions::NEAREST),
+                                tool.label(),
+                            )
+                            .min_size(egui::vec2(184.0, 52.0));
+                            if tool == ui_state.active_tool {
+                                button = button.fill(egui::Color32::from_rgb(60, 110, 160));
+                            }
+                            let response = ui.add(button);
+                            if response.hovered() {
+                                ui_state.hovered_tool = Some(tool);
+                            }
+                            if response.clicked() {
+                                ui_state.active_tool = tool;
+                            }
                         }
-                        let response = ui.add_sized([140.0, 34.0], button);
-                        if response.hovered() {
-                            ui_state.hovered_tool = Some(tool);
-                        }
-                        if response.clicked() {
-                            ui_state.active_tool = tool;
-                        }
-                    }
+                    });
+                    ui.add_space(6.0);
+                    ui.label("Hold Q and release to select hovered tool");
                 });
-                ui.label("Hold Q and release to select hovered tool");
             });
     }
 
@@ -296,25 +309,11 @@ fn draw_material_button(
     let rounding = egui::Rounding::same(6.0);
     painter.rect_filled(rect, rounding, fill);
 
-    let luminance = 0.2126 * color[0] as f32 + 0.7152 * color[1] as f32 + 0.0722 * color[2] as f32;
-    let dark_fill = luminance > 150.0;
-    let label_bg = if dark_fill {
-        egui::Color32::from_rgba_premultiplied(18, 18, 18, 170)
-    } else {
-        egui::Color32::from_rgba_premultiplied(245, 245, 245, 150)
-    };
-    let text_color = if dark_fill {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::BLACK
-    };
-    let text_outline = if dark_fill {
-        egui::Color32::BLACK
-    } else {
-        egui::Color32::WHITE
-    };
+    let label_bg = egui::Color32::from_rgba_premultiplied(10, 10, 10, 205);
+    let text_color = egui::Color32::from_rgb(235, 235, 235);
+    let text_outline = egui::Color32::from_rgba_premultiplied(0, 0, 0, 225);
 
-    let label_height = (rect.height() * 0.54).clamp(20.0, 34.0);
+    let label_height = (rect.height() * 0.58).clamp(24.0, 38.0);
     let label_rect = egui::Rect::from_min_max(
         egui::pos2(rect.min.x + 4.0, rect.max.y - label_height - 4.0),
         egui::pos2(rect.max.x - 4.0, rect.max.y - 4.0),
@@ -322,7 +321,7 @@ fn draw_material_button(
     painter.rect_filled(label_rect, egui::Rounding::same(4.0), label_bg);
 
     let text_pos = label_rect.center();
-    let text = format!("{}\n{}", slot, name);
+    let text = format!("{} {}", slot, name);
     let font = egui::FontId::proportional(12.0);
     for offset in [
         egui::vec2(-1.0, 0.0),
@@ -455,31 +454,55 @@ fn draw_held_tool_sprite(
     now_s: f32,
     using_tool: bool,
 ) {
-    let base_w = (size[0] as f32).clamp(48.0, 220.0);
-    let aspect = size[1] as f32 / size[0] as f32;
-    let sprite_size = egui::vec2(base_w, base_w * aspect.max(0.3));
-    let bob = (now_s * 4.5).sin() * 4.0;
-    let use_kick = if using_tool {
-        (now_s * 18.0).sin().abs() * 16.0
+    let base_w = (size[0] as f32 * 5.0).clamp(96.0, 260.0);
+    let aspect = (size[1] as f32 / size[0].max(1) as f32).clamp(0.35, 1.8);
+    let height = base_w * aspect;
+    let bob = (now_s * 4.0).sin() * 5.0;
+    let swing = if using_tool {
+        (now_s * 18.0).sin().abs() * 22.0
     } else {
         0.0
     };
-    let min = egui::pos2(
-        rect.max.x - sprite_size.x - 24.0,
-        rect.max.y - sprite_size.y - 14.0 + bob + use_kick,
+
+    let pivot = egui::pos2(
+        rect.max.x - 76.0 - swing,
+        rect.max.y - 56.0 + bob + swing * 0.25,
     );
-    let max = min + sprite_size;
+    let top_left = egui::pos2(pivot.x - base_w * 0.72, pivot.y - height - 8.0);
+    let top_right = egui::pos2(pivot.x - base_w * 0.04, pivot.y - height * 1.08);
+    let bottom_right = egui::pos2(pivot.x + base_w * 0.20, pivot.y + 8.0);
+    let bottom_left = egui::pos2(pivot.x - base_w * 0.52, pivot.y + 26.0);
+
+    let mut mesh = egui::Mesh::with_texture(texture);
     let tint = if using_tool {
         egui::Color32::from_white_alpha(255)
     } else {
-        egui::Color32::from_white_alpha(220)
+        egui::Color32::from_white_alpha(235)
     };
-    painter.image(
-        texture,
-        egui::Rect::from_min_max(min, max),
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        tint,
-    );
+    let idx = mesh.vertices.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: top_left,
+        uv: egui::pos2(0.0, 0.0),
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: top_right,
+        uv: egui::pos2(1.0, 0.0),
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: bottom_right,
+        uv: egui::pos2(1.0, 1.0),
+        color: tint,
+    });
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: bottom_left,
+        uv: egui::pos2(0.0, 1.0),
+        color: tint,
+    });
+    mesh.indices
+        .extend_from_slice(&[idx, idx + 1, idx + 2, idx, idx + 2, idx + 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn draw_block_outline(
@@ -679,7 +702,7 @@ fn load_single_tool_texture(
         .and_then(|bytes| parse_ppm_image(&bytes))
         .unwrap_or(fallback);
     let size = image.size;
-    let texture = ctx.load_texture(egui_name.to_string(), image, egui::TextureOptions::LINEAR);
+    let texture = ctx.load_texture(egui_name.to_string(), image, egui::TextureOptions::NEAREST);
     ToolTexture { texture, size }
 }
 
@@ -731,34 +754,35 @@ fn parse_ppm_image(bytes: &[u8]) -> Option<egui::ColorImage> {
     let data = bytes.get(i..i + expected)?;
     let mut rgba = vec![0u8; w * h * 4];
     for px in 0..(w * h) {
-        rgba[px * 4] = data[px * 3];
-        rgba[px * 4 + 1] = data[px * 3 + 1];
-        rgba[px * 4 + 2] = data[px * 3 + 2];
-        rgba[px * 4 + 3] = 255;
+        let r = data[px * 3];
+        let g = data[px * 3 + 1];
+        let b = data[px * 3 + 2];
+        let alpha = if r >= 250 && g >= 250 && b >= 250 {
+            0
+        } else {
+            255
+        };
+        rgba[px * 4] = r;
+        rgba[px * 4 + 1] = g;
+        rgba[px * 4 + 2] = b;
+        rgba[px * 4 + 3] = alpha;
     }
     Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
 }
 
 fn fallback_tool_texture(color: [u8; 4]) -> egui::ColorImage {
-    let size = [64, 64];
+    let size = [16, 16];
     let mut pixels = vec![egui::Color32::TRANSPARENT; size[0] * size[1]];
     for y in 0..size[1] {
         for x in 0..size[0] {
             let idx = y * size[0] + x;
-            let border = x < 4 || y < 4 || x >= size[0] - 4 || y >= size[1] - 4;
-            let checker = ((x / 8) + (y / 8)) % 2 == 0;
-            pixels[idx] = if border {
-                egui::Color32::from_rgba_premultiplied(35, 35, 35, 255)
-            } else if checker {
-                egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3])
+            let border = x == 0 || y == 0 || x == size[0] - 1 || y == size[1] - 1;
+            if border {
+                pixels[idx] = egui::Color32::from_rgba_premultiplied(16, 16, 16, 230);
             } else {
-                egui::Color32::from_rgba_premultiplied(
-                    color[0] / 2,
-                    color[1] / 2,
-                    color[2] / 2,
-                    255,
-                )
-            };
+                pixels[idx] =
+                    egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
+            }
         }
     }
     egui::ColorImage { size, pixels }
