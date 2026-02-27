@@ -162,7 +162,14 @@ pub fn draw_fps_overlays(
     }
 
     if let Some(block) = hit {
-        draw_block_outline(&painter, vp, viewport, block, voxel_size);
+        draw_block_outline(
+            &painter,
+            vp,
+            viewport,
+            ctx.pixels_per_point(),
+            block,
+            voxel_size,
+        );
     }
 }
 
@@ -170,6 +177,7 @@ fn draw_block_outline(
     painter: &egui::Painter,
     vp: Mat4,
     viewport: [u32; 2],
+    pixels_per_point: f32,
     block: [i32; 3],
     voxel_size: f32,
 ) {
@@ -202,7 +210,7 @@ fn draw_block_outline(
 
     let projected: Vec<Option<egui::Pos2>> = corners
         .into_iter()
-        .map(|c| project(vp, viewport, c))
+        .map(|c| project(vp, viewport, pixels_per_point, c))
         .collect();
     let stroke = egui::Stroke::new(2.0, egui::Color32::YELLOW);
     for (a, b) in edges {
@@ -212,7 +220,7 @@ fn draw_block_outline(
     }
 }
 
-fn project(vp: Mat4, viewport: [u32; 2], p: Vec3) -> Option<egui::Pos2> {
+fn project(vp: Mat4, viewport: [u32; 2], pixels_per_point: f32, p: Vec3) -> Option<egui::Pos2> {
     let clip = vp * p.extend(1.0);
     if clip.w <= 0.0 {
         return None;
@@ -222,7 +230,7 @@ fn project(vp: Mat4, viewport: [u32; 2], p: Vec3) -> Option<egui::Pos2> {
         return None;
     }
     let size = Vec2::new(viewport[0] as f32, viewport[1] as f32);
-    let x = (ndc.x * 0.5 + 0.5) * size.x;
-    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * size.y;
+    let x = ((ndc.x * 0.5 + 0.5) * size.x) / pixels_per_point;
+    let y = ((1.0 - (ndc.y * 0.5 + 0.5)) * size.y) / pixels_per_point;
     Some(egui::pos2(x, y))
 }
