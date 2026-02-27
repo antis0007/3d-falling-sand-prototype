@@ -1,7 +1,7 @@
 use crate::input::{FpsController, InputState};
-use crate::renderer::{Camera, Renderer};
+use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
-use crate::ui::{draw, selected_material, UiState};
+use crate::ui::{draw, draw_fps_overlays, selected_material, UiState};
 use crate::world::{default_save_path, load_world, save_world, BrushMode, BrushSettings, World};
 use anyhow::Context;
 use glam::Vec3;
@@ -96,11 +96,15 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                         }
 
+                        let ray_hit =
+                            raycast_hit(&world, ctrl.position, ctrl.look_dir(), brush.max_distance);
+
                         if sim.running {
+                            let step_dt = (sim.fixed_dt / ui.sim_speed.max(0.1)).max(1e-4);
                             sim.accumulator += dt;
-                            while sim.accumulator >= sim.fixed_dt {
+                            while sim.accumulator >= step_dt {
                                 step(&mut world, &mut sim.rng);
-                                sim.accumulator -= sim.fixed_dt;
+                                sim.accumulator -= step_dt;
                             }
                         }
                         renderer.day = ui.day;
@@ -109,6 +113,20 @@ pub async fn run() -> anyhow::Result<()> {
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
                             let actions = draw(ctx, &mut ui, sim.running, &mut brush);
+                            let cam = Camera {
+                                pos: ctrl.position * VOXEL_SIZE,
+                                dir: ctrl.look_dir(),
+                                aspect: renderer.config.width as f32
+                                    / renderer.config.height.max(1) as f32,
+                            };
+                            draw_fps_overlays(
+                                ctx,
+                                ui.paused_menu,
+                                cam.view_proj(),
+                                [renderer.config.width, renderer.config.height],
+                                ray_hit,
+                                VOXEL_SIZE,
+                            );
                             if actions.new_world {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 world = World::new([n, n, n]);
@@ -215,7 +233,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 occlusion_query_set: None,
                             });
                             let cam = Camera {
-                                pos: ctrl.position,
+                                pos: ctrl.position * VOXEL_SIZE,
                                 dir: ctrl.look_dir(),
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,
@@ -282,7 +300,7 @@ fn apply_mouse_edit(
     if !(input.lmb || input.rmb) {
         return;
     }
-    if let Some(hit) = raycast(world, ctrl.position, ctrl.look_dir(), brush.max_distance) {
+    if let Some(hit) = raycast_hit(world, ctrl.position, ctrl.look_dir(), brush.max_distance) {
         let force = if input.rmb {
             Some(BrushMode::Erase)
         } else if input.lmb {
@@ -294,7 +312,7 @@ fn apply_mouse_edit(
     }
 }
 
-fn raycast(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<[i32; 3]> {
+fn raycast_hit(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<[i32; 3]> {
     let d = dir.normalize_or_zero();
     if d.length_squared() == 0.0 {
         return None;
@@ -384,6 +402,5 @@ fn raycast(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<[i32
         }
     }
 
-    let p = origin + d * max_dist;
-    Some([p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32])
+    None
 }
