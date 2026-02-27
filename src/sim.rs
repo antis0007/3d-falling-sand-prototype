@@ -1,13 +1,12 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
 const STONE: MaterialId = 1;
-const WOOD: MaterialId = 2;
-const SNOW: MaterialId = 4;
 const WATER: MaterialId = 5;
 const LAVA: MaterialId = 6;
 const ACID: MaterialId = 7;
 const SMOKE: MaterialId = 8;
 const STEAM: MaterialId = 9;
+const FIRE_GAS: MaterialId = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -25,15 +24,34 @@ pub struct Material {
     pub color: [u8; 4],
     pub phase: Phase,
     pub density: i16,
+    pub flammable: bool,
+    pub acid_resistant: bool,
+    pub melts_from_lava: bool,
+    pub transforms_on_contact: Option<ContactReaction>,
+    pub flow_speed: u8,
+    pub viscosity: f32,
 }
 
-pub const MATERIALS: [Material; 10] = [
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContactReaction {
+    LavaCoolsToWaterOrSteam,
+    WaterVsLava,
+    BurnsIntoSmoke,
+}
+
+pub const MATERIALS: [Material; 12] = [
     Material {
         id: 0,
         name: "Empty",
         color: [0, 0, 0, 0],
         phase: Phase::Gas,
         density: -10,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
     },
     Material {
         id: 1,
@@ -41,6 +59,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [120, 120, 120, 255],
         phase: Phase::Solid,
         density: 100,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
     },
     Material {
         id: 2,
@@ -48,6 +72,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [122, 81, 46, 255],
         phase: Phase::Solid,
         density: 80,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: true,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
     },
     Material {
         id: 3,
@@ -55,6 +85,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [194, 178, 128, 255],
         phase: Phase::Powder,
         density: 60,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: true,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
     },
     Material {
         id: 4,
@@ -62,6 +98,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [230, 235, 240, 255],
         phase: Phase::Powder,
         density: 30,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: true,
+        transforms_on_contact: Some(ContactReaction::LavaCoolsToWaterOrSteam),
+        flow_speed: 0,
+        viscosity: 1.0,
     },
     Material {
         id: 5,
@@ -69,6 +111,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [64, 120, 220, 190],
         phase: Phase::Liquid,
         density: 20,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::WaterVsLava),
+        flow_speed: 4,
+        viscosity: 0.15,
     },
     Material {
         id: 6,
@@ -76,6 +124,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [230, 100, 30, 220],
         phase: Phase::Liquid,
         density: 40,
+        flammable: false,
+        acid_resistant: true,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::LavaCoolsToWaterOrSteam),
+        flow_speed: 2,
+        viscosity: 0.82,
     },
     Material {
         id: 7,
@@ -83,6 +137,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [60, 220, 90, 210],
         phase: Phase::Liquid,
         density: 25,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 3,
+        viscosity: 0.32,
     },
     Material {
         id: 8,
@@ -90,6 +150,12 @@ pub const MATERIALS: [Material; 10] = [
         color: [120, 120, 120, 140],
         phase: Phase::Gas,
         density: 5,
+        flammable: false,
+        acid_resistant: true,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 2,
+        viscosity: 0.05,
     },
     Material {
         id: 9,
@@ -97,6 +163,38 @@ pub const MATERIALS: [Material; 10] = [
         color: [190, 190, 210, 120],
         phase: Phase::Gas,
         density: 2,
+        flammable: false,
+        acid_resistant: true,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 3,
+        viscosity: 0.05,
+    },
+    Material {
+        id: 10,
+        name: "Steel",
+        color: [112, 128, 140, 255],
+        phase: Phase::Solid,
+        density: 160,
+        flammable: false,
+        acid_resistant: true,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 11,
+        name: "Fire Gas",
+        color: [255, 155, 72, 120],
+        phase: Phase::Gas,
+        density: 1,
+        flammable: false,
+        acid_resistant: true,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 4,
+        viscosity: 0.0,
     },
 ];
 
@@ -233,7 +331,11 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             let mut dirs = down_diagonals();
             rng.shuffle(&mut dirs);
             for d in dirs {
-                if try_move(world, p, [p[0] + d[0], p[1] - 1, p[2] + d[1]], id) {
+                let to = [p[0] + d[0], p[1] - 1, p[2] + d[1]];
+                if is_diagonal_blocked(world, p, to) {
+                    continue;
+                }
+                if try_move(world, p, to, id) {
                     return true;
                 }
             }
@@ -245,14 +347,25 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             }
             let mut diag = down_diagonals();
             rng.shuffle(&mut diag);
-            for d in diag {
-                if try_move(world, p, [p[0] + d[0], p[1] - 1, p[2] + d[1]], id) {
+            let lateral_attempts = material(id).flow_speed.max(1) as usize;
+            for d in diag.into_iter().take(lateral_attempts.min(8)) {
+                let to = [p[0] + d[0], p[1] - 1, p[2] + d[1]];
+                if is_diagonal_blocked(world, p, to) {
+                    continue;
+                }
+                if try_move(world, p, to, id) {
                     return true;
                 }
             }
+
+            let cohesion_neighbors = count_same_neighbors(world, p, id);
+            if cohesion_neighbors > 1 && rng.chance(material(id).viscosity.clamp(0.0, 0.95)) {
+                return false;
+            }
+
             let mut side = side_dirs();
             rng.shuffle(&mut side);
-            for d in side {
+            for d in side.into_iter().take(lateral_attempts.min(8)) {
                 if try_move(world, p, [p[0] + d[0], p[1], p[2] + d[1]], id) {
                     return true;
                 }
@@ -265,7 +378,10 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             }
             let mut diag = down_diagonals();
             rng.shuffle(&mut diag);
-            for d in diag {
+            for d in diag
+                .into_iter()
+                .take(material(id).flow_speed.max(1) as usize)
+            {
                 if try_move(world, p, [p[0] + d[0], p[1] + 1, p[2] + d[1]], id) {
                     return true;
                 }
@@ -284,6 +400,33 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
 
 fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShift32) -> bool {
     let mut reacted = false;
+    let mat = material(id);
+
+    if id == FIRE_GAS {
+        let mut neighbors = neighbor_dirs6();
+        rng.shuffle(&mut neighbors);
+        for [dx, dy, dz] in neighbors {
+            let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+            let nid = world.get(np[0], np[1], np[2]);
+            if nid == EMPTY {
+                continue;
+            }
+            if material(nid).flammable && rng.chance(0.2) {
+                let replacement = if rng.chance(0.5) { FIRE_GAS } else { SMOKE };
+                let _ = world.set(np[0], np[1], np[2], replacement);
+                reacted = true;
+            }
+        }
+
+        if rng.chance(0.06) {
+            let _ = world.set(p[0], p[1], p[2], SMOKE);
+            reacted = true;
+        } else if rng.chance(0.08) {
+            let _ = world.set(p[0], p[1], p[2], EMPTY);
+            reacted = true;
+        }
+    }
+
     let mut neighbors = neighbor_dirs6();
     rng.shuffle(&mut neighbors);
 
@@ -315,6 +458,7 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
         for [dx, dy, dz] in neighbors {
             let np = [p[0] + dx, p[1] + dy, p[2] + dz];
             let nid = world.get(np[0], np[1], np[2]);
+            let nmat = material(nid);
 
             if ((id == LAVA && nid == WATER) || (id == WATER && nid == LAVA)) && rng.chance(0.35) {
                 let _ = world.set(p[0], p[1], p[2], STONE);
@@ -324,18 +468,39 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
                 break;
             }
 
-            if id == LAVA && nid == SNOW && rng.chance(0.45) {
+            if id == LAVA
+                && (nmat.transforms_on_contact == Some(ContactReaction::LavaCoolsToWaterOrSteam)
+                    || nmat.melts_from_lava)
+                && rng.chance(0.45)
+            {
                 let replacement = if rng.chance(0.65) { WATER } else { STEAM };
                 let _ = world.set(np[0], np[1], np[2], replacement);
                 reacted = true;
                 continue;
             }
 
-            if id == LAVA && nid == WOOD && rng.chance(0.18) {
-                let replacement = if rng.chance(0.70) { SMOKE } else { EMPTY };
+            if id == LAVA && nmat.flammable && rng.chance(0.18) {
+                let replacement = if rng.chance(0.55) { FIRE_GAS } else { SMOKE };
                 let _ = world.set(np[0], np[1], np[2], replacement);
                 let _ = spawn_reaction_product(world, np, SMOKE, rng);
                 reacted = true;
+            } else if id == LAVA && nmat.flammable && rng.chance(0.12) {
+                let _ = spawn_reaction_product(world, np, FIRE_GAS, rng);
+                reacted = true;
+            }
+        }
+    }
+
+    if mat.flammable && rng.chance(0.06) {
+        for [dx, dy, dz] in neighbor_dirs6() {
+            let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+            let nid = world.get(np[0], np[1], np[2]);
+            if nid == LAVA || nid == FIRE_GAS {
+                let replacement = if rng.chance(0.6) { FIRE_GAS } else { SMOKE };
+                let _ = world.set(p[0], p[1], p[2], replacement);
+                let _ = spawn_reaction_product(world, p, SMOKE, rng);
+                reacted = true;
+                break;
             }
         }
     }
@@ -350,7 +515,28 @@ fn is_acid_dissolvable(id: MaterialId) -> bool {
     if id == EMPTY {
         return false;
     }
-    matches!(material(id).phase, Phase::Solid | Phase::Powder)
+    let mat = material(id);
+    matches!(mat.phase, Phase::Solid | Phase::Powder) && !mat.acid_resistant
+}
+
+fn count_same_neighbors(world: &World, p: [i32; 3], id: MaterialId) -> usize {
+    neighbor_dirs6()
+        .into_iter()
+        .filter(|[dx, dy, dz]| world.get(p[0] + dx, p[1] + dy, p[2] + dz) == id)
+        .count()
+}
+
+fn is_diagonal_blocked(world: &World, from: [i32; 3], to: [i32; 3]) -> bool {
+    let dx = to[0] - from[0];
+    let dz = to[2] - from[2];
+    if dx == 0 && dz == 0 {
+        return false;
+    }
+
+    let side_x = world.get(from[0] + dx, from[1], from[2]) != EMPTY;
+    let side_z = world.get(from[0], from[1], from[2] + dz) != EMPTY;
+    let under = world.get(from[0], to[1], from[2]) != EMPTY;
+    (side_x && side_z) || (under && (side_x || side_z))
 }
 
 fn spawn_reaction_product(

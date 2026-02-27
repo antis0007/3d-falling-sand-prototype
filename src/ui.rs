@@ -96,83 +96,88 @@ pub fn draw(
     tab_palette_held: bool,
 ) -> UiActions {
     let mut actions = UiActions::default();
-    egui::TopBottomPanel::top("top").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("New World").clicked() {
-                actions.new_world = true;
-            }
-            if ui.button("Save").clicked() {
-                actions.save = true;
-            }
-            if ui.button("Load").clicked() {
-                actions.load = true;
-            }
-            if ui
-                .button(if sim_running { "Pause" } else { "Run" })
-                .clicked()
-            {
-                actions.toggle_run = true;
-            }
-            if ui.button("Step Once").clicked() {
-                actions.step_once = true;
-            }
-            if ui
-                .button(if ui_state.day { "Day" } else { "Night" })
-                .clicked()
-            {
-                ui_state.day = !ui_state.day;
-            }
-            ui.add(
-                egui::Slider::new(&mut ui_state.new_world_size, 32..=128)
-                    .text("New world size")
-                    .step_by(16.0),
-            );
-            ui.add(
-                egui::Slider::new(&mut ui_state.mouse_sensitivity, 0.0002..=0.003)
-                    .text("Mouse sensitivity"),
-            );
-            let changed = ui
-                .add(
-                    egui::Slider::new(
-                        &mut ui_state.sim_speed,
-                        UiState::SIM_SPEED_MIN..=UiState::SIM_SPEED_MAX,
-                    )
-                    .text("Sim speed")
-                    .step_by(UiState::SIM_SPEED_STEP as f64),
-                )
-                .changed();
-            if changed {
-                ui_state.set_sim_speed(ui_state.sim_speed);
-            }
-            ui.label(format!(
-                "Mat: {}",
-                material(selected_material(ui_state.selected_slot)).name
-            ));
-            ui.label(format!("Brush r={}", brush.radius));
-            ui.label(format!("Tool: {}", ui_state.active_tool.label()));
-        });
-    });
-
-    egui::TopBottomPanel::bottom("toolbar").show(ctx, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..10 {
-                let id = selected_material(i);
-                let m = material(id);
-                if draw_material_button(
-                    ui,
-                    [72.0, 44.0],
-                    i,
-                    m.name,
-                    m.color,
-                    i == ui_state.selected_slot,
-                )
-                .clicked()
-                {
-                    ui_state.selected_slot = i;
+    let opaque_panel = egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 26));
+    egui::TopBottomPanel::top("top")
+        .frame(opaque_panel)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("New World").clicked() {
+                    actions.new_world = true;
                 }
-            }
+                if ui.button("Save").clicked() {
+                    actions.save = true;
+                }
+                if ui.button("Load").clicked() {
+                    actions.load = true;
+                }
+                if ui
+                    .button(if sim_running { "Pause" } else { "Run" })
+                    .clicked()
+                {
+                    actions.toggle_run = true;
+                }
+                if ui.button("Step Once").clicked() {
+                    actions.step_once = true;
+                }
+                if ui
+                    .button(if ui_state.day { "Day" } else { "Night" })
+                    .clicked()
+                {
+                    ui_state.day = !ui_state.day;
+                }
+                ui.add(
+                    egui::Slider::new(&mut ui_state.new_world_size, 32..=128)
+                        .text("New world size")
+                        .step_by(16.0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut ui_state.mouse_sensitivity, 0.0002..=0.003)
+                        .text("Mouse sensitivity"),
+                );
+                let changed = ui
+                    .add(
+                        egui::Slider::new(
+                            &mut ui_state.sim_speed,
+                            UiState::SIM_SPEED_MIN..=UiState::SIM_SPEED_MAX,
+                        )
+                        .text("Sim speed")
+                        .step_by(UiState::SIM_SPEED_STEP as f64),
+                    )
+                    .changed();
+                if changed {
+                    ui_state.set_sim_speed(ui_state.sim_speed);
+                }
+                ui.label(format!(
+                    "Mat: {}",
+                    material(selected_material(ui_state.selected_slot)).name
+                ));
+                ui.label(format!("Brush r={}", brush.radius));
+                ui.label(format!("Tool: {}", ui_state.active_tool.label()));
+            });
         });
-    });
+
+    egui::TopBottomPanel::bottom("toolbar")
+        .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 22)))
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for i in 0..MATERIALS.len() {
+                    let id = selected_material(i);
+                    let m = material(id);
+                    if draw_material_button(
+                        ui,
+                        [72.0, 44.0],
+                        i,
+                        m.name,
+                        m.color,
+                        i == ui_state.selected_slot,
+                    )
+                    .clicked()
+                    {
+                        ui_state.selected_slot = i;
+                    }
+                }
+            });
+        });
 
     if tab_palette_held && !ui_state.paused_menu {
         egui::Window::new("Materials (TAB)")
@@ -180,9 +185,10 @@ pub fn draw(
             .collapsible(false)
             .resizable(false)
             .title_bar(false)
+            .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(20, 22, 28)))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for i in 0..10 {
+                    for i in 0..MATERIALS.len() {
                         let id = selected_material(i);
                         let m = material(id);
                         if draw_material_button(
@@ -199,7 +205,14 @@ pub fn draw(
                         }
                     }
                 });
-                ui.label("Hold TAB to preview all material slots");
+                ui.separator();
+                ui.label("TAB Palette Options");
+                ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Brush radius"));
+                ui.add(
+                    egui::Slider::new(&mut brush.max_distance, 2.0..=48.0)
+                        .text("Placement distance"),
+                );
+                ui.label("Hold TAB to configure quick brush options");
             });
     }
 
@@ -366,7 +379,7 @@ fn draw_material_button(
 }
 
 pub fn selected_material(slot: usize) -> MaterialId {
-    MATERIALS[slot.min(9)].id
+    MATERIALS[slot.min(MATERIALS.len() - 1)].id
 }
 
 pub fn draw_fps_overlays(

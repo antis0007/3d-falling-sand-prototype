@@ -25,6 +25,7 @@ const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
+const MATERIAL_SLOTS: usize = crate::sim::MATERIALS.len();
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -90,7 +91,10 @@ pub async fn run() -> anyhow::Result<()> {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => renderer.resize(*size),
                     WindowEvent::Focused(focused) => {
-                        let should_unlock = !focused || ui.paused_menu || ui.show_tool_quick_menu;
+                        let should_unlock = !focused
+                            || ui.paused_menu
+                            || ui.show_tool_quick_menu
+                            || input.key(KeyCode::Tab);
                         let _ = set_cursor(window, should_unlock);
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
@@ -153,11 +157,13 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let quick_menu_held =
                             input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
+                        let tab_palette_held = input.key(KeyCode::Tab) && !ui.paused_menu;
                         ui.show_tool_quick_menu = quick_menu_held;
                         if !quick_menu_held {
                             ui.hovered_tool = None;
                         }
-                        let cursor_should_unlock = ui.paused_menu || quick_menu_held;
+                        let cursor_should_unlock =
+                            ui.paused_menu || quick_menu_held || tab_palette_held;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !cursor_should_unlock {
@@ -177,9 +183,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     let mut s =
                                         ui.selected_slot as i32 - input.wheel.signum() as i32;
                                     if s < 0 {
-                                        s += 10;
+                                        s += MATERIAL_SLOTS as i32;
                                     }
-                                    ui.selected_slot = (s as usize) % 10;
+                                    ui.selected_slot = (s as usize) % MATERIAL_SLOTS;
                                 }
                             }
                         }
@@ -221,7 +227,6 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
-                            let tab_palette_held = input.key(KeyCode::Tab) && !ui.paused_menu;
                             let actions = draw(
                                 ctx,
                                 &mut ui,
