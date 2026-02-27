@@ -28,6 +28,7 @@ pub struct BrushSettings {
     pub shape: BrushShape,
     pub mode: BrushMode,
     pub max_distance: f32,
+    pub repeat_interval_s: f32,
 }
 
 impl Default for BrushSettings {
@@ -37,6 +38,7 @@ impl Default for BrushSettings {
             shape: BrushShape::Sphere,
             mode: BrushMode::Place,
             max_distance: 16.0,
+            repeat_interval_s: 0.12,
         }
     }
 }

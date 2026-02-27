@@ -110,6 +110,9 @@ pub fn draw(
         egui::Window::new("Brush").show(ctx, |ui| {
             ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
             ui.add(egui::Slider::new(&mut brush.max_distance, 2.0..=48.0).text("Distance"));
+            ui.add(
+                egui::Slider::new(&mut brush.repeat_interval_s, 0.01..=0.5).text("Hold repeat (s)"),
+            );
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
                 ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
