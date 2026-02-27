@@ -14,7 +14,7 @@ use winit::window::{CursorGrabMode, WindowBuilder};
 
 pub async fn run() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
-    let window = Box::leak(Box::new(
+    let window: &'static winit::window::Window = Box::leak(Box::new(
         WindowBuilder::new()
             .with_title("3D Falling Sand Prototype")
             .build(&event_loop)?,

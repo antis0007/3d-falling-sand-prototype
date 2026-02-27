@@ -193,14 +193,18 @@ impl Renderer {
     }
 
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
-        for (i, chunk) in world.chunks.iter_mut().enumerate() {
-            if !chunk.dirty_mesh {
-                continue;
-            }
+        let dirty_chunks: Vec<usize> = world
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, chunk)| chunk.dirty_mesh.then_some(i))
+            .collect();
+
+        for i in dirty_chunks {
             let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, i);
             if inds.is_empty() {
                 self.meshes.remove(&i);
-                chunk.dirty_mesh = false;
+                world.chunks[i].dirty_mesh = false;
                 continue;
             }
             let vb = self
@@ -227,7 +231,7 @@ impl Renderer {
                     aabb_max,
                 },
             );
-            chunk.dirty_mesh = false;
+            world.chunks[i].dirty_mesh = false;
         }
     }
 

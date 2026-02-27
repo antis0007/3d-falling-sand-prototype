@@ -317,7 +317,8 @@ pub fn load_world(path: &Path) -> anyhow::Result<World> {
         chunk.dirty_mesh = true;
         chunk.active.clear();
         chunk.settled.fill(0);
-        for (i, id) in chunk.iter_raw().iter().copied().enumerate() {
+        let occupied = chunk.iter_raw().to_vec();
+        for (i, id) in occupied.into_iter().enumerate() {
             if id != EMPTY {
                 chunk.active.insert(i as u16);
             }
