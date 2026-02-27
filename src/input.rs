@@ -98,7 +98,7 @@ impl Default for FpsController {
             move_speed: 8.0,
             fly_speed: 10.0,
             jump_speed: 6.5,
-            sensitivity: 0.002,
+            sensitivity: 0.001,
             double_jump_threshold: 0.28,
         }
     }
@@ -116,13 +116,13 @@ impl FpsController {
 
     pub fn step(&mut self, input: &InputState, dt: f32, lock_mouse: bool, now_s: f32) {
         if lock_mouse {
-            self.yaw -= input.mouse_delta.x * self.sensitivity;
-            self.pitch -= input.mouse_delta.y * self.sensitivity;
+            self.yaw += input.mouse_delta.x * self.sensitivity;
+            self.pitch += input.mouse_delta.y * self.sensitivity;
             self.pitch = self.pitch.clamp(-1.54, 1.54);
         }
 
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize_or_zero();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let right = Vec3::Y.cross(forward).normalize_or_zero();
         let mut move_dir = Vec3::ZERO;
         if input.key(KeyCode::KeyW) {
             move_dir += forward;

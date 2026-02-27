@@ -78,6 +78,7 @@ pub async fn run() -> anyhow::Result<()> {
                         last = now;
 
                         if !ui.paused_menu && !egui_c {
+                            ctrl.sensitivity = ui.mouse_sensitivity;
                             ctrl.step(&input, dt, true, start.elapsed().as_secs_f32());
                             if input.wheel.abs() > 0.0 {
                                 let mut s = ui.selected_slot as i32 - input.wheel.signum() as i32;
@@ -200,7 +201,16 @@ pub async fn run() -> anyhow::Result<()> {
                                         store: wgpu::StoreOp::Store,
                                     },
                                 })],
-                                depth_stencil_attachment: None,
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: &renderer.depth_view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
                                 timestamp_writes: None,
                                 occlusion_query_set: None,
                             });

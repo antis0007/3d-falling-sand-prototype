@@ -8,6 +8,7 @@ pub struct UiState {
     pub selected_slot: usize,
     pub new_world_size: usize,
     pub day: bool,
+    pub mouse_sensitivity: f32,
 }
 
 impl Default for UiState {
@@ -18,6 +19,7 @@ impl Default for UiState {
             selected_slot: 3,
             new_world_size: 64,
             day: true,
+            mouse_sensitivity: 0.001,
         }
     }
 }
@@ -68,6 +70,10 @@ pub fn draw(
                 egui::Slider::new(&mut ui_state.new_world_size, 32..=128)
                     .text("New world size")
                     .step_by(16.0),
+            );
+            ui.add(
+                egui::Slider::new(&mut ui_state.mouse_sensitivity, 0.0002..=0.003)
+                    .text("Mouse sensitivity"),
             );
             ui.label(format!(
                 "Mat: {}",
