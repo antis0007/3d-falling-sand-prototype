@@ -14,6 +14,10 @@ const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 pub enum BrushShape {
     Sphere,
     Cube,
+    Torus,
+    Hemisphere,
+    Bowl,
+    InvertedBowl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +32,7 @@ pub struct BrushSettings {
     pub shape: BrushShape,
     pub mode: BrushMode,
     pub max_distance: f32,
+    pub fixed_distance: bool,
     pub repeat_interval_s: f32,
 }
 
@@ -38,6 +43,7 @@ impl Default for BrushSettings {
             shape: BrushShape::Sphere,
             mode: BrushMode::Place,
             max_distance: 16.0,
+            fixed_distance: false,
             repeat_interval_s: 0.12,
         }
     }
@@ -84,6 +90,40 @@ impl Chunk {
 
     pub fn iter_raw_mut(&mut self) -> &mut [MaterialId] {
         &mut self.voxels
+    }
+}
+
+fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) -> bool {
+    match shape {
+        BrushShape::Sphere => (dx * dx + dy * dy + dz * dz) <= rad * rad,
+        BrushShape::Cube => dx.abs().max(dy.abs()).max(dz.abs()) <= rad,
+        BrushShape::Torus => {
+            let ring_radius = (rad as f32).max(1.0);
+            let tube_radius = (rad as f32 * 0.5).max(1.0);
+            let q = ((dx * dx + dz * dz) as f32).sqrt() - ring_radius;
+            (q * q + (dy as f32) * (dy as f32)) <= tube_radius * tube_radius
+        }
+        BrushShape::Hemisphere => dy >= 0 && (dx * dx + dy * dy + dz * dz) <= rad * rad,
+        BrushShape::Bowl => {
+            if dy < 0 {
+                return false;
+            }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            let outer = r2 <= rad * rad;
+            let inner_rad = (rad - 1).max(0);
+            let inner = r2 < inner_rad * inner_rad;
+            outer && !inner
+        }
+        BrushShape::InvertedBowl => {
+            if dy > 0 {
+                return false;
+            }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            let outer = r2 <= rad * rad;
+            let inner_rad = (rad - 1).max(0);
+            let inner = r2 < inner_rad * inner_rad;
+            outer && !inner
+        }
     }
 }
 
@@ -217,10 +257,7 @@ impl World {
         for dz in -rad..=rad {
             for dy in -rad..=rad {
                 for dx in -rad..=rad {
-                    let include = match brush.shape {
-                        BrushShape::Sphere => (dx * dx + dy * dy + dz * dz) <= rad * rad,
-                        BrushShape::Cube => dx.abs().max(dy.abs()).max(dz.abs()) <= rad,
-                    };
+                    let include = brush_shape_includes(brush.shape, dx, dy, dz, rad);
                     if !include {
                         continue;
                     }
