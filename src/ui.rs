@@ -1,6 +1,7 @@
 use crate::sim::{material, MATERIALS};
 use crate::world::{BrushMode, BrushSettings, BrushShape, MaterialId};
 use glam::{Mat4, Vec2, Vec3};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
@@ -33,6 +34,7 @@ pub struct UiState {
     pub show_radial_menu: bool,
     pub show_tool_quick_menu: bool,
     pub active_tool: ToolKind,
+    pub hovered_tool: Option<ToolKind>,
     pub new_world_size: usize,
     pub day: bool,
     pub mouse_sensitivity: f32,
@@ -67,6 +69,7 @@ impl Default for UiState {
             show_radial_menu: false,
             show_tool_quick_menu: false,
             active_tool: ToolKind::Brush,
+            hovered_tool: None,
             new_world_size: 64,
             day: true,
             mouse_sensitivity: 0.001,
@@ -175,9 +178,18 @@ pub fn draw(
                 egui::Slider::new(&mut brush.repeat_interval_s, 0.01..=0.5).text("Hold repeat (s)"),
             );
             ui.checkbox(
-                &mut brush.fixed_distance,
-                "Fixed placement distance (always, no raycast collision)",
+                &mut brush.minecraft_style_placement,
+                "Minecraft style placement (no midair placement/hints)",
             );
+            ui.add_enabled_ui(!brush.minecraft_style_placement, |ui| {
+                ui.checkbox(
+                    &mut brush.fixed_distance,
+                    "Fixed placement distance (always, no raycast collision)",
+                );
+            });
+            if brush.minecraft_style_placement {
+                brush.fixed_distance = false;
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
                 ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
@@ -205,13 +217,16 @@ pub fn draw(
                         if tool == ui_state.active_tool {
                             button = button.fill(egui::Color32::from_rgb(60, 110, 160));
                         }
-                        if ui.add_sized([140.0, 34.0], button).clicked() {
+                        let response = ui.add_sized([140.0, 34.0], button);
+                        if response.hovered() {
+                            ui_state.hovered_tool = Some(tool);
+                        }
+                        if response.clicked() {
                             ui_state.active_tool = tool;
-                            ui_state.show_tool_quick_menu = false;
                         }
                     }
                 });
-                ui.label("Press Q to close");
+                ui.label("Hold Q and release to select hovered tool");
             });
     }
 
@@ -245,6 +260,9 @@ pub fn draw_fps_overlays(
     show_radial_menu: bool,
     radial_toggle_key_label: &str,
     voxel_size: f32,
+    held_tool: Option<(egui::TextureId, [usize; 2])>,
+    now_s: f32,
+    using_tool: bool,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
@@ -294,6 +312,52 @@ pub fn draw_fps_overlays(
         brush,
         !paused && show_radial_menu,
         radial_toggle_key_label,
+    );
+
+    if let Some((texture, size)) = held_tool {
+        draw_held_tool_sprite(
+            &painter,
+            ctx.screen_rect(),
+            texture,
+            size,
+            now_s,
+            using_tool,
+        );
+    }
+}
+
+fn draw_held_tool_sprite(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    texture: egui::TextureId,
+    size: [usize; 2],
+    now_s: f32,
+    using_tool: bool,
+) {
+    let base_w = (size[0] as f32).clamp(48.0, 220.0);
+    let aspect = size[1] as f32 / size[0] as f32;
+    let sprite_size = egui::vec2(base_w, base_w * aspect.max(0.3));
+    let bob = (now_s * 4.5).sin() * 4.0;
+    let use_kick = if using_tool {
+        (now_s * 18.0).sin().abs() * 16.0
+    } else {
+        0.0
+    };
+    let min = egui::pos2(
+        rect.max.x - sprite_size.x - 24.0,
+        rect.max.y - sprite_size.y - 14.0 + bob + use_kick,
+    );
+    let max = min + sprite_size;
+    let tint = if using_tool {
+        egui::Color32::from_white_alpha(255)
+    } else {
+        egui::Color32::from_white_alpha(220)
+    };
+    painter.image(
+        texture,
+        egui::Rect::from_min_max(min, max),
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        tint,
     );
 }
 
@@ -426,4 +490,155 @@ fn project(vp: Mat4, viewport: [u32; 2], pixels_per_point: f32, p: Vec3) -> Opti
     let x = ((ndc.x * 0.5 + 0.5) * size.x) / pixels_per_point;
     let y = ((1.0 - (ndc.y * 0.5 + 0.5)) * size.y) / pixels_per_point;
     Some(egui::pos2(x, y))
+}
+
+#[derive(Clone)]
+pub struct ToolTexture {
+    pub texture: egui::TextureHandle,
+    pub size: [usize; 2],
+}
+
+#[derive(Clone)]
+pub struct ToolTextures {
+    pub brush: ToolTexture,
+    pub builders_wand: ToolTexture,
+    pub destructor_wand: ToolTexture,
+}
+
+impl ToolTextures {
+    pub fn for_tool(&self, tool: ToolKind) -> &ToolTexture {
+        match tool {
+            ToolKind::Brush => &self.brush,
+            ToolKind::BuildersWand => &self.builders_wand,
+            ToolKind::DestructorWand => &self.destructor_wand,
+        }
+    }
+}
+
+pub fn load_tool_textures(ctx: &egui::Context, dir: impl AsRef<Path>) -> ToolTextures {
+    let dir = dir.as_ref().to_path_buf();
+    let brush = load_single_tool_texture(
+        ctx,
+        &dir,
+        "brush.ppm",
+        "tool_brush",
+        fallback_tool_texture([130, 180, 240, 255]),
+    );
+    let builders_wand = load_single_tool_texture(
+        ctx,
+        &dir,
+        "builders_wand.ppm",
+        "tool_builders_wand",
+        fallback_tool_texture([140, 220, 120, 255]),
+    );
+    let destructor_wand = load_single_tool_texture(
+        ctx,
+        &dir,
+        "destructor_wand.ppm",
+        "tool_destructor_wand",
+        fallback_tool_texture([240, 140, 140, 255]),
+    );
+    ToolTextures {
+        brush,
+        builders_wand,
+        destructor_wand,
+    }
+}
+
+fn load_single_tool_texture(
+    ctx: &egui::Context,
+    dir: &Path,
+    file_name: &str,
+    egui_name: &str,
+    fallback: egui::ColorImage,
+) -> ToolTexture {
+    let path = dir.join(file_name);
+    let image = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| parse_ppm_image(&bytes))
+        .unwrap_or(fallback);
+    let size = image.size;
+    let texture = ctx.load_texture(egui_name.to_string(), image, egui::TextureOptions::LINEAR);
+    ToolTexture { texture, size }
+}
+
+fn parse_ppm_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+    fn next_token<'a>(bytes: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+        while *i < bytes.len() {
+            let b = bytes[*i];
+            if b == b'#' {
+                while *i < bytes.len() && bytes[*i] != b'\n' {
+                    *i += 1;
+                }
+            }
+            if *i >= bytes.len() || !bytes[*i].is_ascii_whitespace() {
+                break;
+            }
+            *i += 1;
+        }
+        let start = *i;
+        while *i < bytes.len() && !bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        (start < *i).then_some(&bytes[start..*i])
+    }
+
+    let mut i = 0;
+    let magic = next_token(bytes, &mut i)?;
+    if magic != b"P6" {
+        return None;
+    }
+    let w: usize = std::str::from_utf8(next_token(bytes, &mut i)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    let h: usize = std::str::from_utf8(next_token(bytes, &mut i)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    let max_val: usize = std::str::from_utf8(next_token(bytes, &mut i)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    if max_val != 255 {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let expected = w.checked_mul(h)?.checked_mul(3)?;
+    let data = bytes.get(i..i + expected)?;
+    let mut rgba = vec![0u8; w * h * 4];
+    for px in 0..(w * h) {
+        rgba[px * 4] = data[px * 3];
+        rgba[px * 4 + 1] = data[px * 3 + 1];
+        rgba[px * 4 + 2] = data[px * 3 + 2];
+        rgba[px * 4 + 3] = 255;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
+
+fn fallback_tool_texture(color: [u8; 4]) -> egui::ColorImage {
+    let size = [64, 64];
+    let mut pixels = vec![egui::Color32::TRANSPARENT; size[0] * size[1]];
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let idx = y * size[0] + x;
+            let border = x < 4 || y < 4 || x >= size[0] - 4 || y >= size[1] - 4;
+            let checker = ((x / 8) + (y / 8)) % 2 == 0;
+            pixels[idx] = if border {
+                egui::Color32::from_rgba_premultiplied(35, 35, 35, 255)
+            } else if checker {
+                egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3])
+            } else {
+                egui::Color32::from_rgba_premultiplied(
+                    color[0] / 2,
+                    color[1] / 2,
+                    color[2] / 2,
+                    255,
+                )
+            };
+        }
+    }
+    egui::ColorImage { size, pixels }
 }

@@ -34,6 +34,7 @@ pub struct BrushSettings {
     pub max_distance: f32,
     pub fixed_distance: bool,
     pub repeat_interval_s: f32,
+    pub minecraft_style_placement: bool,
 }
 
 impl Default for BrushSettings {
@@ -45,6 +46,7 @@ impl Default for BrushSettings {
             max_distance: 16.0,
             fixed_distance: false,
             repeat_interval_s: 0.12,
+            minecraft_style_placement: false,
         }
     }
 }
@@ -105,7 +107,7 @@ fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) 
         }
         BrushShape::Hemisphere => dy >= 0 && (dx * dx + dy * dy + dz * dz) <= rad * rad,
         BrushShape::Bowl => {
-            if dy < 0 {
+            if dy > 0 {
                 return false;
             }
             let r2 = dx * dx + dy * dy + dz * dz;
@@ -115,7 +117,7 @@ fn brush_shape_includes(shape: BrushShape, dx: i32, dy: i32, dz: i32, rad: i32) 
             outer && !inner
         }
         BrushShape::InvertedBowl => {
-            if dy > 0 {
+            if dy < 0 {
                 return false;
             }
             let r2 = dx * dx + dy * dy + dz * dz;
