@@ -156,19 +156,51 @@ pub fn draw(
             for i in 0..10 {
                 let id = selected_material(i);
                 let m = material(id);
-                let mut b = egui::Button::new(format!("{}\n{}", i, m.name));
-                b = b.fill(egui::Color32::from_rgba_premultiplied(
-                    m.color[0], m.color[1], m.color[2], m.color[3],
-                ));
-                if i == ui_state.selected_slot {
-                    b = b.stroke(egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                }
-                if ui.add_sized([72.0, 44.0], b).clicked() {
+                if draw_material_button(
+                    ui,
+                    [72.0, 44.0],
+                    i,
+                    m.name,
+                    m.color,
+                    i == ui_state.selected_slot,
+                )
+                .clicked()
+                {
                     ui_state.selected_slot = i;
                 }
             }
         });
     });
+
+    let show_tab_palette = ctx.input(|i| i.key_down(egui::Key::Tab));
+    if show_tab_palette && !ui_state.paused_menu {
+        egui::Window::new("Materials (TAB)")
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0])
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..10 {
+                        let id = selected_material(i);
+                        let m = material(id);
+                        if draw_material_button(
+                            ui,
+                            [120.0, 64.0],
+                            i,
+                            m.name,
+                            m.color,
+                            i == ui_state.selected_slot,
+                        )
+                        .clicked()
+                        {
+                            ui_state.selected_slot = i;
+                        }
+                    }
+                });
+                ui.label("Hold TAB to preview all material slots");
+            });
+    }
 
     if ui_state.show_brush {
         egui::Window::new("Brush").show(ctx, |ui| {
@@ -243,6 +275,95 @@ pub fn draw(
     }
 
     actions
+}
+
+fn draw_material_button(
+    ui: &mut egui::Ui,
+    size: [f32; 2],
+    slot: usize,
+    name: &str,
+    color: [u8; 4],
+    selected: bool,
+) -> egui::Response {
+    let desired = egui::vec2(size[0], size[1]);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let fill = egui::Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
+    let painter = ui.painter();
+    let rounding = egui::Rounding::same(6.0);
+    painter.rect_filled(rect, rounding, fill);
+
+    let luminance = 0.2126 * color[0] as f32 + 0.7152 * color[1] as f32 + 0.0722 * color[2] as f32;
+    let dark_fill = luminance > 150.0;
+    let label_bg = if dark_fill {
+        egui::Color32::from_rgba_premultiplied(18, 18, 18, 170)
+    } else {
+        egui::Color32::from_rgba_premultiplied(245, 245, 245, 150)
+    };
+    let text_color = if dark_fill {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
+    };
+    let text_outline = if dark_fill {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    };
+
+    let label_height = (rect.height() * 0.54).clamp(20.0, 34.0);
+    let label_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x + 4.0, rect.max.y - label_height - 4.0),
+        egui::pos2(rect.max.x - 4.0, rect.max.y - 4.0),
+    );
+    painter.rect_filled(label_rect, egui::Rounding::same(4.0), label_bg);
+
+    let text_pos = label_rect.center();
+    let text = format!("{}\n{}", slot, name);
+    let font = egui::FontId::proportional(12.0);
+    for offset in [
+        egui::vec2(-1.0, 0.0),
+        egui::vec2(1.0, 0.0),
+        egui::vec2(0.0, -1.0),
+        egui::vec2(0.0, 1.0),
+    ] {
+        painter.text(
+            text_pos + offset,
+            egui::Align2::CENTER_CENTER,
+            &text,
+            font.clone(),
+            text_outline,
+        );
+    }
+    painter.text(
+        text_pos,
+        egui::Align2::CENTER_CENTER,
+        &text,
+        font,
+        text_color,
+    );
+
+    let border_color = if selected {
+        egui::Color32::from_rgb(0, 215, 255)
+    } else {
+        egui::Color32::from_rgba_premultiplied(255, 255, 255, 80)
+    };
+    let border_width = if selected { 3.0 } else { 1.0 };
+    painter.rect_stroke(
+        rect,
+        rounding,
+        egui::Stroke::new(border_width + 1.5, egui::Color32::BLACK),
+    );
+    painter.rect_stroke(
+        rect,
+        rounding,
+        egui::Stroke::new(border_width, border_color),
+    );
+
+    response
 }
 
 pub fn selected_material(slot: usize) -> MaterialId {
