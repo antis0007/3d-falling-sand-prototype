@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::player::{grounded_eye_y_blocks, jump_eligibility_y_blocks};
+
 #[derive(Default, Clone)]
 pub struct InputState {
     pub pressed: HashSet<KeyCode>,
@@ -152,11 +154,11 @@ impl FpsController {
             self.position += move_dir * self.move_speed * dt;
             self.vel_y -= 19.6 * dt;
             self.position.y += self.vel_y * dt;
-            if self.position.y < 2.4 {
-                self.position.y = 2.4;
+            if self.position.y < grounded_eye_y_blocks() {
+                self.position.y = grounded_eye_y_blocks();
                 self.vel_y = 0.0;
             }
-            if input.key(KeyCode::Space) && self.position.y <= 2.41 {
+            if input.key(KeyCode::Space) && self.position.y <= jump_eligibility_y_blocks() {
                 self.vel_y = self.jump_speed;
             }
         }

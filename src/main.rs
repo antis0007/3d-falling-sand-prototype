@@ -1,5 +1,6 @@
 mod app;
 mod input;
+mod player;
 mod renderer;
 mod sim;
 mod ui;
