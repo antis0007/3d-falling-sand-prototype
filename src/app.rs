@@ -144,6 +144,9 @@ pub async fn run() -> anyhow::Result<()> {
                             if key == TOOL_QUICK_MENU_TOGGLE_KEY
                                 && event.state == ElementState::Released
                             {
+                                if let Some(hovered) = ui.hovered_shape.take() {
+                                    brush.shape = hovered;
+                                }
                                 if let Some(hovered) = ui.hovered_tool.take() {
                                     ui.active_tool = hovered;
                                 }
@@ -160,6 +163,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let tab_palette_held = input.key(KeyCode::Tab) && !ui.paused_menu;
                         ui.show_tool_quick_menu = quick_menu_held;
                         if !quick_menu_held {
+                            ui.hovered_shape = None;
                             ui.hovered_tool = None;
                         }
                         let cursor_should_unlock =

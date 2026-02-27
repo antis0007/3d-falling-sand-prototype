@@ -34,6 +34,7 @@ pub struct UiState {
     pub show_radial_menu: bool,
     pub show_tool_quick_menu: bool,
     pub active_tool: ToolKind,
+    pub hovered_shape: Option<BrushShape>,
     pub hovered_tool: Option<ToolKind>,
     pub new_world_size: usize,
     pub day: bool,
@@ -69,6 +70,7 @@ impl Default for UiState {
             show_radial_menu: false,
             show_tool_quick_menu: false,
             active_tool: ToolKind::Brush,
+            hovered_shape: None,
             hovered_tool: None,
             new_world_size: 64,
             day: true,
@@ -259,6 +261,32 @@ pub fn draw(
             .title_bar(false)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
+                    ui.heading("Shape Quick Select");
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for (shape, label) in [
+                            (BrushShape::Sphere, "Sphere"),
+                            (BrushShape::Cube, "Cube"),
+                            (BrushShape::Torus, "Torus"),
+                            (BrushShape::Hemisphere, "Hemisphere"),
+                            (BrushShape::Bowl, "Bowl"),
+                            (BrushShape::InvertedBowl, "Inverted Bowl"),
+                        ] {
+                            let response = ui.add_sized(
+                                egui::vec2(184.0, 32.0),
+                                egui::SelectableLabel::new(brush.shape == shape, label),
+                            );
+                            if response.hovered() {
+                                ui_state.hovered_shape = Some(shape);
+                            }
+                            if response.clicked() {
+                                brush.shape = shape;
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                     ui.heading("Tool Quick Select");
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
