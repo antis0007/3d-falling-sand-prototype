@@ -96,7 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         if !ui.paused_menu && !egui_c {
                             ctrl.sensitivity = ui.mouse_sensitivity;
-                            ctrl.step(&input, dt, true, start.elapsed().as_secs_f32());
+                            ctrl.step(&world, &input, dt, true, start.elapsed().as_secs_f32());
                             if input.wheel.abs() > 0.0 {
                                 let mut s = ui.selected_slot as i32 - input.wheel.signum() as i32;
                                 if s < 0 {
