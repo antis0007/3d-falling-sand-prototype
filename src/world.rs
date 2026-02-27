@@ -200,8 +200,36 @@ impl World {
             return false;
         }
         self.chunks[chunk_idx].set(lx, ly, lz, id);
+        self.mark_adjacent_chunks_dirty(x as i32, y as i32, z as i32);
         self.activate_neighbors(x as i32, y as i32, z as i32);
         true
+    }
+
+    fn mark_adjacent_chunks_dirty(&mut self, x: i32, y: i32, z: i32) {
+        const FACES: [[i32; 3]; 6] = [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ];
+
+        for [dx, dy, dz] in FACES {
+            let nx = x + dx;
+            let ny = y + dy;
+            let nz = z + dz;
+            if nx < 0 || ny < 0 || nz < 0 {
+                continue;
+            }
+            let Some((cx, cy, cz, _, _, _)) =
+                self.world_to_chunk(nx as usize, ny as usize, nz as usize)
+            else {
+                continue;
+            };
+            let neighbor_idx = self.chunk_index(cx, cy, cz);
+            self.chunks[neighbor_idx].dirty_mesh = true;
+        }
     }
 
     pub fn activate_neighbors(&mut self, x: i32, y: i32, z: i32) {
@@ -272,6 +300,27 @@ impl World {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_marks_adjacent_chunk_dirty_across_boundary() {
+        let mut world = World::new([CHUNK_SIZE * 2, CHUNK_SIZE, CHUNK_SIZE]);
+        for chunk in &mut world.chunks {
+            chunk.dirty_mesh = false;
+        }
+
+        let edge_x = CHUNK_SIZE as i32 - 1;
+        assert!(world.set(edge_x, 2, 1, 2));
+
+        let left = world.chunk_index(0, 0, 0);
+        let right = world.chunk_index(1, 0, 0);
+        assert!(world.chunks[left].dirty_mesh);
+        assert!(world.chunks[right].dirty_mesh);
     }
 }
 
