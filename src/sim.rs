@@ -1,12 +1,19 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
 const STONE: MaterialId = 1;
+const WOOD: MaterialId = 2;
 const WATER: MaterialId = 5;
 const LAVA: MaterialId = 6;
 const ACID: MaterialId = 7;
 const SMOKE: MaterialId = 8;
 const STEAM: MaterialId = 9;
 const FIRE_GAS: MaterialId = 11;
+const TORCH: MaterialId = 12;
+const EMBER_HOT: MaterialId = 13;
+const EMBER_WARM: MaterialId = 14;
+const EMBER_ASH: MaterialId = 15;
+const PLANT: MaterialId = 16;
+const WEED: MaterialId = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -39,7 +46,7 @@ pub enum ContactReaction {
     BurnsIntoSmoke,
 }
 
-pub const MATERIALS: [Material; 12] = [
+pub const MATERIALS: [Material; 18] = [
     Material {
         id: 0,
         name: "Empty",
@@ -74,7 +81,7 @@ pub const MATERIALS: [Material; 12] = [
         density: 80,
         flammable: true,
         acid_resistant: false,
-        melts_from_lava: true,
+        melts_from_lava: false,
         transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
         flow_speed: 0,
         viscosity: 1.0,
@@ -87,7 +94,7 @@ pub const MATERIALS: [Material; 12] = [
         density: 60,
         flammable: false,
         acid_resistant: false,
-        melts_from_lava: true,
+        melts_from_lava: false,
         transforms_on_contact: None,
         flow_speed: 0,
         viscosity: 1.0,
@@ -196,6 +203,84 @@ pub const MATERIALS: [Material; 12] = [
         flow_speed: 4,
         viscosity: 0.0,
     },
+    Material {
+        id: 12,
+        name: "Torch",
+        color: [255, 184, 96, 255],
+        phase: Phase::Solid,
+        density: 100,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 13,
+        name: "Ember (Hot)",
+        color: [255, 105, 38, 255],
+        phase: Phase::Solid,
+        density: 70,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 14,
+        name: "Ember (Warm)",
+        color: [168, 76, 52, 255],
+        phase: Phase::Solid,
+        density: 70,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 15,
+        name: "Ember Ash",
+        color: [90, 84, 84, 255],
+        phase: Phase::Powder,
+        density: 45,
+        flammable: false,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: None,
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 16,
+        name: "Plant",
+        color: [94, 186, 72, 255],
+        phase: Phase::Solid,
+        density: 50,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 17,
+        name: "Weed",
+        color: [78, 146, 62, 255],
+        phase: Phase::Solid,
+        density: 50,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
 ];
 
 pub fn material(id: MaterialId) -> &'static Material {
@@ -279,7 +364,8 @@ pub fn step(world: &mut World, rng: &mut XorShift32) {
                         continue;
                     }
                     let id = world.get(wx, wy, wz);
-                    if id == EMPTY || material(id).phase == Phase::Solid {
+                    if id == EMPTY || (material(id).phase == Phase::Solid && !is_reactive_solid(id))
+                    {
                         world.chunks[cidx].active.remove(&local_u16);
                         continue;
                     }
@@ -287,6 +373,10 @@ pub fn step(world: &mut World, rng: &mut XorShift32) {
                     if moved {
                         world.chunks[cidx].active.remove(&local_u16);
                     } else {
+                        if is_reactive_solid(id) {
+                            world.chunks[cidx].settled[local] = 0;
+                            continue;
+                        }
                         let settle = &mut world.chunks[cidx].settled[local];
                         *settle = settle.saturating_add(1);
                         if *settle > 5 {
@@ -454,7 +544,13 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
                 continue;
             }
             if material(nid).flammable && rng.chance(0.2) {
-                let replacement = if rng.chance(0.5) { FIRE_GAS } else { SMOKE };
+                let replacement = if nid == WOOD {
+                    EMBER_HOT
+                } else if rng.chance(0.5) {
+                    FIRE_GAS
+                } else {
+                    SMOKE
+                };
                 let _ = world.set(np[0], np[1], np[2], replacement);
                 reacted = true;
             }
@@ -511,12 +607,19 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
             }
 
             if id == LAVA
-                && (nmat.transforms_on_contact == Some(ContactReaction::LavaCoolsToWaterOrSteam)
-                    || nmat.melts_from_lava)
+                && nid != LAVA
+                && nmat.transforms_on_contact == Some(ContactReaction::LavaCoolsToWaterOrSteam)
                 && rng.chance(0.45)
             {
                 let replacement = if rng.chance(0.65) { WATER } else { STEAM };
                 let _ = world.set(np[0], np[1], np[2], replacement);
+                reacted = true;
+                continue;
+            }
+
+            if id == LAVA && nmat.melts_from_lava && rng.chance(0.45) {
+                let _ = world.set(np[0], np[1], np[2], STONE);
+                let _ = spawn_reaction_product(world, np, STEAM, rng);
                 reacted = true;
                 continue;
             }
@@ -547,10 +650,109 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
         }
     }
 
+    if id == TORCH {
+        if rng.chance(0.55) {
+            reacted |= spawn_reaction_product(world, p, FIRE_GAS, rng);
+        }
+        if rng.chance(0.18) {
+            reacted |= spawn_reaction_product(world, p, SMOKE, rng);
+        }
+    }
+
+    if id == WOOD && has_ignition_neighbor(world, p) && rng.chance(0.45) {
+        reacted |= world.set(p[0], p[1], p[2], EMBER_HOT);
+        let _ = spawn_reaction_product(world, p, FIRE_GAS, rng);
+    }
+
+    if id == EMBER_HOT {
+        if rng.chance(0.35) {
+            let _ = spawn_reaction_product(world, p, FIRE_GAS, rng);
+            reacted = true;
+        }
+        if rng.chance(0.08) {
+            reacted |= world.set(p[0], p[1], p[2], EMBER_WARM);
+        }
+    } else if id == EMBER_WARM {
+        if rng.chance(0.18) {
+            let _ = spawn_reaction_product(world, p, SMOKE, rng);
+            reacted = true;
+        }
+        if rng.chance(0.05) {
+            reacted |= world.set(p[0], p[1], p[2], EMBER_ASH);
+        }
+    } else if id == EMBER_ASH && rng.chance(0.01) {
+        reacted |= world.set(p[0], p[1], p[2], EMPTY);
+    }
+
+    if id == PLANT {
+        let has_water = has_neighbor(world, p, WATER);
+        if !has_water && rng.chance(0.08) {
+            reacted |= world.set(p[0], p[1], p[2], WEED);
+        } else if has_water {
+            reacted |= try_grow_plant(world, p, PLANT, rng, true);
+        }
+    }
+
+    if id == WEED {
+        let has_water = has_neighbor(world, p, WATER);
+        if has_water && rng.chance(0.12) {
+            reacted |= world.set(p[0], p[1], p[2], PLANT);
+        } else if !has_water {
+            reacted |= try_grow_plant(world, p, WEED, rng, false);
+        }
+    }
+
     if reacted {
         world.activate_neighbors(p[0], p[1], p[2]);
     }
     reacted
+}
+
+fn is_reactive_solid(id: MaterialId) -> bool {
+    matches!(id, WOOD | TORCH | EMBER_HOT | EMBER_WARM | PLANT | WEED)
+}
+
+fn has_neighbor(world: &World, p: [i32; 3], target: MaterialId) -> bool {
+    neighbor_dirs6()
+        .into_iter()
+        .any(|[dx, dy, dz]| world.get(p[0] + dx, p[1] + dy, p[2] + dz) == target)
+}
+
+fn has_ignition_neighbor(world: &World, p: [i32; 3]) -> bool {
+    neighbor_dirs6().into_iter().any(|[dx, dy, dz]| {
+        let nid = world.get(p[0] + dx, p[1] + dy, p[2] + dz);
+        matches!(nid, LAVA | FIRE_GAS | TORCH | EMBER_HOT)
+    })
+}
+
+fn try_grow_plant(
+    world: &mut World,
+    p: [i32; 3],
+    plant_id: MaterialId,
+    rng: &mut XorShift32,
+    needs_water: bool,
+) -> bool {
+    if needs_water && !has_neighbor(world, p, WATER) {
+        return false;
+    }
+
+    let mut dirs = [[0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+    rng.shuffle(&mut dirs);
+    for [dx, dy, dz] in dirs {
+        if !rng.chance(0.06) {
+            continue;
+        }
+        let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+        if world.get(np[0], np[1], np[2]) != EMPTY {
+            continue;
+        }
+        let below = world.get(np[0], np[1] - 1, np[2]);
+        if below == EMPTY || material(below).phase == Phase::Gas {
+            continue;
+        }
+        return world.set(np[0], np[1], np[2], plant_id);
+    }
+    false
 }
 
 fn is_acid_dissolvable(id: MaterialId) -> bool {
