@@ -4,11 +4,11 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, Win
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::world::{World, EMPTY};
-use crate::player::{grounded_eye_y_blocks, jump_eligibility_y_blocks};
 
 #[derive(Default, Clone)]
 pub struct InputState {
     pub pressed: HashSet<KeyCode>,
+    pub just_pressed: HashSet<KeyCode>,
     pub mouse_delta: Vec2,
     pub wheel: f32,
     pub lmb: bool,
@@ -21,6 +21,7 @@ impl InputState {
     pub fn end_frame(&mut self) {
         self.mouse_delta = Vec2::ZERO;
         self.wheel = 0.0;
+        self.just_pressed.clear();
         self.just_lmb = false;
         self.just_rmb = false;
     }
@@ -35,6 +36,9 @@ impl InputState {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
                         ElementState::Pressed => {
+                            if !self.pressed.contains(&code) {
+                                self.just_pressed.insert(code);
+                            }
                             self.pressed.insert(code);
                         }
                         ElementState::Released => {
@@ -239,12 +243,14 @@ impl FpsController {
             }
         }
 
-        if input.key(KeyCode::Space) && (now_s - self.last_space_t) < self.double_jump_threshold {
-            self.flying = !self.flying;
-            self.vel_y = 0.0;
-            self.last_space_t = -10.0;
-        } else if input.key(KeyCode::Space) {
-            self.last_space_t = now_s;
+        if input.just_pressed.contains(&KeyCode::Space) {
+            if (now_s - self.last_space_t) < self.double_jump_threshold {
+                self.flying = !self.flying;
+                self.vel_y = 0.0;
+                self.last_space_t = -10.0;
+            } else {
+                self.last_space_t = now_s;
+            }
         }
     }
 }
