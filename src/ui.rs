@@ -1,5 +1,6 @@
 use crate::sim::{material, MATERIALS};
 use crate::world::{BrushMode, BrushSettings, BrushShape, MaterialId};
+use glam::{Mat4, Vec2, Vec3};
 
 #[derive(Clone)]
 pub struct UiState {
@@ -9,6 +10,7 @@ pub struct UiState {
     pub new_world_size: usize,
     pub day: bool,
     pub mouse_sensitivity: f32,
+    pub sim_speed: f32,
 }
 
 impl Default for UiState {
@@ -20,6 +22,7 @@ impl Default for UiState {
             new_world_size: 64,
             day: true,
             mouse_sensitivity: 0.001,
+            sim_speed: 1.0,
         }
     }
 }
@@ -75,6 +78,7 @@ pub fn draw(
                 egui::Slider::new(&mut ui_state.mouse_sensitivity, 0.0002..=0.003)
                     .text("Mouse sensitivity"),
             );
+            ui.add(egui::Slider::new(&mut ui_state.sim_speed, 0.1..=4.0).text("Sim speed"));
             ui.label(format!(
                 "Mat: {}",
                 material(selected_material(ui_state.selected_slot)).name
@@ -134,4 +138,91 @@ pub fn draw(
 
 pub fn selected_material(slot: usize) -> MaterialId {
     MATERIALS[slot.min(9)].id
+}
+
+pub fn draw_fps_overlays(
+    ctx: &egui::Context,
+    paused: bool,
+    vp: Mat4,
+    viewport: [u32; 2],
+    hit: Option<[i32; 3]>,
+    voxel_size: f32,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("fps_overlays"),
+    ));
+
+    if !paused {
+        let c = ctx.screen_rect().center();
+        let s = 6.0;
+        let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        painter.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
+        painter.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+    }
+
+    if let Some(block) = hit {
+        draw_block_outline(&painter, vp, viewport, block, voxel_size);
+    }
+}
+
+fn draw_block_outline(
+    painter: &egui::Painter,
+    vp: Mat4,
+    viewport: [u32; 2],
+    block: [i32; 3],
+    voxel_size: f32,
+) {
+    let b = Vec3::new(block[0] as f32, block[1] as f32, block[2] as f32) * voxel_size;
+    let s = voxel_size;
+    let corners = [
+        b,
+        b + Vec3::new(s, 0.0, 0.0),
+        b + Vec3::new(s, s, 0.0),
+        b + Vec3::new(0.0, s, 0.0),
+        b + Vec3::new(0.0, 0.0, s),
+        b + Vec3::new(s, 0.0, s),
+        b + Vec3::new(s, s, s),
+        b + Vec3::new(0.0, s, s),
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    let projected: Vec<Option<egui::Pos2>> = corners
+        .into_iter()
+        .map(|c| project(vp, viewport, c))
+        .collect();
+    let stroke = egui::Stroke::new(2.0, egui::Color32::YELLOW);
+    for (a, b) in edges {
+        if let (Some(pa), Some(pb)) = (projected[a], projected[b]) {
+            painter.line_segment([pa, pb], stroke);
+        }
+    }
+}
+
+fn project(vp: Mat4, viewport: [u32; 2], p: Vec3) -> Option<egui::Pos2> {
+    let clip = vp * p.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    if ndc.z < -1.0 || ndc.z > 1.0 {
+        return None;
+    }
+    let size = Vec2::new(viewport[0] as f32, viewport[1] as f32);
+    let x = (ndc.x * 0.5 + 0.5) * size.x;
+    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * size.y;
+    Some(egui::pos2(x, y))
 }
