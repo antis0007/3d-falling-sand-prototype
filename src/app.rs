@@ -48,6 +48,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut renderer = Renderer::new(window).await?;
     let egui_ctx = egui::Context::default();
+    egui_ctx.set_visuals(egui::Visuals::dark());
     let mut egui_state =
         egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, window, None, None);
     let mut egui_rpass =
@@ -73,7 +74,17 @@ pub async fn run() -> anyhow::Result<()> {
     event_loop
         .run(move |event, elwt| match &event {
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
-                let egui_c = egui_state.on_window_event(window, event).consumed;
+                let block_tab_for_egui = matches!(
+                    event,
+                    WindowEvent::KeyboardInput { event, .. }
+                        if !ui.paused_menu
+                            && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
+                );
+                let egui_c = if block_tab_for_egui {
+                    false
+                } else {
+                    egui_state.on_window_event(window, event).consumed
+                };
                 input.on_window_event(event);
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
@@ -141,9 +152,6 @@ pub async fn run() -> anyhow::Result<()> {
                         if !quick_menu_held {
                             ui.hovered_tool = None;
                         }
-                        if quick_menu_held {
-                            center_cursor(window, renderer.config.width, renderer.config.height);
-                        }
                         let cursor_should_unlock = ui.paused_menu || quick_menu_held;
                         let _ = set_cursor(window, cursor_should_unlock);
 
@@ -208,7 +216,15 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
-                            let actions = draw(ctx, &mut ui, sim.running, &mut brush);
+                            let tab_palette_held = input.key(KeyCode::Tab) && !ui.paused_menu;
+                            let actions = draw(
+                                ctx,
+                                &mut ui,
+                                sim.running,
+                                &mut brush,
+                                &tool_textures,
+                                tab_palette_held,
+                            );
                             let cam = Camera {
                                 pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
                                 dir: ctrl.look_dir(),
@@ -380,13 +396,6 @@ pub async fn run() -> anyhow::Result<()> {
             _ => {}
         })
         .context("event loop")
-}
-
-fn center_cursor(window: &winit::window::Window, width: u32, height: u32) {
-    let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
-        (width / 2) as f64,
-        (height / 2) as f64,
-    ));
 }
 
 fn texture_for_active_tool(
