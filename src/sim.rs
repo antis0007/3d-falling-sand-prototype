@@ -1,5 +1,14 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
+const STONE: MaterialId = 1;
+const WOOD: MaterialId = 2;
+const SNOW: MaterialId = 4;
+const WATER: MaterialId = 5;
+const LAVA: MaterialId = 6;
+const ACID: MaterialId = 7;
+const SMOKE: MaterialId = 8;
+const STEAM: MaterialId = 9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Solid,
@@ -136,6 +145,11 @@ impl XorShift32 {
             arr.swap(i, j);
         }
     }
+
+    pub fn chance(&mut self, p: f32) -> bool {
+        let threshold = (p.clamp(0.0, 1.0) * (u32::MAX as f32)) as u32;
+        self.next() <= threshold
+    }
 }
 
 pub fn step(world: &mut World, rng: &mut XorShift32) {
@@ -200,6 +214,15 @@ fn try_move(world: &mut World, from: [i32; 3], to: [i32; 3], id: MaterialId) -> 
 
 // Rule dispatch point: swap this function for more realistic velocity/pressure-based solvers later.
 pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShift32) -> bool {
+    if react_voxel(world, p, id, rng) {
+        return true;
+    }
+
+    let id = world.get(p[0], p[1], p[2]);
+    if id == EMPTY {
+        return true;
+    }
+
     let mat = material(id);
     match mat.phase {
         Phase::Solid => false,
@@ -257,6 +280,105 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             false
         }
     }
+}
+
+fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShift32) -> bool {
+    let mut reacted = false;
+    let mut neighbors = neighbor_dirs6();
+    rng.shuffle(&mut neighbors);
+
+    if id == ACID {
+        for [dx, dy, dz] in neighbors {
+            let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+            let nid = world.get(np[0], np[1], np[2]);
+            if !is_acid_dissolvable(nid) || !rng.chance(0.24) {
+                continue;
+            }
+
+            if world.set(np[0], np[1], np[2], EMPTY) {
+                reacted = true;
+                if rng.chance(0.40) {
+                    let byproduct = if rng.chance(0.55) { STEAM } else { SMOKE };
+                    let _ = spawn_reaction_product(world, np, byproduct, rng);
+                }
+                if rng.chance(0.10) {
+                    let _ = world.set(p[0], p[1], p[2], EMPTY);
+                }
+                break;
+            }
+        }
+    }
+
+    if id == LAVA || id == WATER {
+        let mut neighbors = neighbor_dirs6();
+        rng.shuffle(&mut neighbors);
+        for [dx, dy, dz] in neighbors {
+            let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+            let nid = world.get(np[0], np[1], np[2]);
+
+            if ((id == LAVA && nid == WATER) || (id == WATER && nid == LAVA)) && rng.chance(0.35) {
+                let _ = world.set(p[0], p[1], p[2], STONE);
+                let replacement = if rng.chance(0.60) { STEAM } else { EMPTY };
+                let _ = world.set(np[0], np[1], np[2], replacement);
+                reacted = true;
+                break;
+            }
+
+            if id == LAVA && nid == SNOW && rng.chance(0.45) {
+                let replacement = if rng.chance(0.65) { WATER } else { STEAM };
+                let _ = world.set(np[0], np[1], np[2], replacement);
+                reacted = true;
+                continue;
+            }
+
+            if id == LAVA && nid == WOOD && rng.chance(0.18) {
+                let replacement = if rng.chance(0.70) { SMOKE } else { EMPTY };
+                let _ = world.set(np[0], np[1], np[2], replacement);
+                let _ = spawn_reaction_product(world, np, SMOKE, rng);
+                reacted = true;
+            }
+        }
+    }
+
+    if reacted {
+        world.activate_neighbors(p[0], p[1], p[2]);
+    }
+    reacted
+}
+
+fn is_acid_dissolvable(id: MaterialId) -> bool {
+    if id == EMPTY {
+        return false;
+    }
+    matches!(material(id).phase, Phase::Solid | Phase::Powder)
+}
+
+fn spawn_reaction_product(
+    world: &mut World,
+    origin: [i32; 3],
+    product: MaterialId,
+    rng: &mut XorShift32,
+) -> bool {
+    let mut dirs = neighbor_dirs6();
+    rng.shuffle(&mut dirs);
+    for [dx, dy, dz] in dirs {
+        let np = [origin[0] + dx, origin[1] + dy, origin[2] + dz];
+        if world.get(np[0], np[1], np[2]) == EMPTY {
+            return world.set(np[0], np[1], np[2], product);
+        }
+    }
+    false
+}
+
+fn neighbor_dirs6() -> [[i32; 3]; 6] {
+    [
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, -1, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+    ]
 }
 
 fn down_diagonals() -> [[i32; 2]; 8] {
