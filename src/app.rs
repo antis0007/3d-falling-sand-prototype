@@ -12,6 +12,12 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowBuilder};
 
+#[derive(Default)]
+struct EditRuntimeState {
+    last_edit_at: Option<Instant>,
+    last_edit_mode: Option<BrushMode>,
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let event_loop = EventLoop::new()?;
     let window: &'static winit::window::Window = Box::leak(Box::new(
@@ -33,6 +39,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut ctrl = FpsController::default();
     let mut ui = UiState::default();
     let mut brush = BrushSettings::default();
+    let mut edit_runtime = EditRuntimeState::default();
     let mut last = Instant::now();
     let start = Instant::now();
 
@@ -93,6 +100,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 &brush,
                                 selected_material(ui.selected_slot),
                                 &input,
+                                &mut edit_runtime,
+                                now,
                             );
                         }
 
@@ -296,19 +305,40 @@ fn apply_mouse_edit(
     brush: &BrushSettings,
     mat: u16,
     input: &InputState,
+    edit_runtime: &mut EditRuntimeState,
+    now: Instant,
 ) {
-    if !(input.lmb || input.rmb) {
+    let requested_mode = if input.just_rmb || input.rmb {
+        Some(BrushMode::Erase)
+    } else if input.just_lmb || input.lmb {
+        Some(BrushMode::Place)
+    } else {
+        None
+    };
+
+    let Some(mode) = requested_mode else {
+        edit_runtime.last_edit_mode = None;
+        return;
+    };
+
+    let is_just_click = matches!(mode, BrushMode::Place) && input.just_lmb
+        || matches!(mode, BrushMode::Erase) && input.just_rmb;
+
+    let repeat_interval_s = brush.repeat_interval_s.max(0.0);
+    let repeat_ready = edit_runtime.last_edit_mode != Some(mode)
+        || edit_runtime
+            .last_edit_at
+            .map(|last| (now - last).as_secs_f32() >= repeat_interval_s)
+            .unwrap_or(true);
+
+    if !is_just_click && !repeat_ready {
         return;
     }
+
     if let Some(hit) = raycast_hit(world, ctrl.position, ctrl.look_dir(), brush.max_distance) {
-        let force = if input.rmb {
-            Some(BrushMode::Erase)
-        } else if input.lmb {
-            Some(BrushMode::Place)
-        } else {
-            None
-        };
-        world.apply_brush(hit, *brush, mat, force);
+        world.apply_brush(hit, *brush, mat, Some(mode));
+        edit_runtime.last_edit_at = Some(now);
+        edit_runtime.last_edit_mode = Some(mode);
     }
 }
 
