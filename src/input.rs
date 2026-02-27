@@ -4,6 +4,7 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, Win
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::world::{World, EMPTY};
+use crate::player::{grounded_eye_y_blocks, jump_eligibility_y_blocks};
 
 #[derive(Default, Clone)]
 pub struct InputState {

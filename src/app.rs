@@ -1,4 +1,8 @@
 use crate::input::{FpsController, InputState};
+use crate::player::{
+    camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
+    PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
+};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{step, SimState};
 use crate::ui::{draw, draw_fps_overlays, selected_material, UiState};
@@ -37,6 +41,9 @@ pub async fn run() -> anyhow::Result<()> {
     let start = Instant::now();
 
     let _ = set_cursor(window, false);
+    debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
+    debug_assert!(PLAYER_EYE_HEIGHT_BLOCKS <= PLAYER_HEIGHT_BLOCKS);
+    debug_assert!((eye_height_world_meters(VOXEL_SIZE) - 1.6).abs() < f32::EPSILON);
     renderer.rebuild_dirty_chunks(&mut world);
 
     event_loop
@@ -114,7 +121,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let out = egui_ctx.run(raw, |ctx| {
                             let actions = draw(ctx, &mut ui, sim.running, &mut brush);
                             let cam = Camera {
-                                pos: ctrl.position * VOXEL_SIZE,
+                                pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
                                 dir: ctrl.look_dir(),
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,
@@ -233,7 +240,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 occlusion_query_set: None,
                             });
                             let cam = Camera {
-                                pos: ctrl.position * VOXEL_SIZE,
+                                pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
                                 dir: ctrl.look_dir(),
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,
