@@ -66,11 +66,12 @@ impl ProcGenConfig {
 pub fn generate_world(config: ProcGenConfig) -> World {
     let mut world = World::new(config.dims);
     world.clear();
+    let heights = build_heightmap(&config);
 
-    base_terrain_pass(&mut world, &config);
+    base_terrain_pass(&mut world, &config, &heights);
     cave_carve_pass(&mut world, &config);
-    surface_layering_pass(&mut world, &config);
-    biome_water_pass(&mut world, &config);
+    surface_layering_pass(&mut world, &config, &heights);
+    biome_water_pass(&mut world, &config, &heights);
     vegetation_pass(&mut world, &config);
 
     world
@@ -81,13 +82,24 @@ pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType 
     dominant_biome(weights)
 }
 
-fn base_terrain_pass(world: &mut World, config: &ProcGenConfig) {
+fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
+    let mut heights = vec![0; config.dims[0] * config.dims[2]];
+    for z in 0..config.dims[2] as i32 {
+        for x in 0..config.dims[0] as i32 {
+            let wx = config.world_origin[0] + x;
+            let wz = config.world_origin[2] + z;
+            let weights = biome_weights(config.seed, wx, wz);
+            heights[x as usize + z as usize * config.dims[0]] =
+                terrain_height(config, wx, wz, weights).clamp(6, config.dims[1] as i32 - 4);
+        }
+    }
+    heights
+}
+
+fn base_terrain_pass(world: &mut World, _config: &ProcGenConfig, heights: &[i32]) {
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let wx = config.world_origin[0] + lx;
-            let wz = config.world_origin[2] + lz;
-            let weights = biome_weights(config.seed, wx, wz);
-            let h = terrain_height(config, wx, wz, weights).clamp(6, world.dims[1] as i32 - 4);
+            let h = heights[lx as usize + lz as usize * world.dims[0]];
             for y in 0..=h {
                 let _ = world.set(lx, y, lz, STONE);
             }
@@ -106,6 +118,12 @@ fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
                 let wx = config.world_origin[0] + lx;
                 let wy = ly;
                 let wz = config.world_origin[2] + lz;
+                let weights = biome_weights(config.seed, wx, wz);
+                let top =
+                    terrain_height(config, wx, wz, weights).clamp(6, world.dims[1] as i32 - 4);
+                if ly >= top - 4 {
+                    continue;
+                }
                 let depth_fade = 1.0 - (ly as f32 / max_y as f32).powf(1.3);
                 let cave = fbm3(
                     config.seed ^ 0xCC77AA11,
@@ -131,12 +149,10 @@ fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
     }
 }
 
-fn surface_layering_pass(world: &mut World, config: &ProcGenConfig) {
+fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let Some(top_y) = surface_y(world, lx, lz) else {
-                continue;
-            };
+            let top_y = heights[lx as usize + lz as usize * world.dims[0]];
             let wx = config.world_origin[0] + lx;
             let wz = config.world_origin[2] + lz;
             let weights = biome_weights(config.seed, wx, wz);
@@ -169,7 +185,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig) {
     }
 }
 
-fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
+fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
     let sea_level = config.sea_level;
     for lz in 1..world.dims[2] as i32 - 1 {
         for lx in 1..world.dims[0] as i32 - 1 {
@@ -183,11 +199,10 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
                 wz,
             ));
             let lake_w = weights[biome_index(BiomeType::Lake)];
-            let Some(surface) = surface_y(world, lx, lz) else {
-                continue;
-            };
+            let surface = heights[lx as usize + lz as usize * world.dims[0]];
 
-            let lowland_neighbors = count_neighbors_below(world, lx, lz, sea_level - 1);
+            let lowland_neighbors =
+                count_neighbors_below_heightmap(heights, world.dims[0], lx, lz, sea_level - 1);
             if ocean_w > 0.42 && surface <= sea_level - 1 && lowland_neighbors >= 4 {
                 for y in (sea_level - 12).max(2)..=sea_level {
                     if world.get(lx, y, lz) == EMPTY {
@@ -207,7 +222,8 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
 
             let depth = (1.0 + 2.0 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let neigh_min = neighbor_min_surface(world, lx, lz).unwrap_or(surface);
+            let neigh_min =
+                neighbor_min_surface_heightmap(heights, world.dims[0], lx, lz).unwrap_or(surface);
             let top = (surface - 1).min(sea_level - 1).min(neigh_min - 1);
             if top < floor {
                 continue;
@@ -228,33 +244,50 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
     }
 }
 
-fn count_neighbors_below(world: &World, x: i32, z: i32, max_height: i32) -> i32 {
+fn count_neighbors_below_heightmap(
+    heights: &[i32],
+    width: usize,
+    x: i32,
+    z: i32,
+    max_height: i32,
+) -> i32 {
     let mut count = 0;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            if let Some(h) = surface_y(world, x + dx, z + dz) {
-                if h <= max_height {
-                    count += 1;
-                }
+            let nx = x + dx;
+            let nz = z + dz;
+            if nx < 0 || nz < 0 {
+                continue;
+            }
+            let idx = nx as usize + nz as usize * width;
+            if idx < heights.len() && heights[idx] <= max_height {
+                count += 1;
             }
         }
     }
     count
 }
 
-fn neighbor_min_surface(world: &World, x: i32, z: i32) -> Option<i32> {
+fn neighbor_min_surface_heightmap(heights: &[i32], width: usize, x: i32, z: i32) -> Option<i32> {
     let mut min_h: Option<i32> = None;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            let Some(h) = surface_y(world, x + dx, z + dz) else {
+            let nx = x + dx;
+            let nz = z + dz;
+            if nx < 0 || nz < 0 {
                 continue;
-            };
+            }
+            let idx = nx as usize + nz as usize * width;
+            if idx >= heights.len() {
+                continue;
+            }
+            let h = heights[idx];
             min_h = Some(match min_h {
                 Some(curr) => curr.min(h),
                 None => h,

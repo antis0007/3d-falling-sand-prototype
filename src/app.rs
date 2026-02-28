@@ -708,9 +708,11 @@ fn prune_generated_regions(
     macro_size: i32,
     keep_radius: i32,
 ) {
+    let center_mx = floor_div(center_origin[0], macro_size);
+    let center_mz = floor_div(center_origin[2], macro_size);
     generated_regions.retain(|origin, _| {
-        let dx = ((origin[0] - center_origin[0]) / macro_size).abs();
-        let dz = ((origin[2] - center_origin[2]) / macro_size).abs();
+        let dx = (floor_div(origin[0], macro_size) - center_mx).abs();
+        let dz = (floor_div(origin[2], macro_size) - center_mz).abs();
         dx <= keep_radius && dz <= keep_radius
     });
 }
