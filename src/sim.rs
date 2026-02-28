@@ -518,9 +518,8 @@ pub fn prioritize_chunks_for_player(
                 let idx = world.chunk_index(cx, cy, cz);
                 let chunk_macro = macrochunk_from_chunk_coord(cx as i32, cy as i32, cz as i32);
                 let dx = (chunk_macro[0] - macro_coord[0]).abs();
-                let dy = (chunk_macro[1] - macro_coord[1]).abs();
                 let dz = (chunk_macro[2] - macro_coord[2]).abs();
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     high.push(idx);
                 }
             }
@@ -994,7 +993,7 @@ fn has_ignition_neighbor(world: &World, p: [i32; 3]) -> bool {
     for dz in -2..=2 {
         for dy in -1..=2 {
             for dx in -2..=2 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 if dx * dx + dy * dy + dz * dz > 5 {
@@ -1107,7 +1106,7 @@ fn has_tree_support(world: &World, p: [i32; 3]) -> bool {
     for dz in -2..=2 {
         for dy in -2..=2 {
             for dx in -2..=2 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 if dx * dx + dy * dy + dz * dz > 5 {
@@ -1132,7 +1131,7 @@ fn has_same_neighbor_in_radius(world: &World, p: [i32; 3], id: MaterialId, radiu
     for dz in -3..=3 {
         for dy in -3..=3 {
             for dx in -3..=3 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 let dist2 = dx * dx + dy * dy + dz * dz;

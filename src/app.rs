@@ -16,6 +16,7 @@ use crate::world::{
 };
 use anyhow::Context;
 use glam::Vec3;
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
@@ -96,6 +97,7 @@ pub async fn run() -> anyhow::Result<()> {
         mpsc::channel();
     let mut requested_procgen_id: Option<u64> = None;
     let mut next_procgen_id: u64 = 1;
+    let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -323,6 +325,8 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
 
                         while let Ok(result) = procgen_rx.try_recv() {
+                            generated_regions
+                                .insert(result.config.world_origin, result.world.clone());
                             if requested_procgen_id != Some(result.generation_id) {
                                 continue;
                             }
@@ -365,16 +369,28 @@ pub async fn run() -> anyhow::Result<()> {
                             if desired_origin != active_procgen_origin
                                 && requested_procgen_id.is_none()
                             {
-                                let next_cfg = cfg.with_origin(desired_origin);
-                                let spec = ProcgenJobSpec {
-                                    generation_id: next_procgen_id,
-                                    config: next_cfg,
-                                    prefer_safe_spawn: false,
-                                    target_global_pos: global,
-                                };
-                                next_procgen_id = next_procgen_id.wrapping_add(1);
-                                requested_procgen_id = Some(spec.generation_id);
-                                queue_procgen_job(&procgen_tx, spec);
+                                generated_regions.insert(active_procgen_origin, world.clone());
+                                if let Some(cached) = generated_regions.get(&desired_origin) {
+                                    active_procgen_origin = desired_origin;
+                                    active_procgen = Some(cfg.with_origin(desired_origin));
+                                    world = cached.clone();
+                                    ctrl.position = Vec3::new(
+                                        (global[0] - active_procgen_origin[0]) as f32 + 0.5,
+                                        ctrl.position.y,
+                                        (global[2] - active_procgen_origin[2]) as f32 + 0.5,
+                                    );
+                                } else {
+                                    let next_cfg = cfg.with_origin(desired_origin);
+                                    let spec = ProcgenJobSpec {
+                                        generation_id: next_procgen_id,
+                                        config: next_cfg,
+                                        prefer_safe_spawn: false,
+                                        target_global_pos: global,
+                                    };
+                                    next_procgen_id = next_procgen_id.wrapping_add(1);
+                                    requested_procgen_id = Some(spec.generation_id);
+                                    queue_procgen_job(&procgen_tx, spec);
+                                }
                             }
                         }
 
@@ -430,6 +446,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
                                     let proc_size =
                                         (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
+                                    generated_regions.clear();
                                     active_procgen_origin = [
                                         -PROCEDURAL_MACROCHUNK_SIZE,
                                         0,
@@ -449,6 +466,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     queue_procgen_job(&procgen_tx, spec);
                                 } else {
                                     requested_procgen_id = None;
+                                    generated_regions.clear();
                                     active_procgen = None;
                                     active_procgen_origin = [0, 0, 0];
                                     world = World::new([n, n, n]);
@@ -467,6 +485,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
                                         requested_procgen_id = None;
+                                        generated_regions.clear();
                                         active_procgen = None;
                                         active_procgen_origin = [0, 0, 0];
                                         let spawn = find_safe_spawn(&world, 1);
