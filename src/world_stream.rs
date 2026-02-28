@@ -118,6 +118,14 @@ impl WorldStream {
         true
     }
 
+    pub fn resident_world(&self, coord: [i32; 3]) -> Option<&World> {
+        let chunk = self.chunks.get(&coord)?;
+        if chunk.residency != ChunkResidency::Resident {
+            return None;
+        }
+        chunk.world.as_ref()
+    }
+
     pub fn deterministic_face_signature(world: &World, axis: usize, side: i32) -> Vec<MaterialId> {
         let mut data = Vec::new();
         let max_x = world.dims[0] as i32 - 1;
