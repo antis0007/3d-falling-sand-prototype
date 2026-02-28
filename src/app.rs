@@ -6,6 +6,7 @@ use crate::player::{
 use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
+use crate::streaming_manager::StreamingManager;
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     ToolTextures, UiState, HOTBAR_SLOTS,
@@ -35,6 +36,7 @@ const GRASS_ID: u16 = 19;
 const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
+const PROCEDURAL_RENDER_BUDGET_CHUNKS: usize = 25;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -100,6 +102,12 @@ pub async fn run() -> anyhow::Result<()> {
     let mut requested_procgen_id: Option<u64> = None;
     let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut next_procgen_id: u64 = 1;
+    let mut streaming = StreamingManager::new(
+        PROCEDURAL_MACROCHUNK_SIZE,
+        PROCEDURAL_RENDER_DISTANCE_MACROS,
+        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+    );
+    streaming.set_render_radius_from_budget(PROCEDURAL_RENDER_BUDGET_CHUNKS);
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -327,6 +335,42 @@ pub async fn run() -> anyhow::Result<()> {
                                 continue;
                             }
                             requested_procgen_id = None;
+                            requested_procgen_origin = None;
+
+                            let previous_origin = active_procgen_origin;
+                            let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                            let frac_z = ctrl.position.z - ctrl.position.z.floor();
+                            let tracked_global = if active_procgen.is_some() {
+                                [
+                                    previous_origin[0] + ctrl.position.x.floor() as i32,
+                                    0,
+                                    previous_origin[2] + ctrl.position.z.floor() as i32,
+                                ]
+                            } else {
+                                result.target_global_pos
+                            };
+
+                            let incoming_world = result.world;
+                            let chosen_world = if let Some(existing) =
+                                streaming.get_snapshot(result.config.world_origin)
+                            {
+                                existing.clone()
+                            } else {
+                                incoming_world.clone()
+                            };
+                            streaming.insert_snapshot(result.config.world_origin, incoming_world);
+                            active_procgen = Some(result.config);
+                            active_procgen_origin = result.config.world_origin;
+                            world = chosen_world;
+                            if result.prefer_safe_spawn {
+                                let spawn = find_safe_spawn(&world, result.config.seed);
+                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                            } else {
+                                ctrl.position = Vec3::new(
+                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + frac_x,
+                                    ctrl.position.y,
+                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + frac_z,
+                                );
                             requested_procgen_coord = None;
 
                             if let Some(stream) = stream.as_mut() {
@@ -365,6 +409,41 @@ pub async fn run() -> anyhow::Result<()> {
                             let desired_coord = [
                                 floor_div(global[0], chunk_size),
                                 0,
+                                floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
+                            ];
+                            streaming.update_residency(player_macro);
+                            let origin_macro = [
+                                floor_div(active_procgen_origin[0], PROCEDURAL_MACROCHUNK_SIZE),
+                                floor_div(active_procgen_origin[2], PROCEDURAL_MACROCHUNK_SIZE),
+                            ];
+                            let center_macro = [
+                                origin_macro[0] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                origin_macro[1] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            ];
+                            let outside_inner_band = (player_macro[0] - center_macro[0]).abs() > 1
+                                || (player_macro[2] - center_macro[1]).abs() > 1;
+                            let desired_origin = if outside_inner_band {
+                                [
+                                    (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                    0,
+                                    (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                ]
+                            } else {
+                                active_procgen_origin
+                            };
+                            if desired_origin != active_procgen_origin
+                                && requested_procgen_id.is_none()
+                                && requested_procgen_origin != Some(desired_origin)
+                            {
+                                streaming.insert_snapshot(active_procgen_origin, world.clone());
+                                if let Some(cached) = streaming.get_snapshot(desired_origin) {
+                                    active_procgen_origin = desired_origin;
+                                    active_procgen = Some(cfg.with_origin(desired_origin));
+                                    world = cached.clone();
+                                    let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                                    let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                 floor_div(global[2], chunk_size),
                             ];
                             if desired_coord != active_stream_coord {
@@ -398,6 +477,23 @@ pub async fn run() -> anyhow::Result<()> {
                             }
 
                             if requested_procgen_id.is_none() {
+                                if let Some(prefetch_origin) =
+                                    streaming.next_missing_render_origin()
+                                {
+                                    if requested_procgen_origin == Some(prefetch_origin) {
+                                        // avoid reloading the same region repeatedly
+                                    } else {
+                                        let next_cfg = cfg.with_origin(prefetch_origin);
+                                        let spec = ProcgenJobSpec {
+                                            generation_id: next_procgen_id,
+                                            config: next_cfg,
+                                            prefer_safe_spawn: false,
+                                            target_global_pos: global,
+                                        };
+                                        next_procgen_id = next_procgen_id.wrapping_add(1);
+                                        requested_procgen_id = Some(spec.generation_id);
+                                        requested_procgen_origin = Some(spec.config.world_origin);
+                                        queue_procgen_job(&procgen_tx, spec);
                                 let mut prefetch = None;
                                 for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
                                     ..=PROCEDURAL_RENDER_DISTANCE_MACROS
@@ -485,6 +581,24 @@ pub async fn run() -> anyhow::Result<()> {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 if actions.new_procedural {
                                     let seed = start.elapsed().as_nanos() as u64;
+                                    let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
+                                    let proc_size =
+                                        (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
+                                    streaming = StreamingManager::new(
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
+                                    streaming.set_render_radius_from_budget(
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
+                                    active_procgen_origin = [
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                        0,
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                    ];
+                                    let config = ProcGenConfig::for_size(proc_size, seed)
+                                        .with_origin(active_procgen_origin);
                                     let config = ProcGenConfig::for_size(64, seed);
                                     let mut new_stream = WorldStream::new(config);
                                     let start_coord = [0, 0, 0];
@@ -505,6 +619,15 @@ pub async fn run() -> anyhow::Result<()> {
                                     queue_procgen_job(&procgen_tx, spec);
                                 } else {
                                     requested_procgen_id = None;
+                                    requested_procgen_origin = None;
+                                    streaming = StreamingManager::new(
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
+                                    streaming.set_render_radius_from_budget(
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
                                     requested_procgen_coord = None;
                                     active_procgen = None;
                                     stream = None;
@@ -525,6 +648,18 @@ pub async fn run() -> anyhow::Result<()> {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
                                         requested_procgen_id = None;
+                                        requested_procgen_origin = None;
+                                        streaming = StreamingManager::new(
+                                            PROCEDURAL_MACROCHUNK_SIZE,
+                                            PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
+                                        streaming.set_render_radius_from_budget(
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
+                                        streaming.set_render_radius_from_budget(
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
                                         requested_procgen_coord = None;
                                         active_procgen = None;
                                         stream = None;
@@ -715,6 +850,15 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
 
 fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
     ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    let mut q = a / b;
+    let r = a % b;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 fn apply_mouse_edit(
