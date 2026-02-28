@@ -80,6 +80,8 @@ impl Default for BrushSettings {
 pub struct Chunk {
     voxels: [MaterialId; CHUNK_VOLUME],
     pub dirty_mesh: bool,
+    pub voxel_version: u64,
+    pub meshed_version: u64,
     pub active: HashSet<u16>,
     pub settled: Vec<u8>,
 }
@@ -89,6 +91,8 @@ impl Chunk {
         Self {
             voxels: [EMPTY; CHUNK_VOLUME],
             dirty_mesh: true,
+            voxel_version: 1,
+            meshed_version: 0,
             active: HashSet::new(),
             settled: vec![0; CHUNK_VOLUME],
         }
@@ -109,6 +113,7 @@ impl Chunk {
         self.settled[idx] = 0;
         self.active.insert(idx as u16);
         self.dirty_mesh = true;
+        self.voxel_version = self.voxel_version.saturating_add(1);
     }
 
     pub fn iter_raw(&self) -> &[MaterialId] {
@@ -254,6 +259,8 @@ impl World {
             };
             let neighbor_idx = self.chunk_index(cx, cy, cz);
             self.chunks[neighbor_idx].dirty_mesh = true;
+            self.chunks[neighbor_idx].voxel_version =
+                self.chunks[neighbor_idx].voxel_version.saturating_add(1);
         }
     }
 

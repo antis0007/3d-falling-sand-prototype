@@ -4,9 +4,11 @@ mod player;
 mod procgen;
 mod renderer;
 mod sim;
+mod streaming_manager;
 mod ui;
 mod world;
 mod world_manager;
+mod world_stream;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
