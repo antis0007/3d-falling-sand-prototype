@@ -175,6 +175,7 @@ pub async fn run() -> anyhow::Result<()> {
     let procgen_jobs = ProcgenJobSystem::new(procgen_tx, 2, 12);
     let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
     let mut residency_plan: BTreeSet<[i32; 3]> = BTreeSet::new();
+    let mut pending_urgent_origin: Option<[i32; 3]> = None;
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -483,11 +484,22 @@ pub async fn run() -> anyhow::Result<()> {
                             procgen_jobs.cancel_unplanned(&residency_plan);
 
                             if desired_origin != active_procgen_origin {
-                                generated_regions.insert(active_procgen_origin, world.clone());
+                                if pending_urgent_origin != Some(desired_origin) {
+                                    generated_regions.insert(active_procgen_origin, world.clone());
+                                    pending_urgent_origin = Some(desired_origin);
+                                }
                                 if let Some(cached) = generated_regions.get(&desired_origin) {
+                                    let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                                    let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                     active_procgen_origin = desired_origin;
                                     active_procgen = Some(cfg.with_origin(desired_origin));
                                     world = cached.clone();
+                                    ctrl.position = Vec3::new(
+                                        (global[0] - active_procgen_origin[0]) as f32 + frac_x,
+                                        ctrl.position.y,
+                                        (global[2] - active_procgen_origin[2]) as f32 + frac_z,
+                                    );
+                                    pending_urgent_origin = None;
                                 } else {
                                     procgen_jobs.enqueue(ProcgenJobSpec {
                                         config: cfg.with_origin(desired_origin),
@@ -497,6 +509,8 @@ pub async fn run() -> anyhow::Result<()> {
                                         epoch: procgen_jobs.current_epoch(),
                                     });
                                 }
+                            } else {
+                                pending_urgent_origin = None;
                             }
 
                             if let Some(prefetch_origin) = next_missing_region_origin(
@@ -587,6 +601,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     let config = ProcGenConfig::for_size(proc_size, seed)
                                         .with_origin(active_procgen_origin);
                                     procgen_jobs.bump_epoch();
+                                    pending_urgent_origin = None;
                                     active_procgen = Some(config);
                                     residency_plan.clear();
                                     residency_plan.insert(active_procgen_origin);
@@ -599,6 +614,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     });
                                 } else {
                                     procgen_jobs.bump_epoch();
+                                    pending_urgent_origin = None;
                                     generated_regions.clear();
                                     residency_plan.clear();
                                     active_procgen = None;
@@ -619,6 +635,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
                                         procgen_jobs.bump_epoch();
+                                        pending_urgent_origin = None;
                                         generated_regions.clear();
                                         residency_plan.clear();
                                         active_procgen = None;
