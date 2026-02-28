@@ -95,17 +95,21 @@ pub async fn run() -> anyhow::Result<()> {
                         let should_unlock = !focused
                             || ui.paused_menu
                             || ui.show_tool_quick_menu
-                            || input.key(KeyCode::Tab);
+                            || ui.tab_palette_open;
                         let _ = set_cursor(window, should_unlock);
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             if event.state == ElementState::Pressed {
+                                let tab_palette_open = ui.tab_palette_open;
                                 match key {
                                     KeyCode::Escape => ui.paused_menu = !ui.paused_menu,
                                     _ if ui.paused_menu => {}
                                     KeyCode::KeyP => sim.running = !sim.running,
                                     KeyCode::KeyB => ui.show_brush = !ui.show_brush,
+                                    KeyCode::Tab if !event.repeat => {
+                                        ui.tab_palette_open = !ui.tab_palette_open
+                                    }
                                     RADIAL_MENU_TOGGLE_KEY => {
                                         ui.show_radial_menu = !ui.show_radial_menu
                                     }
@@ -120,47 +124,53 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
                                     KeyCode::Digit0 => {
-                                        assign_or_select_hotbar(&mut ui, 0, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 0, tab_palette_open)
                                     }
                                     KeyCode::Digit1 => {
-                                        assign_or_select_hotbar(&mut ui, 1, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 1, tab_palette_open)
                                     }
                                     KeyCode::Digit2 => {
-                                        assign_or_select_hotbar(&mut ui, 2, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 2, tab_palette_open)
                                     }
                                     KeyCode::Digit3 => {
-                                        assign_or_select_hotbar(&mut ui, 3, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 3, tab_palette_open)
                                     }
                                     KeyCode::Digit4 => {
-                                        assign_or_select_hotbar(&mut ui, 4, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 4, tab_palette_open)
                                     }
                                     KeyCode::Digit5 => {
-                                        assign_or_select_hotbar(&mut ui, 5, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 5, tab_palette_open)
                                     }
                                     KeyCode::Digit6 => {
-                                        assign_or_select_hotbar(&mut ui, 6, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 6, tab_palette_open)
                                     }
                                     KeyCode::Digit7 => {
-                                        assign_or_select_hotbar(&mut ui, 7, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 7, tab_palette_open)
                                     }
                                     KeyCode::Digit8 => {
-                                        assign_or_select_hotbar(&mut ui, 8, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 8, tab_palette_open)
                                     }
                                     KeyCode::Digit9 => {
-                                        assign_or_select_hotbar(&mut ui, 9, input.key(KeyCode::Tab))
+                                        assign_or_select_hotbar(&mut ui, 9, tab_palette_open)
                                     }
                                     KeyCode::KeyZ => ui.active_tool = ToolKind::Brush,
                                     KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
                                     KeyCode::KeyC => ui.active_tool = ToolKind::DestructorWand,
-                                    KeyCode::KeyA => ui.active_tool = ToolKind::AreaTool,
+                                    KeyCode::KeyV => ui.active_tool = ToolKind::AreaTool,
                                     _ => {}
                                 }
                             }
                             if key == TOOL_QUICK_MENU_TOGGLE_KEY
                                 && event.state == ElementState::Released
+                                && ui.show_tool_quick_menu
+                                && !input.lmb
+                                && !input.rmb
                             {
                                 if let Some(hovered) = ui.hovered_shape.take() {
                                     brush.shape = hovered;
+                                }
+                                if let Some(hovered) = ui.hovered_area_shape.take() {
+                                    brush.area_tool.shape = hovered;
                                 }
                                 if let Some(hovered) = ui.hovered_tool.take() {
                                     ui.active_tool = hovered;
@@ -175,10 +185,11 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let quick_menu_held =
                             input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
-                        let tab_palette_held = input.key(KeyCode::Tab) && !ui.paused_menu;
+                        let tab_palette_held = ui.tab_palette_open && !ui.paused_menu;
                         ui.show_tool_quick_menu = quick_menu_held;
                         if !quick_menu_held {
                             ui.hovered_shape = None;
+                            ui.hovered_area_shape = None;
                             ui.hovered_tool = None;
                         }
                         let cursor_should_unlock =
@@ -211,7 +222,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raycast =
                             target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
-                        let preview_mode = current_action_mode(&input);
+                        let preview_mode = current_action_mode(&input, raycast, ui.active_tool);
                         let preview_blocks = preview_blocks(
                             &world,
                             &brush,
@@ -247,14 +258,8 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
-                            let actions = draw(
-                                ctx,
-                                &mut ui,
-                                sim.running,
-                                &mut brush,
-                                &tool_textures,
-                                tab_palette_held,
-                            );
+                            let actions =
+                                draw(ctx, &mut ui, sim.running, &mut brush, &tool_textures);
                             let cam = Camera {
                                 pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
                                 dir: ctrl.look_dir(),
@@ -276,7 +281,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 VOXEL_SIZE,
                                 held_tool,
                                 start.elapsed().as_secs_f32(),
-                                input.lmb || input.rmb,
+                                !cursor_should_unlock && (input.lmb || input.rmb),
                             );
                             if actions.new_world {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
@@ -541,8 +546,19 @@ fn held_action_mode(input: &InputState) -> Option<BrushMode> {
     }
 }
 
-fn current_action_mode(input: &InputState) -> BrushMode {
-    held_action_mode(input).unwrap_or(BrushMode::Place)
+fn current_action_mode(
+    input: &InputState,
+    raycast: RaycastResult,
+    active_tool: ToolKind,
+) -> BrushMode {
+    if let Some(mode) = held_action_mode(input) {
+        return mode;
+    }
+    if active_tool == ToolKind::AreaTool && raycast.hit.is_some() {
+        BrushMode::Erase
+    } else {
+        BrushMode::Place
+    }
 }
 
 fn preview_blocks(

@@ -4,6 +4,7 @@ use glam::{Mat4, Vec2, Vec3};
 use std::path::Path;
 
 pub const HOTBAR_SLOTS: usize = 10;
+pub const HOTBAR_DISPLAY_ORDER: [usize; HOTBAR_SLOTS] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
 
 #[derive(Clone, Copy, Debug)]
 enum DragSource {
@@ -46,6 +47,7 @@ pub struct UiState {
     pub show_tool_quick_menu: bool,
     pub active_tool: ToolKind,
     pub hovered_shape: Option<BrushShape>,
+    pub hovered_area_shape: Option<AreaFootprintShape>,
     pub hovered_tool: Option<ToolKind>,
     pub new_world_size: usize,
     pub day: bool,
@@ -53,6 +55,7 @@ pub struct UiState {
     pub sim_speed: f32,
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
+    pub tab_palette_open: bool,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -74,6 +77,27 @@ impl UiState {
     pub fn adjust_sim_speed(&mut self, delta_steps: i32) {
         self.set_sim_speed(self.sim_speed + delta_steps as f32 * Self::SIM_SPEED_STEP);
     }
+    pub fn dragging_palette_material(self: &Self) -> Option<MaterialId> {
+        match self.drag_source {
+            Some(DragSource::Palette(material_id)) => Some(material_id),
+            _ => None,
+        }
+    }
+
+    pub fn drag_feedback_text(&self) -> Option<String> {
+        let material_id = self.dragging_palette_material()?;
+        let mat_name = material(material_id).name;
+        if let Some(slot) = self.drag_target_slot {
+            Some(format!(
+                "Drop to assign {mat_name} to hotbar slot {}",
+                hotbar_key_label(slot)
+            ))
+        } else {
+            Some(format!(
+                "Dragging {mat_name} — drop onto a hotbar slot to assign"
+            ))
+        }
+    }
 }
 
 impl Default for UiState {
@@ -86,6 +110,7 @@ impl Default for UiState {
             show_tool_quick_menu: false,
             active_tool: ToolKind::Brush,
             hovered_shape: None,
+            hovered_area_shape: None,
             hovered_tool: None,
             new_world_size: 64,
             day: true,
@@ -93,6 +118,7 @@ impl Default for UiState {
             sim_speed: 1.0,
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
+            tab_palette_open: false,
             drag_source: None,
             drag_target_slot: None,
         }
@@ -114,7 +140,6 @@ pub fn draw(
     sim_running: bool,
     brush: &mut BrushSettings,
     tool_textures: &ToolTextures,
-    tab_palette_held: bool,
 ) -> UiActions {
     let mut actions = UiActions::default();
     let opaque_panel = egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 26));
@@ -182,16 +207,17 @@ pub fn draw(
         .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui_state.drag_target_slot = None;
-                for i in 0..HOTBAR_SLOTS {
+                for &i in &HOTBAR_DISPLAY_ORDER {
                     let id = selected_material(ui_state, i);
                     let m = material(id);
                     let response = draw_material_button(
                         ui,
                         [72.0, 44.0],
-                        i,
+                        Some(hotbar_key_label(i)),
                         m.name,
                         m.color,
                         i == ui_state.selected_slot,
+                        ui_state.drag_target_slot == Some(i),
                     );
                     if response.clicked() {
                         ui_state.selected_slot = i;
@@ -207,7 +233,7 @@ pub fn draw(
             });
         });
 
-    if tab_palette_held && !ui_state.paused_menu {
+    if ui_state.tab_palette_open && !ui_state.paused_menu {
         egui::Window::new("Materials (TAB)")
             .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0])
             .collapsible(false)
@@ -223,10 +249,11 @@ pub fn draw(
                         let response = draw_material_button(
                             ui,
                             [120.0, 64.0],
-                            i,
+                            None,
                             m.name,
                             m.color,
                             id == selected_material(ui_state, ui_state.selected_slot),
+                            false,
                         );
                         if response.clicked() {
                             if let Some(slot) =
@@ -243,6 +270,10 @@ pub fn draw(
                         }
                     }
                 });
+                if let Some(feedback) = ui_state.drag_feedback_text() {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(120, 220, 255), feedback);
+                }
                 ui.separator();
                 ui.label("TAB Palette Options");
                 ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Brush radius"));
@@ -253,7 +284,7 @@ pub fn draw(
                     egui::Slider::new(&mut brush.max_distance, 2.0..=48.0)
                         .text("Placement distance"),
                 );
-                ui.label("Hold TAB to configure quick brush options");
+                ui.label("Press TAB to toggle quick brush options");
                 ui.label(
                     "Drag materials onto hotbar slots, or press 0-9 while hovering a material.",
                 );
@@ -304,33 +335,40 @@ pub fn draw(
                 brush.fixed_distance = false;
             }
             ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
-                ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
-                ui.selectable_value(&mut brush.shape, BrushShape::Torus, "Torus");
-                ui.selectable_value(&mut brush.shape, BrushShape::Hemisphere, "Hemisphere");
-                ui.selectable_value(&mut brush.shape, BrushShape::Bowl, "Bowl");
-                ui.selectable_value(&mut brush.shape, BrushShape::InvertedBowl, "Inverted Bowl");
+                if ui_state.active_tool == ToolKind::AreaTool {
+                    ui.selectable_value(
+                        &mut brush.area_tool.shape,
+                        AreaFootprintShape::Circle,
+                        "Circle",
+                    );
+                    ui.selectable_value(
+                        &mut brush.area_tool.shape,
+                        AreaFootprintShape::Square,
+                        "Square",
+                    );
+                } else {
+                    ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
+                    ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
+                    ui.selectable_value(&mut brush.shape, BrushShape::Torus, "Torus");
+                    ui.selectable_value(&mut brush.shape, BrushShape::Hemisphere, "Hemisphere");
+                    ui.selectable_value(&mut brush.shape, BrushShape::Bowl, "Bowl");
+                    ui.selectable_value(
+                        &mut brush.shape,
+                        BrushShape::InvertedBowl,
+                        "Inverted Bowl",
+                    );
+                }
             });
+            if ui_state.active_tool == ToolKind::AreaTool {
+                ui.add(egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Radius"));
+                ui.add(egui::Slider::new(&mut brush.area_tool.thickness, 1..=4).text("Thickness"));
+            } else {
+                ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
+            }
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut brush.mode, BrushMode::Place, "Place");
                 ui.selectable_value(&mut brush.mode, BrushMode::Erase, "Erase");
             });
-            ui.separator();
-            ui.label("Area tool");
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut brush.area_tool.shape,
-                    AreaFootprintShape::Circle,
-                    "Circle",
-                );
-                ui.selectable_value(
-                    &mut brush.area_tool.shape,
-                    AreaFootprintShape::Square,
-                    "Square",
-                );
-            });
-            ui.add(egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Size"));
-            ui.add(egui::Slider::new(&mut brush.area_tool.thickness, 1..=4).text("Thickness"));
         });
     }
 
@@ -342,29 +380,59 @@ pub fn draw(
             .title_bar(false)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.heading("Shape Quick Select");
+                    ui_state.hovered_shape = None;
+                    ui_state.hovered_area_shape = None;
+                    ui_state.hovered_tool = None;
+                    ui.heading("Shape + Radius Quick Select");
                     ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for (shape, label) in [
-                            (BrushShape::Sphere, "Sphere"),
-                            (BrushShape::Cube, "Cube"),
-                            (BrushShape::Torus, "Torus"),
-                            (BrushShape::Hemisphere, "Hemisphere"),
-                            (BrushShape::Bowl, "Bowl"),
-                            (BrushShape::InvertedBowl, "Inverted Bowl"),
-                        ] {
-                            let response = ui.add_sized(
-                                egui::vec2(184.0, 32.0),
-                                egui::SelectableLabel::new(brush.shape == shape, label),
-                            );
-                            if response.hovered() {
-                                ui_state.hovered_shape = Some(shape);
+                    if ui_state.active_tool == ToolKind::AreaTool {
+                        ui.horizontal_wrapped(|ui| {
+                            for (shape, label) in [
+                                (AreaFootprintShape::Circle, "Circle"),
+                                (AreaFootprintShape::Square, "Square"),
+                            ] {
+                                let response = ui.add_sized(
+                                    egui::vec2(184.0, 32.0),
+                                    egui::SelectableLabel::new(
+                                        brush.area_tool.shape == shape,
+                                        label,
+                                    ),
+                                );
+                                if response.hovered() {
+                                    ui_state.hovered_area_shape = Some(shape);
+                                }
+                                if response.clicked() {
+                                    brush.area_tool.shape = shape;
+                                }
                             }
-                            if response.clicked() {
-                                brush.shape = shape;
+                        });
+                        ui.add(
+                            egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Radius"),
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            for (shape, label) in [
+                                (BrushShape::Sphere, "Sphere"),
+                                (BrushShape::Cube, "Cube"),
+                                (BrushShape::Torus, "Torus"),
+                                (BrushShape::Hemisphere, "Hemisphere"),
+                                (BrushShape::Bowl, "Bowl"),
+                                (BrushShape::InvertedBowl, "Inverted Bowl"),
+                            ] {
+                                let response = ui.add_sized(
+                                    egui::vec2(184.0, 32.0),
+                                    egui::SelectableLabel::new(brush.shape == shape, label),
+                                );
+                                if response.hovered() {
+                                    ui_state.hovered_shape = Some(shape);
+                                }
+                                if response.clicked() {
+                                    brush.shape = shape;
+                                }
                             }
-                        }
-                    });
+                        });
+                        ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
+                    }
                     ui.add_space(10.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -392,23 +460,6 @@ pub fn draw(
                         }
                     });
                     ui.add_space(6.0);
-                    if ui_state.active_tool == ToolKind::AreaTool {
-                        ui.separator();
-                        ui.label("Area tool settings");
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(
-                                &mut brush.area_tool.shape,
-                                AreaFootprintShape::Circle,
-                                "Circle",
-                            );
-                            ui.selectable_value(
-                                &mut brush.area_tool.shape,
-                                AreaFootprintShape::Square,
-                                "Square",
-                            );
-                        });
-                        ui.add(egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Size"));
-                    }
                     ui.label("Hold Q and release to select hovered tool");
                 });
             });
@@ -432,10 +483,11 @@ pub fn draw(
 fn draw_material_button(
     ui: &mut egui::Ui,
     size: [f32; 2],
-    slot: usize,
+    slot_label: Option<&str>,
     name: &str,
     color: [u8; 4],
     selected: bool,
+    drag_targeted: bool,
 ) -> egui::Response {
     let desired = egui::vec2(size[0], size[1]);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click_and_drag());
@@ -460,7 +512,11 @@ fn draw_material_button(
     painter.rect_filled(label_rect, egui::Rounding::same(4.0), label_bg);
 
     let text_pos = label_rect.center();
-    let text = format!("{} {}", slot, name);
+    let text = if let Some(slot_label) = slot_label {
+        format!("{} {}", slot_label, name)
+    } else {
+        name.to_owned()
+    };
     let font = egui::FontId::proportional(12.0);
     for offset in [
         egui::vec2(-1.0, 0.0),
@@ -484,12 +540,20 @@ fn draw_material_button(
         text_color,
     );
 
-    let border_color = if selected {
+    let border_color = if drag_targeted {
+        egui::Color32::from_rgb(255, 210, 80)
+    } else if selected {
         egui::Color32::from_rgb(0, 215, 255)
     } else {
         egui::Color32::from_rgba_premultiplied(255, 255, 255, 80)
     };
-    let border_width = if selected { 3.0 } else { 1.0 };
+    let border_width = if drag_targeted {
+        3.5
+    } else if selected {
+        3.0
+    } else {
+        1.0
+    };
     painter.rect_stroke(
         rect,
         rounding,
@@ -502,6 +566,22 @@ fn draw_material_button(
     );
 
     response
+}
+
+fn hotbar_key_label(slot: usize) -> &'static str {
+    match slot {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "?",
+    }
 }
 
 pub fn selected_material(ui_state: &UiState, slot: usize) -> MaterialId {

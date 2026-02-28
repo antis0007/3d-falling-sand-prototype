@@ -4,10 +4,16 @@ use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
 pub const VOXEL_SIZE: f32 = 0.5;
+const TURF_ID: MaterialId = 17;
+const BUSH_ID: MaterialId = 18;
+const GRASS_ID: MaterialId = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -349,6 +355,10 @@ fn mesh_chunk(world: &World, idx: usize) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) 
                 if id == EMPTY {
                     continue;
                 }
+                if matches!(id, BUSH_ID | GRASS_ID) {
+                    add_crossed_billboard(world, [wx, wy, wz], id, &mut verts, &mut inds);
+                    continue;
+                }
                 let color = material(id).color;
                 add_voxel_faces(world, [wx, wy, wz], id, color, &mut verts, &mut inds);
             }
@@ -367,7 +377,7 @@ fn mesh_chunk(world: &World, idx: usize) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) 
 fn add_voxel_faces(
     world: &World,
     p: [i32; 3],
-    _id: MaterialId,
+    id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
@@ -409,7 +419,8 @@ fn add_voxel_faces(
             continue;
         }
         let b = verts.len() as u32;
-        let shaded = shade_color(color, shade);
+        let face_color = turf_face_color(id, d, color);
+        let shaded = shade_color(face_color, shade);
         for v in quad {
             verts.push(Vertex {
                 pos: [
@@ -422,6 +433,107 @@ fn add_voxel_faces(
         }
         inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
+}
+
+fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] {
+    if id != TURF_ID {
+        return fallback;
+    }
+    if dir == [0, 1, 0] {
+        return [92, 171, 78, 255];
+    }
+    if dir == [0, -1, 0] {
+        return [121, 88, 56, 255];
+    }
+    [116, 103, 61, 255]
+}
+
+fn add_crossed_billboard(
+    world: &World,
+    p: [i32; 3],
+    id: MaterialId,
+    verts: &mut Vec<Vertex>,
+    inds: &mut Vec<u32>,
+) {
+    let above = world.get(p[0], p[1] + 1, p[2]);
+    if above != EMPTY {
+        return;
+    }
+    let base_color = material(id).color;
+    let texture_tint = plant_texture_tint(id);
+    let color = [
+        ((base_color[0] as u16 + texture_tint[0] as u16) / 2) as u8,
+        ((base_color[1] as u16 + texture_tint[1] as u16) / 2) as u8,
+        ((base_color[2] as u16 + texture_tint[2] as u16) / 2) as u8,
+        base_color[3],
+    ];
+
+    let quads = [
+        [
+            [0.15, 0.0, 0.15],
+            [0.85, 1.0, 0.85],
+            [0.85, 0.0, 0.85],
+            [0.15, 1.0, 0.15],
+        ],
+        [
+            [0.15, 0.0, 0.85],
+            [0.85, 1.0, 0.15],
+            [0.85, 0.0, 0.15],
+            [0.15, 1.0, 0.85],
+        ],
+    ];
+
+    for quad in quads {
+        let b = verts.len() as u32;
+        for v in quad {
+            verts.push(Vertex {
+                pos: [
+                    (p[0] as f32 + v[0]) * VOXEL_SIZE,
+                    (p[1] as f32 + v[1]) * VOXEL_SIZE,
+                    (p[2] as f32 + v[2]) * VOXEL_SIZE,
+                ],
+                color,
+            });
+        }
+        inds.extend_from_slice(&[b, b + 1, b + 2, b + 1, b, b + 3]);
+    }
+}
+
+fn plant_texture_tint(id: MaterialId) -> [u8; 4] {
+    static TINTS: OnceLock<([u8; 4], [u8; 4])> = OnceLock::new();
+    let (grass, bush) = *TINTS.get_or_init(|| {
+        let grass =
+            load_tint_from_file(Path::new("assets/materials/grass.txt"), [90, 180, 80, 220]);
+        let bush = load_tint_from_file(Path::new("assets/materials/bush.txt"), [70, 150, 65, 220]);
+        (grass, bush)
+    });
+    if id == GRASS_ID {
+        grass
+    } else {
+        bush
+    }
+}
+
+fn load_tint_from_file(path: &Path, fallback: [u8; 4]) -> [u8; 4] {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return fallback;
+    };
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(line) = line else {
+        return fallback;
+    };
+    let mut vals = line
+        .split(',')
+        .map(str::trim)
+        .filter_map(|v| v.parse::<u8>().ok());
+    let (Some(r), Some(g), Some(b), Some(a)) = (vals.next(), vals.next(), vals.next(), vals.next())
+    else {
+        return fallback;
+    };
+    [r, g, b, a]
 }
 
 fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
