@@ -20,7 +20,7 @@ use crate::world::{
 use crate::world_stream::{floor_div, ChunkResidency, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -424,6 +424,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                 let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                 if stream_ref.load_coord_into_world(desired_coord, &mut world) {
+                                    let previous_active = active_stream_coord;
                                     active_stream_coord = desired_coord;
                                     let new_origin = stream_ref.chunk_origin(active_stream_coord);
                                     ctrl.position = Vec3::new(
@@ -1773,5 +1774,33 @@ fn raycast_target(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Rayc
             miss.y.floor() as i32,
             miss.z.floor() as i32,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_stream_meshes_retains_transition_union_until_ready() {
+        let desired = macro_residency_set([1, 0, 0], 1);
+        let previous = macro_residency_set([0, 0, 0], 1);
+        let union: HashSet<[i32; 3]> = desired.union(&previous).copied().collect();
+
+        let keep_not_ready = build_keep_stream_meshes(&desired, [1, 0, 0], &union, false, 0);
+        assert!(keep_not_ready.contains(&[-1, 0, 0]));
+
+        let keep_grace = build_keep_stream_meshes(&desired, [1, 0, 0], &union, true, 2);
+        assert!(keep_grace.contains(&[-1, 0, 0]));
+
+        let keep_pruned = build_keep_stream_meshes(&desired, [1, 0, 0], &union, true, 0);
+        assert!(!keep_pruned.contains(&[-1, 0, 0]));
+    }
+
+    #[test]
+    fn reprioritize_stream_mesh_queue_keeps_nearest_for_next_pop() {
+        let mut pending = vec![[4, 0, 0], [1, 0, 0], [3, 0, 0]];
+        reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0]);
+        assert_eq!(pending.pop(), Some([1, 0, 0]));
     }
 }
