@@ -175,10 +175,28 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
             let weights = biome_weights(config.seed, wx, wz);
             let river_w = weights[biome_index(BiomeType::River)];
             let lake_w = weights[biome_index(BiomeType::Lake)];
+            let wetness = river_w.max(lake_w);
+            if wetness < 0.42 {
+                continue;
+            }
 
-            let river_depth = (river_w * 5.0).round() as i32;
-            let lake_depth = (lake_w * 6.0).round() as i32;
-            let water_floor = (config.sea_level - 1 - river_depth - lake_depth).max(2);
+            let river_depth = (river_w * 6.0).round() as i32;
+            let lake_depth = (lake_w * 7.0).round() as i32;
+            let water_floor = (config.sea_level - 2 - river_depth - lake_depth).max(2);
+
+            let Some(surface) = surface_y(world, lx, lz) else {
+                continue;
+            };
+            if surface > config.sea_level + 2 && wetness < 0.7 {
+                continue;
+            }
+
+            let carve_top = config.sea_level.min(surface + 1);
+            for y in water_floor..=carve_top {
+                if world.get(lx, y, lz) != WATER {
+                    let _ = world.set(lx, y, lz, EMPTY);
+                }
+            }
 
             for y in water_floor..=config.sea_level {
                 if world.get(lx, y, lz) == EMPTY {
@@ -186,11 +204,9 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
                 }
             }
 
-            if river_w > 0.42 || lake_w > 0.46 {
-                for y in (water_floor - 1).max(1)..=water_floor {
-                    if world.get(lx, y, lz) != WATER {
-                        let _ = world.set(lx, y, lz, SAND);
-                    }
+            for y in (water_floor - 1).max(1)..=water_floor {
+                if world.get(lx, y, lz) != WATER {
+                    let _ = world.set(lx, y, lz, SAND);
                 }
             }
         }

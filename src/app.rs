@@ -31,6 +31,8 @@ const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
+const PROCEDURAL_MACROCHUNK_SIZE: i32 = 128;
+const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 1;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -72,6 +74,7 @@ pub async fn run() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut sim_tick: u64 = 0;
     let mut active_procgen: Option<ProcGenConfig> = None;
+    let mut active_procgen_origin: [i32; 3] = [0, 0, 0];
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -88,7 +91,17 @@ pub async fn run() -> anyhow::Result<()> {
                         if !ui.paused_menu
                             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
                 );
-                let egui_c = if block_tab_for_egui {
+                let ui_allows_pointer =
+                    ui.paused_menu || ui.tab_palette_open || ui.show_tool_quick_menu;
+                let block_pointer_for_egui = !ui_allows_pointer
+                    && matches!(
+                        event,
+                        WindowEvent::CursorMoved { .. }
+                            | WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. }
+                            | WindowEvent::TouchpadPressure { .. }
+                    );
+                let egui_c = if block_tab_for_egui || block_pointer_for_egui {
                     false
                 } else {
                     egui_state.on_window_event(window, event).consumed
@@ -181,7 +194,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Some(hovered) = ui.hovered_tool.take() {
                                     ui.active_tool = hovered;
                                 }
-                                let _ = set_cursor(window, ui.paused_menu || ui.tab_palette_open);
+                                let _ = set_cursor(
+                                    window,
+                                    should_unlock_cursor(&ui, false, ui.tab_palette_open),
+                                );
                             }
                         }
                     }
@@ -200,9 +216,8 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.hovered_tool = None;
                         }
                         let cursor_should_unlock =
-                            ui.paused_menu || quick_menu_held || tab_palette_held;
-                        let gameplay_blocked =
-                            ui.paused_menu || quick_menu_held || tab_palette_held;
+                            should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
+                        let gameplay_blocked = cursor_should_unlock;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !gameplay_blocked {
@@ -234,6 +249,16 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             }
                         }
+
+                        let modifier_hint = if input.key(KeyCode::ControlLeft)
+                            || input.key(KeyCode::ControlRight)
+                        {
+                            Some(format!("Brush Size: {}", brush.radius))
+                        } else if input.key(KeyCode::AltLeft) || input.key(KeyCode::AltRight) {
+                            Some(format!("Brush Distance: {:.1}", brush.max_distance))
+                        } else {
+                            None
+                        };
 
                         let raycast =
                             target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
@@ -277,11 +302,44 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
                         renderer.rebuild_dirty_chunks(&mut world);
 
+                        if let Some(mut cfg) = active_procgen {
+                            let global = [
+                                active_procgen_origin[0] + ctrl.position.x.floor() as i32,
+                                active_procgen_origin[1] + ctrl.position.y.floor() as i32,
+                                active_procgen_origin[2] + ctrl.position.z.floor() as i32,
+                            ];
+                            let player_macro = [
+                                floor_div(global[0], PROCEDURAL_MACROCHUNK_SIZE),
+                                floor_div(global[1], PROCEDURAL_MACROCHUNK_SIZE),
+                                floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
+                            ];
+                            let desired_origin = [
+                                (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                    * PROCEDURAL_MACROCHUNK_SIZE,
+                                (player_macro[1] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                    * PROCEDURAL_MACROCHUNK_SIZE,
+                                (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                    * PROCEDURAL_MACROCHUNK_SIZE,
+                            ];
+                            if desired_origin != active_procgen_origin {
+                                active_procgen_origin = desired_origin;
+                                cfg = cfg.with_origin(active_procgen_origin);
+                                active_procgen = Some(cfg);
+                                world = generate_world(cfg);
+                                ctrl.position = Vec3::new(
+                                    (global[0] - active_procgen_origin[0]) as f32 + 0.5,
+                                    (global[1] - active_procgen_origin[1]) as f32 + 0.5,
+                                    (global[2] - active_procgen_origin[2]) as f32 + 0.5,
+                                );
+                                renderer.rebuild_dirty_chunks(&mut world);
+                            }
+                        }
+
                         ui.biome_hint = if let Some(cfg) = active_procgen {
                             let biome = biome_hint_at_world(
                                 &cfg,
-                                ctrl.position.x.floor() as i32,
-                                ctrl.position.z.floor() as i32,
+                                active_procgen_origin[0] + ctrl.position.x.floor() as i32,
+                                active_procgen_origin[2] + ctrl.position.z.floor() as i32,
                             );
                             format!("Biome: {}", biome.label())
                         } else {
@@ -314,16 +372,27 @@ pub async fn run() -> anyhow::Result<()> {
                                 held_tool,
                                 start.elapsed().as_secs_f32(),
                                 !cursor_should_unlock && (input.lmb || input.rmb),
+                                modifier_hint.as_deref(),
                             );
                             if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 world = if actions.new_procedural {
                                     let seed = start.elapsed().as_nanos() as u64;
-                                    let config = ProcGenConfig::for_size(n, seed);
+                                    let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
+                                    let proc_size =
+                                        (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
+                                    active_procgen_origin = [
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                    ];
+                                    let config = ProcGenConfig::for_size(proc_size, seed)
+                                        .with_origin(active_procgen_origin);
                                     active_procgen = Some(config);
                                     generate_world(config)
                                 } else {
                                     active_procgen = None;
+                                    active_procgen_origin = [0, 0, 0];
                                     World::new([n, n, n])
                                 };
                                 let spawn = if let Some(cfg) = active_procgen {
@@ -511,6 +580,19 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
     }
     Ok(())
+}
+
+fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
+    ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    let mut q = a / b;
+    let r = a % b;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 fn apply_mouse_edit(

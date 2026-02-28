@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::sim::{material, Phase};
 use crate::world::{World, EMPTY};
 
 #[derive(Default, Clone)]
@@ -146,7 +147,12 @@ impl FpsController {
         for z in min_z..=max_z {
             for y in min_y..=max_y {
                 for x in min_x..=max_x {
-                    if world.get(x, y, z) != EMPTY {
+                    let id = world.get(x, y, z);
+                    if id == EMPTY {
+                        continue;
+                    }
+                    let phase = material(id).phase;
+                    if matches!(phase, Phase::Solid | Phase::Powder) {
                         return true;
                     }
                 }

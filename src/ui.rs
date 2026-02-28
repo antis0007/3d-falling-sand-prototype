@@ -649,6 +649,7 @@ pub fn draw_fps_overlays(
     held_tool: Option<(egui::TextureId, [usize; 2])>,
     now_s: f32,
     using_tool: bool,
+    modifier_hint: Option<&str>,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
@@ -661,6 +662,17 @@ pub fn draw_fps_overlays(
         let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
         painter.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
         painter.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+    }
+
+    if let Some(hint) = modifier_hint {
+        let c = ctx.screen_rect().center();
+        painter.text(
+            egui::pos2(c.x + 16.0, c.y + 14.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_rgb(210, 230, 255),
+        );
     }
 
     let rect = ctx.screen_rect();
