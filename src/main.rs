@@ -1,4 +1,11 @@
 mod app;
+mod chunk_store;
+mod edits;
+mod floating_origin;
+mod meshing;
+mod sim_world;
+mod streaming;
+mod types;
 mod input;
 mod player;
 mod procgen;
