@@ -1,5 +1,7 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
+const MACROCHUNK_SIZE_VOXELS: i32 = 64;
+
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
 const WATER: MaterialId = 5;
@@ -439,57 +441,130 @@ const WATER_HOTSPOT_RADIUS_SQ: i32 = 9;
 const WATER_ISOLATION_RADIUS_SQ: i32 = 9;
 
 pub fn step(world: &mut World, rng: &mut XorShift32) {
-    let dims = world.dims;
+    let mut all_chunks = Vec::with_capacity(world.chunks.len());
     for cz in 0..world.chunks_dims[2] {
         for cy in 0..world.chunks_dims[1] {
             for cx in 0..world.chunks_dims[0] {
-                let cidx = world.chunk_index(cx, cy, cz);
-                let active_list: Vec<u16> = world.chunks[cidx].active.iter().copied().collect();
-                for local_u16 in active_list {
-                    let local = local_u16 as usize;
-                    if !world.chunks[cidx].active.contains(&local_u16) {
-                        continue;
-                    }
-                    let lx = local % CHUNK_SIZE;
-                    let ly = (local / CHUNK_SIZE) % CHUNK_SIZE;
-                    let lz = local / (CHUNK_SIZE * CHUNK_SIZE);
-                    let wx = (cx * CHUNK_SIZE + lx) as i32;
-                    let wy = (cy * CHUNK_SIZE + ly) as i32;
-                    let wz = (cz * CHUNK_SIZE + lz) as i32;
-                    if wx < 0
-                        || wy < 0
-                        || wz < 0
-                        || wx >= dims[0] as i32
-                        || wy >= dims[1] as i32
-                        || wz >= dims[2] as i32
-                    {
-                        world.chunks[cidx].active.remove(&local_u16);
-                        continue;
-                    }
-                    let id = world.get(wx, wy, wz);
-                    if id == EMPTY || (material(id).phase == Phase::Solid && !is_reactive_solid(id))
-                    {
-                        world.chunks[cidx].active.remove(&local_u16);
-                        continue;
-                    }
-                    let moved = step_voxel(world, [wx, wy, wz], id, rng);
-                    if moved {
-                        world.chunks[cidx].active.remove(&local_u16);
-                    } else {
-                        if is_reactive_solid(id) {
-                            world.chunks[cidx].settled[local] = 0;
-                            continue;
-                        }
-                        let settle = &mut world.chunks[cidx].settled[local];
-                        *settle = settle.saturating_add(1);
-                        if *settle > 5 {
-                            world.chunks[cidx].active.remove(&local_u16);
-                        }
-                    }
+                all_chunks.push(world.chunk_index(cx, cy, cz));
+            }
+        }
+    }
+    step_selected_chunks(world, rng, &all_chunks);
+}
+
+pub fn step_selected_chunks(world: &mut World, rng: &mut XorShift32, chunk_indices: &[usize]) {
+    let dims = world.dims;
+    for &cidx in chunk_indices {
+        let [cx, cy, cz] = chunk_index_to_coord(world, cidx);
+        let active_list: Vec<u16> = world.chunks[cidx].active.iter().copied().collect();
+        for local_u16 in active_list {
+            let local = local_u16 as usize;
+            if !world.chunks[cidx].active.contains(&local_u16) {
+                continue;
+            }
+            let lx = local % CHUNK_SIZE;
+            let ly = (local / CHUNK_SIZE) % CHUNK_SIZE;
+            let lz = local / (CHUNK_SIZE * CHUNK_SIZE);
+            let wx = (cx * CHUNK_SIZE + lx) as i32;
+            let wy = (cy * CHUNK_SIZE + ly) as i32;
+            let wz = (cz * CHUNK_SIZE + lz) as i32;
+            if wx < 0
+                || wy < 0
+                || wz < 0
+                || wx >= dims[0] as i32
+                || wy >= dims[1] as i32
+                || wz >= dims[2] as i32
+            {
+                world.chunks[cidx].active.remove(&local_u16);
+                continue;
+            }
+            let id = world.get(wx, wy, wz);
+            if id == EMPTY || (material(id).phase == Phase::Solid && !is_reactive_solid(id)) {
+                world.chunks[cidx].active.remove(&local_u16);
+                continue;
+            }
+            let moved = step_voxel(world, [wx, wy, wz], id, rng);
+            if moved {
+                world.chunks[cidx].active.remove(&local_u16);
+            } else {
+                if is_reactive_solid(id) {
+                    world.chunks[cidx].settled[local] = 0;
+                    continue;
+                }
+                let settle = &mut world.chunks[cidx].settled[local];
+                *settle = settle.saturating_add(1);
+                if *settle > 5 {
+                    world.chunks[cidx].active.remove(&local_u16);
                 }
             }
         }
     }
+}
+
+pub fn prioritize_chunks_for_player(
+    world: &World,
+    player_pos: glam::Vec3,
+) -> (Vec<usize>, Vec<usize>) {
+    let macro_coord = macrochunk_from_world(
+        player_pos.x.floor() as i32,
+        player_pos.y.floor() as i32,
+        player_pos.z.floor() as i32,
+    );
+    let mut high = Vec::new();
+    let mut low = Vec::new();
+    for cz in 0..world.chunks_dims[2] {
+        for cy in 0..world.chunks_dims[1] {
+            for cx in 0..world.chunks_dims[0] {
+                let idx = world.chunk_index(cx, cy, cz);
+                let chunk_macro = macrochunk_from_chunk_coord(cx as i32, cy as i32, cz as i32);
+                let dx = (chunk_macro[0] - macro_coord[0]).abs();
+                let dy = (chunk_macro[1] - macro_coord[1]).abs();
+                let dz = (chunk_macro[2] - macro_coord[2]).abs();
+                if dx == 0 && dy == 0 && dz == 0 {
+                    high.push(idx);
+                }
+            }
+        }
+    }
+    high.sort_unstable();
+    low.sort_unstable();
+    (high, low)
+}
+
+pub fn macrochunk_from_world(x: i32, y: i32, z: i32) -> [i32; 3] {
+    [
+        floor_div(x, MACROCHUNK_SIZE_VOXELS),
+        floor_div(y, MACROCHUNK_SIZE_VOXELS),
+        floor_div(z, MACROCHUNK_SIZE_VOXELS),
+    ]
+}
+
+pub fn macrochunk_from_chunk_coord(cx: i32, cy: i32, cz: i32) -> [i32; 3] {
+    let chunk_voxel_size = CHUNK_SIZE as i32;
+    macrochunk_from_world(
+        cx * chunk_voxel_size,
+        cy * chunk_voxel_size,
+        cz * chunk_voxel_size,
+    )
+}
+
+fn chunk_index_to_coord(world: &World, cidx: usize) -> [usize; 3] {
+    let w = world.chunks_dims[0];
+    let h = world.chunks_dims[1];
+    let cz = cidx / (w * h);
+    let rem = cidx % (w * h);
+    let cy = rem / w;
+    let cx = rem % w;
+    [cx, cy, cz]
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    let mut q = a / b;
+    let r = a % b;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 fn try_move(world: &mut World, from: [i32; 3], to: [i32; 3], id: MaterialId) -> bool {
@@ -919,7 +994,7 @@ fn has_ignition_neighbor(world: &World, p: [i32; 3]) -> bool {
     for dz in -2..=2 {
         for dy in -1..=2 {
             for dx in -2..=2 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 if dx * dx + dy * dy + dz * dz > 5 {
@@ -1032,7 +1107,7 @@ fn has_tree_support(world: &World, p: [i32; 3]) -> bool {
     for dz in -2..=2 {
         for dy in -2..=2 {
             for dx in -2..=2 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 if dx * dx + dy * dy + dz * dz > 5 {
@@ -1057,7 +1132,7 @@ fn has_same_neighbor_in_radius(world: &World, p: [i32; 3], id: MaterialId, radiu
     for dz in -3..=3 {
         for dy in -3..=3 {
             for dx in -3..=3 {
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx == 0 && dz == 0 {
                     continue;
                 }
                 let dist2 = dx * dx + dy * dy + dz * dz;

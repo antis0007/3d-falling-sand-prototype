@@ -415,7 +415,7 @@ fn add_voxel_faces(
         ),
     ];
     for (d, quad, shade) in dirs {
-        if is_face_occluded(world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2])) {
+        if is_face_occluded(id, world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2])) {
             continue;
         }
         let b = verts.len() as u32;
@@ -435,9 +435,13 @@ fn add_voxel_faces(
     }
 }
 
-fn is_face_occluded(neighbor_id: MaterialId) -> bool {
+fn is_face_occluded(self_id: MaterialId, neighbor_id: MaterialId) -> bool {
     if neighbor_id == EMPTY {
         return false;
+    }
+
+    if neighbor_id == self_id {
+        return true;
     }
 
     if matches!(neighbor_id, GRASS_ID | BUSH_ID) {

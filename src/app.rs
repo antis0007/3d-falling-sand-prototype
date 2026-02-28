@@ -3,8 +3,9 @@ use crate::player::{
     camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
+use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
-use crate::sim::{step, SimState};
+use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     ToolTextures, UiState, HOTBAR_SLOTS,
@@ -15,6 +16,8 @@ use crate::world::{
 };
 use anyhow::Context;
 use glam::Vec3;
+use std::collections::BTreeMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
@@ -29,6 +32,9 @@ const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
+const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
+const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
+const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -40,6 +46,22 @@ struct EditRuntimeState {
 struct RaycastResult {
     hit: Option<[i32; 3]>,
     place: [i32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct ProcgenJobSpec {
+    generation_id: u64,
+    config: ProcGenConfig,
+    prefer_safe_spawn: bool,
+    target_global_pos: [i32; 3],
+}
+
+struct ProcgenJobResult {
+    generation_id: u64,
+    config: ProcGenConfig,
+    world: World,
+    prefer_safe_spawn: bool,
+    target_global_pos: [i32; 3],
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -68,6 +90,15 @@ pub async fn run() -> anyhow::Result<()> {
     let mut edit_runtime = EditRuntimeState::default();
     let mut last = Instant::now();
     let start = Instant::now();
+    let mut sim_tick: u64 = 0;
+    let mut active_procgen: Option<ProcGenConfig> = None;
+    let mut active_procgen_origin: [i32; 3] = [0, 0, 0];
+    let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
+        mpsc::channel();
+    let mut requested_procgen_id: Option<u64> = None;
+    let mut requested_procgen_origin: Option<[i32; 3]> = None;
+    let mut next_procgen_id: u64 = 1;
+    let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -84,7 +115,17 @@ pub async fn run() -> anyhow::Result<()> {
                         if !ui.paused_menu
                             && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
                 );
-                let egui_c = if block_tab_for_egui {
+                let ui_allows_pointer =
+                    ui.paused_menu || ui.tab_palette_open || ui.show_tool_quick_menu;
+                let block_pointer_for_egui = !ui_allows_pointer
+                    && matches!(
+                        event,
+                        WindowEvent::CursorMoved { .. }
+                            | WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. }
+                            | WindowEvent::TouchpadPressure { .. }
+                    );
+                let egui_c = if block_tab_for_egui || block_pointer_for_egui {
                     false
                 } else {
                     egui_state.on_window_event(window, event).consumed
@@ -177,7 +218,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Some(hovered) = ui.hovered_tool.take() {
                                     ui.active_tool = hovered;
                                 }
-                                let _ = set_cursor(window, ui.paused_menu || ui.tab_palette_open);
+                                let _ = set_cursor(
+                                    window,
+                                    should_unlock_cursor(&ui, false, ui.tab_palette_open),
+                                );
                             }
                         }
                     }
@@ -196,9 +240,8 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.hovered_tool = None;
                         }
                         let cursor_should_unlock =
-                            ui.paused_menu || quick_menu_held || tab_palette_held;
-                        let gameplay_blocked =
-                            ui.paused_menu || quick_menu_held || tab_palette_held;
+                            should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
+                        let gameplay_blocked = cursor_should_unlock;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !gameplay_blocked {
@@ -231,6 +274,16 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
+                        let modifier_hint = if input.key(KeyCode::ControlLeft)
+                            || input.key(KeyCode::ControlRight)
+                        {
+                            Some(format!("Brush Size: {}", brush.radius))
+                        } else if input.key(KeyCode::AltLeft) || input.key(KeyCode::AltRight) {
+                            Some(format!("Brush Distance: {:.1}", brush.max_distance))
+                        } else {
+                            None
+                        };
+
                         let raycast =
                             target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
                         let preview_mode = current_action_mode(&input, raycast, ui.active_tool);
@@ -260,12 +313,182 @@ pub async fn run() -> anyhow::Result<()> {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
                             while sim.accumulator >= step_dt {
-                                step(&mut world, &mut sim.rng);
+                                let (high_priority, low_priority) =
+                                    prioritize_chunks_for_player(&world, ctrl.position);
+                                step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
+                                if sim_tick % LOW_PRIORITY_THROTTLE_TICKS == 0 {
+                                    step_selected_chunks(&mut world, &mut sim.rng, &low_priority);
+                                }
+                                sim_tick = sim_tick.wrapping_add(1);
                                 sim.accumulator -= step_dt;
                             }
                         }
                         renderer.day = ui.day;
+
+                        while let Ok(result) = procgen_rx.try_recv() {
+                            if requested_procgen_id != Some(result.generation_id) {
+                                continue;
+                            }
+                            requested_procgen_id = None;
+                            requested_procgen_origin = None;
+
+                            let previous_origin = active_procgen_origin;
+                            let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                            let frac_z = ctrl.position.z - ctrl.position.z.floor();
+                            let tracked_global = if active_procgen.is_some() {
+                                [
+                                    previous_origin[0] + ctrl.position.x.floor() as i32,
+                                    0,
+                                    previous_origin[2] + ctrl.position.z.floor() as i32,
+                                ]
+                            } else {
+                                result.target_global_pos
+                            };
+
+                            let incoming_world = result.world;
+                            let chosen_world = if let Some(existing) =
+                                generated_regions.get(&result.config.world_origin)
+                            {
+                                existing.clone()
+                            } else {
+                                incoming_world.clone()
+                            };
+                            generated_regions
+                                .entry(result.config.world_origin)
+                                .or_insert_with(|| incoming_world.clone());
+                            prune_generated_regions(
+                                &mut generated_regions,
+                                result.config.world_origin,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
+                            active_procgen = Some(result.config);
+                            active_procgen_origin = result.config.world_origin;
+                            world = chosen_world;
+                            if result.prefer_safe_spawn {
+                                let spawn = find_safe_spawn(&world, result.config.seed);
+                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                            } else {
+                                ctrl.position = Vec3::new(
+                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + frac_x,
+                                    ctrl.position.y,
+                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + frac_z,
+                                );
+                            }
+                        }
+
+                        if let Some(cfg) = active_procgen {
+                            let global = [
+                                active_procgen_origin[0] + ctrl.position.x.floor() as i32,
+                                0,
+                                active_procgen_origin[2] + ctrl.position.z.floor() as i32,
+                            ];
+                            let player_macro = [
+                                floor_div(global[0], PROCEDURAL_MACROCHUNK_SIZE),
+                                0,
+                                floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
+                            ];
+                            let origin_macro = [
+                                floor_div(active_procgen_origin[0], PROCEDURAL_MACROCHUNK_SIZE),
+                                floor_div(active_procgen_origin[2], PROCEDURAL_MACROCHUNK_SIZE),
+                            ];
+                            let center_macro = [
+                                origin_macro[0] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                origin_macro[1] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            ];
+                            let outside_inner_band = (player_macro[0] - center_macro[0]).abs() > 1
+                                || (player_macro[2] - center_macro[1]).abs() > 1;
+                            let desired_origin = if outside_inner_band {
+                                [
+                                    (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                    0,
+                                    (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                ]
+                            } else {
+                                active_procgen_origin
+                            };
+                            if desired_origin != active_procgen_origin
+                                && requested_procgen_id.is_none()
+                                && requested_procgen_origin != Some(desired_origin)
+                            {
+                                generated_regions.insert(active_procgen_origin, world.clone());
+                                if let Some(cached) = generated_regions.get(&desired_origin) {
+                                    active_procgen_origin = desired_origin;
+                                    active_procgen = Some(cfg.with_origin(desired_origin));
+                                    world = cached.clone();
+                                    prune_generated_regions(
+                                        &mut generated_regions,
+                                        desired_origin,
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                    );
+                                    let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                                    let frac_z = ctrl.position.z - ctrl.position.z.floor();
+                                    ctrl.position = Vec3::new(
+                                        (global[0] - active_procgen_origin[0]) as f32 + frac_x,
+                                        ctrl.position.y,
+                                        (global[2] - active_procgen_origin[2]) as f32 + frac_z,
+                                    );
+                                } else {
+                                    let next_cfg = cfg.with_origin(desired_origin);
+                                    let spec = ProcgenJobSpec {
+                                        generation_id: next_procgen_id,
+                                        config: next_cfg,
+                                        prefer_safe_spawn: false,
+                                        target_global_pos: global,
+                                    };
+                                    next_procgen_id = next_procgen_id.wrapping_add(1);
+                                    requested_procgen_id = Some(spec.generation_id);
+                                    requested_procgen_origin = Some(spec.config.world_origin);
+                                    queue_procgen_job(&procgen_tx, spec);
+                                }
+                            }
+
+                            if requested_procgen_id.is_none() {
+                                if let Some(prefetch_origin) = next_missing_region_origin(
+                                    &generated_regions,
+                                    active_procgen_origin,
+                                    player_macro,
+                                    PROCEDURAL_MACROCHUNK_SIZE,
+                                    PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                ) {
+                                    if requested_procgen_origin == Some(prefetch_origin) {
+                                        // avoid reloading the same region repeatedly
+                                    } else {
+                                        let next_cfg = cfg.with_origin(prefetch_origin);
+                                        let spec = ProcgenJobSpec {
+                                            generation_id: next_procgen_id,
+                                            config: next_cfg,
+                                            prefer_safe_spawn: false,
+                                            target_global_pos: global,
+                                        };
+                                        next_procgen_id = next_procgen_id.wrapping_add(1);
+                                        requested_procgen_id = Some(spec.generation_id);
+                                        requested_procgen_origin = Some(spec.config.world_origin);
+                                        queue_procgen_job(&procgen_tx, spec);
+                                    }
+                                }
+                            }
+                        }
+
                         renderer.rebuild_dirty_chunks(&mut world);
+
+                        ui.biome_hint = if let Some(cfg) = active_procgen {
+                            let biome = biome_hint_at_world(
+                                &cfg,
+                                active_procgen_origin[0] + ctrl.position.x.floor() as i32,
+                                active_procgen_origin[2] + ctrl.position.z.floor() as i32,
+                            );
+                            if requested_procgen_id.is_some() {
+                                format!("Biome: {} (generating...)", biome.label())
+                            } else {
+                                format!("Biome: {}", biome.label())
+                            }
+                        } else {
+                            "Biome: Flat Test World".to_string()
+                        };
 
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
@@ -293,10 +516,44 @@ pub async fn run() -> anyhow::Result<()> {
                                 held_tool,
                                 start.elapsed().as_secs_f32(),
                                 !cursor_should_unlock && (input.lmb || input.rmb),
+                                modifier_hint.as_deref(),
                             );
-                            if actions.new_world {
+                            if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
-                                world = World::new([n, n, n]);
+                                if actions.new_procedural {
+                                    let seed = start.elapsed().as_nanos() as u64;
+                                    let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
+                                    let proc_size =
+                                        (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
+                                    generated_regions.clear();
+                                    active_procgen_origin = [
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                        0,
+                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                    ];
+                                    let config = ProcGenConfig::for_size(proc_size, seed)
+                                        .with_origin(active_procgen_origin);
+                                    let spec = ProcgenJobSpec {
+                                        generation_id: next_procgen_id,
+                                        config,
+                                        prefer_safe_spawn: true,
+                                        target_global_pos: [0, 0, 0],
+                                    };
+                                    next_procgen_id = next_procgen_id.wrapping_add(1);
+                                    requested_procgen_id = Some(spec.generation_id);
+                                    requested_procgen_origin = Some(spec.config.world_origin);
+                                    active_procgen = Some(config);
+                                    queue_procgen_job(&procgen_tx, spec);
+                                } else {
+                                    requested_procgen_id = None;
+                                    requested_procgen_origin = None;
+                                    generated_regions.clear();
+                                    active_procgen = None;
+                                    active_procgen_origin = [0, 0, 0];
+                                    world = World::new([n, n, n]);
+                                    let spawn = find_safe_spawn(&world, 1);
+                                    ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                                }
                                 sim.running = false;
                             }
                             if actions.save {
@@ -308,6 +565,13 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
+                                        requested_procgen_id = None;
+                                        requested_procgen_origin = None;
+                                        generated_regions.clear();
+                                        active_procgen = None;
+                                        active_procgen_origin = [0, 0, 0];
+                                        let spawn = find_safe_spawn(&world, 1);
+                                        ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                         sim.running = false;
                                     }
                                 }
@@ -453,6 +717,20 @@ fn texture_for_active_tool(
     Some((texture.texture.id(), texture.size))
 }
 
+fn queue_procgen_job(tx: &Sender<ProcgenJobResult>, spec: ProcgenJobSpec) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let world = generate_world(spec.config);
+        let _ = tx.send(ProcgenJobResult {
+            generation_id: spec.generation_id,
+            config: spec.config,
+            world,
+            prefer_safe_spawn: spec.prefer_safe_spawn,
+            target_global_pos: spec.target_global_pos,
+        });
+    });
+}
+
 fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {
     if tab_palette_held {
         if let Some(material_id) = ui.hovered_palette_material {
@@ -473,6 +751,62 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
     }
     Ok(())
+}
+
+fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
+    ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
+}
+
+fn next_missing_region_origin(
+    generated_regions: &BTreeMap<[i32; 3], World>,
+    active_origin: [i32; 3],
+    player_macro: [i32; 3],
+    macro_size: i32,
+    render_distance_macros: i32,
+) -> Option<[i32; 3]> {
+    let center_x = player_macro[0] - render_distance_macros;
+    let center_z = player_macro[2] - render_distance_macros;
+    let mut candidates = Vec::new();
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let origin = [
+                (center_x + dx) * macro_size,
+                0,
+                (center_z + dz) * macro_size,
+            ];
+            if origin == active_origin || generated_regions.contains_key(&origin) {
+                continue;
+            }
+            let manhattan = dx.abs() + dz.abs();
+            candidates.push((manhattan, origin));
+        }
+    }
+    candidates.sort_by_key(|(dist, _)| *dist);
+    candidates.into_iter().map(|(_, origin)| origin).next()
+}
+
+fn prune_generated_regions(
+    generated_regions: &mut BTreeMap<[i32; 3], World>,
+    center_origin: [i32; 3],
+    macro_size: i32,
+    keep_radius: i32,
+) {
+    let center_mx = floor_div(center_origin[0], macro_size);
+    let center_mz = floor_div(center_origin[2], macro_size);
+    generated_regions.retain(|origin, _| {
+        let dx = (floor_div(origin[0], macro_size) - center_mx).abs();
+        let dz = (floor_div(origin[2], macro_size) - center_mz).abs();
+        dx <= keep_radius && dz <= keep_radius
+    });
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    let mut q = a / b;
+    let r = a % b;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 fn apply_mouse_edit(
