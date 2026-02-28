@@ -501,6 +501,14 @@ pub fn step_selected_chunks(world: &mut World, rng: &mut XorShift32, chunk_indic
     }
 }
 
+/// Prioritize chunks in a flat 3x3 macrochunk area centered on the player's current macro layer.
+///
+/// High-priority receives every chunk whose macrochunk satisfies `dx <= 1 && dz <= 1 && dy == 0`.
+/// This guarantees simulation of at least 9 macrochunks when that full neighborhood is in-bounds,
+/// and gracefully clamps near world edges where fewer macrochunks exist.
+///
+/// Low-priority is intentionally disabled for now. Returning an empty list makes this policy
+/// explicit and prevents misleading throttle logic at call sites.
 pub fn prioritize_chunks_for_player(
     world: &World,
     player_pos: glam::Vec3,
@@ -511,7 +519,7 @@ pub fn prioritize_chunks_for_player(
         player_pos.z.floor() as i32,
     );
     let mut high = Vec::new();
-    let mut low = Vec::new();
+    let low = Vec::new();
     for cz in 0..world.chunks_dims[2] {
         for cy in 0..world.chunks_dims[1] {
             for cx in 0..world.chunks_dims[0] {
@@ -520,14 +528,13 @@ pub fn prioritize_chunks_for_player(
                 let dx = (chunk_macro[0] - macro_coord[0]).abs();
                 let dy = (chunk_macro[1] - macro_coord[1]).abs();
                 let dz = (chunk_macro[2] - macro_coord[2]).abs();
-                if dx == 0 && dy == 0 && dz == 0 {
+                if dx <= 1 && dy == 0 && dz <= 1 {
                     high.push(idx);
                 }
             }
         }
     }
     high.sort_unstable();
-    low.sort_unstable();
     (high, low)
 }
 
@@ -1413,4 +1420,48 @@ fn side_dirs() -> [[i32; 2]; 8] {
         [-1, 1],
         [1, 1],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_macrochunk_count(world: &World, chunk_indices: &[usize]) -> usize {
+        let mut macrocoords = std::collections::BTreeSet::new();
+        for &cidx in chunk_indices {
+            let [cx, cy, cz] = chunk_index_to_coord(world, cidx);
+            macrocoords.insert(macrochunk_from_chunk_coord(cx as i32, cy as i32, cz as i32));
+        }
+        macrocoords.len()
+    }
+
+    #[test]
+    fn prioritize_selects_full_3x3_macro_neighborhood_when_present() {
+        // 192 voxels = 12 chunks = 3 macrochunks per horizontal axis.
+        let world = World::new([192, 64, 192]);
+        let player_pos = glam::Vec3::new(96.0, 32.0, 96.0);
+
+        let (high, low) = prioritize_chunks_for_player(&world, player_pos);
+
+        assert!(
+            low.is_empty(),
+            "low-priority is intentionally disabled by policy"
+        );
+        assert_eq!(unique_macrochunk_count(&world, &high), 9);
+    }
+
+    #[test]
+    fn prioritize_clamps_at_world_edges() {
+        let world = World::new([192, 64, 192]);
+        let player_pos = glam::Vec3::new(1.0, 1.0, 1.0);
+
+        let (high, low) = prioritize_chunks_for_player(&world, player_pos);
+
+        assert!(
+            low.is_empty(),
+            "low-priority is intentionally disabled by policy"
+        );
+        // Corner can only cover a 2x2 neighborhood in-bounds.
+        assert_eq!(unique_macrochunk_count(&world, &high), 4);
+    }
 }
