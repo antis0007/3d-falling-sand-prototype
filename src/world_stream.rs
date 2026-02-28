@@ -212,6 +212,9 @@ impl WorldStream {
     }
 
     pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
+        // Unknown/resident-missing voxels intentionally map to EMPTY at this API level.
+        // Meshing callers that need seam-safe culling should use `sample_global_voxel_known`
+        // and apply their unknown-neighbor policy consistently.
         self.sample_global_voxel_known(global).unwrap_or(EMPTY)
     }
 
@@ -353,5 +356,24 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| e.coord == coord && e.new == ChunkResidency::Resident));
+    }
+
+    #[test]
+    fn load_coord_into_world_keeps_source_versions_intact() {
+        let mut stream = test_stream();
+        let coord = [0, 0, 0];
+        let mut src = World::new([64, 64, 64]);
+        assert!(src.set(1, 1, 1, 7));
+        let before_versions: Vec<u64> = src.chunks.iter().map(|c| c.voxel_version).collect();
+
+        stream.apply_generated(coord, src.clone());
+
+        let mut dst = World::new([64, 64, 64]);
+        assert!(stream.load_coord_into_world(coord, &mut dst));
+
+        let resident = stream.resident_world(coord).expect("resident world");
+        let guard = resident.read().expect("resident read lock");
+        let after_versions: Vec<u64> = guard.chunks.iter().map(|c| c.voxel_version).collect();
+        assert_eq!(before_versions, after_versions);
     }
 }
