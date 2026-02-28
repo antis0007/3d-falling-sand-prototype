@@ -416,19 +416,20 @@ fn mesh_chunk(
     for lz in 0..CHUNK_SIZE as i32 {
         for ly in 0..CHUNK_SIZE as i32 {
             for lx in 0..CHUNK_SIZE as i32 {
-                let wx = origin[0] + ox + lx;
-                let wy = origin[1] + oy + ly;
-                let wz = origin[2] + oz + lz;
+                let local = [ox + lx, oy + ly, oz + lz];
+                let wx = origin[0] + local[0];
+                let wy = origin[1] + local[1];
+                let wz = origin[2] + local[2];
                 let id = chunk.get(lx as usize, ly as usize, lz as usize);
                 if id == EMPTY {
                     continue;
                 }
                 if matches!(id, BUSH_ID | GRASS_ID) {
-                    add_crossed_billboard(world, [wx, wy, wz], id, &mut verts, &mut inds);
+                    add_crossed_billboard(world, [wx, wy, wz], local, id, &mut verts, &mut inds);
                     continue;
                 }
                 let color = material(id).color;
-                add_voxel_faces(world, [wx, wy, wz], id, color, &mut verts, &mut inds);
+                add_voxel_faces(world, [wx, wy, wz], local, id, color, &mut verts, &mut inds);
             }
         }
     }
@@ -448,7 +449,8 @@ fn mesh_chunk(
 
 fn add_voxel_faces(
     world: &World,
-    p: [i32; 3],
+    render_p: [i32; 3],
+    local_p: [i32; 3],
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
@@ -487,7 +489,10 @@ fn add_voxel_faces(
         ),
     ];
     for (d, quad, shade) in dirs {
-        if is_face_occluded(id, world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2])) {
+        if is_face_occluded(
+            id,
+            world.get(local_p[0] + d[0], local_p[1] + d[1], local_p[2] + d[2]),
+        ) {
             continue;
         }
         let b = verts.len() as u32;
@@ -496,9 +501,9 @@ fn add_voxel_faces(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (p[2] as f32 + v[2]) * VOXEL_SIZE,
+                    (render_p[0] as f32 + v[0]) * VOXEL_SIZE,
+                    (render_p[1] as f32 + v[1]) * VOXEL_SIZE,
+                    (render_p[2] as f32 + v[2]) * VOXEL_SIZE,
                 ],
                 color: shaded,
             });
@@ -543,12 +548,13 @@ fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] 
 
 fn add_crossed_billboard(
     world: &World,
-    p: [i32; 3],
+    render_p: [i32; 3],
+    local_p: [i32; 3],
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
 ) {
-    let above = world.get(p[0], p[1] + 1, p[2]);
+    let above = world.get(local_p[0], local_p[1] + 1, local_p[2]);
     if above != EMPTY {
         return;
     }
@@ -581,9 +587,9 @@ fn add_crossed_billboard(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (p[2] as f32 + v[2]) * VOXEL_SIZE,
+                    (render_p[0] as f32 + v[0]) * VOXEL_SIZE,
+                    (render_p[1] as f32 + v[1]) * VOXEL_SIZE,
+                    (render_p[2] as f32 + v[2]) * VOXEL_SIZE,
                 ],
                 color,
             });
