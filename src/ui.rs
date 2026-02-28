@@ -252,15 +252,11 @@ pub fn draw(
                             None,
                             m.name,
                             m.color,
-                            id == selected_material(ui_state, ui_state.selected_slot),
+                            false,
                             false,
                         );
                         if response.clicked() {
-                            if let Some(slot) =
-                                ui_state.hotbar.iter().position(|&slot_id| slot_id == id)
-                            {
-                                ui_state.selected_slot = slot;
-                            }
+                            ui_state.hotbar[ui_state.selected_slot] = id;
                         }
                         if response.hovered() {
                             ui_state.hovered_palette_material = Some(id);
@@ -312,6 +308,28 @@ pub fn draw(
             }
         }
         ui_state.drag_target_slot = None;
+    }
+
+    if let Some(material_id) = ui_state.dragging_palette_material() {
+        if let Some(pointer_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+            let size = egui::vec2(16.0, 16.0);
+            let rect = egui::Rect::from_center_size(pointer_pos + egui::vec2(10.0, 10.0), size);
+            let fill = material(material_id).color;
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("drag_preview_square"),
+            ));
+            painter.rect_filled(
+                rect,
+                egui::Rounding::same(2.0),
+                egui::Color32::from_rgba_premultiplied(fill[0], fill[1], fill[2], 240),
+            );
+            painter.rect_stroke(
+                rect,
+                egui::Rounding::same(2.0),
+                egui::Stroke::new(1.0, egui::Color32::BLACK),
+            );
+        }
     }
 
     if ui_state.show_brush {
