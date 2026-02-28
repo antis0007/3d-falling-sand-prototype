@@ -329,15 +329,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 continue;
                             }
                             requested_procgen_id = None;
-                            let mut incoming_world = result.world;
-                            if !result.prefer_safe_spawn {
-                                copy_world_overlap(
-                                    &world,
-                                    active_procgen_origin,
-                                    &mut incoming_world,
-                                    result.config.world_origin,
-                                );
-                            }
+                            let incoming_world = result.world;
                             generated_regions
                                 .insert(result.config.world_origin, incoming_world.clone());
                             prune_generated_regions(
@@ -721,51 +713,6 @@ fn prune_generated_regions(
         let dz = ((origin[2] - center_origin[2]) / macro_size).abs();
         dx <= keep_radius && dz <= keep_radius
     });
-}
-
-fn copy_world_overlap(src: &World, src_origin: [i32; 3], dst: &mut World, dst_origin: [i32; 3]) {
-    let src_min = [src_origin[0], src_origin[1], src_origin[2]];
-    let src_max = [
-        src_origin[0] + src.dims[0] as i32 - 1,
-        src_origin[1] + src.dims[1] as i32 - 1,
-        src_origin[2] + src.dims[2] as i32 - 1,
-    ];
-    let dst_min = [dst_origin[0], dst_origin[1], dst_origin[2]];
-    let dst_max = [
-        dst_origin[0] + dst.dims[0] as i32 - 1,
-        dst_origin[1] + dst.dims[1] as i32 - 1,
-        dst_origin[2] + dst.dims[2] as i32 - 1,
-    ];
-
-    let ov_min = [
-        src_min[0].max(dst_min[0]),
-        src_min[1].max(dst_min[1]),
-        src_min[2].max(dst_min[2]),
-    ];
-    let ov_max = [
-        src_max[0].min(dst_max[0]),
-        src_max[1].min(dst_max[1]),
-        src_max[2].min(dst_max[2]),
-    ];
-
-    if ov_min[0] > ov_max[0] || ov_min[1] > ov_max[1] || ov_min[2] > ov_max[2] {
-        return;
-    }
-
-    for wz in ov_min[2]..=ov_max[2] {
-        for wy in ov_min[1]..=ov_max[1] {
-            for wx in ov_min[0]..=ov_max[0] {
-                let sx = wx - src_origin[0];
-                let sy = wy - src_origin[1];
-                let sz = wz - src_origin[2];
-                let dx = wx - dst_origin[0];
-                let dy = wy - dst_origin[1];
-                let dz = wz - dst_origin[2];
-                let id = src.get(sx, sy, sz);
-                let _ = dst.set(dx, dy, dz, id);
-            }
-        }
-    }
 }
 
 fn floor_div(a: i32, b: i32) -> i32 {
