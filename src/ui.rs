@@ -56,6 +56,7 @@ pub struct UiState {
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
+    pub biome_hint: String,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -119,6 +120,7 @@ impl Default for UiState {
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
+            biome_hint: "Biome: n/a".to_string(),
             drag_source: None,
             drag_target_slot: None,
         }
@@ -128,6 +130,7 @@ impl Default for UiState {
 #[derive(Default)]
 pub struct UiActions {
     pub new_world: bool,
+    pub new_procedural: bool,
     pub save: bool,
     pub load: bool,
     pub toggle_run: bool,
@@ -149,6 +152,9 @@ pub fn draw(
             ui.horizontal(|ui| {
                 if ui.button("New World").clicked() {
                     actions.new_world = true;
+                }
+                if ui.button("New Procedural").clicked() {
+                    actions.new_procedural = true;
                 }
                 if ui.button("Save").clicked() {
                     actions.save = true;
@@ -230,6 +236,11 @@ pub fn draw(
                         ui_state.drag_target_slot = Some(i);
                     }
                 }
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&ui_state.biome_hint).strong());
+                    ui.label("Biome under player");
+                });
             });
         });
 
@@ -638,6 +649,7 @@ pub fn draw_fps_overlays(
     held_tool: Option<(egui::TextureId, [usize; 2])>,
     now_s: f32,
     using_tool: bool,
+    modifier_hint: Option<&str>,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
@@ -650,6 +662,17 @@ pub fn draw_fps_overlays(
         let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
         painter.line_segment([egui::pos2(c.x - s, c.y), egui::pos2(c.x + s, c.y)], stroke);
         painter.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+    }
+
+    if let Some(hint) = modifier_hint {
+        let c = ctx.screen_rect().center();
+        painter.text(
+            egui::pos2(c.x + 16.0, c.y + 14.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_rgb(210, 230, 255),
+        );
     }
 
     let rect = ctx.screen_rect();
