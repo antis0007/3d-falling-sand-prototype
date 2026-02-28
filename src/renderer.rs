@@ -83,6 +83,7 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
     meshes: HashMap<usize, ChunkMesh>,
+    streamed_meshes: HashMap<[i32; 3], Vec<ChunkMesh>>,
     pub day: bool,
 }
 
@@ -199,6 +200,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             meshes: HashMap::new(),
+            streamed_meshes: HashMap::new(),
             day: true,
         })
     }
@@ -211,7 +213,8 @@ impl Renderer {
         (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
     }
 
-    pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
+    pub fn rebuild_dirty_chunks_with_budget(&mut self, world: &mut World, budget: usize) {
+        let budget = budget.max(1);
         let dirty_chunks: Vec<usize> = world
             .chunks
             .iter()
@@ -219,10 +222,11 @@ impl Renderer {
             .filter_map(|(i, chunk)| {
                 (chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version).then_some(i)
             })
+            .take(budget)
             .collect();
 
         for i in dirty_chunks {
-            let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, i);
+            let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, i, None);
             if inds.is_empty() {
                 self.meshes.remove(&i);
                 world.chunks[i].dirty_mesh = false;
@@ -258,8 +262,49 @@ impl Renderer {
         }
     }
 
+    pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
+        self.rebuild_dirty_chunks_with_budget(world, usize::MAX);
+    }
+
+    pub fn upsert_stream_mesh(&mut self, coord: [i32; 3], world: &World, world_origin: [i32; 3]) {
+        let mut meshes = Vec::with_capacity(world.chunks.len());
+        for idx in 0..world.chunks.len() {
+            let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, idx, Some(world_origin));
+            if inds.is_empty() {
+                continue;
+            }
+            let vb = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("stream chunk vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("stream chunk ib"),
+                    contents: bytemuck::cast_slice(&inds),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            meshes.push(ChunkMesh {
+                vb,
+                ib,
+                index_count: inds.len() as u32,
+                aabb_min,
+                aabb_max,
+            });
+        }
+        self.streamed_meshes.insert(coord, meshes);
+    }
+
+    pub fn prune_stream_meshes(&mut self, keep: &std::collections::HashSet<[i32; 3]>) {
+        self.streamed_meshes.retain(|coord, _| keep.contains(coord));
+    }
+
     pub fn clear_mesh_cache(&mut self) {
         self.meshes.clear();
+        self.streamed_meshes.clear();
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
@@ -279,6 +324,16 @@ impl Renderer {
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        for meshes in self.streamed_meshes.values() {
+            for mesh in meshes {
+                if !aabb_in_view(camera.view_proj(), mesh.aabb_min, mesh.aabb_max) {
+                    continue;
+                }
+                pass.set_vertex_buffer(0, mesh.vb.slice(..));
+                pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
     }
 }
@@ -339,7 +394,11 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
     true
 }
 
-fn mesh_chunk(world: &World, idx: usize) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+fn mesh_chunk(
+    world: &World,
+    idx: usize,
+    world_origin: Option<[i32; 3]>,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let cdx = world.chunks_dims[0];
     let cdy = world.chunks_dims[1];
     let cx = idx % cdx;
@@ -352,13 +411,14 @@ fn mesh_chunk(world: &World, idx: usize) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) 
     let ox = cx as i32 * CHUNK_SIZE as i32;
     let oy = cy as i32 * CHUNK_SIZE as i32;
     let oz = cz as i32 * CHUNK_SIZE as i32;
+    let origin = world_origin.unwrap_or([0, 0, 0]);
 
     for lz in 0..CHUNK_SIZE as i32 {
         for ly in 0..CHUNK_SIZE as i32 {
             for lx in 0..CHUNK_SIZE as i32 {
-                let wx = ox + lx;
-                let wy = oy + ly;
-                let wz = oz + lz;
+                let wx = origin[0] + ox + lx;
+                let wy = origin[1] + oy + ly;
+                let wz = origin[2] + oz + lz;
                 let id = chunk.get(lx as usize, ly as usize, lz as usize);
                 if id == EMPTY {
                     continue;
@@ -373,11 +433,15 @@ fn mesh_chunk(world: &World, idx: usize) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) 
         }
     }
 
-    let min = Vec3::new(ox as f32, oy as f32, oz as f32) * VOXEL_SIZE;
+    let min = Vec3::new(
+        (origin[0] + ox) as f32,
+        (origin[1] + oy) as f32,
+        (origin[2] + oz) as f32,
+    ) * VOXEL_SIZE;
     let max = Vec3::new(
-        (ox + CHUNK_SIZE as i32) as f32,
-        (oy + CHUNK_SIZE as i32) as f32,
-        (oz + CHUNK_SIZE as i32) as f32,
+        (origin[0] + ox + CHUNK_SIZE as i32) as f32,
+        (origin[1] + oy + CHUNK_SIZE as i32) as f32,
+        (origin[2] + oz + CHUNK_SIZE as i32) as f32,
     ) * VOXEL_SIZE;
     (verts, inds, min, max)
 }

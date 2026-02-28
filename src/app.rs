@@ -43,6 +43,8 @@ const PROCEDURAL_SIM_DISTANCE_MACROS: i32 = 1;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 4;
 const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
+const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
+const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 1;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -127,13 +129,15 @@ pub async fn run() -> anyhow::Result<()> {
     let mut job_status: HashMap<ProcgenJobKey, ProcgenJobStatus> = HashMap::new();
     let mut requested_procgen_id: Option<u64> = None;
     let mut requested_procgen_coord: Option<[i32; 3]> = None;
+    let mut pending_stream_mesh_coords: Vec<[i32; 3]> = Vec::new();
+    let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
     debug_assert!(PLAYER_EYE_HEIGHT_BLOCKS <= PLAYER_HEIGHT_BLOCKS);
     debug_assert!((eye_height_world_meters(VOXEL_SIZE) - 1.6).abs() < f32::EPSILON);
-    renderer.rebuild_dirty_chunks(&mut world);
+    renderer.rebuild_dirty_chunks_with_budget(&mut world, ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME);
 
     event_loop
         .run(move |event, elwt| match &event {
@@ -334,6 +338,10 @@ pub async fn run() -> anyhow::Result<()> {
                                                     ctrl.position =
                                                         Vec3::new(spawn[0], spawn[1], spawn[2]);
                                                 }
+                                            } else if queued_stream_mesh_coords
+                                                .insert(result.spec.coord)
+                                            {
+                                                pending_stream_mesh_coords.push(result.spec.coord);
                                             }
                                         }
                                     }
@@ -368,6 +376,24 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             procedural_simulation_allowed =
                                 sim_residency.contains(&active_stream_coord);
+
+                            let mut keep_stream_meshes = render_residency.clone();
+                            keep_stream_meshes.remove(&active_stream_coord);
+                            renderer.prune_stream_meshes(&keep_stream_meshes);
+                            pending_stream_mesh_coords
+                                .retain(|coord| keep_stream_meshes.contains(coord));
+                            queued_stream_mesh_coords
+                                .retain(|coord| keep_stream_meshes.contains(coord));
+                            for &coord in &render_residency {
+                                if coord == active_stream_coord {
+                                    continue;
+                                }
+                                if stream_ref.state(coord) == ChunkResidency::Resident
+                                    && queued_stream_mesh_coords.insert(coord)
+                                {
+                                    pending_stream_mesh_coords.push(coord);
+                                }
+                            }
 
                             if desired_coord != active_stream_coord {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
@@ -437,6 +463,19 @@ pub async fn run() -> anyhow::Result<()> {
                                 &mut job_status,
                                 global,
                             );
+
+                            for _ in 0..STREAM_MESH_BUILD_BUDGET_PER_FRAME {
+                                let Some(coord) = pending_stream_mesh_coords.pop() else {
+                                    break;
+                                };
+                                if coord == active_stream_coord {
+                                    continue;
+                                }
+                                if let Some(chunk_world) = stream_ref.resident_world(coord) {
+                                    let origin = stream_ref.chunk_origin(coord);
+                                    renderer.upsert_stream_mesh(coord, chunk_world, origin);
+                                }
+                            }
                         }
 
                         if sim.running && !ui.paused_menu && procedural_simulation_allowed {
@@ -450,7 +489,10 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        renderer.rebuild_dirty_chunks(&mut world);
+                        renderer.rebuild_dirty_chunks_with_budget(
+                            &mut world,
+                            ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME,
+                        );
 
                         ui.biome_hint = if let (Some(cfg), Some(stream_ref)) =
                             (active_procgen, stream.as_ref())
@@ -530,6 +572,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 if actions.new_procedural {
                                     renderer.clear_mesh_cache();
+                                    pending_stream_mesh_coords.clear();
+                                    queued_stream_mesh_coords.clear();
                                     job_status.clear();
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let config = ProcGenConfig::for_size(64, seed);
@@ -601,6 +645,9 @@ pub async fn run() -> anyhow::Result<()> {
                                         );
                                     }
                                 } else {
+                                    renderer.clear_mesh_cache();
+                                    pending_stream_mesh_coords.clear();
+                                    queued_stream_mesh_coords.clear();
                                     job_status.clear();
                                     active_procgen = None;
                                     stream = None;
@@ -626,7 +673,10 @@ pub async fn run() -> anyhow::Result<()> {
                             if actions.load {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
+                                        renderer.clear_mesh_cache();
                                         world = w;
+                                        pending_stream_mesh_coords.clear();
+                                        queued_stream_mesh_coords.clear();
                                         job_status.clear();
                                         active_procgen = None;
                                         stream = None;
