@@ -1,4 +1,4 @@
-use crate::sim::material;
+use crate::sim::{material, Phase};
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
@@ -415,7 +415,7 @@ fn add_voxel_faces(
         ),
     ];
     for (d, quad, shade) in dirs {
-        if world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2]) != EMPTY {
+        if is_face_occluded(world.get(p[0] + d[0], p[1] + d[1], p[2] + d[2])) {
             continue;
         }
         let b = verts.len() as u32;
@@ -433,6 +433,23 @@ fn add_voxel_faces(
         }
         inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
+}
+
+fn is_face_occluded(neighbor_id: MaterialId) -> bool {
+    if neighbor_id == EMPTY {
+        return false;
+    }
+
+    if matches!(neighbor_id, GRASS_ID | BUSH_ID) {
+        return false;
+    }
+
+    let neighbor = material(neighbor_id);
+    if neighbor.color[3] < 255 {
+        return false;
+    }
+
+    matches!(neighbor.phase, Phase::Solid | Phase::Powder)
 }
 
 fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] {
@@ -495,7 +512,20 @@ fn add_crossed_billboard(
                 color,
             });
         }
-        inds.extend_from_slice(&[b, b + 1, b + 2, b + 1, b, b + 3]);
+        inds.extend_from_slice(&[
+            b,
+            b + 1,
+            b + 2,
+            b + 1,
+            b,
+            b + 3,
+            b + 2,
+            b + 1,
+            b,
+            b + 3,
+            b,
+            b + 1,
+        ]);
     }
 }
 

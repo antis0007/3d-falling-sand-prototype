@@ -20,6 +20,7 @@ const PLANT: MaterialId = 20;
 const WEED: MaterialId = 21;
 const TREE_SEED: MaterialId = 22;
 const LEAVES: MaterialId = 23;
+const DEAD_LEAF: MaterialId = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -52,7 +53,7 @@ pub enum ContactReaction {
     BurnsIntoSmoke,
 }
 
-pub const MATERIALS: [Material; 24] = [
+pub const MATERIALS: [Material; 25] = [
     Material {
         id: 0,
         name: "Empty",
@@ -128,8 +129,8 @@ pub const MATERIALS: [Material; 24] = [
         acid_resistant: false,
         melts_from_lava: false,
         transforms_on_contact: Some(ContactReaction::WaterVsLava),
-        flow_speed: 4,
-        viscosity: 0.15,
+        flow_speed: 5,
+        viscosity: 0.05,
     },
     Material {
         id: 6,
@@ -141,8 +142,8 @@ pub const MATERIALS: [Material; 24] = [
         acid_resistant: true,
         melts_from_lava: false,
         transforms_on_contact: Some(ContactReaction::LavaCoolsToWaterOrSteam),
-        flow_speed: 2,
-        viscosity: 0.82,
+        flow_speed: 1,
+        viscosity: 0.92,
     },
     Material {
         id: 7,
@@ -365,6 +366,19 @@ pub const MATERIALS: [Material; 24] = [
         flow_speed: 0,
         viscosity: 1.0,
     },
+    Material {
+        id: 24,
+        name: "Dead Leaves",
+        color: [170, 114, 60, 255],
+        phase: Phase::Powder,
+        density: 14,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
 ];
 
 pub fn material(id: MaterialId) -> &'static Material {
@@ -418,6 +432,11 @@ impl XorShift32 {
         self.next() <= threshold
     }
 }
+
+const WATER_BASE_EVAPORATION_CHANCE: f32 = 0.006;
+const WATER_HOT_EVAPORATION_CHANCE: f32 = 0.035;
+const WATER_HOTSPOT_RADIUS_SQ: i32 = 9;
+const WATER_ISOLATION_RADIUS_SQ: i32 = 9;
 
 pub fn step(world: &mut World, rng: &mut XorShift32) {
     let dims = world.dims;
@@ -499,8 +518,29 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
 
     let mat = material(id);
     match mat.phase {
-        Phase::Solid => false,
+        Phase::Solid => {
+            if id == LEAVES {
+                return update_leaf_lifecycle(world, p, rng);
+            }
+            if id == BUSH || id == GRASS {
+                if !has_solid_support_below(world, p) {
+                    return world.set(p[0], p[1], p[2], EMPTY);
+                }
+            }
+            false
+        }
         Phase::Powder => {
+            if id == DEAD_LEAF {
+                if p[1] > 0 && try_move(world, p, [p[0], p[1] - 1, p[2]], id) {
+                    return true;
+                }
+                if rng.chance(0.0012) {
+                    return world.set(p[0], p[1], p[2], DIRT);
+                }
+                if rng.chance(0.0006) {
+                    return world.set(p[0], p[1], p[2], EMPTY);
+                }
+            }
             if p[1] == 0 {
                 return world.set(p[0], p[1], p[2], EMPTY);
             }
@@ -525,9 +565,18 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
                 return world.set(p[0], p[1], p[2], EMPTY);
             }
             if id == WATER {
-                let neighbors = count_same_neighbors(world, p, WATER);
-                if neighbors <= 1 && rng.chance(0.18) {
-                    return world.set(p[0], p[1], p[2], EMPTY);
+                let is_isolated =
+                    !has_same_neighbor_in_radius(world, p, WATER, WATER_ISOLATION_RADIUS_SQ);
+                if is_isolated {
+                    let near_heat = has_heat_source_nearby(world, p, WATER_HOTSPOT_RADIUS_SQ);
+                    let chance = if near_heat {
+                        WATER_HOT_EVAPORATION_CHANCE
+                    } else {
+                        WATER_BASE_EVAPORATION_CHANCE
+                    };
+                    if rng.chance(chance) {
+                        return world.set(p[0], p[1], p[2], EMPTY);
+                    }
                 }
             }
             if try_move(world, p, [p[0], p[1] - 1, p[2]], id) {
@@ -568,8 +617,9 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
 
             let cohesion_neighbors = count_same_neighbors(world, p, id);
             if cohesion_neighbors > 1
-                && rng
-                    .chance((material(id).viscosity * 0.6 + surface_tension * 0.3).clamp(0.0, 0.95))
+                && rng.chance(
+                    (material(id).viscosity * 0.75 + surface_tension * 0.2).clamp(0.0, 0.97),
+                )
             {
                 return false;
             }
@@ -785,23 +835,10 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
 
     if id == PLANT {
         let has_water = has_neighbor(world, p, WATER);
-        if !has_water && rng.chance(0.04) {
+        if !has_water && rng.chance(0.008) {
             reacted |= world.set(p[0], p[1], p[2], WEED);
         } else if has_water {
-            reacted |= try_grow_plant(world, p, PLANT, rng, true, 0.025);
-        }
-
-        if rng.chance(0.0035) {
-            reacted |= world.set(p[0], p[1], p[2], WOOD);
-        }
-    }
-
-    if id == WEED {
-        let has_water = has_neighbor(world, p, WATER);
-        if has_water && rng.chance(0.18) {
-            reacted |= world.set(p[0], p[1], p[2], PLANT);
-        } else {
-            reacted |= try_grow_plant(world, p, WEED, rng, false, 0.018);
+            reacted |= try_grow_plant(world, p, PLANT, rng, true, 0.012);
         }
 
         if rng.chance(0.0025) {
@@ -809,9 +846,21 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
         }
     }
 
+    if id == WEED {
+        let has_water = has_neighbor(world, p, WATER);
+        if has_water && rng.chance(0.08) {
+            reacted |= world.set(p[0], p[1], p[2], PLANT);
+        } else {
+            reacted |= try_grow_plant(world, p, WEED, rng, false, 0.006);
+        }
+
+        if rng.chance(0.0015) {
+            reacted |= world.set(p[0], p[1], p[2], WOOD);
+        }
+    }
+
     if id == DIRT {
-        let above = world.get(p[0], p[1] + 1, p[2]);
-        if above == EMPTY && rng.chance(0.012) {
+        if is_exposed_to_sky(world, p) && rng.chance(0.008) {
             reacted |= world.set(p[0], p[1], p[2], TURF);
         }
     }
@@ -822,7 +871,7 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
             if rng.chance(0.20) {
                 reacted |= world.set(p[0], p[1], p[2], DIRT);
             }
-        } else if rng.chance(0.004) {
+        } else if rng.chance(0.0004) {
             let grow_id = if rng.chance(0.55) { GRASS } else { BUSH };
             reacted |= try_spawn_surface_plant(world, p, grow_id, rng);
         }
@@ -845,7 +894,18 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
 fn is_reactive_solid(id: MaterialId) -> bool {
     matches!(
         id,
-        WOOD | TORCH | EMBER_HOT | EMBER_WARM | PLANT | WEED | TREE_SEED | DIRT | TURF
+        WOOD | TORCH
+            | EMBER_HOT
+            | EMBER_WARM
+            | PLANT
+            | WEED
+            | TREE_SEED
+            | DIRT
+            | TURF
+            | LEAVES
+            | BUSH
+            | GRASS
+            | DEAD_LEAF
     )
 }
 
@@ -934,10 +994,110 @@ fn try_spawn_surface_plant(
     if world.get(np[0], np[1], np[2]) != EMPTY {
         return false;
     }
-    if rng.chance(0.65) {
+    if !has_solid_support_below(world, np) {
+        return false;
+    }
+    if rng.chance(0.2) {
         return world.set(np[0], np[1], np[2], plant_id);
     }
     false
+}
+
+fn update_leaf_lifecycle(world: &mut World, p: [i32; 3], rng: &mut XorShift32) -> bool {
+    if has_tree_support(world, p) {
+        return false;
+    }
+
+    if p[1] > 0 {
+        let below = [p[0], p[1] - 1, p[2]];
+        if world.get(below[0], below[1], below[2]) == EMPTY && try_move(world, p, below, LEAVES) {
+            return true;
+        }
+    }
+
+    if world.set(p[0], p[1], p[2], DEAD_LEAF) {
+        return true;
+    }
+
+    if rng.chance(0.002) {
+        return world.set(p[0], p[1], p[2], DIRT);
+    }
+    if rng.chance(0.0015) {
+        return world.set(p[0], p[1], p[2], EMPTY);
+    }
+    false
+}
+
+fn has_tree_support(world: &World, p: [i32; 3]) -> bool {
+    for dz in -2..=2 {
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                if dx * dx + dy * dy + dz * dz > 5 {
+                    continue;
+                }
+                let nid = world.get(p[0] + dx, p[1] + dy, p[2] + dz);
+                if matches!(nid, WOOD | LEAVES) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn has_solid_support_below(world: &World, p: [i32; 3]) -> bool {
+    let below = world.get(p[0], p[1] - 1, p[2]);
+    below != EMPTY && material(below).phase != Phase::Gas
+}
+
+fn has_same_neighbor_in_radius(world: &World, p: [i32; 3], id: MaterialId, radius_sq: i32) -> bool {
+    for dz in -3..=3 {
+        for dy in -3..=3 {
+            for dx in -3..=3 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let dist2 = dx * dx + dy * dy + dz * dz;
+                if dist2 == 0 || dist2 > radius_sq {
+                    continue;
+                }
+                if world.get(p[0] + dx, p[1] + dy, p[2] + dz) == id {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn has_heat_source_nearby(world: &World, p: [i32; 3], radius_sq: i32) -> bool {
+    for dz in -3..=3 {
+        for dy in -3..=3 {
+            for dx in -3..=3 {
+                let dist2 = dx * dx + dy * dy + dz * dz;
+                if dist2 > radius_sq {
+                    continue;
+                }
+                let nid = world.get(p[0] + dx, p[1] + dy, p[2] + dz);
+                if matches!(nid, LAVA | FIRE_GAS | TORCH | EMBER_HOT | EMBER_WARM) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_exposed_to_sky(world: &World, p: [i32; 3]) -> bool {
+    for y in p[1] + 1..world.dims[1] as i32 {
+        if world.get(p[0], y, p[2]) != EMPTY {
+            return false;
+        }
+    }
+    true
 }
 
 fn germinate_tree(world: &mut World, p: [i32; 3], rng: &mut XorShift32) -> bool {
@@ -1070,7 +1230,7 @@ fn can_displace(world: &World, to: [i32; 3], id: MaterialId) -> bool {
 }
 
 fn liquid_surface_tension(mat: &Material) -> f32 {
-    (0.35 + mat.viscosity * 0.6).clamp(0.1, 0.95)
+    (0.2 + mat.viscosity * 0.75).clamp(0.08, 0.97)
 }
 
 fn liquid_pressure_head(world: &World, p: [i32; 3], id: MaterialId) -> f32 {
