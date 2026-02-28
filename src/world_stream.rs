@@ -1,5 +1,6 @@
 use crate::procgen::ProcGenConfig;
 use crate::world::{MaterialId, World, EMPTY};
+use crate::world_bounds::ProceduralWorldBounds;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,13 +29,15 @@ impl StreamChunk {
 
 pub struct WorldStream {
     base_config: ProcGenConfig,
+    bounds: ProceduralWorldBounds,
     chunks: BTreeMap<[i32; 3], StreamChunk>,
 }
 
 impl WorldStream {
-    pub fn new(base_config: ProcGenConfig) -> Self {
+    pub fn new(base_config: ProcGenConfig, bounds: ProceduralWorldBounds) -> Self {
         Self {
             base_config,
+            bounds,
             chunks: BTreeMap::new(),
         }
     }
@@ -136,6 +139,9 @@ impl WorldStream {
     pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
         let dims = self.base_config.dims;
         if dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
+            return EMPTY;
+        }
+        if !self.bounds.contains_global_y(global[1]) {
             return EMPTY;
         }
         let dx = dims[0] as i32;

@@ -17,6 +17,7 @@ use crate::world::{
     default_save_path, load_world, save_world, AreaFootprintShape, BrushMode, BrushSettings,
     BrushShape, World,
 };
+use crate::world_bounds::ProceduralWorldBounds;
 use crate::world_stream::{floor_div, ChunkResidency, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
@@ -44,6 +45,8 @@ const PROCEDURAL_SIM_DISTANCE_MACROS_Y: i32 = 1;
 const _: [(); 1] = [(); (PROCEDURAL_SIM_DISTANCE_MACROS >= 1) as usize];
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 4;
 const PROCEDURAL_RENDER_DISTANCE_MACROS_Y: i32 = 1;
+const PROCEDURAL_MIN_MACRO_Y: i32 = -4;
+const PROCEDURAL_MAX_MACRO_Y: i32 = 4;
 const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
@@ -124,6 +127,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last = Instant::now();
     let start = Instant::now();
     let mut active_procgen: Option<ProcGenConfig> = None;
+    let mut procedural_bounds: Option<ProceduralWorldBounds> = None;
     let mut stream: Option<WorldStream> = None;
     let mut active_stream_coord: [i32; 3] = [0, 0, 0];
     let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
@@ -370,7 +374,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        if let (Some(cfg), Some(stream_ref)) = (active_procgen, stream.as_mut()) {
+                        if let (Some(cfg), Some(bounds), Some(stream_ref)) =
+                            (active_procgen, procedural_bounds, stream.as_mut())
+                        {
                             let chunk_size_x = cfg.dims[0] as i32;
                             let chunk_size_y = cfg.dims[1] as i32;
                             let chunk_size_z = cfg.dims[2] as i32;
@@ -381,21 +387,23 @@ pub async fn run() -> anyhow::Result<()> {
                                 active_origin[1] + ctrl.position.y.floor() as i32,
                                 active_origin[2] + ctrl.position.z.floor() as i32,
                             ];
-                            let desired_coord = [
+                            let desired_coord = bounds.clamp_macro_coord([
                                 floor_div(global[0], chunk_size_x),
                                 floor_div(global[1], chunk_size_y),
                                 floor_div(global[2], chunk_size_z),
-                            ];
+                            ]);
 
-                            let sim_residency = macro_residency_set(
+                            let sim_residency = filtered_macro_residency_set(
                                 desired_coord,
                                 PROCEDURAL_SIM_DISTANCE_MACROS,
                                 PROCEDURAL_SIM_DISTANCE_MACROS_Y,
+                                bounds,
                             );
-                            let render_residency = macro_residency_set(
+                            let render_residency = filtered_macro_residency_set(
                                 desired_coord,
                                 PROCEDURAL_RENDER_DISTANCE_MACROS,
                                 PROCEDURAL_RENDER_DISTANCE_MACROS_Y,
+                                bounds,
                             );
                             procedural_simulation_allowed =
                                 sim_residency.contains(&active_stream_coord);
@@ -496,6 +504,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 &mut next_epoch,
                                 &mut job_status,
                                 global,
+                                bounds,
                             );
 
                             let prefetch_coords: Vec<[i32; 3]> = unloaded_render
@@ -512,6 +521,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 &mut next_epoch,
                                 &mut job_status,
                                 global,
+                                bounds,
                             );
 
                             reprioritize_pending_stream_meshes(
@@ -646,8 +656,13 @@ pub async fn run() -> anyhow::Result<()> {
                                     job_status.clear();
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let config = ProcGenConfig::for_size(64, seed);
-                                    let mut new_stream = WorldStream::new(config);
-                                    let start_coord = [0, 0, 0];
+                                    let bounds = ProceduralWorldBounds::new(
+                                        PROCEDURAL_MIN_MACRO_Y,
+                                        PROCEDURAL_MAX_MACRO_Y,
+                                        config.dims[1] as i32,
+                                    );
+                                    let mut new_stream = WorldStream::new(config, bounds);
+                                    let start_coord = bounds.clamp_macro_coord([0, 0, 0]);
                                     let generated_start = generate_world_with_control(
                                         new_stream.make_config(start_coord),
                                         ProcGenControl {
@@ -663,19 +678,22 @@ pub async fn run() -> anyhow::Result<()> {
                                     ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
 
                                     active_procgen = Some(config);
+                                    procedural_bounds = Some(bounds);
                                     active_stream_coord = start_coord;
                                     stream = Some(new_stream);
 
                                     if let Some(stream_ref) = stream.as_mut() {
-                                        let render_coords = sorted_residency_coords(
+                                        let render_coords = sorted_filtered_residency_coords(
                                             start_coord,
                                             PROCEDURAL_RENDER_DISTANCE_MACROS,
                                             PROCEDURAL_RENDER_DISTANCE_MACROS_Y,
+                                            bounds,
                                         );
-                                        let start_sim_residency = macro_residency_set(
+                                        let start_sim_residency = filtered_macro_residency_set(
                                             start_coord,
                                             PROCEDURAL_SIM_DISTANCE_MACROS,
                                             PROCEDURAL_SIM_DISTANCE_MACROS_Y,
+                                            bounds,
                                         );
                                         let urgent_coords: Vec<[i32; 3]> = render_coords
                                             .iter()
@@ -695,6 +713,7 @@ pub async fn run() -> anyhow::Result<()> {
                                             &mut next_epoch,
                                             &mut job_status,
                                             [0, 0, 0],
+                                            bounds,
                                         );
                                         let prefetch_coords: Vec<[i32; 3]> = render_coords
                                             .into_iter()
@@ -713,6 +732,7 @@ pub async fn run() -> anyhow::Result<()> {
                                             &mut next_epoch,
                                             &mut job_status,
                                             [0, 0, 0],
+                                            bounds,
                                         );
                                     }
                                 } else {
@@ -727,6 +747,7 @@ pub async fn run() -> anyhow::Result<()> {
                                         &mut requested_procgen_id,
                                         &mut requested_procgen_coord,
                                         &mut active_procgen,
+                                        &mut procedural_bounds,
                                         &mut stream,
                                         &mut active_stream_coord,
                                     );
@@ -756,6 +777,7 @@ pub async fn run() -> anyhow::Result<()> {
                                             &mut requested_procgen_id,
                                             &mut requested_procgen_coord,
                                             &mut active_procgen,
+                                            &mut procedural_bounds,
                                             &mut stream,
                                             &mut active_stream_coord,
                                         );
@@ -1109,6 +1131,18 @@ fn macro_residency_set(center: [i32; 3], radius: i32, vertical_radius: i32) -> H
     set
 }
 
+fn filtered_macro_residency_set(
+    center: [i32; 3],
+    radius: i32,
+    vertical_radius: i32,
+    bounds: ProceduralWorldBounds,
+) -> HashSet<[i32; 3]> {
+    macro_residency_set(center, radius, vertical_radius)
+        .into_iter()
+        .filter(|coord| bounds.contains_macro_coord(*coord))
+        .collect()
+}
+
 fn build_keep_stream_meshes(
     render_residency: &HashSet<[i32; 3]>,
     active_stream_coord: [i32; 3],
@@ -1134,6 +1168,20 @@ fn sorted_residency_coords(center: [i32; 3], radius: i32, vertical_radius: i32) 
     coords
 }
 
+fn sorted_filtered_residency_coords(
+    center: [i32; 3],
+    radius: i32,
+    vertical_radius: i32,
+    bounds: ProceduralWorldBounds,
+) -> Vec<[i32; 3]> {
+    let mut coords: Vec<[i32; 3]> =
+        filtered_macro_residency_set(center, radius, vertical_radius, bounds)
+            .into_iter()
+            .collect();
+    coords.sort_by_key(|coord| macro_distance_sq(*coord, center));
+    coords
+}
+
 fn schedule_procgen_batch(
     coords: &[[i32; 3]],
     budget: usize,
@@ -1144,11 +1192,17 @@ fn schedule_procgen_batch(
     next_epoch: &mut u64,
     job_status: &mut HashMap<ProcgenJobKey, ProcgenJobStatus>,
     target_global_pos: [i32; 3],
+    bounds: ProceduralWorldBounds,
 ) {
     let requested = budget;
     let mut scheduled = 0;
     let mut skipped_non_unloaded = 0;
+    let mut skipped_out_of_bounds = 0;
     for coord in coords {
+        if !bounds.contains_macro_coord(*coord) {
+            skipped_out_of_bounds += 1;
+            continue;
+        }
         if stream.state(*coord) != ChunkResidency::Unloaded {
             skipped_non_unloaded += 1;
             continue;
@@ -1176,10 +1230,11 @@ fn schedule_procgen_batch(
         }
     }
     log::debug!(
-        "schedule_procgen_batch: requested={}, scheduled={}, skipped_non_unloaded={}",
+        "schedule_procgen_batch: requested={}, scheduled={}, skipped_non_unloaded={}, skipped_out_of_bounds={}",
         requested,
         scheduled,
-        skipped_non_unloaded
+        skipped_non_unloaded,
+        skipped_out_of_bounds
     );
 }
 
@@ -1225,12 +1280,14 @@ fn clear_procedural_streaming_state(
     requested_procgen_id: &mut Option<u64>,
     requested_procgen_coord: &mut Option<[i32; 3]>,
     active_procgen: &mut Option<ProcGenConfig>,
+    procedural_bounds: &mut Option<ProceduralWorldBounds>,
     stream: &mut Option<WorldStream>,
     active_stream_coord: &mut [i32; 3],
 ) {
     *requested_procgen_id = None;
     *requested_procgen_coord = None;
     *active_procgen = None;
+    *procedural_bounds = None;
     *stream = None;
     *active_stream_coord = [0, 0, 0];
 }
@@ -1811,6 +1868,31 @@ mod tests {
         assert_eq!(coords.len(), 27);
     }
 
+    #[test]
+    fn world_bounds_clamp_macro_coord_limits_vertical_axis() {
+        let bounds = ProceduralWorldBounds::new(-1, 1, 64);
+        assert_eq!(bounds.clamp_macro_coord([3, 10, -2]), [3, 1, -2]);
+        assert_eq!(bounds.clamp_macro_coord([3, -10, -2]), [3, -1, -2]);
+    }
+
+    #[test]
+    fn filtered_macro_residency_excludes_out_of_range_y_coords() {
+        let bounds = ProceduralWorldBounds::new(-1, 1, 64);
+        let coords = filtered_macro_residency_set([0, 0, 0], 1, 3, bounds);
+        assert!(coords.iter().all(|coord| coord[1] >= -1 && coord[1] <= 1));
+        assert!(!coords.contains(&[0, -2, 0]));
+        assert!(!coords.contains(&[0, 2, 0]));
+    }
+
+    #[test]
+    fn sorted_filtered_residency_never_includes_out_of_range_y_coords() {
+        let bounds = ProceduralWorldBounds::new(-2, 0, 64);
+        let coords = sorted_filtered_residency_coords([0, -1, 0], 2, 2, bounds);
+        assert!(!coords.is_empty());
+        assert!(coords
+            .iter()
+            .all(|coord| bounds.contains_macro_coord(*coord)));
+    }
     #[test]
     fn sorted_residency_prefers_nearest_coord_first() {
         let sorted = sorted_residency_coords([0, 0, 0], 1, 1);
