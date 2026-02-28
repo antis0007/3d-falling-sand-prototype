@@ -26,6 +26,29 @@ pub enum BrushMode {
     Erase,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AreaFootprintShape {
+    Circle,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AreaToolSettings {
+    pub radius: i32,
+    pub shape: AreaFootprintShape,
+    pub thickness: i32,
+}
+
+impl Default for AreaToolSettings {
+    fn default() -> Self {
+        Self {
+            radius: 1,
+            shape: AreaFootprintShape::Circle,
+            thickness: 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BrushSettings {
     pub radius: i32,
@@ -35,6 +58,7 @@ pub struct BrushSettings {
     pub fixed_distance: bool,
     pub repeat_interval_s: f32,
     pub minecraft_style_placement: bool,
+    pub area_tool: AreaToolSettings,
 }
 
 impl Default for BrushSettings {
@@ -47,6 +71,7 @@ impl Default for BrushSettings {
             fixed_distance: false,
             repeat_interval_s: 0.12,
             minecraft_style_placement: false,
+            area_tool: AreaToolSettings::default(),
         }
     }
 }

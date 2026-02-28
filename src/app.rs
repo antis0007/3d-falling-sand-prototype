@@ -10,7 +10,8 @@ use crate::ui::{
     ToolTextures, UiState, HOTBAR_SLOTS,
 };
 use crate::world::{
-    default_save_path, load_world, save_world, BrushMode, BrushSettings, BrushShape, World,
+    default_save_path, load_world, save_world, AreaFootprintShape, BrushMode, BrushSettings,
+    BrushShape, World,
 };
 use anyhow::Context;
 use glam::Vec3;
@@ -151,6 +152,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::KeyZ => ui.active_tool = ToolKind::Brush,
                                     KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
                                     KeyCode::KeyC => ui.active_tool = ToolKind::DestructorWand,
+                                    KeyCode::KeyA => ui.active_tool = ToolKind::AreaTool,
                                     _ => {}
                                 }
                             }
@@ -488,7 +490,19 @@ fn apply_mouse_edit(
         return;
     }
 
-    if brush.radius == 0 && active_tool != ToolKind::Brush {
+    if active_tool == ToolKind::AreaTool {
+        let target = if mode == BrushMode::Place { mat } else { 0 };
+        for p in preview_area_tool_blocks(world, brush, raycast, mode) {
+            world.set(p[0], p[1], p[2], target);
+        }
+        edit_runtime.last_edit_at = Some(now);
+        edit_runtime.last_edit_mode = Some(mode);
+        return;
+    }
+
+    if brush.radius == 0
+        && (active_tool == ToolKind::BuildersWand || active_tool == ToolKind::DestructorWand)
+    {
         if active_tool == ToolKind::BuildersWand && mode != BrushMode::Place {
             return;
         }
@@ -539,6 +553,10 @@ fn preview_blocks(
     active_tool: ToolKind,
     show_hover_hints: bool,
 ) -> Vec<[i32; 3]> {
+    if active_tool == ToolKind::AreaTool {
+        return preview_area_tool_blocks(world, brush, raycast, mode);
+    }
+
     let Some(center) = brush_center(*brush, raycast, mode) else {
         if !show_hover_hints {
             return Vec::new();
@@ -588,6 +606,76 @@ fn preview_blocks(
         }
     }
     out
+}
+
+fn preview_area_tool_blocks(
+    world: &World,
+    brush: &BrushSettings,
+    raycast: RaycastResult,
+    mode: BrushMode,
+) -> Vec<[i32; 3]> {
+    let Some(center) = area_tool_center(raycast, mode) else {
+        return Vec::new();
+    };
+    let normal = raycast
+        .hit
+        .map(|hit| {
+            [
+                raycast.place[0] - hit[0],
+                raycast.place[1] - hit[1],
+                raycast.place[2] - hit[2],
+            ]
+        })
+        .filter(|n| *n != [0, 0, 0])
+        .unwrap_or([0, 1, 0]);
+
+    let (axis_u, axis_v) = match normal {
+        [1, _, _] | [-1, _, _] => ([0, 1, 0], [0, 0, 1]),
+        [_, 1, _] | [_, -1, _] => ([1, 0, 0], [0, 0, 1]),
+        _ => ([1, 0, 0], [0, 1, 0]),
+    };
+
+    let mut out = Vec::new();
+    let radius = brush.area_tool.radius.max(0);
+    let thickness = brush.area_tool.thickness.max(1);
+
+    for dv in -radius..=radius {
+        for du in -radius..=radius {
+            let include = match brush.area_tool.shape {
+                AreaFootprintShape::Circle => du * du + dv * dv <= radius * radius,
+                AreaFootprintShape::Square => true,
+            };
+            if !include {
+                continue;
+            }
+            for depth in 0..thickness {
+                let p = [
+                    center[0] + axis_u[0] * du + axis_v[0] * dv + normal[0] * depth,
+                    center[1] + axis_u[1] * du + axis_v[1] * dv + normal[1] * depth,
+                    center[2] + axis_u[2] * du + axis_v[2] * dv + normal[2] * depth,
+                ];
+                if p[0] < 0
+                    || p[1] < 0
+                    || p[2] < 0
+                    || p[0] >= world.dims[0] as i32
+                    || p[1] >= world.dims[1] as i32
+                    || p[2] >= world.dims[2] as i32
+                {
+                    continue;
+                }
+                out.push(p);
+            }
+        }
+    }
+
+    out
+}
+
+fn area_tool_center(raycast: RaycastResult, mode: BrushMode) -> Option<[i32; 3]> {
+    match mode {
+        BrushMode::Place => Some(raycast.place),
+        BrushMode::Erase => raycast.hit.or(Some(raycast.place)),
+    }
 }
 
 fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -> Option<[i32; 3]> {
@@ -669,7 +757,7 @@ fn preview_wand_blocks(
     active_tool: ToolKind,
     max_blocks: usize,
 ) -> Vec<[i32; 3]> {
-    if active_tool == ToolKind::Brush {
+    if active_tool == ToolKind::Brush || active_tool == ToolKind::AreaTool {
         return Vec::new();
     }
 
