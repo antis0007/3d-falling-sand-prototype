@@ -122,6 +122,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut next_procgen_id: u64 = 1;
     let mut next_epoch: u64 = 1;
     let mut job_status: HashMap<ProcgenJobKey, ProcgenJobStatus> = HashMap::new();
+    let mut requested_procgen_id: Option<u64> = None;
+    let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -1090,7 +1092,9 @@ fn current_action_mode(
     if let Some(mode) = held_action_mode(input) {
         return mode;
     }
-    if active_tool == ToolKind::AreaTool && raycast.hit.is_some() {
+    if (active_tool == ToolKind::AreaTool || active_tool == ToolKind::DestructorWand)
+        && raycast.hit.is_some()
+    {
         BrushMode::Erase
     } else {
         BrushMode::Place
