@@ -331,6 +331,8 @@ pub async fn run() -> anyhow::Result<()> {
                             requested_procgen_id = None;
 
                             let previous_origin = active_procgen_origin;
+                            let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                            let frac_z = ctrl.position.z - ctrl.position.z.floor();
                             let tracked_global = if active_procgen.is_some() {
                                 [
                                     previous_origin[0] + ctrl.position.x.floor() as i32,
@@ -358,9 +360,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                             } else {
                                 ctrl.position = Vec3::new(
-                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + 0.5,
+                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + frac_x,
                                     ctrl.position.y,
-                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + 0.5,
+                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + frac_z,
                                 );
                             }
                         }
@@ -411,10 +413,12 @@ pub async fn run() -> anyhow::Result<()> {
                                         PROCEDURAL_MACROCHUNK_SIZE,
                                         PROCEDURAL_RENDER_DISTANCE_MACROS,
                                     );
+                                    let frac_x = ctrl.position.x - ctrl.position.x.floor();
+                                    let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                     ctrl.position = Vec3::new(
-                                        (global[0] - active_procgen_origin[0]) as f32 + 0.5,
+                                        (global[0] - active_procgen_origin[0]) as f32 + frac_x,
                                         ctrl.position.y,
-                                        (global[2] - active_procgen_origin[2]) as f32 + 0.5,
+                                        (global[2] - active_procgen_origin[2]) as f32 + frac_z,
                                     );
                                 } else {
                                     let next_cfg = cfg.with_origin(desired_origin);

@@ -496,8 +496,8 @@ fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 5] {
     let fz = macro_z as f32 / cluster_scale + warp_z;
     let x0 = fx.floor() as i32;
     let z0 = fz.floor() as i32;
-    let tx = fx.fract();
-    let tz = fz.fract();
+    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+    let tz = (fz - z0 as f32).clamp(0.0, 1.0);
 
     let mut weights = [0.0; 5];
     for oz in 0..=1 {
