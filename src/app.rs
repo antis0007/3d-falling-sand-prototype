@@ -45,6 +45,7 @@ const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
 const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 1;
+const PROCGEN_RESULTS_BUDGET_PER_FRAME: usize = 4;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -317,7 +318,10 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut procedural_simulation_allowed = true;
                         renderer.day = ui.day;
 
-                        while let Ok(result) = procgen_rx.try_recv() {
+                        for _ in 0..PROCGEN_RESULTS_BUDGET_PER_FRAME {
+                            let Ok(result) = procgen_rx.try_recv() else {
+                                break;
+                            };
                             job_status.insert(result.spec.key, result.status);
                             if let Some(stream_ref) = stream.as_mut() {
                                 match result.status {
@@ -346,6 +350,7 @@ pub async fn run() -> anyhow::Result<()> {
                                         }
                                     }
                                     ProcgenJobStatus::Cancelled => {
+                                        stream_ref.cancel_generation(result.spec.coord);
                                         job_status.remove(&result.spec.key);
                                     }
                                     _ => {}
@@ -409,16 +414,20 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             }
 
-                            for (&key, status) in job_status.clone().iter() {
+                            let mut cancel_keys = Vec::new();
+                            for (&key, status) in &job_status {
                                 if !render_residency.contains(&key.0)
                                     && matches!(
                                         status,
                                         ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight
                                     )
                                 {
-                                    next_epoch = next_epoch.wrapping_add(1);
-                                    procgen_workers.cancel_key(key, next_epoch);
+                                    cancel_keys.push(key);
                                 }
+                            }
+                            for key in cancel_keys {
+                                next_epoch = next_epoch.wrapping_add(1);
+                                procgen_workers.cancel_key(key, next_epoch);
                             }
 
                             let mut unloaded_render: Vec<[i32; 3]> = render_residency
@@ -925,9 +934,7 @@ impl ProcgenWorkerPool {
             return ProcgenJobStatus::Queued;
         }
         if st.queue.len() >= st.max_queue {
-            if let Some(dropped) = st.queue.pop() {
-                st.queued_keys.remove(&dropped.spec.key);
-            }
+            return ProcgenJobStatus::Cancelled;
         }
         st.sequence = st.sequence.wrapping_add(1);
         let seq = st.sequence;
@@ -1064,13 +1071,14 @@ fn schedule_procgen_batch(
         };
         *next_procgen_id = next_procgen_id.wrapping_add(1);
         *next_epoch = next_epoch.wrapping_add(1);
-        stream.mark_generating(spec.coord);
         let st = procgen_workers.enqueue_or_coalesce(spec);
         job_status.insert(spec.key, st);
-
-        scheduled += 1;
-        if scheduled == budget {
-            break;
+        if st == ProcgenJobStatus::Queued {
+            stream.mark_generating(spec.coord);
+            scheduled += 1;
+            if scheduled == budget {
+                break;
+            }
         }
     }
     log::debug!(
