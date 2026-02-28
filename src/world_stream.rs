@@ -2,6 +2,7 @@ use crate::procgen::ProcGenConfig;
 use crate::world::{MaterialId, World, EMPTY};
 use crate::world_bounds::ProceduralWorldBounds;
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChunkResidency {
@@ -13,7 +14,8 @@ pub enum ChunkResidency {
 #[derive(Clone)]
 struct StreamChunk {
     residency: ChunkResidency,
-    world: Option<World>,
+    world: Option<Arc<RwLock<World>>>,
+    world_version: u64,
     has_persistent_edits: bool,
 }
 
@@ -22,6 +24,7 @@ impl StreamChunk {
         Self {
             residency: ChunkResidency::Unloaded,
             world: None,
+            world_version: 0,
             has_persistent_edits: false,
         }
     }
@@ -118,10 +121,11 @@ impl WorldStream {
             return;
         }
         self.update_residency(coord, ChunkResidency::Resident);
-        if let Some(chunk) = self.chunks.get_mut(&coord) {
-            chunk.world = Some(world.clone());
-        }
         self.validate_seams(coord, &world);
+        if let Some(chunk) = self.chunks.get_mut(&coord) {
+            chunk.world = Some(Arc::new(RwLock::new(world)));
+            chunk.world_version = 0;
+        }
     }
 
     pub fn cancel_generation(&mut self, coord: [i32; 3]) {
@@ -138,13 +142,16 @@ impl WorldStream {
         }
     }
 
-    pub fn persist_coord_state(&mut self, coord: [i32; 3], world: &World) {
+    pub fn persist_coord_state(&mut self, coord: [i32; 3], world: &World, world_version: u64) {
         self.update_residency(coord, ChunkResidency::Resident);
         let chunk = self
             .chunks
             .entry(coord)
             .or_insert_with(StreamChunk::unloaded);
-        chunk.world = Some(world.clone());
+        if chunk.world.is_none() || chunk.world_version != world_version {
+            chunk.world = Some(Arc::new(RwLock::new(world.clone())));
+            chunk.world_version = world_version;
+        }
         chunk.has_persistent_edits = true;
     }
 
@@ -158,6 +165,9 @@ impl WorldStream {
         let Some(data) = &chunk.world else {
             return false;
         };
+        let Ok(data) = data.read() else {
+            return false;
+        };
         world.chunks.clone_from(&data.chunks);
         for chunk in &mut world.chunks {
             chunk.dirty_mesh = true;
@@ -168,20 +178,20 @@ impl WorldStream {
         true
     }
 
-    pub fn resident_world(&self, coord: [i32; 3]) -> Option<&World> {
+    pub fn resident_world(&self, coord: [i32; 3]) -> Option<Arc<RwLock<World>>> {
         let chunk = self.chunks.get(&coord)?;
         if chunk.residency != ChunkResidency::Resident {
             return None;
         }
-        chunk.world.as_ref()
+        chunk.world.clone()
     }
 
-    pub fn resident_world_mut(&mut self, coord: [i32; 3]) -> Option<&mut World> {
-        let chunk = self.chunks.get_mut(&coord)?;
+    pub fn resident_world_mut(&self, coord: [i32; 3]) -> Option<Arc<RwLock<World>>> {
+        let chunk = self.chunks.get(&coord)?;
         if chunk.residency != ChunkResidency::Resident {
             return None;
         }
-        chunk.world.as_mut()
+        chunk.world.clone()
     }
 
     pub fn resident_coords(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
@@ -228,6 +238,9 @@ impl WorldStream {
             global[2] - coord[2] * dz,
         ];
         let world = self.resident_world(coord)?;
+        let Ok(world) = world.read() else {
+            return None;
+        };
         Some(world.get(local[0], local[1], local[2]))
     }
 
@@ -289,7 +302,10 @@ impl WorldStream {
             if neighbor.has_persistent_edits {
                 continue;
             }
-            if Self::deterministic_face_signature(neighbor_world, axis, -side)
+            let Ok(neighbor_world) = neighbor_world.read() else {
+                continue;
+            };
+            if Self::deterministic_face_signature(&neighbor_world, axis, -side)
                 != Self::deterministic_face_signature(world, axis, side)
             {
                 log::warn!(
