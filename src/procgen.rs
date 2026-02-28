@@ -277,6 +277,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                 let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
                 let qualifies = surface <= sea_level
+                    && lowland_neighbors >= 5
                     && ((lowland_neighbors >= 6 && lowland_area >= 0.62)
                         || (ocean_w > 0.74 && lowland_area >= 0.52));
 
@@ -299,9 +300,13 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                 continue;
             }
 
+            let river_level = river_water_level(config.seed, wx, wz, sea_level);
+            if surface > river_level + 2 {
+                continue;
+            }
+
             let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let river_level = river_water_level(config.seed, wx, wz, sea_level);
             let top = (surface - 1).min(river_level);
             if top < floor {
                 continue;
@@ -384,10 +389,8 @@ fn height_sample_with_fallback(
     sampled_surface_height(config, wx, wz)
 }
 
-fn river_water_level(seed: u64, x: i32, z: i32, sea_level: i32) -> i32 {
-    let n = fbm2(seed ^ 0x51EAA001, x as f32 * 0.0012, z as f32 * 0.0012, 2);
-    let delta = ((n - 0.5) * 4.0).round() as i32;
-    (sea_level - 1 + delta).clamp(sea_level - 3, sea_level + 1)
+fn river_water_level(_seed: u64, _x: i32, _z: i32, sea_level: i32) -> i32 {
+    sea_level - 1
 }
 
 fn enforce_subsea_materials_pass(world: &mut World, config: &ProcGenConfig) {
