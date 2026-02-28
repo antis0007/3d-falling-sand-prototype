@@ -305,10 +305,6 @@ pub fn draw(
                 ui.selectable_value(&mut brush.shape, BrushShape::Bowl, "Bowl");
                 ui.selectable_value(&mut brush.shape, BrushShape::InvertedBowl, "Inverted Bowl");
             });
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut brush.mode, BrushMode::Place, "Place");
-                ui.selectable_value(&mut brush.mode, BrushMode::Erase, "Erase");
-            });
         });
     }
 
@@ -485,6 +481,7 @@ pub fn draw_fps_overlays(
     viewport: [u32; 2],
     preview_blocks: &[[i32; 3]],
     brush: &BrushSettings,
+    action_mode: BrushMode,
     show_radial_menu: bool,
     radial_toggle_key_label: &str,
     voxel_size: f32,
@@ -515,7 +512,7 @@ pub fn draw_fps_overlays(
         egui::Color32::WHITE,
     );
 
-    let outline_color = if brush.mode == BrushMode::Place {
+    let outline_color = if action_mode == BrushMode::Place {
         egui::Color32::from_rgb(120, 220, 120)
     } else {
         egui::Color32::from_rgb(255, 120, 120)
@@ -538,6 +535,7 @@ pub fn draw_fps_overlays(
         &painter,
         ctx.screen_rect(),
         brush,
+        action_mode,
         !paused && show_radial_menu,
         radial_toggle_key_label,
     );
@@ -666,6 +664,7 @@ fn draw_brush_radial_hint(
     painter: &egui::Painter,
     rect: egui::Rect,
     brush: &BrushSettings,
+    action_mode: BrushMode,
     show_radial_menu: bool,
     radial_toggle_key_label: &str,
 ) {
@@ -702,7 +701,7 @@ fn draw_brush_radial_hint(
     painter.text(
         center + egui::vec2(radius + 22.0 * anim, 0.0),
         egui::Align2::CENTER_CENTER,
-        if brush.mode == BrushMode::Place {
+        if action_mode == BrushMode::Place {
             "Place"
         } else {
             "Erase"
@@ -721,7 +720,7 @@ fn draw_brush_radial_hint(
         center + egui::vec2(0.0, radius + 18.0 * anim),
         egui::Align2::CENTER_CENTER,
         format!(
-            "Scroll: material | Ctrl+Scroll: radius | Alt+Scroll: range | {}: toggle radial",
+            "LMB: add | RMB: erase | Scroll: material | Ctrl+Scroll: radius | Alt+Scroll: range | {}: radial",
             radial_toggle_key_label
         ),
         egui::FontId::proportional(11.0),
