@@ -291,8 +291,6 @@ impl World {
             };
             let neighbor_idx = self.chunk_index(cx, cy, cz);
             self.chunks[neighbor_idx].dirty_mesh = true;
-            self.chunks[neighbor_idx].voxel_version =
-                self.chunks[neighbor_idx].voxel_version.saturating_add(1);
         }
     }
 
@@ -320,10 +318,15 @@ impl World {
     }
 
     pub fn fill_floor(&mut self, height: usize, mat: MaterialId) {
+        self.fill_floor_raw(height, mat);
+        self.finalize_generation_side_effects();
+    }
+
+    pub fn fill_floor_raw(&mut self, height: usize, mat: MaterialId) {
         for z in 0..self.dims[2] as i32 {
             for y in 0..height as i32 {
                 for x in 0..self.dims[0] as i32 {
-                    self.set(x, y, z, mat);
+                    self.set_raw_no_side_effects(x, y, z, mat);
                 }
             }
         }
@@ -381,14 +384,16 @@ mod tests {
         for chunk in &mut world.chunks {
             chunk.dirty_mesh = false;
         }
+        let right = world.chunk_index(1, 0, 0);
+        let right_version_before = world.chunks[right].voxel_version;
 
         let edge_x = CHUNK_SIZE as i32 - 1;
         assert!(world.set(edge_x, 2, 1, 2));
 
         let left = world.chunk_index(0, 0, 0);
-        let right = world.chunk_index(1, 0, 0);
         assert!(world.chunks[left].dirty_mesh);
         assert!(world.chunks[right].dirty_mesh);
+        assert_eq!(world.chunks[right].voxel_version, right_version_before);
     }
 }
 

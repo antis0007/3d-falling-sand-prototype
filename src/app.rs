@@ -474,12 +474,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             }
                             renderer.prune_stream_meshes(&prune_keep);
-                            pending_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
-                            queued_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
-                            pending_stream_mesh_versions
-                                .retain(|coord, _| prune_keep.contains(coord));
-                            sim_accumulators_by_coord
-                                .retain(|coord, _| sim_residency.contains(coord));
+                            prune_streaming_runtime_state(
+                                &prune_keep,
+                                &sim_residency,
+                                &mut pending_stream_mesh_coords,
+                                &mut queued_stream_mesh_coords,
+                                &mut pending_stream_mesh_versions,
+                                &mut stream_mesh_hysteresis,
+                                &mut sim_accumulators_by_coord,
+                            );
                             for &coord in &render_residency {
                                 if coord == active_stream_coord {
                                     continue;
@@ -849,13 +852,18 @@ pub async fn run() -> anyhow::Result<()> {
                                 !cursor_should_unlock && (input.lmb || input.rmb),
                                 modifier_hint.as_deref(),
                             );
-                            if actions.new_world || actions.new_procedural {
+                                if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 if actions.new_procedural {
                                     renderer.clear_mesh_cache();
-                                    pending_stream_mesh_coords.clear();
-                                    queued_stream_mesh_coords.clear();
-                                    job_status.clear();
+                                    reset_streaming_runtime_tracking(
+                                        &mut pending_stream_mesh_coords,
+                                        &mut queued_stream_mesh_coords,
+                                        &mut pending_stream_mesh_versions,
+                                        &mut stream_mesh_hysteresis,
+                                        &mut sim_accumulators_by_coord,
+                                        &mut job_status,
+                                    );
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let config = ProcGenConfig::for_size(64, seed);
                                     let bounds = ProceduralWorldBounds::new(
@@ -939,9 +947,14 @@ pub async fn run() -> anyhow::Result<()> {
                                     }
                                 } else {
                                     renderer.clear_mesh_cache();
-                                    pending_stream_mesh_coords.clear();
-                                    queued_stream_mesh_coords.clear();
-                                    job_status.clear();
+                                    reset_streaming_runtime_tracking(
+                                        &mut pending_stream_mesh_coords,
+                                        &mut queued_stream_mesh_coords,
+                                        &mut pending_stream_mesh_versions,
+                                        &mut stream_mesh_hysteresis,
+                                        &mut sim_accumulators_by_coord,
+                                        &mut job_status,
+                                    );
                                     active_procgen = None;
                                     stream = None;
                                     active_stream_coord = [0, 0, 0];
@@ -968,9 +981,14 @@ pub async fn run() -> anyhow::Result<()> {
                                     if let Ok(w) = load_world(&path) {
                                         renderer.clear_mesh_cache();
                                         world = w;
-                                        pending_stream_mesh_coords.clear();
-                                        queued_stream_mesh_coords.clear();
-                                        job_status.clear();
+                                        reset_streaming_runtime_tracking(
+                                            &mut pending_stream_mesh_coords,
+                                            &mut queued_stream_mesh_coords,
+                                            &mut pending_stream_mesh_versions,
+                                            &mut stream_mesh_hysteresis,
+                                            &mut sim_accumulators_by_coord,
+                                            &mut job_status,
+                                        );
                                         active_procgen = None;
                                         stream = None;
                                         active_stream_coord = [0, 0, 0];
@@ -1188,6 +1206,14 @@ struct ProcgenWorkerPool {
     shutdown: Arc<AtomicBool>,
 }
 
+impl Drop for ProcgenWorkerPool {
+    fn drop(&mut self) {
+        self.shutdown.store(true, AtomicOrdering::Relaxed);
+        let (_, cv) = &*self.state;
+        cv.notify_all();
+    }
+}
+
 impl ProcgenWorkerPool {
     fn new(
         tx: Sender<ProcgenJobResult>,
@@ -1250,10 +1276,9 @@ impl ProcgenWorkerPool {
     }
 
     fn cancel_key(&self, key: ProcgenJobKey, epoch: u64) {
-        self.cancel_epochs
-            .lock()
-            .expect("cancel lock")
-            .insert(key, epoch);
+        let mut cancel_epochs = self.cancel_epochs.lock().expect("cancel lock");
+        let slot = cancel_epochs.entry(key).or_insert(epoch);
+        *slot = (*slot).max(epoch);
     }
 }
 
@@ -1408,6 +1433,38 @@ fn build_keep_stream_meshes(
     keep_stream_meshes
 }
 
+fn prune_streaming_runtime_state(
+    prune_keep: &HashSet<[i32; 3]>,
+    sim_residency: &HashSet<[i32; 3]>,
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
+    pending_stream_mesh_versions: &mut HashMap<[i32; 3], u64>,
+    stream_mesh_hysteresis: &mut HashMap<[i32; 3], u8>,
+    sim_accumulators_by_coord: &mut HashMap<[i32; 3], f32>,
+) {
+    pending_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
+    queued_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
+    pending_stream_mesh_versions.retain(|coord, _| prune_keep.contains(coord));
+    stream_mesh_hysteresis.retain(|coord, _| prune_keep.contains(coord));
+    sim_accumulators_by_coord.retain(|coord, _| sim_residency.contains(coord));
+}
+
+fn reset_streaming_runtime_tracking(
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
+    pending_stream_mesh_versions: &mut HashMap<[i32; 3], u64>,
+    stream_mesh_hysteresis: &mut HashMap<[i32; 3], u8>,
+    sim_accumulators_by_coord: &mut HashMap<[i32; 3], f32>,
+    job_status: &mut HashMap<ProcgenJobKey, ProcgenJobStatus>,
+) {
+    pending_stream_mesh_coords.clear();
+    queued_stream_mesh_coords.clear();
+    pending_stream_mesh_versions.clear();
+    stream_mesh_hysteresis.clear();
+    sim_accumulators_by_coord.clear();
+    job_status.clear();
+}
+
 fn reprioritize_pending_stream_meshes(
     pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
     active_stream_coord: [i32; 3],
@@ -1415,8 +1472,8 @@ fn reprioritize_pending_stream_meshes(
 ) {
     let fwd = camera_forward.normalize_or_zero();
     pending_stream_mesh_coords.sort_by(|a, b| {
-        let ord = stream_mesh_priority(*b, active_stream_coord, fwd)
-            .partial_cmp(&stream_mesh_priority(*a, active_stream_coord, fwd))
+        let ord = stream_mesh_priority(*a, active_stream_coord, fwd)
+            .partial_cmp(&stream_mesh_priority(*b, active_stream_coord, fwd))
             .unwrap_or(Ordering::Equal);
         if ord == Ordering::Equal {
             macro_distance_sq(*b, active_stream_coord)
@@ -1615,9 +1672,11 @@ fn schedule_procgen_batch(
             priority,
             epoch: *next_epoch,
         };
-        *next_procgen_id = next_procgen_id.wrapping_add(1);
-        *next_epoch = next_epoch.wrapping_add(1);
         let st = procgen_workers.enqueue_or_coalesce(spec);
+        if st != ProcgenJobStatus::Cancelled {
+            *next_procgen_id = next_procgen_id.wrapping_add(1);
+            *next_epoch = next_epoch.wrapping_add(1);
+        }
         job_status.insert(spec.key, st);
         if st == ProcgenJobStatus::Queued {
             stream.mark_generating(spec.coord);
@@ -2248,6 +2307,20 @@ fn raycast_target(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Rayc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn test_spec(coord: [i32; 3], generation_id: u64, epoch: u64) -> ProcgenJobSpec {
+        ProcgenJobSpec {
+            generation_id,
+            key: ProcgenJobKey(coord),
+            coord,
+            config: ProcGenConfig::for_size(16, 1234).with_origin([0, 0, 0]),
+            prefer_safe_spawn: false,
+            target_global_pos: [0, 0, 0],
+            priority: ProcgenPriority::Urgent,
+            epoch,
+        }
+    }
 
     #[test]
     fn macro_residency_radius_one_produces_27_coords() {
@@ -2298,7 +2371,8 @@ mod tests {
     fn reprioritize_stream_mesh_queue_keeps_nearest_for_next_pop() {
         let mut pending = vec![[4, 0, 0], [1, 0, 0], [3, 0, 0], [0, 1, 0]];
         reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0], Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(pending.pop(), Some([0, 1, 0]));
+        let next = pending.pop().expect("expected queued coord");
+        assert_eq!(macro_distance_sq(next, [0, 0, 0]), 1);
     }
     #[test]
     fn boundary_hysteresis_blocks_early_transition() {
@@ -2355,5 +2429,39 @@ mod tests {
         assert!(pending.contains(&[1, 0, 0]));
         assert!(pending.contains(&[1, 1, 0]));
         assert!(world.chunks.iter().any(|c| c.dirty_mesh));
+    }
+
+    #[test]
+    fn procgen_duplicate_while_in_flight_keeps_replacement_and_reaches_ready() {
+        let (tx, rx) = mpsc::channel();
+        let pool = ProcgenWorkerPool::new(tx, 1, 1, 8, 2);
+        let coord = [0, 0, 0];
+
+        assert_eq!(
+            pool.enqueue_or_coalesce(test_spec(coord, 1, 1)),
+            ProcgenJobStatus::Queued
+        );
+
+        let mut saw_in_flight = false;
+        let mut saw_ready = false;
+        for _ in 0..32 {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("expected procgen worker message");
+            if msg.spec.key == ProcgenJobKey(coord) && msg.status == ProcgenJobStatus::InFlight {
+                saw_in_flight = true;
+                assert_eq!(
+                    pool.enqueue_or_coalesce(test_spec(coord, 2, 2)),
+                    ProcgenJobStatus::InFlight
+                );
+            }
+            if msg.spec.key == ProcgenJobKey(coord) && msg.status == ProcgenJobStatus::Ready {
+                saw_ready = true;
+                break;
+            }
+        }
+
+        assert!(saw_in_flight);
+        assert!(saw_ready);
     }
 }
