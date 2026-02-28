@@ -9,7 +9,8 @@ const TURF: MaterialId = 17;
 const BUSH: MaterialId = 18;
 const GRASS: MaterialId = 19;
 const LEAVES: MaterialId = 23;
-const BIOME_ANCHOR_SIZE: i32 = 64;
+const BIOME_CLUSTER_MACROS: i32 = 3;
+const MACROCHUNK_SIZE: i32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiomeType {
@@ -173,10 +174,11 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
 
             let desert = weights[biome_index(BiomeType::Desert)];
             let ocean = weights[biome_index(BiomeType::Ocean)];
-            let coastal = ocean > 0.4 && top_y <= config.sea_level + 2;
+            let shore_w = smoothstep((ocean - 0.22) / 0.35);
+            let coastal = shore_w > 0.18 && top_y <= config.sea_level + 3;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
             let sand_depth = if coastal {
-                5
+                (3.0 + shore_w * 4.0).round() as i32
             } else {
                 (2.0 + 3.0 * desert).round() as i32
             };
@@ -192,7 +194,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     } else {
                         TURF
                     }
-                } else if desert > 0.58 && d <= sand_depth {
+                } else if (desert > 0.58 || coastal) && d <= sand_depth {
                     SAND
                 } else if d <= dirt_depth {
                     DIRT
@@ -468,8 +470,15 @@ fn river_meander_signal(seed: u64, x: i32, z: i32) -> f32 {
 }
 
 fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 5] {
-    let fx = x as f32 / BIOME_ANCHOR_SIZE as f32;
-    let fz = z as f32 / BIOME_ANCHOR_SIZE as f32;
+    let macro_x = floor_div(x, MACROCHUNK_SIZE);
+    let macro_z = floor_div(z, MACROCHUNK_SIZE);
+    let cluster_scale = BIOME_CLUSTER_MACROS as f32;
+
+    let warp_x = (fbm2(seed ^ 0x5522AA11, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
+    let warp_z = (fbm2(seed ^ 0x5522AA12, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
+
+    let fx = macro_x as f32 / cluster_scale + warp_x;
+    let fz = macro_z as f32 / cluster_scale + warp_z;
     let x0 = fx.floor() as i32;
     let z0 = fz.floor() as i32;
     let tx = fx.fract();
@@ -502,17 +511,24 @@ fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 5] {
 
 fn biome_anchor(seed: u64, chunk_x: i32, chunk_z: i32) -> BiomeType {
     let v = hash01(seed ^ 0xFA112233, chunk_x, 0, chunk_z);
-    if v < 0.18 {
-        BiomeType::River
-    } else if v < 0.33 {
+    if v < 0.26 {
         BiomeType::Desert
-    } else if v < 0.45 {
+    } else if v < 0.36 {
         BiomeType::Lake
-    } else if v < 0.70 {
+    } else if v < 0.78 {
         BiomeType::Forest
     } else {
         BiomeType::Ocean
     }
+}
+
+fn floor_div(a: i32, b: i32) -> i32 {
+    let mut q = a / b;
+    let r = a % b;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 fn dominant_biome(weights: [f32; 5]) -> BiomeType {
