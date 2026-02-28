@@ -61,6 +61,11 @@ impl ChunkStore {
         let (chunk_coord, local) = voxel_to_chunk(coord);
         let (x, y, z) = (local[0] as usize, local[1] as usize, local[2] as usize);
 
+        // Critical for streaming worlds: don't allocate empty chunks when erasing.
+        if material == EMPTY && !self.chunk_exists(chunk_coord) {
+            return;
+        }
+
         let chunk = self.ensure_chunk(chunk_coord);
         if chunk.get(x, y, z) == material {
             return;
@@ -70,46 +75,22 @@ impl ChunkStore {
 
         let last = (CHUNK_SIZE_VOXELS - 1) as usize;
         if x == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x - 1,
-                y: chunk_coord.y,
-                z: chunk_coord.z,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x - 1, y: chunk_coord.y, z: chunk_coord.z });
         }
         if x == last {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x + 1,
-                y: chunk_coord.y,
-                z: chunk_coord.z,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x + 1, y: chunk_coord.y, z: chunk_coord.z });
         }
         if y == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x,
-                y: chunk_coord.y - 1,
-                z: chunk_coord.z,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y - 1, z: chunk_coord.z });
         }
         if y == last {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x,
-                y: chunk_coord.y + 1,
-                z: chunk_coord.z,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y + 1, z: chunk_coord.z });
         }
         if z == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x,
-                y: chunk_coord.y,
-                z: chunk_coord.z - 1,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y, z: chunk_coord.z - 1 });
         }
         if z == last {
-            self.mark_neighbor_dirty(ChunkCoord {
-                x: chunk_coord.x,
-                y: chunk_coord.y,
-                z: chunk_coord.z + 1,
-            });
+            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y, z: chunk_coord.z + 1 });
         }
     }
 
@@ -131,6 +112,10 @@ impl ChunkStore {
         }
     }
 
+    pub fn is_dirty(&self, coord: ChunkCoord) -> bool {
+        self.dirty_chunks.contains(&coord)
+    }
+
     pub fn take_dirty_chunks(&mut self) -> Vec<ChunkCoord> {
         self.dirty_chunks.drain().collect()
     }
@@ -143,11 +128,5 @@ impl ChunkStore {
         if self.chunk_exists(coord) {
             self.dirty_chunks.insert(coord);
         }
-    }
-}
-
-impl Default for ChunkStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
