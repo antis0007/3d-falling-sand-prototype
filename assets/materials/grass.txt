@@ -1,0 +1,2 @@
+# RGBA tint for crossed-billboard grass material
+96,186,88,220

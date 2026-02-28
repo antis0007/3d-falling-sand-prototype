@@ -115,7 +115,7 @@ impl FpsController {
     const PLAYER_RADIUS: f32 = 0.3;
     const EYE_TO_FEET: f32 = 3.2;
     const EYE_TO_HEAD: f32 = 0.8;
-    const STEP_HEIGHT: f32 = 0.6;
+    const STEP_HEIGHT: f32 = 1.05;
     const GROUND_EPSILON: f32 = 0.05;
 
     pub fn look_dir(&self) -> Vec3 {

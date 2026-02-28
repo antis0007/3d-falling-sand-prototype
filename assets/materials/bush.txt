@@ -1,0 +1,2 @@
+# RGBA tint for crossed-billboard bush material
+74,156,70,220
