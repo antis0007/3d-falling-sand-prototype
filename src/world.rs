@@ -235,6 +235,38 @@ impl World {
         true
     }
 
+    pub fn set_raw_no_side_effects(&mut self, x: i32, y: i32, z: i32, id: MaterialId) -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        let Some((cx, cy, cz, lx, ly, lz)) = self.world_to_chunk(x, y, z) else {
+            return false;
+        };
+        let chunk_idx = self.chunk_index(cx, cy, cz);
+        let chunk = &mut self.chunks[chunk_idx];
+        if chunk.get(lx, ly, lz) == id {
+            return false;
+        }
+        let idx = Chunk::index(lx, ly, lz);
+        chunk.voxels[idx] = id;
+        chunk.settled[idx] = 0;
+        true
+    }
+
+    pub fn finalize_generation_side_effects(&mut self) {
+        for chunk in &mut self.chunks {
+            chunk.dirty_mesh = true;
+            chunk.voxel_version = chunk.voxel_version.saturating_add(1);
+            chunk.active.clear();
+            for (idx, &mat) in chunk.voxels.iter().enumerate() {
+                if mat != EMPTY {
+                    chunk.active.insert(idx as u16);
+                }
+            }
+        }
+    }
+
     fn mark_adjacent_chunks_dirty(&mut self, x: i32, y: i32, z: i32) {
         const FACES: [[i32; 3]; 6] = [
             [1, 0, 0],
