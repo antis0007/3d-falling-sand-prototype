@@ -146,6 +146,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut sim_accumulators_by_coord: HashMap<[i32; 3], f32> = HashMap::new();
     let mut stream_mesh_hysteresis: HashMap<[i32; 3], u8> = HashMap::new();
     let mut pending_stream_mesh_versions: HashMap<[i32; 3], u64> = HashMap::new();
+    let mut active_world_version: u64 = 0;
+    let mut active_world_dirty_since_persist = false;
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
     let mut cursor_is_unlocked = false;
 
@@ -334,8 +336,8 @@ pub async fn run() -> anyhow::Result<()> {
                             !cursor_should_unlock && !egui_c,
                         );
 
-                        if !gameplay_blocked {
-                            apply_mouse_edit(
+                        if !gameplay_blocked
+                            && apply_mouse_edit(
                                 &mut world,
                                 &brush,
                                 selected_material(&ui, ui.selected_slot),
@@ -344,7 +346,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 now,
                                 raycast,
                                 ui.active_tool,
-                            );
+                            )
+                        {
+                            active_world_version = active_world_version.wrapping_add(1);
+                            active_world_dirty_since_persist = true;
                         }
 
                         let mut procedural_simulation_allowed = true;
@@ -403,7 +408,14 @@ pub async fn run() -> anyhow::Result<()> {
                             let chunk_size_x = cfg.dims[0] as i32;
                             let chunk_size_y = cfg.dims[1] as i32;
                             let chunk_size_z = cfg.dims[2] as i32;
-                            stream_ref.persist_coord_state(active_stream_coord, &world);
+                            if active_world_dirty_since_persist {
+                                stream_ref.persist_coord_state(
+                                    active_stream_coord,
+                                    &world,
+                                    active_world_version,
+                                );
+                                active_world_dirty_since_persist = false;
+                            }
                             for event in stream_ref.take_residency_changes() {
                                 handle_residency_change_for_meshing(
                                     event,
@@ -628,7 +640,10 @@ pub async fn run() -> anyhow::Result<()> {
                                     let Some(version) = pending_stream_mesh_versions.remove(&coord) else {
                                         continue;
                                     };
-                                    renderer.upsert_stream_mesh(coord, version, chunk_world, origin, |p| {
+                                    let Ok(chunk_world) = chunk_world.read() else {
+                                        continue;
+                                    };
+                                    renderer.upsert_stream_mesh(coord, version, &chunk_world, origin, |p| {
                                         stream_ref.sample_global_voxel_known(p)
                                     });
                                 }
@@ -662,7 +677,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 .collect();
                                 coords.sort_by_key(|coord| macro_distance_sq(*coord, desired_coord));
 
-                                stream_ref.persist_coord_state(active_stream_coord, &world);
                                 let mut total_steps = 0usize;
                                 let mut active_stepped = false;
                                 for coord in coords {
@@ -689,8 +703,11 @@ pub async fn run() -> anyhow::Result<()> {
                                             let Some(chunk_world) = stream_ref.resident_world_mut(coord) else {
                                                 break;
                                             };
-                                            let (high_priority, _) = prioritize_chunks_for_player(chunk_world, local_player);
-                                            step_selected_chunks(chunk_world, &mut sim.rng, &high_priority);
+                                            let Ok(mut chunk_world) = chunk_world.write() else {
+                                                break;
+                                            };
+                                            let (high_priority, _) = prioritize_chunks_for_player(&chunk_world, local_player);
+                                            step_selected_chunks(&mut chunk_world, &mut sim.rng, &high_priority);
                                             queue_stream_mesh_rebuild(
                                                 coord,
                                                 &mut renderer,
@@ -708,7 +725,14 @@ pub async fn run() -> anyhow::Result<()> {
                                     }
                                 }
                                 if active_stepped {
-                                    stream_ref.persist_coord_state(active_stream_coord, &world);
+                                    active_world_version = active_world_version.wrapping_add(1);
+                                    active_world_dirty_since_persist = true;
+                                    stream_ref.persist_coord_state(
+                                        active_stream_coord,
+                                        &world,
+                                        active_world_version,
+                                    );
+                                    active_world_dirty_since_persist = false;
                                 }
                             }
                         }
@@ -1687,12 +1711,12 @@ fn apply_mouse_edit(
     now: Instant,
     raycast: RaycastResult,
     active_tool: ToolKind,
-) {
+) -> bool {
     let requested_mode = held_action_mode(input);
 
     let Some(mode) = requested_mode else {
         edit_runtime.last_edit_mode = None;
-        return;
+        return false;
     };
 
     let is_just_click = matches!(mode, BrushMode::Place) && input.just_lmb
@@ -1706,7 +1730,7 @@ fn apply_mouse_edit(
             .unwrap_or(true);
 
     if !is_just_click && !repeat_ready {
-        return;
+        return false;
     }
 
     if active_tool == ToolKind::AreaTool {
@@ -1717,17 +1741,17 @@ fn apply_mouse_edit(
         }
         edit_runtime.last_edit_at = Some(now);
         edit_runtime.last_edit_mode = Some(mode);
-        return;
+        return true;
     }
 
     if brush.radius == 0
         && (active_tool == ToolKind::BuildersWand || active_tool == ToolKind::DestructorWand)
     {
         if active_tool == ToolKind::BuildersWand && mode != BrushMode::Place {
-            return;
+            return false;
         }
         if active_tool == ToolKind::DestructorWand && mode != BrushMode::Erase {
-            return;
+            return false;
         }
         let wand_blocks = preview_wand_blocks(world, raycast, active_tool, WAND_MAX_BLOCKS);
         let target = if active_tool == ToolKind::BuildersWand {
@@ -1741,15 +1765,16 @@ fn apply_mouse_edit(
         }
         edit_runtime.last_edit_at = Some(now);
         edit_runtime.last_edit_mode = Some(mode);
-        return;
+        return true;
     }
 
     let Some(center) = brush_center(*brush, raycast, mode) else {
-        return;
+        return false;
     };
     apply_brush_with_placement_rules(world, center, *brush, mat, mode);
     edit_runtime.last_edit_at = Some(now);
     edit_runtime.last_edit_mode = Some(mode);
+    true
 }
 
 fn apply_brush_with_placement_rules(
