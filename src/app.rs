@@ -20,7 +20,7 @@ use crate::world::{
 use crate::world_stream::{floor_div, ChunkResidency, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -44,7 +44,8 @@ const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 4;
 const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
-const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 1;
+const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 6;
+const STREAM_MESH_TRANSITION_GRACE_FRAMES: u8 = 12;
 const PROCGEN_RESULTS_BUDGET_PER_FRAME: usize = 4;
 
 #[derive(Default)]
@@ -132,6 +133,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut pending_stream_mesh_coords: Vec<[i32; 3]> = Vec::new();
     let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
+    let mut transitioning_render_meshes: HashSet<[i32; 3]> = HashSet::new();
+    let mut transition_grace_frames_remaining: u8 = 0;
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -391,8 +394,27 @@ pub async fn run() -> anyhow::Result<()> {
                             procedural_simulation_allowed =
                                 sim_residency.contains(&active_stream_coord);
 
-                            let mut keep_stream_meshes = render_residency.clone();
-                            keep_stream_meshes.remove(&active_stream_coord);
+                            let replacement_ready = replacement_stream_meshes_ready(
+                                stream_ref,
+                                &renderer,
+                                &render_residency,
+                                active_stream_coord,
+                            );
+                            if replacement_ready {
+                                transition_grace_frames_remaining =
+                                    transition_grace_frames_remaining.saturating_sub(1);
+                                if transition_grace_frames_remaining == 0 {
+                                    transitioning_render_meshes.clear();
+                                }
+                            }
+
+                            let keep_stream_meshes = build_keep_stream_meshes(
+                                &render_residency,
+                                active_stream_coord,
+                                &transitioning_render_meshes,
+                                replacement_ready,
+                                transition_grace_frames_remaining,
+                            );
                             renderer.prune_stream_meshes(&keep_stream_meshes);
                             pending_stream_mesh_coords
                                 .retain(|coord| keep_stream_meshes.contains(coord));
@@ -413,6 +435,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                 let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                 if stream_ref.load_coord_into_world(desired_coord, &mut world) {
+                                    let previous_active = active_stream_coord;
                                     active_stream_coord = desired_coord;
                                     let new_origin = stream_ref.chunk_origin(active_stream_coord);
                                     ctrl.position = Vec3::new(
@@ -420,9 +443,36 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
-                                    renderer.clear_mesh_cache();
-                                    queued_stream_mesh_coords.clear();
-                                    pending_stream_mesh_coords.clear();
+
+                                    let previous_render_residency = macro_residency_set(
+                                        previous_active,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                    );
+                                    transitioning_render_meshes = previous_render_residency
+                                        .union(&render_residency)
+                                        .copied()
+                                        .collect();
+                                    transitioning_render_meshes.remove(&active_stream_coord);
+                                    transition_grace_frames_remaining =
+                                        STREAM_MESH_TRANSITION_GRACE_FRAMES;
+
+                                    for coord in sorted_residency_coords(
+                                        active_stream_coord,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                    ) {
+                                        if coord == active_stream_coord {
+                                            continue;
+                                        }
+                                        if stream_ref.state(coord) == ChunkResidency::Resident
+                                            && queued_stream_mesh_coords.insert(coord)
+                                        {
+                                            pending_stream_mesh_coords.push(coord);
+                                        }
+                                    }
+                                    reprioritize_pending_stream_meshes(
+                                        &mut pending_stream_mesh_coords,
+                                        active_stream_coord,
+                                    );
                                 }
                             }
 
@@ -485,6 +535,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 global,
                             );
 
+                            reprioritize_pending_stream_meshes(
+                                &mut pending_stream_mesh_coords,
+                                active_stream_coord,
+                            );
                             for _ in 0..STREAM_MESH_BUILD_BUDGET_PER_FRAME {
                                 let Some(coord) = pending_stream_mesh_coords.pop() else {
                                     break;
@@ -1063,6 +1117,42 @@ fn macro_residency_set(center: [i32; 3], radius: i32) -> HashSet<[i32; 3]> {
         }
     }
     set
+}
+
+fn replacement_stream_meshes_ready(
+    stream: &WorldStream,
+    renderer: &Renderer,
+    desired_residency: &HashSet<[i32; 3]>,
+    active_stream_coord: [i32; 3],
+) -> bool {
+    desired_residency.iter().all(|coord| {
+        if *coord == active_stream_coord {
+            return true;
+        }
+        stream.state(*coord) != ChunkResidency::Resident || renderer.has_stream_mesh(*coord)
+    })
+}
+
+fn build_keep_stream_meshes(
+    desired_residency: &HashSet<[i32; 3]>,
+    active_stream_coord: [i32; 3],
+    transitioning_render_meshes: &HashSet<[i32; 3]>,
+    replacement_ready: bool,
+    transition_grace_frames_remaining: u8,
+) -> HashSet<[i32; 3]> {
+    let mut keep_stream_meshes = desired_residency.clone();
+    keep_stream_meshes.remove(&active_stream_coord);
+    if !replacement_ready || transition_grace_frames_remaining > 0 {
+        keep_stream_meshes.extend(transitioning_render_meshes.iter().copied());
+    }
+    keep_stream_meshes
+}
+
+fn reprioritize_pending_stream_meshes(
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    focus_coord: [i32; 3],
+) {
+    pending_stream_mesh_coords.sort_by_key(|coord| Reverse(macro_distance_sq(*coord, focus_coord)));
 }
 
 fn sorted_residency_coords(center: [i32; 3], radius: i32) -> Vec<[i32; 3]> {
@@ -1727,5 +1817,33 @@ fn raycast_target(world: &World, origin: Vec3, dir: Vec3, max_dist: f32) -> Rayc
             miss.y.floor() as i32,
             miss.z.floor() as i32,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_stream_meshes_retains_transition_union_until_ready() {
+        let desired = macro_residency_set([1, 0, 0], 1);
+        let previous = macro_residency_set([0, 0, 0], 1);
+        let union: HashSet<[i32; 3]> = desired.union(&previous).copied().collect();
+
+        let keep_not_ready = build_keep_stream_meshes(&desired, [1, 0, 0], &union, false, 0);
+        assert!(keep_not_ready.contains(&[-1, 0, 0]));
+
+        let keep_grace = build_keep_stream_meshes(&desired, [1, 0, 0], &union, true, 2);
+        assert!(keep_grace.contains(&[-1, 0, 0]));
+
+        let keep_pruned = build_keep_stream_meshes(&desired, [1, 0, 0], &union, true, 0);
+        assert!(!keep_pruned.contains(&[-1, 0, 0]));
+    }
+
+    #[test]
+    fn reprioritize_stream_mesh_queue_keeps_nearest_for_next_pop() {
+        let mut pending = vec![[4, 0, 0], [1, 0, 0], [3, 0, 0]];
+        reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0]);
+        assert_eq!(pending.pop(), Some([1, 0, 0]));
     }
 }
