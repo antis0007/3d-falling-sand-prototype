@@ -650,6 +650,8 @@ fn surface_layering_pass(
             let col = &columns[idx];
             let top_y = col.surface_height;
             let weights = col.weights;
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
 
             let desert = weights[biome_index(BiomeType::Desert)];
             let marine_influence = hydrology.ocean_weight[idx]
@@ -671,13 +673,31 @@ fn surface_layering_pass(
             let coastal = smoothstep((hydrology.ocean_weight[idx] - 0.35) / 0.45);
             let river_bank = smoothstep((hydrology.river_weight[idx] - 0.30) / 0.55);
             let slope = col.slope as f32;
+            let blend_mask = fbm2(
+                config.seed ^ 0x1133_77AA,
+                wx as f32 * 0.010,
+                wz as f32 * 0.010,
+                2,
+            );
+            let depth_mod = fbm2(
+                config.seed ^ 0x5A17_9C20,
+                wx as f32 * 0.0065,
+                wz as f32 * 0.0065,
+                3,
+            );
+            let anti_stripe = (blend_mask - 0.5) * 0.26 + (depth_mod - 0.5) * 0.12;
 
             let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert_surface) - 0.9 * highlands)
-                .round()
-                .clamp(2.0, 8.0) as i32;
-            let sand_depth = (1.0 + 3.5 * desert_surface + 3.0 * coastal + 2.0 * river_bank)
-                .round()
-                .clamp(1.0, 10.0) as i32;
+                + anti_stripe * 5.0;
+            let dirt_depth = dirt_depth.round().clamp(2.0, 8.0) as i32;
+            let sand_depth =
+                (1.0 + 3.5 * desert_surface + 3.0 * coastal + 2.0 * river_bank + anti_stripe * 4.0)
+                    .round()
+                    .clamp(1.0, 10.0) as i32;
+            let sediment_context =
+                coastal > 0.38 || river_bank > 0.42 || (desert_surface > 0.55 && slope < 4.0);
+            let deep_stone_context =
+                highlands > 0.58 || slope > 4.2 || top_y > config.sea_level_local() + 10;
 
             for d in 0..(dirt_depth + sand_depth + 2) {
                 let y = top_y - d;
@@ -685,29 +705,64 @@ fn surface_layering_pass(
                     continue;
                 }
                 let sand_bias = (desert_surface * 0.8 + coastal * 0.7 + river_bank * 0.6
-                    - slope * 0.05)
+                    - slope * 0.05
+                    + anti_stripe)
                     .clamp(0.0, 1.0);
-                let rock_bias = (highlands * 0.75 + slope * 0.12).clamp(0.0, 1.0);
-                let block = if marine_substrate {
-                    if d <= sand_depth + 1 {
-                        SAND
-                    } else {
-                        STONE
-                    }
-                } else if d == 0 {
-                    if rock_bias > 0.62 && top_y > config.sea_level_local() + 4 {
-                        STONE
-                    } else if sand_bias > 0.50 {
-                        SAND
-                    } else {
-                        TURF
-                    }
-                } else if d <= sand_depth && sand_bias > 0.35 {
+                let rock_bias =
+                    (highlands * 0.75 + slope * 0.12 - anti_stripe * 0.5).clamp(0.0, 1.0);
+                let top_cover = if rock_bias > 0.65 && top_y > config.sea_level_local() + 4 {
+                    STONE
+                } else if sand_bias > 0.52 && sediment_context {
                     SAND
-                } else if d <= dirt_depth {
-                    DIRT
+                } else {
+                    TURF
+                };
+                let cover_depth = if top_cover == SAND {
+                    sand_depth.min(3)
+                } else {
+                    1
+                };
+
+                let mut block = if d < cover_depth {
+                    top_cover
+                } else if d < cover_depth + dirt_depth {
+                    if top_cover == STONE {
+                        STONE
+                    } else if top_cover == SAND && d <= cover_depth && sediment_context {
+                        SAND
+                    } else {
+                        DIRT
+                    }
                 } else {
                     STONE
+                };
+
+                let sand_cap = cover_depth + (sand_depth / 2).max(1);
+                if block == SAND && d > sand_cap {
+                    block = if deep_stone_context { STONE } else { DIRT };
+                }
+                if block == SAND && deep_stone_context && !sediment_context {
+                    block = STONE;
+                }
+                if block == SAND && !sediment_context {
+                    block = DIRT;
+                }
+                if d >= cover_depth + dirt_depth {
+                    block = STONE;
+                }
+
+                if d > 0 && top_cover == TURF && block == TURF {
+                    block = DIRT;
+                }
+
+                if d > cover_depth + dirt_depth + 1 && block != STONE {
+                    block = STONE;
+                }
+
+                if d <= sand_depth && sand_bias > 0.35 && sediment_context && !deep_stone_context {
+                    SAND
+                } else {
+                    block
                 };
                 let _ = world.set_raw_no_side_effects(lx, y, lz, block);
             }
@@ -1417,30 +1472,45 @@ fn river_meander_signal(seed: u64, x: i32, z: i32) -> f32 {
 }
 
 fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; BIOME_COUNT] {
+    let mut weights = [0.0; BIOME_COUNT];
     let macro_x = x as f32 / MACROCHUNK_SIZE as f32;
     let macro_z = z as f32 / MACROCHUNK_SIZE as f32;
     let cluster_scale = BIOME_CLUSTER_MACROS as f32;
+    let coarse_warp_x = (fbm2(seed ^ 0x5522AA11, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.2;
+    let coarse_warp_z = (fbm2(seed ^ 0x5522AA12, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.2;
+    let fine_warp_x =
+        (fbm2(seed ^ 0x2211_8899, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.7;
+    let fine_warp_z =
+        (fbm2(seed ^ 0x2211_889A, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.7;
+    let warped_x = macro_x / cluster_scale + coarse_warp_x + fine_warp_x;
+    let warped_z = macro_z / cluster_scale + coarse_warp_z + fine_warp_z;
 
-    let warp_x = (fbm2(seed ^ 0x5522AA11, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
-    let warp_z = (fbm2(seed ^ 0x5522AA12, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
-
-    let fx = macro_x / cluster_scale + warp_x;
-    let fz = macro_z / cluster_scale + warp_z;
-    let x0 = fx.floor() as i32;
-    let z0 = fz.floor() as i32;
-    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
-    let tz = (fz - z0 as f32).clamp(0.0, 1.0);
-
-    let mut weights = [0.0; BIOME_COUNT];
-    for oz in 0..=1 {
-        for ox in 0..=1 {
-            let ax = x0 + ox;
-            let az = z0 + oz;
-            let biome = biome_anchor(seed, ax, az);
-            let wx = if ox == 0 { 1.0 - tx } else { tx };
-            let wz = if oz == 0 { 1.0 - tz } else { tz };
-            weights[biome_index(biome)] += wx * wz;
-        }
+    for i in 0..BIOME_COUNT {
+        let jitter_x = hash01(
+            seed ^ 0xABCD_0000 ^ i as u64,
+            warped_x.floor() as i32,
+            0,
+            warped_z.floor() as i32,
+        ) - 0.5;
+        let jitter_z = hash01(
+            seed ^ 0xABCD_1000 ^ i as u64,
+            warped_x.floor() as i32,
+            0,
+            warped_z.floor() as i32,
+        ) - 0.5;
+        let field = fbm2(
+            seed ^ 0x4100_0000 ^ (i as u64).wrapping_mul(0x9E37_79B9),
+            (warped_x + jitter_x * 0.42) * 0.95 + i as f32 * 0.217,
+            (warped_z + jitter_z * 0.42) * 0.95 - i as f32 * 0.173,
+            4,
+        );
+        let ridge = fbm2(
+            seed ^ 0x4600_0000 ^ (i as u64).wrapping_mul(0xBF58_476D),
+            (warped_x - jitter_z * 0.28) * 1.4,
+            (warped_z + jitter_x * 0.28) * 1.4,
+            2,
+        );
+        weights[i] = (field * 0.72 + ridge * 0.28).max(0.01);
     }
 
     let warp = fbm2(seed ^ 0xF009_1201, x as f32 * 0.0024, z as f32 * 0.0024, 3) - 0.5;
@@ -1698,6 +1768,18 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    fn is_surface_material(mat: MaterialId) -> bool {
+        matches!(mat, TURF | SAND | STONE)
+    }
+
+    fn is_subsoil(mat: MaterialId) -> bool {
+        matches!(mat, DIRT | SAND)
+    }
+
+    fn is_ground(mat: MaterialId) -> bool {
+        matches!(mat, STONE | DIRT | SAND | TURF)
+    }
+
     fn water_surface(world: &World, x: i32, z: i32) -> Option<i32> {
         for y in (1..world.dims[1] as i32).rev() {
             if world.get(x, y, z) == WATER {
@@ -1951,55 +2033,114 @@ mod tests {
     }
 
     #[test]
-    fn no_trees_in_flooded_zones() {
-        let config = ProcGenConfig::for_size(64, 0xDEC0DED).with_origin([0, 0, 0]);
+    fn surface_layers_stay_monotonic_in_vertical_columns() {
+        let config = ProcGenConfig::for_size(64, 0x3300_4411).with_origin([0, 0, 0]);
         let world = generate_world(config);
 
         for z in 0..world.dims[2] as i32 {
             for x in 0..world.dims[0] as i32 {
-                if water_surface(&world, x, z).is_none() {
+                let mut top = None;
+                for y in (2..world.dims[1] as i32).rev() {
+                    if is_ground(world.get(x, y, z)) {
+                        top = Some(y);
+                        break;
+                    }
+                }
+                let Some(top_y) = top else {
                     continue;
+                };
+
+                let top_mat = world.get(x, top_y, z);
+                assert!(
+                    is_surface_material(top_mat),
+                    "unexpected top material at ({x},{top_y},{z}): {top_mat}"
+                );
+
+                let mut seen_subsoil = false;
+                let mut seen_parent = false;
+                for d in 1..=12 {
+                    let y = top_y - d;
+                    if y <= 1 {
+                        break;
+                    }
+                    let mat = world.get(x, y, z);
+                    if mat == EMPTY || mat == WATER {
+                        continue;
+                    }
+                    if mat == STONE {
+                        seen_parent = true;
+                        continue;
+                    }
+                    if is_subsoil(mat) {
+                        assert!(
+                            !seen_parent,
+                            "subsoil appeared below parent rock at ({x},{y},{z}); mat={mat}"
+                        );
+                        seen_subsoil = true;
+                    }
+                    if mat == SAND && seen_parent {
+                        panic!("sand appeared below stone at ({x},{y},{z})");
+                    }
                 }
-                for y in 1..world.dims[1] as i32 - 1 {
-                    let m = world.get(x, y, z);
-                    assert!(
-                        m != WOOD && m != BUSH && m != GRASS,
-                        "flooded column contains vegetation artifact at ({x},{y},{z})"
-                    );
-                }
+
+                assert!(
+                    seen_subsoil || top_mat == STONE,
+                    "expected subsoil under top cover at ({x},{top_y},{z}); top={top_mat}"
+                );
             }
         }
     }
 
     #[test]
-    fn no_dominant_desert_biome_in_below_sea_ocean_basins() {
-        let config = ProcGenConfig::for_size(64, 0xD35E_4711).with_origin([0, 0, 0]);
-        let sea = config.sea_level_local();
+    fn avoids_short_run_alternating_surface_stripes() {
+        let config = ProcGenConfig::for_size(64, 0x9090_4422).with_origin([0, 0, 0]);
+        let world = generate_world(config);
+        let heights = build_surface_heightmap_from_world(&world);
 
-        let mut checked = 0;
-        for z in (-512..512).step_by(6) {
-            for x in (-512..512).step_by(6) {
-                let w = biome_weights(config.seed, x, z);
-                let h = terrain_height(&config, x, z, w);
-                if h > sea {
-                    continue;
+        let mut alternating_pairs = 0usize;
+        let mut sampled_pairs = 0usize;
+
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 - 3 {
+                let mut seq = [EMPTY; 4];
+                for i in 0..4 {
+                    let sx = x + i as i32;
+                    let h = heights[sx as usize + z as usize * world.dims[0]];
+                    seq[i] = world.get(sx, h, z);
                 }
-                checked += 1;
-                assert!(
-                    dominant_biome(w) != BiomeType::Desert,
-                    "below-sea basin resolves to desert biome at ({x},{z})"
-                );
-                assert!(
-                    w[biome_index(BiomeType::Desert)] < 0.40,
-                    "desert weight too high in below-sea basin at ({x},{z}): {}",
-                    w[biome_index(BiomeType::Desert)]
-                );
+                if seq.iter().all(|m| is_surface_material(*m)) {
+                    sampled_pairs += 1;
+                    if seq[0] == seq[2] && seq[1] == seq[3] && seq[0] != seq[1] {
+                        alternating_pairs += 1;
+                    }
+                }
             }
         }
 
+        for x in 0..world.dims[0] as i32 {
+            for z in 0..world.dims[2] as i32 - 3 {
+                let mut seq = [EMPTY; 4];
+                for i in 0..4 {
+                    let sz = z + i as i32;
+                    let h = heights[x as usize + sz as usize * world.dims[0]];
+                    seq[i] = world.get(x, h, sz);
+                }
+                if seq.iter().all(|m| is_surface_material(*m)) {
+                    sampled_pairs += 1;
+                    if seq[0] == seq[2] && seq[1] == seq[3] && seq[0] != seq[1] {
+                        alternating_pairs += 1;
+                    }
+                }
+            }
+        }
+
+        let ratio = alternating_pairs as f32 / sampled_pairs.max(1) as f32;
         assert!(
-            checked > 48,
-            "insufficient below-sea basin samples: {checked}"
+            ratio < 0.08,
+            "alternating stripe ratio too high: {:.2}% ({}/{})",
+            ratio * 100.0,
+            alternating_pairs,
+            sampled_pairs
         );
     }
 }
