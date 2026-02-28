@@ -411,6 +411,9 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
+                                    renderer.clear_mesh_cache();
+                                    queued_stream_mesh_coords.clear();
+                                    pending_stream_mesh_coords.clear();
                                 }
                             }
 
@@ -481,8 +484,19 @@ pub async fn run() -> anyhow::Result<()> {
                                     continue;
                                 }
                                 if let Some(chunk_world) = stream_ref.resident_world(coord) {
-                                    let origin = stream_ref.chunk_origin(coord);
-                                    renderer.upsert_stream_mesh(coord, chunk_world, origin);
+                                    let coord_origin = stream_ref.chunk_origin(coord);
+                                    let active_origin =
+                                        stream_ref.chunk_origin(active_stream_coord);
+                                    let relative_origin = [
+                                        coord_origin[0] - active_origin[0],
+                                        coord_origin[1] - active_origin[1],
+                                        coord_origin[2] - active_origin[2],
+                                    ];
+                                    renderer.upsert_stream_mesh(
+                                        coord,
+                                        chunk_world,
+                                        relative_origin,
+                                    );
                                 }
                             }
                         }
