@@ -513,6 +513,8 @@ fn cave_carve_pass(
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("cave_carve_pass");
+    let deep_cave_start = config.sea_level - 10;
+    let surface_falloff_start = config.sea_level + 18;
     let max_y = world.dims[1] as i32 - 2;
     for lz in 0..world.dims[2] as i32 {
         for ly in 4..max_y {
@@ -521,31 +523,58 @@ fn cave_carve_pass(
                     continue;
                 }
                 let wx = config.world_origin[0] + lx;
-                let wy = ly;
+                let world_y = config.world_origin[1] + ly;
                 let wz = config.world_origin[2] + lz;
                 let col = &columns[lx as usize + lz as usize * world.dims[0]];
                 let top = col.surface_height.clamp(6, world.dims[1] as i32 - 4);
                 if ly >= top - 4 {
                     continue;
                 }
-                let depth_fade = 1.0 - (ly as f32 / max_y as f32).powf(1.3);
-                let cave = fbm3(
+                let depth_profile = smoothstep(((deep_cave_start - world_y) as f32) / 26.0);
+                let near_surface_falloff =
+                    1.0 - smoothstep(((world_y - surface_falloff_start) as f32) / 20.0);
+                let global_depth = (depth_profile * near_surface_falloff).clamp(0.0, 1.0);
+
+                let large_caverns = fbm3(
                     config.seed ^ 0xCC77AA11,
-                    wx as f32 * 0.035,
-                    wy as f32 * 0.042,
-                    wz as f32 * 0.035,
-                    4,
+                    wx as f32 * 0.013,
+                    world_y as f32 * 0.015,
+                    wz as f32 * 0.013,
+                    5,
                 );
-                let cave_warp = fbm3(
+
+                let warp = fbm3(
                     config.seed ^ 0x1077BEEF,
                     wx as f32 * 0.02,
-                    wy as f32 * 0.02,
+                    world_y as f32 * 0.02,
                     wz as f32 * 0.02,
                     3,
+                ) - 0.5;
+                let tunnel_network = fbm3(
+                    config.seed ^ 0x7AA1_0444,
+                    (wx as f32 + warp * 26.0) * 0.055,
+                    (world_y as f32 + warp * 18.0) * 0.07,
+                    (wz as f32 - warp * 26.0) * 0.055,
+                    4,
                 );
-                let value = 0.7 * cave + 0.3 * cave_warp;
-                let threshold = 0.63 + (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.18;
-                if value > threshold && depth_fade > 0.08 {
+
+                let w = col.weights;
+                let moisture = (w[biome_index(BiomeType::Forest)] * 0.8
+                    + w[biome_index(BiomeType::River)]
+                    + w[biome_index(BiomeType::Lake)] * 0.9
+                    + w[biome_index(BiomeType::Ocean)] * 0.7
+                    + w[biome_index(BiomeType::Plains)] * 0.35
+                    - w[biome_index(BiomeType::Desert)] * 0.9)
+                    .clamp(0.0, 1.0);
+                let density_bias = (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.16;
+
+                let cavern_threshold =
+                    (0.74 - global_depth * 0.18 + moisture * 0.06 + density_bias).clamp(0.50, 0.90);
+                let tunnel_threshold =
+                    (0.70 - global_depth * 0.26 + moisture * 0.10 + density_bias * 0.7)
+                        .clamp(0.42, 0.88);
+                let carve = large_caverns > cavern_threshold || tunnel_network > tunnel_threshold;
+                if carve {
                     let _ = world.set_raw_no_side_effects(lx, ly, lz, EMPTY);
                 }
             }
@@ -1356,6 +1385,48 @@ mod tests {
         None
     }
 
+    fn cave_agreement(a: &World, b: &World, axis: char) -> (usize, usize) {
+        let heights_a = build_surface_heightmap_from_world(a);
+        let heights_b = build_surface_heightmap_from_world(b);
+        let mut matches = 0usize;
+        let mut total = 0usize;
+        let max_y = (a.dims[1] as i32 - 2).min(b.dims[1] as i32 - 2);
+        for t in 0..a.dims[2] as i32 {
+            for y in 4..max_y {
+                let (ax, az, bx, bz, top_a, top_b) = if axis == 'x' {
+                    (
+                        a.dims[0] as i32 - 1,
+                        t,
+                        0,
+                        t,
+                        heights_a[a.dims[0] - 1 + t as usize * a.dims[0]],
+                        heights_b[t as usize * b.dims[0]],
+                    )
+                } else {
+                    (
+                        t,
+                        a.dims[2] as i32 - 1,
+                        t,
+                        0,
+                        heights_a[t as usize + (a.dims[2] - 1) * a.dims[0]],
+                        heights_b[t as usize],
+                    )
+                };
+
+                if y >= top_a.min(top_b) - 4 {
+                    continue;
+                }
+                total += 1;
+                let cave_a = a.get(ax, y, az) == EMPTY;
+                let cave_b = b.get(bx, y, bz) == EMPTY;
+                if cave_a == cave_b {
+                    matches += 1;
+                }
+            }
+        }
+        (matches, total)
+    }
+
     #[test]
     fn adjacent_river_cells_have_continuous_levels() {
         let config = ProcGenConfig::for_size(64, 0xBADC0FFE).with_origin([0, 0, 0]);
@@ -1428,5 +1499,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chunk_border_caves_use_global_context() {
+        let size = 64;
+        let seed = 0xAA55_7711;
+        let center_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(size, seed).with_origin([size as i32, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, size as i32]);
+
+        let center = generate_world(center_cfg);
+        let east = generate_world(east_cfg);
+        let south = generate_world(south_cfg);
+
+        let (ew_matches, ew_total) = cave_agreement(&center, &east, 'x');
+        let (ns_matches, ns_total) = cave_agreement(&center, &south, 'z');
+        let ew_ratio = ew_matches as f32 / ew_total.max(1) as f32;
+        let ns_ratio = ns_matches as f32 / ns_total.max(1) as f32;
+
+        assert!(
+            ew_ratio > 0.60,
+            "east/west cave border mismatch too high: {:.2}% agreement ({}/{})",
+            ew_ratio * 100.0,
+            ew_matches,
+            ew_total
+        );
+        assert!(
+            ns_ratio > 0.60,
+            "north/south cave border mismatch too high: {:.2}% agreement ({}/{})",
+            ns_ratio * 100.0,
+            ns_matches,
+            ns_total
+        );
     }
 }
