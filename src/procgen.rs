@@ -88,9 +88,23 @@ fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
         for x in 0..config.dims[0] as i32 {
             let wx = config.world_origin[0] + x;
             let wz = config.world_origin[2] + z;
-            let weights = biome_weights(config.seed, wx, wz);
-            heights[x as usize + z as usize * config.dims[0]] =
-                terrain_height(config, wx, wz, weights).clamp(6, config.dims[1] as i32 - 4);
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let sx = wx + dx;
+                    let sz = wz + dz;
+                    let w = biome_weights(config.seed, sx, sz);
+                    sum += terrain_height(config, sx, sz, w) as f32;
+                    n += 1.0;
+                }
+            }
+            let w0 = biome_weights(config.seed, wx, wz);
+            let raw = terrain_height(config, wx, wz, w0) as f32;
+            let h = (raw * 0.6 + (sum / n) * 0.4)
+                .round()
+                .clamp(6.0, (config.dims[1] as i32 - 4) as f32) as i32;
+            heights[x as usize + z as usize * config.dims[0]] = h;
         }
     }
     heights
@@ -158,8 +172,14 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
             let weights = biome_weights(config.seed, wx, wz);
 
             let desert = weights[biome_index(BiomeType::Desert)];
+            let ocean = weights[biome_index(BiomeType::Ocean)];
+            let coastal = ocean > 0.4 && top_y <= config.sea_level + 2;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
-            let sand_depth = (2.0 + 3.0 * desert).round() as i32;
+            let sand_depth = if coastal {
+                5
+            } else {
+                (2.0 + 3.0 * desert).round() as i32
+            };
 
             for d in 0..(dirt_depth + sand_depth + 2) {
                 let y = top_y - d;
@@ -167,7 +187,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     continue;
                 }
                 let block = if d == 0 {
-                    if desert > 0.58 {
+                    if coastal || desert > 0.58 {
                         SAND
                     } else {
                         TURF
@@ -220,7 +240,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                 continue;
             }
 
-            let depth = (1.0 + 2.0 * wetness).round() as i32;
+            let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
             let neigh_min =
                 neighbor_min_surface_heightmap(heights, world.dims[0], lx, lz).unwrap_or(surface);
@@ -259,11 +279,11 @@ fn count_neighbors_below_heightmap(
             }
             let nx = x + dx;
             let nz = z + dz;
-            if nx < 0 || nz < 0 {
+            if nx < 0 || nz < 0 || nx >= width as i32 || nz >= (heights.len() / width) as i32 {
                 continue;
             }
             let idx = nx as usize + nz as usize * width;
-            if idx < heights.len() && heights[idx] <= max_height {
+            if heights[idx] <= max_height {
                 count += 1;
             }
         }
@@ -280,13 +300,10 @@ fn neighbor_min_surface_heightmap(heights: &[i32], width: usize, x: i32, z: i32)
             }
             let nx = x + dx;
             let nz = z + dz;
-            if nx < 0 || nz < 0 {
+            if nx < 0 || nz < 0 || nx >= width as i32 || nz >= (heights.len() / width) as i32 {
                 continue;
             }
             let idx = nx as usize + nz as usize * width;
-            if idx >= heights.len() {
-                continue;
-            }
             let h = heights[idx];
             min_h = Some(match min_h {
                 Some(curr) => curr.min(h),
