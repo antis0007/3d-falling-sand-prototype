@@ -115,6 +115,37 @@ struct ColumnGenData {
     ocean: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ProcGenStages {
+    base_relief: bool,
+    erosion_valley: bool,
+    channel_extraction: bool,
+    basin_filling: bool,
+    material_painting: bool,
+    vegetation: bool,
+}
+
+impl Default for ProcGenStages {
+    fn default() -> Self {
+        Self {
+            base_relief: true,
+            erosion_valley: true,
+            channel_extraction: true,
+            basin_filling: true,
+            material_painting: true,
+            vegetation: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HydrologyData {
+    river_weight: Vec<f32>,
+    ocean_weight: Vec<f32>,
+    lake_level: Vec<Option<i32>>,
+    river_level: Vec<Option<i32>>,
+}
+
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
         let sea_level = 18.min(size as i32 - 10).max(10);
@@ -158,25 +189,37 @@ pub fn generate_world_with_control(
     let mut world = World::new(config.dims);
     world.clear();
     let timings = ProcGenPassTimings::default();
+    let stages = ProcGenStages::default();
     let (heights, columns) = build_column_cache(&config, &timings);
+    let hydrology = build_hydrology_cache(&config, &heights, &columns, &timings);
 
     if (control.should_cancel)(control.epoch) {
         return None;
     }
 
-    base_terrain_pass(&mut world, &config, &heights, &timings);
+    if stages.base_relief {
+        base_terrain_pass(&mut world, &config, &heights, &timings);
+    }
     if (control.should_cancel)(control.epoch) {
         return None;
     }
-    cave_carve_pass(&mut world, &config, &columns, &timings);
+    if stages.erosion_valley {
+        cave_carve_pass(&mut world, &config, &columns, &timings);
+    }
     if (control.should_cancel)(control.epoch) {
         return None;
     }
-    surface_layering_pass(&mut world, &config, &columns, &timings);
-    shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
-    biome_water_pass(&mut world, &config, &columns, &timings);
+    if stages.material_painting {
+        surface_layering_pass(&mut world, &config, &columns, &hydrology, &timings);
+        shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
+    }
+    if stages.channel_extraction || stages.basin_filling {
+        biome_water_pass(&mut world, &config, &columns, &hydrology, &timings);
+    }
     enforce_subsea_materials_pass(&mut world, &config, &timings);
-    vegetation_pass(&mut world, &config, &columns, &timings);
+    if stages.vegetation {
+        vegetation_pass(&mut world, &config, &columns, &timings);
+    }
     world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
 
@@ -252,6 +295,200 @@ fn build_column_cache(
     (heights, columns)
 }
 
+fn build_hydrology_cache(
+    config: &ProcGenConfig,
+    heights: &[i32],
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) -> HydrologyData {
+    let _timer = timings.scoped("channel_extraction");
+    let width = config.dims[0];
+    let depth = config.dims[2];
+    let len = width * depth;
+
+    let mut flow_to = vec![None; len];
+    for z in 0..depth as i32 {
+        for x in 0..width as i32 {
+            let idx = x as usize + z as usize * width;
+            let center = heights[idx];
+            let mut best = center;
+            let mut best_idx = None;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                let nh = height_sample_with_fallback(heights, width, config, nx, nz);
+                if nh < best {
+                    best = nh;
+                    if nx >= 0 && nz >= 0 && nx < width as i32 && nz < depth as i32 {
+                        best_idx = Some(nx as usize + nz as usize * width);
+                    } else {
+                        best_idx = None;
+                    }
+                }
+            }
+            flow_to[idx] = best_idx;
+        }
+    }
+
+    let mut order: Vec<usize> = (0..len).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(heights[i]));
+    let mut flow_accum = vec![1.0f32; len];
+    for idx in order {
+        if let Some(down) = flow_to[idx] {
+            flow_accum[down] += flow_accum[idx];
+        }
+    }
+
+    let mut ocean_weight = vec![0.0; len];
+    let mut river_weight = vec![0.0; len];
+    for z in 0..depth as i32 {
+        for x in 0..width as i32 {
+            let idx = x as usize + z as usize * width;
+            let col = &columns[idx];
+            let accum_norm = (flow_accum[idx].ln() / 5.0).clamp(0.0, 1.0);
+            let ocean_biome = col.weights[biome_index(BiomeType::Ocean)];
+            let coastal_low =
+                smoothstep((config.sea_level as f32 + 3.0 - heights[idx] as f32) / 7.0);
+            ocean_weight[idx] = (ocean_biome * 0.75 + coastal_low * 0.25).clamp(0.0, 1.0);
+
+            let river_biome = col.weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
+                col.wx,
+                col.wz,
+            ));
+            river_weight[idx] = smoothstep((accum_norm * 0.8 + river_biome * 0.7 - 0.42) / 0.45);
+        }
+    }
+
+    let mut distance = vec![0i32; len];
+    for &idx in (0..len).collect::<Vec<_>>().iter().rev() {
+        let mut steps = 0;
+        let mut cur = idx;
+        for _ in 0..128 {
+            match flow_to[cur] {
+                Some(n) => {
+                    steps += 1;
+                    cur = n;
+                }
+                None => break,
+            }
+        }
+        distance[idx] = steps;
+    }
+
+    let mut river_level = vec![None; len];
+    let mut river_mask = vec![false; len];
+    for i in 0..len {
+        if river_weight[i] > 0.45 {
+            river_mask[i] = true;
+        }
+    }
+    let mut visited = vec![false; len];
+    for z in 0..depth as i32 {
+        for x in 0..width as i32 {
+            let start = x as usize + z as usize * width;
+            if visited[start] || !river_mask[start] {
+                continue;
+            }
+            let mut q = VecDeque::new();
+            let mut region = Vec::new();
+            q.push_back((x, z));
+            visited[start] = true;
+            while let Some((cx, cz)) = q.pop_front() {
+                region.push((cx, cz));
+                for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
+                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                        continue;
+                    }
+                    let nidx = nx as usize + nz as usize * width;
+                    if visited[nidx] || !river_mask[nidx] {
+                        continue;
+                    }
+                    visited[nidx] = true;
+                    q.push_back((nx, nz));
+                }
+            }
+            let mut avg = 0.0;
+            for (rx, rz) in &region {
+                let idx = *rx as usize + *rz as usize * width;
+                let step_drop = (distance[idx] / 10) as i32;
+                let level = (config.sea_level - step_drop).min(heights[idx] - 1);
+                avg += level as f32;
+            }
+            let flat = (avg / region.len() as f32).round() as i32;
+            for (rx, rz) in region {
+                let idx = rx as usize + rz as usize * width;
+                let step_drop = (distance[idx] / 10) as i32;
+                let ctrl = flat.min(config.sea_level - step_drop + 1);
+                river_level[idx] = Some(ctrl.min(heights[idx] - 1));
+            }
+        }
+    }
+
+    let mut sink_owner = vec![None::<usize>; len];
+    for i in 0..len {
+        let mut cur = i;
+        let mut sink = None;
+        for _ in 0..128 {
+            if let Some(n) = flow_to[cur] {
+                cur = n;
+            } else {
+                sink = Some(cur);
+                break;
+            }
+        }
+        sink_owner[i] = sink;
+    }
+    let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..len {
+        if ocean_weight[i] > 0.55 || river_weight[i] > 0.55 {
+            continue;
+        }
+        if let Some(s) = sink_owner[i] {
+            basin_cells.entry(s).or_default().push(i);
+        }
+    }
+    let mut lake_level = vec![None; len];
+    for (_sink, cells) in basin_cells {
+        if cells.len() < 4 {
+            continue;
+        }
+        let mut in_basin = vec![false; len];
+        for &i in &cells {
+            in_basin[i] = true;
+        }
+        let mut spill = i32::MAX;
+        for &i in &cells {
+            let x = (i % width) as i32;
+            let z = (i / width) as i32;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                    continue;
+                }
+                let ni = nx as usize + nz as usize * width;
+                if !in_basin[ni] {
+                    spill = spill.min(heights[ni]);
+                }
+            }
+        }
+        if spill == i32::MAX {
+            continue;
+        }
+        let level = (spill - 1).min(config.sea_level + 6);
+        for &i in &cells {
+            if heights[i] < level {
+                lake_level[i] = Some(level);
+            }
+        }
+    }
+
+    HydrologyData {
+        river_weight,
+        ocean_weight,
+        lake_level,
+        river_level,
+    }
+}
+
 fn base_terrain_pass(
     world: &mut World,
     _config: &ProcGenConfig,
@@ -320,67 +557,48 @@ fn surface_layering_pass(
     world: &mut World,
     config: &ProcGenConfig,
     columns: &[ColumnGenData],
+    hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
-    let _timer = timings.scoped("surface_layering_pass");
+    let _timer = timings.scoped("material_painting");
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let col = &columns[lx as usize + lz as usize * world.dims[0]];
+            let idx = lx as usize + lz as usize * world.dims[0];
+            let col = &columns[idx];
             let top_y = col.surface_height;
             let weights = col.weights;
 
             let desert = weights[biome_index(BiomeType::Desert)];
             let plains = weights[biome_index(BiomeType::Plains)];
             let highlands = weights[biome_index(BiomeType::Highlands)];
-            let ocean = weights[biome_index(BiomeType::Ocean)];
-            let river =
-                weights[biome_index(BiomeType::River)].max(if col.river { 1.0 } else { 0.0 });
-            let slope = col.slope;
-            let shore_w = smoothstep((ocean - 0.24) / 0.34);
-            let near_sea_band = top_y <= config.sea_level + 4;
-            let coastal = shore_w > 0.18 && near_sea_band;
-            let cliffy_coast = coastal && slope >= 3;
-            let subsea_ocean = top_y <= config.sea_level && ocean > 0.55;
-            let river_bank = river > 0.48 && top_y <= config.sea_level + 2;
-            let dirt_depth = (4.0 + 3.0 * (1.0 - desert) + plains * 2.0 - highlands * 1.2)
+            let coastal = smoothstep((hydrology.ocean_weight[idx] - 0.35) / 0.45);
+            let river_bank = smoothstep((hydrology.river_weight[idx] - 0.30) / 0.55);
+            let slope = col.slope as f32;
+
+            let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert) - 0.9 * highlands)
                 .round()
                 .clamp(2.0, 8.0) as i32;
-            let sand_depth = if coastal {
-                (3.0 + shore_w * 4.0).round() as i32
-            } else {
-                (2.0 + 3.0 * desert).round() as i32
-            };
+            let sand_depth = (1.0 + 3.5 * desert + 3.0 * coastal + 2.0 * river_bank)
+                .round()
+                .clamp(1.0, 10.0) as i32;
 
             for d in 0..(dirt_depth + sand_depth + 2) {
                 let y = top_y - d;
                 if y <= 1 {
                     continue;
                 }
+                let sand_bias = (desert * 0.8 + coastal * 0.7 + river_bank * 0.6 - slope * 0.05)
+                    .clamp(0.0, 1.0);
+                let rock_bias = (highlands * 0.75 + slope * 0.12).clamp(0.0, 1.0);
                 let block = if d == 0 {
-                    if subsea_ocean {
-                        if coastal || river_bank || desert > 0.4 {
-                            SAND
-                        } else {
-                            STONE
-                        }
-                    } else if cliffy_coast || (highlands > 0.58 && top_y > config.sea_level + 4) {
-                        if top_y > config.sea_level + 5 {
-                            STONE
-                        } else {
-                            TURF
-                        }
-                    } else if coastal || river_bank || desert > 0.58 {
+                    if rock_bias > 0.62 && top_y > config.sea_level + 4 {
+                        STONE
+                    } else if sand_bias > 0.50 {
                         SAND
                     } else {
                         TURF
                     }
-                } else if subsea_ocean && y <= config.sea_level {
-                    if d <= sand_depth + 1 {
-                        SAND
-                    } else {
-                        STONE
-                    }
-                } else if (desert > 0.58 || coastal || river_bank) && d <= sand_depth {
+                } else if d <= sand_depth && sand_bias > 0.35 {
                     SAND
                 } else if d <= dirt_depth {
                     DIRT
@@ -488,219 +706,69 @@ fn biome_water_pass(
     world: &mut World,
     config: &ProcGenConfig,
     columns: &[ColumnGenData],
+    hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
-    let _timer = timings.scoped("biome_water_pass");
+    let _timer = timings.scoped("basin_filling");
     let sea_level = config.sea_level;
     let heights = build_surface_heightmap_from_world(world);
     let width = world.dims[0];
     let depth = world.dims[2];
-    let mut wet_mask = vec![false; width * depth];
-    let mut channel_floor = vec![0i32; width * depth];
-    let mut water_target = vec![0i32; width * depth];
-    for lz in 0..world.dims[2] as i32 {
-        for lx in 0..world.dims[0] as i32 {
-            let col = &columns[lx as usize + lz as usize * width];
-            let wx = col.wx;
-            let wz = col.wz;
-            let weights = col.weights;
-            let ocean_w = weights[biome_index(BiomeType::Ocean)];
-            let river_w = weights[biome_index(BiomeType::River)].max(river_meander_signal(
-                config.seed,
-                wx,
-                wz,
-            ));
-            let lake_w = weights[biome_index(BiomeType::Lake)];
-            let surface = heights[lx as usize + lz as usize * width];
 
-            let lowland_neighbors =
-                count_neighbors_below_heightmap(&heights, width, config, lx, lz, sea_level - 1);
-            let lowland_area =
-                local_lowland_fraction(&heights, width, config, lx, lz, sea_level - 1, 3);
-            let ocean_dominant = ocean_w > 0.66;
-            if ocean_dominant {
-                let depth_variation = ((fbm2(
-                    config.seed ^ 0x0CEA_0010,
-                    wx as f32 * 0.0032,
-                    wz as f32 * 0.0032,
-                    3,
-                ) - 0.5)
-                    * 3.0)
-                    .round() as i32;
-                let target_depth = (10 + depth_variation).clamp(8, 14);
-                let floor = (sea_level - target_depth).max(2);
-                let qualifies =
-                    surface <= sea_level - 1 && lowland_neighbors >= 6 && lowland_area >= 0.60;
+    for z in 0..depth as i32 {
+        for x in 0..width as i32 {
+            let idx = x as usize + z as usize * width;
+            let surface = heights[idx];
+            let ocean_w = hydrology.ocean_weight[idx];
+            let river_w = hydrology.river_weight[idx];
+            let lake_w = columns[idx].weights[biome_index(BiomeType::Lake)];
 
-                if qualifies {
-                    for y in 1..floor {
-                        let _ = world.set_raw_no_side_effects(lx, y, lz, STONE);
-                    }
-                    for y in floor..=sea_level {
-                        let _ = world.set_raw_no_side_effects(lx, y, lz, WATER);
-                    }
-                    for y in (floor - 2).max(1)..floor {
-                        let _ = world.set_raw_no_side_effects(lx, y, lz, SAND);
-                    }
-                    continue;
+            let ocean_fill = smoothstep((ocean_w - 0.45) / 0.35);
+            if ocean_fill > 0.05 && surface <= sea_level + 2 {
+                let depth_target = (7.0 + 5.0 * ocean_fill).round() as i32;
+                let floor = (sea_level - depth_target).max(2);
+                for y in floor..=sea_level {
+                    let _ = world.set_raw_no_side_effects(x, y, z, WATER);
+                }
+                for y in (floor - 2).max(1)..floor {
+                    let _ = world.set_raw_no_side_effects(x, y, z, SAND);
                 }
             }
 
-            let wetness = river_w.max(lake_w);
-            if wetness < 0.58 {
-                continue;
-            }
-
-            let global_plane = quantized_water_plane(config, wx, wz);
-            if surface > global_plane + 2 {
-                continue;
-            }
-
-            let depth = (1.0 + 1.2 * wetness).round() as i32;
-            let floor = (surface - depth).max(2);
-            if floor >= surface {
-                continue;
-            }
-
-            for y in floor..=surface {
-                let _ = world.set_raw_no_side_effects(lx, y, lz, EMPTY);
-            }
-            for y in (floor - 1).max(1)..=floor {
-                if world.get(lx, y, lz) != WATER {
-                    let _ = world.set_raw_no_side_effects(lx, y, lz, SAND);
-                }
-            }
-
-            let idx = lx as usize + lz as usize * width;
-            wet_mask[idx] = true;
-            channel_floor[idx] = floor;
-            water_target[idx] = global_plane;
-        }
-    }
-
-    let mut visited = vec![false; width * depth];
-    for lz in 0..depth as i32 {
-        for lx in 0..width as i32 {
-            let start = lx as usize + lz as usize * width;
-            if visited[start] || !wet_mask[start] {
-                continue;
-            }
-
-            let mut queue = VecDeque::new();
-            let mut region = Vec::new();
-            queue.push_back((lx, lz));
-            visited[start] = true;
-
-            while let Some((cx, cz)) = queue.pop_front() {
-                region.push((cx, cz));
-                for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
-                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
-                        continue;
+            if let Some(level) = hydrology.lake_level[idx] {
+                let lake_fill = smoothstep((lake_w + 0.35 - 0.35) / 0.65);
+                if lake_fill > 0.08 {
+                    let floor = (surface - (1.0 + lake_fill * 3.0) as i32).max(2);
+                    let top = level.min(surface.max(level));
+                    for y in floor..=top {
+                        let _ = world.set_raw_no_side_effects(x, y, z, WATER);
                     }
-                    let nidx = nx as usize + nz as usize * width;
-                    if visited[nidx] || !wet_mask[nidx] {
-                        continue;
-                    }
-                    visited[nidx] = true;
-                    queue.push_back((nx, nz));
-                }
-            }
-
-            let mut avg_target = 0.0;
-            for (rx, rz) in &region {
-                let ridx = *rx as usize + *rz as usize * width;
-                avg_target += water_target[ridx] as f32;
-            }
-            avg_target /= region.len() as f32;
-
-            let mut spill = i32::MAX;
-            for (rx, rz) in &region {
-                let r_idx = *rx as usize + *rz as usize * width;
-                let r_floor = channel_floor[r_idx] + 1;
-                for (nx, nz) in [
-                    (*rx - 1, *rz),
-                    (*rx + 1, *rz),
-                    (*rx, *rz - 1),
-                    (*rx, *rz + 1),
-                ] {
-                    let n_surface = height_sample_with_fallback(&heights, width, config, nx, nz);
-                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
-                        spill = spill.min(n_surface.max(r_floor));
-                        continue;
-                    }
-                    let nidx = nx as usize + nz as usize * width;
-                    if !wet_mask[nidx] {
-                        spill = spill.min(n_surface.max(r_floor));
+                    for y in (floor - 1).max(1)..floor {
+                        let _ = world.set_raw_no_side_effects(x, y, z, SAND);
                     }
                 }
             }
 
-            let mut basin_target = avg_target.round() as i32;
-            if spill != i32::MAX {
-                basin_target = basin_target.min(spill);
-            }
-
-            for (rx, rz) in region {
-                let ridx = rx as usize + rz as usize * width;
-                let wx = config.world_origin[0] + rx;
-                let wz = config.world_origin[2] + rz;
-                let slope = drainage_step(config.seed, wx, wz);
-                let surface = heights[ridx];
-                let floor = channel_floor[ridx];
-                let mut top = basin_target + slope;
-                top = top.min(surface - 1).max(floor);
-                for y in floor..=top {
-                    let _ = world.set_raw_no_side_effects(rx, y, rz, WATER);
+            if let Some(level) = hydrology.river_level[idx] {
+                let river_fill = smoothstep((river_w - 0.35) / 0.45);
+                if river_fill > 0.05 {
+                    let channel_depth = (1.0 + river_fill * 3.5).round() as i32;
+                    let floor = (surface - channel_depth).max(2);
+                    let top = level.min(surface - 1).max(floor);
+                    for y in floor..=top {
+                        let _ = world.set_raw_no_side_effects(x, y, z, WATER);
+                    }
+                    let bank_blend = smoothstep(
+                        (river_fill + columns[idx].weights[biome_index(BiomeType::Desert)] * 0.2
+                            - 0.2)
+                            / 0.8,
+                    );
+                    if bank_blend > 0.05 {
+                        let _ = world.set_raw_no_side_effects(x, floor.max(1) - 1, z, SAND);
+                    }
                 }
             }
         }
-    }
-}
-
-fn sampled_global_water_potential(config: &ProcGenConfig, x: i32, z: i32) -> f32 {
-    let low_noise = fbm2(
-        config.seed ^ 0xD00D_1001,
-        x as f32 * 0.0014,
-        z as f32 * 0.0014,
-        4,
-    );
-    let dir_x = fbm2(
-        config.seed ^ 0xD00D_1002,
-        x as f32 * 0.001,
-        z as f32 * 0.001,
-        2,
-    ) * 2.0
-        - 1.0;
-    let dir_z = fbm2(
-        config.seed ^ 0xD00D_1003,
-        x as f32 * 0.001,
-        z as f32 * 0.001,
-        2,
-    ) * 2.0
-        - 1.0;
-    let len = (dir_x * dir_x + dir_z * dir_z).sqrt().max(1e-4);
-    let flow_x = dir_x / len;
-    let flow_z = dir_z / len;
-    let outlet_proj = (x as f32 * flow_x + z as f32 * flow_z) * 0.0018;
-    low_noise * 0.7 - outlet_proj * 0.3
-}
-
-fn quantized_water_plane(config: &ProcGenConfig, x: i32, z: i32) -> i32 {
-    let potential = sampled_global_water_potential(config, x, z);
-    let plane_size = 2.0;
-    let base = config.sea_level as f32 - 3.0;
-    let raw = base + (potential - 0.5) * 8.0;
-    (raw / plane_size).round() as i32 * plane_size as i32
-}
-
-fn drainage_step(seed: u64, x: i32, z: i32) -> i32 {
-    let g = fbm2(seed ^ 0xD00D_1004, x as f32 * 0.003, z as f32 * 0.003, 2);
-    if g > 0.75 {
-        1
-    } else if g < 0.25 {
-        -1
-    } else {
-        0
     }
 }
 
@@ -766,10 +834,11 @@ fn height_sample_with_fallback(
     sampled_surface_height(config, wx, wz, None)
 }
 
+#[cfg(test)]
 fn explicit_rapid_or_fall(seed: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> bool {
-    let a = drainage_step(seed, x0, z0);
-    let b = drainage_step(seed, x1, z1);
-    (a - b).abs() >= 2
+    let a = river_meander_signal(seed, x0, z0);
+    let b = river_meander_signal(seed, x1, z1);
+    (a - b).abs() > 0.55
 }
 
 fn enforce_subsea_materials_pass(
@@ -928,50 +997,48 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     let scale = config.terrain_scale.max(0.25);
     let continental = fbm2(
         config.seed ^ 0xA1000001,
-        x as f32 * 0.0035 * scale,
-        z as f32 * 0.0035 * scale,
+        x as f32 * 0.0032 * scale,
+        z as f32 * 0.0032 * scale,
         5,
     );
-    let hills = fbm2(
+    let ridge = fbm2(
         config.seed ^ 0xA1000002,
-        x as f32 * 0.008 * scale,
-        z as f32 * 0.008 * scale,
+        x as f32 * 0.0078 * scale,
+        z as f32 * 0.0078 * scale,
         4,
     );
     let detail = fbm2(
         config.seed ^ 0xA1000003,
-        x as f32 * 0.022 * scale,
-        z as f32 * 0.022 * scale,
-        2,
-    );
-
-    let broad = (continental - 0.45) * 34.0;
-    let rolling = (hills - 0.5) * 12.0;
-    let micro = (detail - 0.5) * 2.5;
-
-    let mut h = config.sea_level as f32 + broad + rolling + micro;
-
-    let flatness = fbm2(
-        config.seed ^ 0xA1000004,
-        x as f32 * 0.0022,
-        z as f32 * 0.0022,
+        x as f32 * 0.024 * scale,
+        z as f32 * 0.024 * scale,
         3,
     );
-    if flatness > 0.55 {
-        let plateau = (h / 3.0).round() * 3.0;
-        h = h * 0.45 + plateau * 0.55;
-    }
 
-    let river_signal = river_meander_signal(config.seed, x, z);
-    let river_w = weights[biome_index(BiomeType::River)].max(river_signal);
-    let bank_lower = (river_w * 4.0).clamp(0.0, 4.0);
+    let highlands = weights[biome_index(BiomeType::Highlands)];
+    let plains = weights[biome_index(BiomeType::Plains)];
+    let forest = weights[biome_index(BiomeType::Forest)];
+    let desert = weights[biome_index(BiomeType::Desert)];
+    let lake = weights[biome_index(BiomeType::Lake)];
+    let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(config.seed, x, z));
     let ocean_w = weights[biome_index(BiomeType::Ocean)];
 
-    h += weights[biome_index(BiomeType::Desert)] * 1.2;
-    h += weights[biome_index(BiomeType::Highlands)] * 4.2;
-    h += weights[biome_index(BiomeType::Plains)] * 0.4;
-    h -= bank_lower;
-    h -= weights[biome_index(BiomeType::Lake)] * 3.0;
+    let biome_amp = plains * 7.0 + forest * 9.5 + desert * 6.0 + highlands * 20.0;
+    let biome_rough = plains * 0.25 + forest * 0.45 + desert * 0.35 + highlands * 0.90;
+
+    let broad = (continental - 0.45) * (24.0 + highlands * 20.0);
+    let rough = (ridge - 0.5) * (6.0 + biome_amp * 0.25);
+    let micro = (detail - 0.5) * (2.0 + biome_rough * 6.0);
+
+    let mut inland = config.sea_level as f32 + broad + rough + micro;
+    inland += highlands * 9.0;
+    inland += forest * 1.6;
+    inland += desert * 0.8;
+    inland -= plains * 1.2;
+
+    let valley = smoothstep((river - 0.28) / 0.62);
+    let valley_cut = valley * (3.5 + highlands * 2.0 + plains * 1.0);
+    inland -= valley_cut;
+    inland -= lake * 4.2;
 
     let ocean_depth_shape = (fbm2(
         config.seed ^ 0x0CEA_0001,
@@ -981,11 +1048,11 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     ) - 0.5)
         * 3.0;
     let ocean_floor_target = config.sea_level as f32 - 12.0 + ocean_depth_shape;
-    h = h * (1.0 - ocean_w * 0.45) + (config.sea_level as f32 - 5.0) * ocean_w * 0.45;
-    h = h * (1.0 - ocean_w * 0.82) + ocean_floor_target * ocean_w * 0.82;
-
     let coast_w = smoothstep((ocean_w - 0.50) / 0.30);
     let coast_target = config.sea_level as f32;
+
+    let mut h = inland;
+    h = h * (1.0 - ocean_w * 0.82) + ocean_floor_target * ocean_w * 0.82;
     h = h * (1.0 - coast_w * 0.30) + coast_target * coast_w * 0.30;
 
     if ocean_w > 0.70 {
@@ -1333,18 +1400,32 @@ mod tests {
     fn chunk_border_waterline_uses_global_context() {
         let size = 64;
         let seed = 0x1234_5678;
-        let left_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
-        let right_cfg = ProcGenConfig::for_size(size, seed).with_origin([size as i32, 0, 0]);
-        let left = generate_world(left_cfg);
-        let right = generate_world(right_cfg);
+        let center_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(size, seed).with_origin([size as i32, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, size as i32]);
+
+        let center = generate_world(center_cfg);
+        let east = generate_world(east_cfg);
+        let south = generate_world(south_cfg);
 
         for z in 0..size as i32 {
-            let a = water_surface(&left, size as i32 - 1, z);
-            let b = water_surface(&right, 0, z);
+            let a = water_surface(&center, size as i32 - 1, z);
+            let b = water_surface(&east, 0, z);
             if let (Some(al), Some(bl)) = (a, b) {
                 assert!(
                     (al - bl).abs() <= 1,
-                    "border waterline mismatch at z={z}: {al} vs {bl}"
+                    "east/west border waterline mismatch at z={z}: {al} vs {bl}"
+                );
+            }
+        }
+
+        for x in 0..size as i32 {
+            let a = water_surface(&center, x, size as i32 - 1);
+            let b = water_surface(&south, x, 0);
+            if let (Some(al), Some(bl)) = (a, b) {
+                assert!(
+                    (al - bl).abs() <= 1,
+                    "north/south border waterline mismatch at x={x}: {al} vs {bl}"
                 );
             }
         }
