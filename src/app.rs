@@ -96,6 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
         mpsc::channel();
     let mut requested_procgen_id: Option<u64> = None;
+    let mut requested_procgen_origin: Option<[i32; 3]> = None;
     let mut next_procgen_id: u64 = 1;
     let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
 
@@ -329,6 +330,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 continue;
                             }
                             requested_procgen_id = None;
+                            requested_procgen_origin = None;
 
                             let previous_origin = active_procgen_origin;
                             let frac_x = ctrl.position.x - ctrl.position.x.floor();
@@ -401,6 +403,7 @@ pub async fn run() -> anyhow::Result<()> {
                             };
                             if desired_origin != active_procgen_origin
                                 && requested_procgen_id.is_none()
+                                && requested_procgen_origin != Some(desired_origin)
                             {
                                 generated_regions.insert(active_procgen_origin, world.clone());
                                 if let Some(cached) = generated_regions.get(&desired_origin) {
@@ -430,6 +433,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     };
                                     next_procgen_id = next_procgen_id.wrapping_add(1);
                                     requested_procgen_id = Some(spec.generation_id);
+                                    requested_procgen_origin = Some(spec.config.world_origin);
                                     queue_procgen_job(&procgen_tx, spec);
                                 }
                             }
@@ -442,16 +446,21 @@ pub async fn run() -> anyhow::Result<()> {
                                     PROCEDURAL_MACROCHUNK_SIZE,
                                     PROCEDURAL_RENDER_DISTANCE_MACROS,
                                 ) {
-                                    let next_cfg = cfg.with_origin(prefetch_origin);
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
-                                        config: next_cfg,
-                                        prefer_safe_spawn: false,
-                                        target_global_pos: global,
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                    if requested_procgen_origin == Some(prefetch_origin) {
+                                        // avoid reloading the same region repeatedly
+                                    } else {
+                                        let next_cfg = cfg.with_origin(prefetch_origin);
+                                        let spec = ProcgenJobSpec {
+                                            generation_id: next_procgen_id,
+                                            config: next_cfg,
+                                            prefer_safe_spawn: false,
+                                            target_global_pos: global,
+                                        };
+                                        next_procgen_id = next_procgen_id.wrapping_add(1);
+                                        requested_procgen_id = Some(spec.generation_id);
+                                        requested_procgen_origin = Some(spec.config.world_origin);
+                                        queue_procgen_job(&procgen_tx, spec);
+                                    }
                                 }
                             }
                         }
@@ -524,10 +533,12 @@ pub async fn run() -> anyhow::Result<()> {
                                     };
                                     next_procgen_id = next_procgen_id.wrapping_add(1);
                                     requested_procgen_id = Some(spec.generation_id);
+                                    requested_procgen_origin = Some(spec.config.world_origin);
                                     active_procgen = Some(config);
                                     queue_procgen_job(&procgen_tx, spec);
                                 } else {
                                     requested_procgen_id = None;
+                                    requested_procgen_origin = None;
                                     generated_regions.clear();
                                     active_procgen = None;
                                     active_procgen_origin = [0, 0, 0];
@@ -547,6 +558,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
                                         requested_procgen_id = None;
+                                        requested_procgen_origin = None;
                                         generated_regions.clear();
                                         active_procgen = None;
                                         active_procgen_origin = [0, 0, 0];
