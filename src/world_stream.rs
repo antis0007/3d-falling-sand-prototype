@@ -184,6 +184,23 @@ impl WorldStream {
         chunk.world.as_mut()
     }
 
+    pub fn resident_coords(&self) -> impl Iterator<Item = [i32; 3]> + '_ {
+        self.chunks.iter().filter_map(|(coord, chunk)| {
+            (chunk.residency == ChunkResidency::Resident && chunk.world.is_some()).then_some(*coord)
+        })
+    }
+
+    pub fn resident_coords_sorted_by_distance(&self, center: [i32; 3]) -> Vec<[i32; 3]> {
+        let mut coords: Vec<[i32; 3]> = self.resident_coords().collect();
+        coords.sort_by_key(|coord| {
+            let dx = coord[0] - center[0];
+            let dy = coord[1] - center[1];
+            let dz = coord[2] - center[2];
+            dx * dx + dy * dy + dz * dz
+        });
+        coords
+    }
+
     pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
         self.sample_global_voxel_known(global).unwrap_or(EMPTY)
     }

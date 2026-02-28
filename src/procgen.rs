@@ -499,7 +499,7 @@ fn build_hydrology_cache(
                     best_idx = Some(nidx);
                 }
             }
-            flow_to[widx] = best_idx;
+            flow_to[idx] = best_idx;
         }
     }
 
@@ -512,58 +512,23 @@ fn build_hydrology_cache(
         }
     }
 
-    let mut sink_owner = vec![0u64; window_len];
-    for i in 0..window_len {
-        let mut cur = i;
-        for _ in 0..256 {
-            if let Some(n) = flow_to[cur] {
-                cur = n;
-            } else {
-                break;
-            }
-        }
-        let sink_x = (cur % window_size) as i32 + window_min_wx;
-        let sink_z = (cur / window_size) as i32 + window_min_wz;
-        sink_owner[i] = pack_column_key(sink_x, sink_z);
-    }
-
-    let mut spill_by_sink: HashMap<u64, i32> = HashMap::new();
-    for idx in 0..window_len {
-        let x = (idx % window_size) as i32;
-        let z = (idx / window_size) as i32;
-        for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-            if nx < 0 || nz < 0 || nx >= window_size as i32 || nz >= window_size as i32 {
-                continue;
-            }
-            let ni = nx as usize + nz as usize * window_size;
-            if sink_owner[ni] != sink_owner[idx] {
-                let saddle = window_heights[idx].max(window_heights[ni]);
-                spill_by_sink
-                    .entry(sink_owner[idx])
-                    .and_modify(|level| *level = (*level).min(saddle))
-                    .or_insert(saddle);
-            }
-        }
-    }
-
-    let mut hydrology_context = HashMap::with_capacity(window_len);
-    for lz in 0..window_size as i32 {
-        for lx in 0..window_size as i32 {
-            let idx = lx as usize + lz as usize * window_size;
-            let wx = window_min_wx + lx;
-            let wz = window_min_wz + lz;
-            let sink = sink_owner[idx];
-            hydrology_context.insert(
-                pack_column_key(wx, wz),
-                HydrologyColumnContext {
-                    surface_height: window_heights[idx],
-                    flow_accum: flow_accum[idx],
-                    sink_owner: sink,
-                    spill_level: spill_by_sink.get(&sink).copied(),
-                },
-            );
-        }
-    }
+    let mut seam_hints: HashMap<SeamDirection, Vec<SeamHydrologyHint>> = HashMap::new();
+    seam_hints.insert(
+        SeamDirection::North,
+        vec![SeamHydrologyHint::default(); width],
+    );
+    seam_hints.insert(
+        SeamDirection::South,
+        vec![SeamHydrologyHint::default(); width],
+    );
+    seam_hints.insert(
+        SeamDirection::West,
+        vec![SeamHydrologyHint::default(); depth],
+    );
+    seam_hints.insert(
+        SeamDirection::East,
+        vec![SeamHydrologyHint::default(); depth],
+    );
 
     let mut ocean_weight = vec![0.0; len];
     let mut river_weight = vec![0.0; len];
@@ -587,8 +552,10 @@ fn build_hydrology_cache(
                     steps += 1;
                     cur = n;
                 }
+                None => break,
             }
         }
+        distance[idx] = steps;
     }
 
     let mut river_level = vec![None; len];
@@ -639,6 +606,8 @@ fn build_hydrology_cache(
                     river_level[local_idx] = Some(ctrl.min(context.cells[idx].surface_height - 1));
                 }
             }
+        }
+    }
 
     let mut sink_owner = vec![None::<usize>; ctx_len];
     for i in 0..ctx_len {
@@ -699,7 +668,13 @@ fn build_hydrology_cache(
             }
         }
     }
-    hints
+    HydrologyData {
+        river_weight,
+        ocean_weight,
+        lake_level,
+        river_level,
+        seam_hints,
+    }
 }
 
 fn pack_column_key(wx: i32, wz: i32) -> u64 {
@@ -1266,35 +1241,11 @@ fn apply_channel_edit(
     }
 }
 
-            if let Some(level) = hydrology.river_level[idx] {
-                let river_fill = smoothstep((river_w - 0.24) / 0.50);
-                let ocean_dominant = hydrology.ocean_weight[idx] > 0.52;
-                let top_solid = world.get(x, surface, z) != EMPTY;
-                let sky_open = (surface + 1..world.dims[1] as i32)
-                    .all(|y| world.get(x, y, z) == EMPTY || world.get(x, y, z) == WATER);
-                if river_fill > 0.02 && !ocean_dominant && top_solid && sky_open {
-                    let top = level.min(surface).min(sea_level + 1).max(2);
-                    let channel_depth = (2.0 + river_fill * 4.5).round() as i32;
-                    let floor = (top - channel_depth).max(1);
-                    for y in floor..=top {
-                        let existing = world.get(x, y, z);
-                        if existing != EMPTY && existing != WATER {
-                            let _ = world.set_raw_no_side_effects(x, y, z, EMPTY);
-                        }
-                    }
-                    for y in floor..=top {
-                        let _ = world.set_raw_no_side_effects(x, y, z, WATER);
-                    }
-                    let bank_blend = smoothstep(
-                        (river_fill + columns[idx].weights[biome_index(BiomeType::Desert)] * 0.2
-                            - 0.2)
-                            / 0.8,
-                    );
-                    if bank_blend > 0.05 {
-                        let _ = world.set_raw_no_side_effects(x, floor.max(1) - 1, z, SAND);
-                    }
-                }
-            }
+fn is_column_open_to_sky(world: &World, x: i32, z: i32, start_y: i32) -> bool {
+    for y in start_y.max(0)..world.dims[1] as i32 {
+        let mat = world.get(x, y, z);
+        if mat != EMPTY && mat != WATER {
+            return false;
         }
     }
     true
