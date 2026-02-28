@@ -91,6 +91,7 @@ struct ProcgenJobSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcgenJobStatus {
     Queued,
+    Coalesced,
     InFlight,
     Ready,
     Cancelled,
@@ -138,8 +139,6 @@ pub async fn run() -> anyhow::Result<()> {
     let mut next_procgen_id: u64 = 1;
     let mut next_epoch: u64 = 1;
     let mut job_status: HashMap<ProcgenJobKey, ProcgenJobStatus> = HashMap::new();
-    let mut requested_procgen_id: Option<u64> = None;
-    let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut pending_stream_mesh_coords: Vec<[i32; 3]> = Vec::new();
     let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
     let mut unsafe_handoff_prevented_count: u64 = 0;
@@ -148,6 +147,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut stream_mesh_hysteresis: HashMap<[i32; 3], u8> = HashMap::new();
     let mut pending_stream_mesh_versions: HashMap<[i32; 3], u64> = HashMap::new();
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
+    let mut cursor_is_unlocked = false;
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -192,7 +192,10 @@ pub async fn run() -> anyhow::Result<()> {
                             || ui.paused_menu
                             || ui.show_tool_quick_menu
                             || ui.tab_palette_open;
-                        let _ = set_cursor(window, should_unlock);
+                        if should_unlock != cursor_is_unlocked {
+                            let _ = set_cursor(window, should_unlock);
+                            cursor_is_unlocked = should_unlock;
+                        }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
@@ -243,10 +246,12 @@ pub async fn run() -> anyhow::Result<()> {
                                 && !input.rmb
                             {
                                 apply_quick_menu_hover_selection(&mut ui, &mut brush);
-                                let _ = set_cursor(
-                                    window,
-                                    should_unlock_cursor(&ui, false, ui.tab_palette_open),
-                                );
+                                let should_unlock =
+                                    should_unlock_cursor(&ui, false, ui.tab_palette_open);
+                                if should_unlock != cursor_is_unlocked {
+                                    let _ = set_cursor(window, should_unlock);
+                                    cursor_is_unlocked = should_unlock;
+                                }
                             }
                         }
                     }
@@ -272,7 +277,10 @@ pub async fn run() -> anyhow::Result<()> {
                         let cursor_should_unlock =
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
-                        let _ = set_cursor(window, cursor_should_unlock);
+                        if cursor_should_unlock != cursor_is_unlocked {
+                            let _ = set_cursor(window, cursor_should_unlock);
+                            cursor_is_unlocked = cursor_should_unlock;
+                        }
 
                         if !gameplay_blocked {
                             ctrl.sensitivity = ui.mouse_sensitivity;
@@ -323,7 +331,7 @@ pub async fn run() -> anyhow::Result<()> {
                             raycast,
                             preview_mode,
                             ui.active_tool,
-                            !cursor_should_unlock || !egui_c,
+                            !cursor_should_unlock && !egui_c,
                         );
 
                         if !gameplay_blocked {
@@ -400,6 +408,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 handle_residency_change_for_meshing(
                                     event,
                                     active_stream_coord,
+                                    bounds,
                                     &mut world,
                                     |coord| {
                                         queue_stream_mesh_rebuild(
@@ -443,6 +452,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 &render_residency,
                                 active_stream_coord,
                                 desired_coord,
+                                bounds,
                                 &mut stream_mesh_hysteresis,
                             );
                             let mut prune_keep = keep_stream_meshes.clone();
@@ -454,6 +464,10 @@ pub async fn run() -> anyhow::Result<()> {
                             renderer.prune_stream_meshes(&prune_keep);
                             pending_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
                             queued_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
+                            pending_stream_mesh_versions
+                                .retain(|coord, _| prune_keep.contains(coord));
+                            sim_accumulators_by_coord
+                                .retain(|coord, _| sim_residency.contains(coord));
                             for &coord in &render_residency {
                                 if coord == active_stream_coord {
                                     continue;
@@ -720,7 +734,12 @@ pub async fn run() -> anyhow::Result<()> {
                                 origin[2] + ctrl.position.z.floor() as i32,
                             );
                             if job_status.values().any(|s| {
-                                matches!(s, ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight)
+                                matches!(
+                                    s,
+                                    ProcgenJobStatus::Queued
+                                        | ProcgenJobStatus::Coalesced
+                                        | ProcgenJobStatus::InFlight
+                                )
                             }) {
                                 format!(
                                     "Biome: {} | Feature: {} (generating...)",
@@ -736,7 +755,12 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let queued_count = job_status
                             .values()
-                            .filter(|status| matches!(status, ProcgenJobStatus::Queued))
+                            .filter(|status| {
+                                matches!(
+                                    status,
+                                    ProcgenJobStatus::Queued | ProcgenJobStatus::Coalesced
+                                )
+                            })
                             .count();
                         let in_flight_count = job_status
                             .values()
@@ -898,8 +922,6 @@ pub async fn run() -> anyhow::Result<()> {
                                     stream = None;
                                     active_stream_coord = [0, 0, 0];
                                     clear_procedural_streaming_state(
-                                        &mut requested_procgen_id,
-                                        &mut requested_procgen_coord,
                                         &mut active_procgen,
                                         &mut procedural_bounds,
                                         &mut stream,
@@ -929,8 +951,6 @@ pub async fn run() -> anyhow::Result<()> {
                                         stream = None;
                                         active_stream_coord = [0, 0, 0];
                                         clear_procedural_streaming_state(
-                                            &mut requested_procgen_id,
-                                            &mut requested_procgen_coord,
                                             &mut active_procgen,
                                             &mut procedural_bounds,
                                             &mut stream,
@@ -1077,7 +1097,15 @@ pub async fn run() -> anyhow::Result<()> {
                     input.on_device_event(event);
                 }
             }
-            Event::AboutToWait => window.request_redraw(),
+            Event::AboutToWait => {
+                let streaming_work_pending = !pending_stream_mesh_coords.is_empty()
+                    || !queued_stream_mesh_coords.is_empty()
+                    || !job_status.is_empty();
+                let ui_active = ui.paused_menu || ui.tab_palette_open || ui.show_tool_quick_menu;
+                if sim.running || streaming_work_pending || ui_active {
+                    window.request_redraw();
+                }
+            }
             _ => {}
         })
         .context("event loop")
@@ -1124,6 +1152,7 @@ struct ProcgenQueueState {
     queue: BinaryHeap<ProcgenQueueEntry>,
     queued_keys: HashSet<ProcgenJobKey>,
     in_flight: HashSet<ProcgenJobKey>,
+    pending_by_key: HashMap<ProcgenJobKey, ProcgenJobSpec>,
     max_queue: usize,
     max_in_flight: usize,
     sequence: u64,
@@ -1148,6 +1177,7 @@ impl ProcgenWorkerPool {
                 queue: BinaryHeap::new(),
                 queued_keys: HashSet::new(),
                 in_flight: HashSet::new(),
+                pending_by_key: HashMap::new(),
                 max_queue,
                 max_in_flight,
                 sequence: 0,
@@ -1171,14 +1201,15 @@ impl ProcgenWorkerPool {
     }
 
     fn enqueue_or_coalesce(&self, spec: ProcgenJobSpec) -> ProcgenJobStatus {
-        self.cancel_epochs
-            .lock()
-            .expect("cancel lock")
-            .insert(spec.key, spec.epoch);
         let (lock, cv) = &*self.state;
         let mut st = lock.lock().expect("procgen queue lock");
-        if st.queued_keys.contains(&spec.key) || st.in_flight.contains(&spec.key) {
-            return ProcgenJobStatus::Queued;
+        if st.in_flight.contains(&spec.key) {
+            st.pending_by_key.insert(spec.key, spec);
+            return ProcgenJobStatus::InFlight;
+        }
+        if st.queued_keys.contains(&spec.key) {
+            st.pending_by_key.insert(spec.key, spec);
+            return ProcgenJobStatus::Coalesced;
         }
         if st.queue.len() >= st.max_queue {
             return ProcgenJobStatus::Cancelled;
@@ -1261,6 +1292,17 @@ fn worker_loop(
         let (lock, cv) = &*state;
         let mut st = lock.lock().expect("procgen queue lock");
         st.in_flight.remove(&spec.key);
+        if let Some(next_spec) = st.pending_by_key.remove(&spec.key) {
+            if st.queue.len() < st.max_queue {
+                st.sequence = st.sequence.wrapping_add(1);
+                let seq = st.sequence;
+                st.queued_keys.insert(next_spec.key);
+                st.queue.push(ProcgenQueueEntry {
+                    spec: next_spec,
+                    sequence: seq,
+                });
+            }
+        }
         cv.notify_one();
     }
 }
@@ -1302,16 +1344,21 @@ fn build_keep_stream_meshes(
     render_residency: &HashSet<[i32; 3]>,
     active_stream_coord: [i32; 3],
     desired_coord: [i32; 3],
+    bounds: ProceduralWorldBounds,
     stream_mesh_hysteresis: &mut HashMap<[i32; 3], u8>,
 ) -> HashSet<[i32; 3]> {
     let mut keep_stream_meshes = render_residency.clone();
     for &coord in render_residency {
         for neighbor in WorldStream::neighbor_coords(coord) {
-            keep_stream_meshes.insert(neighbor);
+            if bounds.contains_macro_coord(neighbor) {
+                keep_stream_meshes.insert(neighbor);
+            }
         }
     }
     for neighbor in WorldStream::neighbor_coords(desired_coord) {
-        keep_stream_meshes.insert(neighbor);
+        if bounds.contains_macro_coord(neighbor) {
+            keep_stream_meshes.insert(neighbor);
+        }
     }
 
     let mut stale = Vec::new();
@@ -1452,6 +1499,7 @@ fn handoff_ready(stream: &WorldStream, desired_coord: [i32; 3]) -> bool {
 fn handle_residency_change_for_meshing<F>(
     event: ResidencyChangeEvent,
     active_stream_coord: [i32; 3],
+    bounds: ProceduralWorldBounds,
     world: &mut World,
     mut enqueue_mesh: F,
 ) where
@@ -1460,17 +1508,51 @@ fn handle_residency_change_for_meshing<F>(
     if event.old == event.new {
         return;
     }
+    if event.coord != active_stream_coord && bounds.contains_macro_coord(event.coord) {
+        enqueue_mesh(event.coord);
+    }
+
     for neighbor in WorldStream::neighbor_coords(event.coord) {
         if neighbor == active_stream_coord {
-            for chunk in &mut world.chunks {
-                chunk.dirty_mesh = true;
-                if chunk.meshed_version == chunk.voxel_version {
-                    chunk.meshed_version = chunk.meshed_version.saturating_sub(1);
-                }
-            }
+            mark_neighbor_face_chunks_dirty(world, event.coord, active_stream_coord);
             continue;
         }
-        enqueue_mesh(neighbor);
+        if bounds.contains_macro_coord(neighbor) {
+            enqueue_mesh(neighbor);
+        }
+    }
+}
+
+fn mark_neighbor_face_chunks_dirty(
+    world: &mut World,
+    neighbor_coord: [i32; 3],
+    active_stream_coord: [i32; 3],
+) {
+    let delta = [
+        neighbor_coord[0] - active_stream_coord[0],
+        neighbor_coord[1] - active_stream_coord[1],
+        neighbor_coord[2] - active_stream_coord[2],
+    ];
+
+    for cz in 0..world.chunks_dims[2] {
+        for cy in 0..world.chunks_dims[1] {
+            for cx in 0..world.chunks_dims[0] {
+                let touches_face = (delta[0] > 0 && cx + 1 == world.chunks_dims[0])
+                    || (delta[0] < 0 && cx == 0)
+                    || (delta[1] > 0 && cy + 1 == world.chunks_dims[1])
+                    || (delta[1] < 0 && cy == 0)
+                    || (delta[2] > 0 && cz + 1 == world.chunks_dims[2])
+                    || (delta[2] < 0 && cz == 0);
+                if touches_face {
+                    let idx = world.chunk_index(cx, cy, cz);
+                    let chunk = &mut world.chunks[idx];
+                    chunk.dirty_mesh = true;
+                    if chunk.meshed_version == chunk.voxel_version {
+                        chunk.meshed_version = chunk.meshed_version.saturating_sub(1);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1569,15 +1651,11 @@ fn apply_quick_menu_hover_selection(ui: &mut UiState, brush: &mut BrushSettings)
 }
 
 fn clear_procedural_streaming_state(
-    requested_procgen_id: &mut Option<u64>,
-    requested_procgen_coord: &mut Option<[i32; 3]>,
     active_procgen: &mut Option<ProcGenConfig>,
     procedural_bounds: &mut Option<ProceduralWorldBounds>,
     stream: &mut Option<WorldStream>,
     active_stream_coord: &mut [i32; 3],
 ) {
-    *requested_procgen_id = None;
-    *requested_procgen_coord = None;
     *active_procgen = None;
     *procedural_bounds = None;
     *stream = None;
@@ -2232,6 +2310,7 @@ mod tests {
         let mut world = World::new([64, 64, 64]);
         let mut pending = Vec::new();
         let mut queued = HashSet::new();
+        let bounds = ProceduralWorldBounds::new(-1, 1, 64);
         handle_residency_change_for_meshing(
             ResidencyChangeEvent {
                 coord: [1, 0, 0],
@@ -2239,6 +2318,7 @@ mod tests {
                 new: ChunkResidency::Resident,
             },
             [0, 0, 0],
+            bounds,
             &mut world,
             |coord| {
                 queued.insert(coord);
@@ -2247,7 +2327,8 @@ mod tests {
         );
 
         assert!(pending.contains(&[2, 0, 0]));
+        assert!(pending.contains(&[1, 0, 0]));
         assert!(pending.contains(&[1, 1, 0]));
-        assert!(world.chunks.iter().all(|c| c.dirty_mesh));
+        assert!(world.chunks.iter().any(|c| c.dirty_mesh));
     }
 }
