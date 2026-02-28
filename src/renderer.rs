@@ -325,6 +325,10 @@ impl Renderer {
         self.streamed_meshes.retain(|coord, _| keep.contains(coord));
     }
 
+    pub fn has_stream_mesh(&self, coord: [i32; 3]) -> bool {
+        self.streamed_meshes.contains_key(&coord)
+    }
+
     pub fn clear_mesh_cache(&mut self) {
         self.meshes.clear();
         self.streamed_meshes.clear();

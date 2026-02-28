@@ -644,6 +644,7 @@ pub fn draw_fps_overlays(
     vp: Mat4,
     viewport: [u32; 2],
     preview_blocks: &[[i32; 3]],
+    preview_origin: [i32; 3],
     brush: &BrushSettings,
     action_mode: BrushMode,
     show_radial_menu: bool,
@@ -695,12 +696,17 @@ pub fn draw_fps_overlays(
     };
 
     for block in preview_blocks {
+        let world_block = [
+            block[0] + preview_origin[0],
+            block[1] + preview_origin[1],
+            block[2] + preview_origin[2],
+        ];
         draw_block_outline(
             &painter,
             vp,
             viewport,
             ctx.pixels_per_point(),
-            *block,
+            world_block,
             voxel_size,
             outline_color,
         );
