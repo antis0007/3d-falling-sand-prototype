@@ -3,7 +3,7 @@ use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -272,9 +272,8 @@ impl Renderer {
         for i in dirty_chunks.indices {
             let (verts, inds, aabb_min, aabb_max) =
                 mesh_chunk(world, i, world_origin, |local, global| {
-                    let local_id = world.get(local[0], local[1], local[2]);
-                    if local_id != EMPTY {
-                        return local_id;
+                    if local_in_bounds(world, local) {
+                        return world.get(local[0], local[1], local[2]);
                     }
                     match sample_global(global) {
                         Some(id) => id,
@@ -315,17 +314,13 @@ impl Renderer {
             world.chunks[i].meshed_version = world.chunks[i].voxel_version;
             self.dirty_since_frame.remove(&i);
         }
-
-        let dirty_now: HashSet<usize> = world
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, chunk)| {
-                (chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version).then_some(i)
-            })
-            .collect();
-        self.dirty_since_frame
-            .retain(|idx, _| dirty_now.contains(idx));
+        self.dirty_since_frame.retain(|idx, _| {
+            world
+                .chunks
+                .get(*idx)
+                .map(|chunk| chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version)
+                .unwrap_or(false)
+        });
     }
 
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
@@ -333,7 +328,11 @@ impl Renderer {
     }
 
     pub fn request_stream_mesh_version(&mut self, coord: [i32; 3]) -> u64 {
-        let next = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0) + 1;
+        let next = self
+            .stream_mesh_versions
+            .get(&coord)
+            .map(|version| version.saturating_add(1))
+            .unwrap_or(0);
         self.stream_mesh_versions.insert(coord, next);
         next
     }
@@ -350,11 +349,13 @@ impl Renderer {
     {
         let mut meshes = Vec::with_capacity(world.chunks.len());
         for idx in 0..world.chunks.len() {
+            if world.chunks[idx].iter_raw().iter().all(|&v| v == EMPTY) {
+                continue;
+            }
             let (verts, inds, aabb_min, aabb_max) =
                 mesh_chunk(world, idx, world_origin, |local, global| {
-                    let local_id = world.get(local[0], local[1], local[2]);
-                    if local_id != EMPTY {
-                        return local_id;
+                    if local_in_bounds(world, local) {
+                        return world.get(local[0], local[1], local[2]);
                     }
                     match sample_global(global) {
                         Some(id) => id,
@@ -419,12 +420,13 @@ impl Renderer {
         self.streamed_meshes
             .get(&coord)
             .map(|entry| desired > entry.active_version)
-            .unwrap_or(desired > 0)
+            .unwrap_or(false)
     }
 
     pub fn clear_mesh_cache(&mut self) {
         self.meshes.clear();
         self.streamed_meshes.clear();
+        self.stream_mesh_versions.clear();
         self.dirty_since_frame.clear();
         self.dirty_scan_cursor = 0;
     }
@@ -532,15 +534,17 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
         Vec3::new(min.x, max.y, max.z),
         Vec3::new(max.x, max.y, max.z),
     ];
+    let clips = corners.map(|corner| vp * corner.extend(1.0));
+
     for plane in 0..6 {
         let mut outside = 0;
-        for c in corners {
-            let clip = vp * c.extend(1.0);
+        for clip in clips {
             let v = match plane {
                 0 => clip.x + clip.w,
                 1 => -clip.x + clip.w,
                 2 => clip.y + clip.w,
                 3 => -clip.y + clip.w,
+                // perspective_rh_gl uses OpenGL clip space where -w <= z <= w.
                 4 => clip.z + clip.w,
                 _ => -clip.z + clip.w,
             };
@@ -557,9 +561,20 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
 
 fn unknown_neighbor_material(policy: UnknownNeighborOcclusionPolicy) -> MaterialId {
     match policy {
+        // Conservative: treat unknown neighbors as solid to avoid seams/cracks.
         UnknownNeighborOcclusionPolicy::Conservative => TURF_ID,
+        // Aggressive: treat unknown neighbors as empty to expose surfaces early.
         UnknownNeighborOcclusionPolicy::Aggressive => EMPTY,
     }
+}
+
+fn local_in_bounds(world: &World, local: [i32; 3]) -> bool {
+    local[0] >= 0
+        && local[1] >= 0
+        && local[2] >= 0
+        && (local[0] as usize) < world.dims[0]
+        && (local[1] as usize) < world.dims[1]
+        && (local[2] as usize) < world.dims[2]
 }
 
 fn mesh_chunk<F>(
@@ -579,6 +594,15 @@ where
     let mut verts = Vec::new();
     let mut inds = Vec::new();
     let chunk = &world.chunks[idx];
+    if chunk.iter_raw().iter().all(|&v| v == EMPTY) {
+        let min = Vec3::new(
+            (world_origin[0] + (cx as i32 * CHUNK_SIZE as i32)) as f32,
+            (world_origin[1] + (cy as i32 * CHUNK_SIZE as i32)) as f32,
+            (world_origin[2] + (cz as i32 * CHUNK_SIZE as i32)) as f32,
+        ) * VOXEL_SIZE;
+        let max = min + Vec3::splat(CHUNK_SIZE as f32 * VOXEL_SIZE);
+        return (verts, inds, min, max);
+    }
 
     let ox = cx as i32 * CHUNK_SIZE as i32;
     let oy = cy as i32 * CHUNK_SIZE as i32;
@@ -763,15 +787,15 @@ fn add_crossed_billboard<F>(
     let quads = [
         [
             [0.15, 0.0, 0.15],
+            [0.15, 1.0, 0.15],
             [0.85, 1.0, 0.85],
             [0.85, 0.0, 0.85],
-            [0.15, 1.0, 0.15],
         ],
         [
             [0.15, 0.0, 0.85],
+            [0.15, 1.0, 0.85],
             [0.85, 1.0, 0.15],
             [0.85, 0.0, 0.15],
-            [0.15, 1.0, 0.85],
         ],
     ];
 
@@ -889,5 +913,51 @@ mod tests {
         }
 
         assert!(reached, "highest index chunk should eventually be selected");
+    }
+
+    #[test]
+    fn unknown_neighbor_policy_maps_as_expected() {
+        assert_eq!(
+            unknown_neighbor_material(UnknownNeighborOcclusionPolicy::Conservative),
+            TURF_ID
+        );
+        assert_eq!(
+            unknown_neighbor_material(UnknownNeighborOcclusionPolicy::Aggressive),
+            EMPTY
+        );
+    }
+
+    #[test]
+    fn crossed_billboard_builds_two_double_sided_quads() {
+        let mut verts = Vec::new();
+        let mut inds = Vec::new();
+        add_crossed_billboard(
+            [0, 0, 0],
+            [0, 0, 0],
+            &mut |_local, _global| EMPTY,
+            GRASS_ID,
+            &mut verts,
+            &mut inds,
+        );
+
+        assert_eq!(verts.len(), 8);
+        assert_eq!(inds.len(), 24);
+        assert_eq!(&inds[0..12], &[0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]);
+        assert_eq!(&inds[12..24], &[4, 5, 6, 4, 6, 7, 4, 6, 5, 4, 7, 6]);
+    }
+
+    #[test]
+    fn aabb_culling_identity_view_proj() {
+        let vp = Mat4::IDENTITY;
+        assert!(aabb_in_view(
+            vp,
+            Vec3::new(-0.5, -0.5, -0.5),
+            Vec3::new(0.5, 0.5, 0.5)
+        ));
+        assert!(!aabb_in_view(
+            vp,
+            Vec3::new(1000.0, 0.0, 0.0),
+            Vec3::new(1001.0, 1.0, 1.0)
+        ));
     }
 }
