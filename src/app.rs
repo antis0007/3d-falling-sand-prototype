@@ -34,7 +34,7 @@ const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
 const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
-const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 1;
+const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -325,15 +325,30 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
 
                         while let Ok(result) = procgen_rx.try_recv() {
-                            generated_regions
-                                .insert(result.config.world_origin, result.world.clone());
                             if requested_procgen_id != Some(result.generation_id) {
                                 continue;
                             }
                             requested_procgen_id = None;
+                            let mut incoming_world = result.world;
+                            if !result.prefer_safe_spawn {
+                                copy_world_overlap(
+                                    &world,
+                                    active_procgen_origin,
+                                    &mut incoming_world,
+                                    result.config.world_origin,
+                                );
+                            }
+                            generated_regions
+                                .insert(result.config.world_origin, incoming_world.clone());
+                            prune_generated_regions(
+                                &mut generated_regions,
+                                result.config.world_origin,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
                             active_procgen = Some(result.config);
                             active_procgen_origin = result.config.world_origin;
-                            world = result.world;
+                            world = incoming_world;
                             if result.prefer_safe_spawn {
                                 let spawn = find_safe_spawn(&world, result.config.seed);
                                 ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
@@ -359,13 +374,27 @@ pub async fn run() -> anyhow::Result<()> {
                                 0,
                                 floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
                             ];
-                            let desired_origin = [
-                                (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
-                                    * PROCEDURAL_MACROCHUNK_SIZE,
-                                0,
-                                (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
-                                    * PROCEDURAL_MACROCHUNK_SIZE,
+                            let origin_macro = [
+                                floor_div(active_procgen_origin[0], PROCEDURAL_MACROCHUNK_SIZE),
+                                floor_div(active_procgen_origin[2], PROCEDURAL_MACROCHUNK_SIZE),
                             ];
+                            let center_macro = [
+                                origin_macro[0] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                origin_macro[1] + PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            ];
+                            let outside_inner_band = (player_macro[0] - center_macro[0]).abs() > 1
+                                || (player_macro[2] - center_macro[1]).abs() > 1;
+                            let desired_origin = if outside_inner_band {
+                                [
+                                    (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                    0,
+                                    (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
+                                        * PROCEDURAL_MACROCHUNK_SIZE,
+                                ]
+                            } else {
+                                active_procgen_origin
+                            };
                             if desired_origin != active_procgen_origin
                                 && requested_procgen_id.is_none()
                             {
@@ -374,6 +403,12 @@ pub async fn run() -> anyhow::Result<()> {
                                     active_procgen_origin = desired_origin;
                                     active_procgen = Some(cfg.with_origin(desired_origin));
                                     world = cached.clone();
+                                    prune_generated_regions(
+                                        &mut generated_regions,
+                                        desired_origin,
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                    );
                                     ctrl.position = Vec3::new(
                                         (global[0] - active_procgen_origin[0]) as f32 + 0.5,
                                         ctrl.position.y,
@@ -673,6 +708,64 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
 
 fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
     ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
+}
+
+fn prune_generated_regions(
+    generated_regions: &mut BTreeMap<[i32; 3], World>,
+    center_origin: [i32; 3],
+    macro_size: i32,
+    keep_radius: i32,
+) {
+    generated_regions.retain(|origin, _| {
+        let dx = ((origin[0] - center_origin[0]) / macro_size).abs();
+        let dz = ((origin[2] - center_origin[2]) / macro_size).abs();
+        dx <= keep_radius && dz <= keep_radius
+    });
+}
+
+fn copy_world_overlap(src: &World, src_origin: [i32; 3], dst: &mut World, dst_origin: [i32; 3]) {
+    let src_min = [src_origin[0], src_origin[1], src_origin[2]];
+    let src_max = [
+        src_origin[0] + src.dims[0] as i32 - 1,
+        src_origin[1] + src.dims[1] as i32 - 1,
+        src_origin[2] + src.dims[2] as i32 - 1,
+    ];
+    let dst_min = [dst_origin[0], dst_origin[1], dst_origin[2]];
+    let dst_max = [
+        dst_origin[0] + dst.dims[0] as i32 - 1,
+        dst_origin[1] + dst.dims[1] as i32 - 1,
+        dst_origin[2] + dst.dims[2] as i32 - 1,
+    ];
+
+    let ov_min = [
+        src_min[0].max(dst_min[0]),
+        src_min[1].max(dst_min[1]),
+        src_min[2].max(dst_min[2]),
+    ];
+    let ov_max = [
+        src_max[0].min(dst_max[0]),
+        src_max[1].min(dst_max[1]),
+        src_max[2].min(dst_max[2]),
+    ];
+
+    if ov_min[0] > ov_max[0] || ov_min[1] > ov_max[1] || ov_min[2] > ov_max[2] {
+        return;
+    }
+
+    for wz in ov_min[2]..=ov_max[2] {
+        for wy in ov_min[1]..=ov_max[1] {
+            for wx in ov_min[0]..=ov_max[0] {
+                let sx = wx - src_origin[0];
+                let sy = wy - src_origin[1];
+                let sz = wz - src_origin[2];
+                let dx = wx - dst_origin[0];
+                let dy = wy - dst_origin[1];
+                let dz = wz - dst_origin[2];
+                let id = src.get(sx, sy, sz);
+                let _ = dst.set(dx, dy, dz, id);
+            }
+        }
+    }
 }
 
 fn floor_div(a: i32, b: i32) -> i32 {

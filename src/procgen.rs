@@ -171,8 +171,8 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig) {
 
 fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
     let sea_level = config.sea_level;
-    for lz in 0..world.dims[2] as i32 {
-        for lx in 0..world.dims[0] as i32 {
+    for lz in 1..world.dims[2] as i32 - 1 {
+        for lx in 1..world.dims[0] as i32 - 1 {
             let wx = config.world_origin[0] + lx;
             let wz = config.world_origin[2] + lz;
             let weights = biome_weights(config.seed, wx, wz);
@@ -187,24 +187,27 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
                 continue;
             };
 
-            if ocean_w > 0.42 {
-                for y in (sea_level - 12).max(2)..=sea_level {
+            let local_min = is_local_minimum(world, lx, lz, surface);
+
+            if ocean_w > 0.46 && surface <= sea_level - 2 {
+                let ocean_floor = (sea_level - 10).max(2);
+                for y in ocean_floor..=sea_level {
                     if world.get(lx, y, lz) == EMPTY {
                         let _ = world.set(lx, y, lz, WATER);
                     }
                 }
-                for y in (sea_level - 13).max(1)..=(sea_level - 12).max(1) {
+                for y in (ocean_floor - 1).max(1)..=ocean_floor {
                     let _ = world.set(lx, y, lz, SAND);
                 }
                 continue;
             }
 
             let wetness = river_w.max(lake_w);
-            if wetness < 0.58 {
+            if wetness < 0.62 || !local_min {
                 continue;
             }
 
-            let depth = (1.0 + 2.0 * wetness).round() as i32;
+            let depth = (1.0 + 1.6 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
             let top = (surface - 1).min(sea_level - 1);
             if top < floor {
@@ -224,6 +227,25 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
             }
         }
     }
+}
+
+fn is_local_minimum(world: &World, x: i32, z: i32, h: i32) -> bool {
+    let mut higher_neighbors = 0;
+    let mut count = 0;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            if let Some(nh) = surface_y(world, x + dx, z + dz) {
+                count += 1;
+                if nh >= h {
+                    higher_neighbors += 1;
+                }
+            }
+        }
+    }
+    count > 0 && higher_neighbors >= count * 2 / 3
 }
 
 fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
