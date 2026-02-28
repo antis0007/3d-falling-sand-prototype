@@ -117,6 +117,7 @@ pub async fn run() -> anyhow::Result<()> {
         egui_wgpu::Renderer::new(&renderer.device, renderer.config.format, None, 1);
 
     let mut world = World::new([64, 64, 64]);
+    world.fill_floor(2, 1);
     let mut sim = SimState::default();
     let mut input = InputState::default();
     let mut ctrl = FpsController::default();
@@ -752,6 +753,7 @@ pub async fn run() -> anyhow::Result<()> {
                                         &mut active_stream_coord,
                                     );
                                     world = World::new([n, n, n]);
+                                    world.fill_floor(2, 1);
                                     let spawn = find_safe_spawn(&world, 1);
                                     ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                 }
