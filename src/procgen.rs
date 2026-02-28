@@ -170,6 +170,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
             let near_sea_band = top_y <= config.sea_level + 4;
             let coastal = shore_w > 0.18 && near_sea_band;
             let cliffy_coast = coastal && slope >= 3;
+            let subsea_ocean = top_y <= config.sea_level && ocean > 0.55;
             let river_bank = river > 0.48 && top_y <= config.sea_level + 2;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
             let sand_depth = if coastal {
@@ -184,7 +185,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     continue;
                 }
                 let block = if d == 0 {
-                    if top_y <= config.sea_level {
+                    if subsea_ocean {
                         if coastal || river_bank || desert > 0.4 {
                             SAND
                         } else {
@@ -201,7 +202,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     } else {
                         TURF
                     }
-                } else if y <= config.sea_level {
+                } else if subsea_ocean && y <= config.sea_level {
                     if d <= sand_depth + 1 {
                         SAND
                     } else {
@@ -264,7 +265,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
             );
             let lowland_area =
                 local_lowland_fraction(heights, world.dims[0], config, lx, lz, sea_level - 1, 3);
-            let ocean_dominant = ocean_w > 0.52;
+            let ocean_dominant = ocean_w > 0.62;
             if ocean_dominant {
                 let depth_variation = ((fbm2(
                     config.seed ^ 0x0CEA_0010,
@@ -276,10 +277,8 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                     .round() as i32;
                 let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
-                let qualifies = surface <= sea_level
-                    && lowland_neighbors >= 5
-                    && ((lowland_neighbors >= 6 && lowland_area >= 0.62)
-                        || (ocean_w > 0.74 && lowland_area >= 0.52));
+                let qualifies =
+                    surface <= sea_level - 1 && lowland_neighbors >= 6 && lowland_area >= 0.60;
 
                 if qualifies {
                     for y in 1..floor {
@@ -301,7 +300,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
             }
 
             let river_level = river_water_level(config.seed, wx, wz, sea_level);
-            if surface > river_level + 2 {
+            if surface > river_level + 1 {
                 continue;
             }
 
@@ -578,15 +577,15 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 5]) -> 
     ) - 0.5)
         * 3.0;
     let ocean_floor_target = config.sea_level as f32 - 12.0 + ocean_depth_shape;
-    h = h * (1.0 - ocean_w * 0.55) + (config.sea_level as f32 - 6.0) * ocean_w * 0.55;
-    h = h * (1.0 - ocean_w * 0.85) + ocean_floor_target * ocean_w * 0.85;
+    h = h * (1.0 - ocean_w * 0.45) + (config.sea_level as f32 - 5.0) * ocean_w * 0.45;
+    h = h * (1.0 - ocean_w * 0.82) + ocean_floor_target * ocean_w * 0.82;
 
-    let coast_w = smoothstep((ocean_w - 0.42) / 0.28);
-    let coast_target = config.sea_level as f32 + 1.0;
-    h = h * (1.0 - coast_w * 0.45) + coast_target * coast_w * 0.45;
+    let coast_w = smoothstep((ocean_w - 0.50) / 0.30);
+    let coast_target = config.sea_level as f32;
+    h = h * (1.0 - coast_w * 0.30) + coast_target * coast_w * 0.30;
 
-    if ocean_w > 0.65 {
-        h = h.min(config.sea_level as f32 - 2.0);
+    if ocean_w > 0.70 {
+        h = h.min(config.sea_level as f32 - 1.0);
     }
 
     h.round() as i32
