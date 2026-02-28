@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::world::{MaterialId, World, EMPTY};
+use crate::chunk_store::ChunkStore;
+use crate::types::ChunkCoord;
+use crate::world::{Chunk, MaterialId, World, CHUNK_SIZE, EMPTY};
 
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
@@ -15,6 +17,69 @@ const LEAVES: MaterialId = 23;
 const BIOME_CLUSTER_MACROS: i32 = 3;
 const MACROCHUNK_SIZE: i32 = 64;
 const BIOME_COUNT: usize = 7;
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+fn hash3(seed: u64, x: i32, y: i32, z: i32) -> u64 {
+    let mut h = seed;
+    h ^= (x as i64 as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    h ^= (y as i64 as u64).wrapping_mul(0xC2B2AE3D27D4EB4F);
+    h ^= (z as i64 as u64).wrapping_mul(0x165667B19E3779F9);
+    splitmix64(h)
+}
+
+pub fn generate_chunk(seed: u64, c: ChunkCoord) -> Chunk {
+    let mut chunk = Chunk::new();
+    let base_x = c.x * CHUNK_SIZE as i32;
+    let base_y = c.y * CHUNK_SIZE as i32;
+    let base_z = c.z * CHUNK_SIZE as i32;
+
+    for lz in 0..CHUNK_SIZE {
+        for lx in 0..CHUNK_SIZE {
+            let wx = base_x + lx as i32;
+            let wz = base_z + lz as i32;
+
+            let terrain_hash = hash3(seed ^ 0xA02BDBF7BB3C0A7, wx, 0, wz);
+            let terrain_offset = ((terrain_hash & 31) as i32) - 10;
+            let surface_y = terrain_offset;
+
+            for ly in 0..CHUNK_SIZE {
+                let wy = base_y + ly as i32;
+                let cave_hash = hash3(seed ^ 0x51A2C41D9A7B3E11, wx, wy, wz);
+                let cave_open = (cave_hash & 0xFF) < 28;
+
+                let material = if wy > surface_y {
+                    EMPTY
+                } else if cave_open && wy < surface_y - 2 {
+                    EMPTY
+                } else if wy == surface_y {
+                    TURF
+                } else if wy > surface_y - 3 {
+                    DIRT
+                } else {
+                    STONE
+                };
+
+                if material != EMPTY {
+                    chunk.set(lx, ly, lz, material);
+                }
+            }
+        }
+    }
+
+    chunk
+}
+
+pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
+    store.insert_chunk(c, chunk);
+    store.mark_dirty(c);
+}
 
 #[derive(Default)]
 struct ProcGenPassTimings {
