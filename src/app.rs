@@ -21,7 +21,7 @@ use crate::world_bounds::ProceduralWorldBounds;
 use crate::world_stream::{floor_div, ChunkResidency, ResidencyChangeEvent, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -53,6 +53,7 @@ const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
 const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_RESULTS_BUDGET_PER_FRAME: usize = 4;
 const STREAM_HANDOFF_HYSTERESIS: f32 = 0.12;
+const STREAM_MESH_HYSTERESIS_FRAMES: u8 = 30;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -144,6 +145,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut unsafe_handoff_prevented_count: u64 = 0;
     let mut delayed_transition_count: u64 = 0;
     let mut sim_accumulators_by_coord: HashMap<[i32; 3], f32> = HashMap::new();
+    let mut stream_mesh_hysteresis: HashMap<[i32; 3], u8> = HashMap::new();
+    let mut pending_stream_mesh_versions: HashMap<[i32; 3], u64> = HashMap::new();
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -363,10 +366,14 @@ pub async fn run() -> anyhow::Result<()> {
                                                     ctrl.position =
                                                         Vec3::new(spawn[0], spawn[1], spawn[2]);
                                                 }
-                                            } else if queued_stream_mesh_coords
-                                                .insert(result.spec.coord)
-                                            {
-                                                pending_stream_mesh_coords.push(result.spec.coord);
+                                            } else {
+                                                queue_stream_mesh_rebuild(
+                                                    result.spec.coord,
+                                                    &mut renderer,
+                                                    &mut queued_stream_mesh_coords,
+                                                    &mut pending_stream_mesh_coords,
+                                                    &mut pending_stream_mesh_versions,
+                                                );
                                             }
                                             job_status.remove(&result.spec.key);
                                         }
@@ -394,8 +401,15 @@ pub async fn run() -> anyhow::Result<()> {
                                     event,
                                     active_stream_coord,
                                     &mut world,
-                                    &mut pending_stream_mesh_coords,
-                                    &mut queued_stream_mesh_coords,
+                                    |coord| {
+                                        queue_stream_mesh_rebuild(
+                                            coord,
+                                            &mut renderer,
+                                            &mut queued_stream_mesh_coords,
+                                            &mut pending_stream_mesh_coords,
+                                            &mut pending_stream_mesh_versions,
+                                        );
+                                    },
                                 );
                             }
                             let active_origin = stream_ref.chunk_origin(active_stream_coord);
@@ -425,22 +439,35 @@ pub async fn run() -> anyhow::Result<()> {
                             procedural_simulation_allowed =
                                 sim_residency.contains(&active_stream_coord);
 
-                            let keep_stream_meshes =
-                                build_keep_stream_meshes(&render_residency, active_stream_coord);
-                            renderer.prune_stream_meshes(&keep_stream_meshes);
-                            pending_stream_mesh_coords
-                                .retain(|coord| keep_stream_meshes.contains(coord));
-                            queued_stream_mesh_coords
-                                .retain(|coord| keep_stream_meshes.contains(coord));
+                            let keep_stream_meshes = build_keep_stream_meshes(
+                                &render_residency,
+                                active_stream_coord,
+                                desired_coord,
+                                &mut stream_mesh_hysteresis,
+                            );
+                            let mut prune_keep = keep_stream_meshes.clone();
+                            for &coord in &keep_stream_meshes {
+                                if renderer.stream_mesh_is_transitioning(coord) {
+                                    prune_keep.insert(coord);
+                                }
+                            }
+                            renderer.prune_stream_meshes(&prune_keep);
+                            pending_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
+                            queued_stream_mesh_coords.retain(|coord| prune_keep.contains(coord));
                             for &coord in &render_residency {
                                 if coord == active_stream_coord {
                                     continue;
                                 }
                                 if stream_ref.state(coord) == ChunkResidency::Resident
                                     && !renderer.has_stream_mesh(coord)
-                                    && queued_stream_mesh_coords.insert(coord)
                                 {
-                                    pending_stream_mesh_coords.push(coord);
+                                    queue_stream_mesh_rebuild(
+                                        coord,
+                                        &mut renderer,
+                                        &mut queued_stream_mesh_coords,
+                                        &mut pending_stream_mesh_coords,
+                                        &mut pending_stream_mesh_versions,
+                                    );
                                 }
                             }
 
@@ -470,9 +497,10 @@ pub async fn run() -> anyhow::Result<()> {
                                     queue_stream_mesh_if_needed(
                                         desired_coord,
                                         stream_ref,
-                                        &renderer,
+                                        &mut renderer,
                                         &mut queued_stream_mesh_coords,
                                         &mut pending_stream_mesh_coords,
+                                        &mut pending_stream_mesh_versions,
                                     );
                                 } else if stream_ref.load_coord_into_world(desired_coord, &mut world) {
                                     active_stream_coord = desired_coord;
@@ -494,14 +522,20 @@ pub async fn run() -> anyhow::Result<()> {
                                         }
                                         if stream_ref.state(coord) == ChunkResidency::Resident
                                             && !renderer.has_stream_mesh(coord)
-                                            && queued_stream_mesh_coords.insert(coord)
                                         {
-                                            pending_stream_mesh_coords.push(coord);
+                                            queue_stream_mesh_rebuild(
+                                                coord,
+                                                &mut renderer,
+                                                &mut queued_stream_mesh_coords,
+                                                &mut pending_stream_mesh_coords,
+                                                &mut pending_stream_mesh_versions,
+                                            );
                                         }
                                     }
                                     reprioritize_pending_stream_meshes(
                                         &mut pending_stream_mesh_coords,
                                         active_stream_coord,
+                                        ctrl.look_dir(),
                                     );
                                 }
                             }
@@ -570,6 +604,7 @@ pub async fn run() -> anyhow::Result<()> {
                             reprioritize_pending_stream_meshes(
                                 &mut pending_stream_mesh_coords,
                                 active_stream_coord,
+                                ctrl.look_dir(),
                             );
                             for _ in 0..STREAM_MESH_BUILD_BUDGET_PER_FRAME {
                                 let Some(coord) = pending_stream_mesh_coords.pop() else {
@@ -581,7 +616,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                                 if let Some(chunk_world) = stream_ref.resident_world(coord) {
                                     let origin = stream_ref.chunk_origin(coord);
-                                    renderer.upsert_stream_mesh(coord, chunk_world, origin, |p| {
+                                    let Some(version) = pending_stream_mesh_versions.remove(&coord) else {
+                                        continue;
+                                    };
+                                    renderer.upsert_stream_mesh(coord, version, chunk_world, origin, |p| {
                                         stream_ref.sample_global_voxel_known(p)
                                     });
                                 }
@@ -590,19 +628,8 @@ pub async fn run() -> anyhow::Result<()> {
 
                         if sim.running && !ui.paused_menu && procedural_simulation_allowed {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
-                            sim.accumulator += dt;
-                            sim_accumulators_by_coord
-                                .entry(active_stream_coord)
-                                .and_modify(|acc| *acc += dt)
-                                .or_insert(dt);
-                            while sim.accumulator >= step_dt {
-                                let (high_priority, _low_priority) =
-                                    prioritize_chunks_for_player(&world, ctrl.position);
-                                step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
-                                sim.accumulator -= step_dt;
-                            }
-                            if let (Some(stream_ref), Some(bounds)) =
-                                (stream.as_mut(), procedural_bounds)
+                            if let (Some(stream_ref), Some(bounds), Some(cfg)) =
+                                (stream.as_mut(), procedural_bounds, active_procgen)
                             {
                                 let active_origin = stream_ref.chunk_origin(active_stream_coord);
                                 let global_player = [
@@ -610,24 +637,31 @@ pub async fn run() -> anyhow::Result<()> {
                                     active_origin[1] + ctrl.position.y.floor() as i32,
                                     active_origin[2] + ctrl.position.z.floor() as i32,
                                 ];
-                                let sim_coords = filtered_macro_residency_set(
-                                    active_stream_coord,
+                                let desired_coord = bounds.clamp_macro_coord([
+                                    floor_div(global_player[0], cfg.dims[0] as i32),
+                                    floor_div(global_player[1], cfg.dims[1] as i32),
+                                    floor_div(global_player[2], cfg.dims[2] as i32),
+                                ]);
+                                let mut coords: Vec<[i32; 3]> = filtered_macro_residency_set(
+                                    desired_coord,
                                     PROCEDURAL_SIM_DISTANCE_MACROS,
                                     PROCEDURAL_SIM_DISTANCE_MACROS_Y,
                                     bounds,
-                                );
-                                let mut coords: Vec<[i32; 3]> = sim_coords
-                                    .iter()
-                                    .copied()
-                                    .filter(|coord| *coord != active_stream_coord)
-                                    .filter(|coord| bounds.contains_macro_coord(*coord))
-                                    .collect();
-                                coords.sort_by_key(|coord| macro_distance_sq(*coord, active_stream_coord));
+                                )
+                                .into_iter()
+                                .filter(|coord| stream_ref.state(*coord) == ChunkResidency::Resident)
+                                .collect();
+                                coords.sort_by_key(|coord| macro_distance_sq(*coord, desired_coord));
+
+                                stream_ref.persist_coord_state(active_stream_coord, &world);
+                                let mut total_steps = 0usize;
+                                let mut active_stepped = false;
                                 for coord in coords {
-                                    let distance_sq = macro_distance_sq(coord, active_stream_coord) as f32;
-                                    let cadence_scale = (1.0 + distance_sq.sqrt() * 0.5).clamp(1.0, 3.5);
+                                    let distance_sq = macro_distance_sq(coord, desired_coord) as f32;
+                                    let cadence_scale = (1.0 + distance_sq.sqrt() * 0.5).clamp(1.0, 4.0);
                                     let accumulator = sim_accumulators_by_coord.entry(coord).or_insert(0.0);
                                     *accumulator += dt;
+                                    let mut local_steps = 0usize;
                                     let coord_origin = stream_ref.chunk_origin(coord);
                                     let local_player = Vec3::new(
                                         (global_player[0] - coord_origin[0]) as f32,
@@ -635,17 +669,37 @@ pub async fn run() -> anyhow::Result<()> {
                                         (global_player[2] - coord_origin[2]) as f32,
                                     );
                                     while *accumulator >= step_dt * cadence_scale {
-                                        let Some(chunk_world) = stream_ref.resident_world_mut(coord) else {
+                                        if total_steps >= 16 && distance_sq > 1.0 {
                                             break;
-                                        };
-                                        let (high_priority, _) =
-                                            prioritize_chunks_for_player(chunk_world, local_player);
-                                        step_selected_chunks(chunk_world, &mut sim.rng, &high_priority);
+                                        }
+                                        if coord == active_stream_coord {
+                                            let (high_priority, _) = prioritize_chunks_for_player(&world, ctrl.position);
+                                            step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
+                                            active_stepped = true;
+                                        } else {
+                                            let Some(chunk_world) = stream_ref.resident_world_mut(coord) else {
+                                                break;
+                                            };
+                                            let (high_priority, _) = prioritize_chunks_for_player(chunk_world, local_player);
+                                            step_selected_chunks(chunk_world, &mut sim.rng, &high_priority);
+                                            queue_stream_mesh_rebuild(
+                                                coord,
+                                                &mut renderer,
+                                                &mut queued_stream_mesh_coords,
+                                                &mut pending_stream_mesh_coords,
+                                                &mut pending_stream_mesh_versions,
+                                            );
+                                        }
                                         *accumulator -= step_dt * cadence_scale;
-                                        if queued_stream_mesh_coords.insert(coord) {
-                                            pending_stream_mesh_coords.push(coord);
+                                        total_steps += 1;
+                                        local_steps += 1;
+                                        if local_steps >= 3 {
+                                            break;
                                         }
                                     }
+                                }
+                                if active_stepped {
+                                    stream_ref.persist_coord_state(active_stream_coord, &world);
                                 }
                             }
                         }
@@ -1252,12 +1306,37 @@ fn filtered_macro_residency_set(
 fn build_keep_stream_meshes(
     render_residency: &HashSet<[i32; 3]>,
     active_stream_coord: [i32; 3],
+    desired_coord: [i32; 3],
+    stream_mesh_hysteresis: &mut HashMap<[i32; 3], u8>,
 ) -> HashSet<[i32; 3]> {
     let mut keep_stream_meshes = render_residency.clone();
     for &coord in render_residency {
         for neighbor in WorldStream::neighbor_coords(coord) {
             keep_stream_meshes.insert(neighbor);
         }
+    }
+    for neighbor in WorldStream::neighbor_coords(desired_coord) {
+        keep_stream_meshes.insert(neighbor);
+    }
+
+    let mut stale = Vec::new();
+    for (coord, ttl) in stream_mesh_hysteresis.iter_mut() {
+        if keep_stream_meshes.contains(coord) {
+            *ttl = STREAM_MESH_HYSTERESIS_FRAMES;
+        } else if *ttl > 0 {
+            *ttl -= 1;
+            keep_stream_meshes.insert(*coord);
+        } else {
+            stale.push(*coord);
+        }
+    }
+    for coord in stale {
+        stream_mesh_hysteresis.remove(&coord);
+    }
+    for &coord in &keep_stream_meshes {
+        stream_mesh_hysteresis
+            .entry(coord)
+            .or_insert(STREAM_MESH_HYSTERESIS_FRAMES);
     }
     keep_stream_meshes.remove(&active_stream_coord);
     keep_stream_meshes
@@ -1266,9 +1345,50 @@ fn build_keep_stream_meshes(
 fn reprioritize_pending_stream_meshes(
     pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
     active_stream_coord: [i32; 3],
+    camera_forward: Vec3,
 ) {
-    pending_stream_mesh_coords
-        .sort_by_key(|coord| Reverse(macro_distance_sq(*coord, active_stream_coord)));
+    let fwd = camera_forward.normalize_or_zero();
+    pending_stream_mesh_coords.sort_by(|a, b| {
+        let ord = stream_mesh_priority(*b, active_stream_coord, fwd)
+            .partial_cmp(&stream_mesh_priority(*a, active_stream_coord, fwd))
+            .unwrap_or(Ordering::Equal);
+        if ord == Ordering::Equal {
+            macro_distance_sq(*b, active_stream_coord)
+                .cmp(&macro_distance_sq(*a, active_stream_coord))
+        } else {
+            ord
+        }
+    });
+}
+
+fn stream_mesh_priority(coord: [i32; 3], center: [i32; 3], camera_forward: Vec3) -> f32 {
+    let delta = Vec3::new(
+        (coord[0] - center[0]) as f32,
+        (coord[1] - center[1]) as f32,
+        (coord[2] - center[2]) as f32,
+    );
+    let dist = delta.length();
+    let dir = if dist > 0.0001 {
+        delta / dist
+    } else {
+        Vec3::ZERO
+    };
+    let forward_bias = dir.dot(camera_forward).max(0.0);
+    -dist + forward_bias * 1.5
+}
+
+fn queue_stream_mesh_rebuild(
+    coord: [i32; 3],
+    renderer: &mut Renderer,
+    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    pending_stream_mesh_versions: &mut HashMap<[i32; 3], u64>,
+) {
+    let version = renderer.request_stream_mesh_version(coord);
+    pending_stream_mesh_versions.insert(coord, version);
+    if queued_stream_mesh_coords.insert(coord) {
+        pending_stream_mesh_coords.push(coord);
+    }
 }
 
 fn sorted_residency_coords(center: [i32; 3], radius: i32, vertical_radius: i32) -> Vec<[i32; 3]> {
@@ -1314,15 +1434,19 @@ fn crossed_boundary_with_hysteresis(
 fn queue_stream_mesh_if_needed(
     coord: [i32; 3],
     stream: &WorldStream,
-    renderer: &Renderer,
+    renderer_mut: &mut Renderer,
     queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
     pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    pending_stream_mesh_versions: &mut HashMap<[i32; 3], u64>,
 ) {
-    if stream.state(coord) == ChunkResidency::Resident
-        && !renderer.has_stream_mesh(coord)
-        && queued_stream_mesh_coords.insert(coord)
-    {
-        pending_stream_mesh_coords.push(coord);
+    if stream.state(coord) == ChunkResidency::Resident && !renderer_mut.has_stream_mesh(coord) {
+        queue_stream_mesh_rebuild(
+            coord,
+            renderer_mut,
+            queued_stream_mesh_coords,
+            pending_stream_mesh_coords,
+            pending_stream_mesh_versions,
+        );
     }
 }
 
@@ -1350,13 +1474,14 @@ fn handoff_ready(
     true
 }
 
-fn handle_residency_change_for_meshing(
+fn handle_residency_change_for_meshing<F>(
     event: ResidencyChangeEvent,
     active_stream_coord: [i32; 3],
     world: &mut World,
-    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
-    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
-) {
+    mut enqueue_mesh: F,
+) where
+    F: FnMut([i32; 3]),
+{
     if event.old == event.new {
         return;
     }
@@ -1370,9 +1495,7 @@ fn handle_residency_change_for_meshing(
             }
             continue;
         }
-        if queued_stream_mesh_coords.insert(neighbor) {
-            pending_stream_mesh_coords.push(neighbor);
-        }
+        enqueue_mesh(neighbor);
     }
 }
 
@@ -2096,7 +2219,7 @@ mod tests {
     #[test]
     fn reprioritize_stream_mesh_queue_keeps_nearest_for_next_pop() {
         let mut pending = vec![[4, 0, 0], [1, 0, 0], [3, 0, 0], [0, 1, 0]];
-        reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0]);
+        reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0], Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(pending.pop(), Some([0, 1, 0]));
     }
     #[test]
@@ -2126,8 +2249,10 @@ mod tests {
             },
             [0, 0, 0],
             &mut world,
-            &mut pending,
-            &mut queued,
+            |coord| {
+                queued.insert(coord);
+                pending.push(coord);
+            },
         );
 
         assert!(pending.contains(&[2, 0, 0]));

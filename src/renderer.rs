@@ -77,6 +77,17 @@ pub struct ChunkMesh {
     aabb_max: Vec3,
 }
 
+struct PendingStreamMesh {
+    version: u64,
+    meshes: Vec<ChunkMesh>,
+}
+
+struct StreamMeshEntry {
+    active_version: u64,
+    active_meshes: Vec<ChunkMesh>,
+    pending: Option<PendingStreamMesh>,
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -89,7 +100,8 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
     meshes: HashMap<usize, ChunkMesh>,
-    streamed_meshes: HashMap<[i32; 3], Vec<ChunkMesh>>,
+    streamed_meshes: HashMap<[i32; 3], StreamMeshEntry>,
+    stream_mesh_versions: HashMap<[i32; 3], u64>,
     dirty_scan_cursor: usize,
     mesh_frame: u64,
     dirty_since_frame: HashMap<usize, u64>,
@@ -211,6 +223,7 @@ impl Renderer {
             depth_view,
             meshes: HashMap::new(),
             streamed_meshes: HashMap::new(),
+            stream_mesh_versions: HashMap::new(),
             dirty_scan_cursor: 0,
             mesh_frame: 0,
             dirty_since_frame: HashMap::new(),
@@ -306,9 +319,16 @@ impl Renderer {
         self.rebuild_dirty_chunks_with_budget(world, usize::MAX, [0, 0, 0]);
     }
 
+    pub fn request_stream_mesh_version(&mut self, coord: [i32; 3]) -> u64 {
+        let next = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0) + 1;
+        self.stream_mesh_versions.insert(coord, next);
+        next
+    }
+
     pub fn upsert_stream_mesh<F>(
         &mut self,
         coord: [i32; 3],
+        version: u64,
         world: &World,
         world_origin: [i32; 3],
         mut sample_global: F,
@@ -356,15 +376,44 @@ impl Renderer {
                 aabb_max,
             });
         }
-        self.streamed_meshes.insert(coord, meshes);
+        let expected = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0);
+        if version != expected {
+            return;
+        }
+        let entry = self
+            .streamed_meshes
+            .entry(coord)
+            .or_insert(StreamMeshEntry {
+                active_version: 0,
+                active_meshes: Vec::new(),
+                pending: None,
+            });
+        entry.pending = Some(PendingStreamMesh { version, meshes });
+        if let Some(pending) = entry.pending.take() {
+            entry.active_meshes = pending.meshes;
+            entry.active_version = pending.version;
+        }
     }
 
     pub fn prune_stream_meshes(&mut self, keep: &std::collections::HashSet<[i32; 3]>) {
         self.streamed_meshes.retain(|coord, _| keep.contains(coord));
+        self.stream_mesh_versions
+            .retain(|coord, _| keep.contains(coord));
     }
 
     pub fn has_stream_mesh(&self, coord: [i32; 3]) -> bool {
-        self.streamed_meshes.contains_key(&coord)
+        self.streamed_meshes
+            .get(&coord)
+            .map(|entry| !entry.active_meshes.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn stream_mesh_is_transitioning(&self, coord: [i32; 3]) -> bool {
+        let desired = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0);
+        self.streamed_meshes
+            .get(&coord)
+            .map(|entry| desired > entry.active_version)
+            .unwrap_or(desired > 0)
     }
 
     pub fn clear_mesh_cache(&mut self) {
@@ -392,8 +441,8 @@ impl Renderer {
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
-        for meshes in self.streamed_meshes.values() {
-            for mesh in meshes {
+        for entry in self.streamed_meshes.values() {
+            for mesh in &entry.active_meshes {
                 if !aabb_in_view(camera.view_proj(), mesh.aabb_min, mesh.aabb_max) {
                     continue;
                 }
