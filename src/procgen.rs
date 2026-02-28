@@ -46,7 +46,7 @@ pub struct ProcGenConfig {
 
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
-        let sea_level = 22.min(size as i32 - 8).max(12);
+        let sea_level = 18.min(size as i32 - 10).max(10);
         Self {
             dims: [size, size, size],
             world_origin: [0, 0, 0],
@@ -164,9 +164,12 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                 wx,
                 wz,
             ));
-            let shore_w = smoothstep((ocean - 0.22) / 0.35);
-            let coastal = shore_w > 0.18 && top_y <= config.sea_level + 3;
-            let river_bank = river > 0.48 && top_y <= config.sea_level + 3;
+            let slope = local_slope_heightmap(heights, world.dims[0], lx, lz);
+            let shore_w = smoothstep((ocean - 0.24) / 0.34);
+            let near_sea_band = top_y <= config.sea_level + 4;
+            let coastal = shore_w > 0.18 && near_sea_band;
+            let cliffy_coast = coastal && slope >= 3;
+            let river_bank = river > 0.48 && top_y <= config.sea_level + 2;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
             let sand_depth = if coastal {
                 (3.0 + shore_w * 4.0).round() as i32
@@ -180,7 +183,13 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     continue;
                 }
                 let block = if d == 0 {
-                    if coastal || river_bank || desert > 0.58 {
+                    if cliffy_coast {
+                        if top_y > config.sea_level + 2 {
+                            TURF
+                        } else {
+                            STONE
+                        }
+                    } else if coastal || river_bank || desert > 0.58 {
                         SAND
                     } else {
                         TURF
@@ -196,6 +205,24 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
             }
         }
     }
+}
+
+fn local_slope_heightmap(heights: &[i32], width: usize, x: i32, z: i32) -> i32 {
+    let depth = (heights.len() / width) as i32;
+    let center = heights[x as usize + z as usize * width];
+    let mut max_delta = 0;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            let nx = (x + dx).clamp(0, width as i32 - 1);
+            let nz = (z + dz).clamp(0, depth - 1);
+            let h = heights[nx as usize + nz as usize * width];
+            max_delta = max_delta.max((h - center).abs());
+        }
+    }
+    max_delta
 }
 
 fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
@@ -236,15 +263,13 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                     .round() as i32;
                 let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
-                let qualifies = surface <= sea_level + 1
+                let qualifies = surface <= sea_level
                     && ((lowland_neighbors >= 6 && lowland_area >= 0.62)
-                        || (ocean_w > 0.72 && lowland_area >= 0.5));
+                        || (ocean_w > 0.74 && lowland_area >= 0.52));
 
                 if qualifies {
                     for y in 1..floor {
-                        if world.get(lx, y, lz) == EMPTY {
-                            let _ = world.set(lx, y, lz, STONE);
-                        }
+                        let _ = world.set(lx, y, lz, STONE);
                     }
                     for y in floor..=sea_level {
                         let _ = world.set(lx, y, lz, WATER);
