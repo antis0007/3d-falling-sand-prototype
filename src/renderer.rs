@@ -213,7 +213,12 @@ impl Renderer {
         (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
     }
 
-    pub fn rebuild_dirty_chunks_with_budget(&mut self, world: &mut World, budget: usize) {
+    pub fn rebuild_dirty_chunks_with_budget(
+        &mut self,
+        world: &mut World,
+        budget: usize,
+        world_origin: [i32; 3],
+    ) {
         let budget = budget.max(1);
         let dirty_chunks: Vec<usize> = world
             .chunks
@@ -226,7 +231,10 @@ impl Renderer {
             .collect();
 
         for i in dirty_chunks {
-            let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, i, None);
+            let (verts, inds, aabb_min, aabb_max) =
+                mesh_chunk(world, i, world_origin, |local, _world| {
+                    world.get(local[0], local[1], local[2])
+                });
             if inds.is_empty() {
                 self.meshes.remove(&i);
                 world.chunks[i].dirty_mesh = false;
@@ -263,13 +271,28 @@ impl Renderer {
     }
 
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
-        self.rebuild_dirty_chunks_with_budget(world, usize::MAX);
+        self.rebuild_dirty_chunks_with_budget(world, usize::MAX, [0, 0, 0]);
     }
 
-    pub fn upsert_stream_mesh(&mut self, coord: [i32; 3], world: &World, world_origin: [i32; 3]) {
+    pub fn upsert_stream_mesh<F>(
+        &mut self,
+        coord: [i32; 3],
+        world: &World,
+        world_origin: [i32; 3],
+        mut sample_global: F,
+    ) where
+        F: FnMut([i32; 3]) -> MaterialId,
+    {
         let mut meshes = Vec::with_capacity(world.chunks.len());
         for idx in 0..world.chunks.len() {
-            let (verts, inds, aabb_min, aabb_max) = mesh_chunk(world, idx, Some(world_origin));
+            let (verts, inds, aabb_min, aabb_max) =
+                mesh_chunk(world, idx, world_origin, |local, global| {
+                    let local_id = world.get(local[0], local[1], local[2]);
+                    if local_id != EMPTY {
+                        return local_id;
+                    }
+                    sample_global(global)
+                });
             if inds.is_empty() {
                 continue;
             }
@@ -394,11 +417,15 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
     true
 }
 
-fn mesh_chunk(
+fn mesh_chunk<F>(
     world: &World,
     idx: usize,
-    world_origin: Option<[i32; 3]>,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+    world_origin: [i32; 3],
+    mut sample_voxel: F,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3)
+where
+    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
+{
     let cdx = world.chunks_dims[0];
     let cdy = world.chunks_dims[1];
     let cx = idx % cdx;
@@ -411,51 +438,68 @@ fn mesh_chunk(
     let ox = cx as i32 * CHUNK_SIZE as i32;
     let oy = cy as i32 * CHUNK_SIZE as i32;
     let oz = cz as i32 * CHUNK_SIZE as i32;
-    let origin = world_origin.unwrap_or([0, 0, 0]);
-
     for lz in 0..CHUNK_SIZE as i32 {
         for ly in 0..CHUNK_SIZE as i32 {
             for lx in 0..CHUNK_SIZE as i32 {
                 let local = [ox + lx, oy + ly, oz + lz];
-                let wx = origin[0] + local[0];
-                let wy = origin[1] + local[1];
-                let wz = origin[2] + local[2];
+                let world_p = [
+                    world_origin[0] + local[0],
+                    world_origin[1] + local[1],
+                    world_origin[2] + local[2],
+                ];
                 let id = chunk.get(lx as usize, ly as usize, lz as usize);
                 if id == EMPTY {
                     continue;
                 }
                 if matches!(id, BUSH_ID | GRASS_ID) {
-                    add_crossed_billboard(world, [wx, wy, wz], local, id, &mut verts, &mut inds);
+                    add_crossed_billboard(
+                        [local[0], local[1], local[2]],
+                        world_p,
+                        &mut sample_voxel,
+                        id,
+                        &mut verts,
+                        &mut inds,
+                    );
                     continue;
                 }
                 let color = material(id).color;
-                add_voxel_faces(world, [wx, wy, wz], local, id, color, &mut verts, &mut inds);
+                add_voxel_faces(
+                    [local[0], local[1], local[2]],
+                    world_p,
+                    &mut sample_voxel,
+                    id,
+                    color,
+                    &mut verts,
+                    &mut inds,
+                );
             }
         }
     }
 
     let min = Vec3::new(
-        (origin[0] + ox) as f32,
-        (origin[1] + oy) as f32,
-        (origin[2] + oz) as f32,
+        (world_origin[0] + ox) as f32,
+        (world_origin[1] + oy) as f32,
+        (world_origin[2] + oz) as f32,
     ) * VOXEL_SIZE;
     let max = Vec3::new(
-        (origin[0] + ox + CHUNK_SIZE as i32) as f32,
-        (origin[1] + oy + CHUNK_SIZE as i32) as f32,
-        (origin[2] + oz + CHUNK_SIZE as i32) as f32,
+        (world_origin[0] + ox + CHUNK_SIZE as i32) as f32,
+        (world_origin[1] + oy + CHUNK_SIZE as i32) as f32,
+        (world_origin[2] + oz + CHUNK_SIZE as i32) as f32,
     ) * VOXEL_SIZE;
     (verts, inds, min, max)
 }
 
-fn add_voxel_faces(
-    world: &World,
-    render_p: [i32; 3],
+fn add_voxel_faces<F>(
     local_p: [i32; 3],
+    world_p: [i32; 3],
+    sample_voxel: &mut F,
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
-) {
+) where
+    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
+{
     let dirs = [
         (
             [1, 0, 0],
@@ -489,10 +533,9 @@ fn add_voxel_faces(
         ),
     ];
     for (d, quad, shade) in dirs {
-        if is_face_occluded(
-            id,
-            world.get(local_p[0] + d[0], local_p[1] + d[1], local_p[2] + d[2]),
-        ) {
+        let local_neighbor = [local_p[0] + d[0], local_p[1] + d[1], local_p[2] + d[2]];
+        let world_neighbor = [world_p[0] + d[0], world_p[1] + d[1], world_p[2] + d[2]];
+        if is_face_occluded(id, sample_voxel(local_neighbor, world_neighbor)) {
             continue;
         }
         let b = verts.len() as u32;
@@ -501,9 +544,9 @@ fn add_voxel_faces(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (render_p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (render_p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (render_p[2] as f32 + v[2]) * VOXEL_SIZE,
+                    (world_p[0] as f32 + v[0]) * VOXEL_SIZE,
+                    (world_p[1] as f32 + v[1]) * VOXEL_SIZE,
+                    (world_p[2] as f32 + v[2]) * VOXEL_SIZE,
                 ],
                 color: shaded,
             });
@@ -546,15 +589,20 @@ fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] 
     [116, 103, 61, 255]
 }
 
-fn add_crossed_billboard(
-    world: &World,
-    render_p: [i32; 3],
+fn add_crossed_billboard<F>(
     local_p: [i32; 3],
+    world_p: [i32; 3],
+    sample_voxel: &mut F,
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
-) {
-    let above = world.get(local_p[0], local_p[1] + 1, local_p[2]);
+) where
+    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
+{
+    let above = sample_voxel(
+        [local_p[0], local_p[1] + 1, local_p[2]],
+        [world_p[0], world_p[1] + 1, world_p[2]],
+    );
     if above != EMPTY {
         return;
     }
@@ -587,9 +635,9 @@ fn add_crossed_billboard(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (render_p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (render_p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (render_p[2] as f32 + v[2]) * VOXEL_SIZE,
+                    (world_p[0] as f32 + v[0]) * VOXEL_SIZE,
+                    (world_p[1] as f32 + v[1]) * VOXEL_SIZE,
+                    (world_p[2] as f32 + v[2]) * VOXEL_SIZE,
                 ],
                 color,
             });
