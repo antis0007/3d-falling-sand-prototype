@@ -92,9 +92,21 @@ pub struct ProcGenConfig {
     pub world_origin: [i32; 3],
     pub seed: u64,
     pub sea_level: i32,
+    pub global_min_y: i32,
+    pub global_max_y: i32,
+    pub surface_band_center: i32,
+    pub deep_cave_start: i32,
+    pub sky_ceiling_start: i32,
     pub terrain_scale: f32,
     pub cave_density: f32,
     pub tree_density: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerticalStratum {
+    Deep,
+    Surface,
+    Sky,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +166,11 @@ impl ProcGenConfig {
             world_origin: [0, 0, 0],
             seed,
             sea_level,
+            global_min_y: -1024,
+            global_max_y: 1024,
+            surface_band_center: 0,
+            deep_cave_start: -64,
+            sky_ceiling_start: 160,
             terrain_scale: 1.0,
             cave_density: 0.13,
             tree_density: 0.012,
@@ -163,6 +180,24 @@ impl ProcGenConfig {
     pub fn with_origin(mut self, world_origin: [i32; 3]) -> Self {
         self.world_origin = world_origin;
         self
+    }
+
+    fn sea_level_world(self) -> i32 {
+        self.surface_band_center + self.sea_level
+    }
+
+    fn sea_level_local(self) -> i32 {
+        self.sea_level_world() - self.world_origin[1]
+    }
+
+    fn stratum_for_world_y(self, world_y: i32) -> VerticalStratum {
+        if world_y < self.deep_cave_start {
+            VerticalStratum::Deep
+        } else if world_y >= self.sky_ceiling_start {
+            VerticalStratum::Sky
+        } else {
+            VerticalStratum::Surface
+        }
     }
 }
 
@@ -285,7 +320,7 @@ fn build_column_cache(
                 col.wz,
             ));
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
-            let near_sea_band = col.surface_height <= config.sea_level + 4;
+            let near_sea_band = col.surface_height <= config.sea_level_local() + 4;
             col.slope = slope_at_world(config, col.wx, col.wz);
             col.coastal = shore_w > 0.18 && near_sea_band;
             col.river = river > 0.48;
@@ -346,7 +381,7 @@ fn build_hydrology_cache(
             let accum_norm = (flow_accum[idx].ln() / 5.0).clamp(0.0, 1.0);
             let ocean_biome = col.weights[biome_index(BiomeType::Ocean)];
             let coastal_low =
-                smoothstep((config.sea_level as f32 + 3.0 - heights[idx] as f32) / 7.0);
+                smoothstep((config.sea_level_local() as f32 + 3.0 - heights[idx] as f32) / 7.0);
             ocean_weight[idx] = (ocean_biome * 0.75 + coastal_low * 0.25).clamp(0.0, 1.0);
 
             let river_biome = col.weights[biome_index(BiomeType::River)].max(river_meander_signal(
@@ -410,14 +445,14 @@ fn build_hydrology_cache(
             for (rx, rz) in &region {
                 let idx = *rx as usize + *rz as usize * width;
                 let step_drop = (distance[idx] / 10) as i32;
-                let level = (config.sea_level - step_drop).min(heights[idx] - 1);
+                let level = (config.sea_level_local() - step_drop).min(heights[idx] - 1);
                 avg += level as f32;
             }
             let flat = (avg / region.len() as f32).round() as i32;
             for (rx, rz) in region {
                 let idx = rx as usize + rz as usize * width;
                 let step_drop = (distance[idx] / 10) as i32;
-                let ctrl = flat.min(config.sea_level - step_drop + 1);
+                let ctrl = flat.min(config.sea_level_local() - step_drop + 1);
                 river_level[idx] = Some(ctrl.min(heights[idx] - 1));
             }
         }
@@ -473,7 +508,7 @@ fn build_hydrology_cache(
         if spill == i32::MAX {
             continue;
         }
-        let level = (spill - 1).min(config.sea_level + 10);
+        let level = (spill - 1).min(config.sea_level_local() + 10);
         for &i in &cells {
             if heights[i] <= level {
                 lake_level[i] = Some(level);
@@ -491,16 +526,27 @@ fn build_hydrology_cache(
 
 fn base_terrain_pass(
     world: &mut World,
-    _config: &ProcGenConfig,
+    config: &ProcGenConfig,
     heights: &[i32],
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("base_terrain_pass");
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let h = heights[lx as usize + lz as usize * world.dims[0]];
-            for y in 0..=h {
-                let _ = world.set_raw_no_side_effects(lx, y, lz, STONE);
+            let surface_local = heights[lx as usize + lz as usize * world.dims[0]];
+            let surface_world = config.world_origin[1] + surface_local;
+            for ly in 0..world.dims[1] as i32 {
+                let world_y = config.world_origin[1] + ly;
+                if world_y < config.global_min_y || world_y > config.global_max_y {
+                    continue;
+                }
+                if world_y > surface_world {
+                    continue;
+                }
+                if config.stratum_for_world_y(world_y) == VerticalStratum::Sky {
+                    continue;
+                }
+                let _ = world.set_raw_no_side_effects(lx, ly, lz, STONE);
             }
         }
     }
@@ -517,7 +563,7 @@ fn cave_carve_pass(
     let surface_falloff_start = config.sea_level + 18;
     let max_y = world.dims[1] as i32 - 2;
     for lz in 0..world.dims[2] as i32 {
-        for ly in 4..max_y {
+        for ly in 2..max_y {
             for lx in 0..world.dims[0] as i32 {
                 if world.get(lx, ly, lz) == EMPTY {
                     continue;
@@ -525,9 +571,16 @@ fn cave_carve_pass(
                 let wx = config.world_origin[0] + lx;
                 let world_y = config.world_origin[1] + ly;
                 let wz = config.world_origin[2] + lz;
+                if wy < config.global_min_y || wy > config.global_max_y {
+                    continue;
+                }
+                let stratum = config.stratum_for_world_y(wy);
+                if stratum == VerticalStratum::Sky {
+                    continue;
+                }
                 let col = &columns[lx as usize + lz as usize * world.dims[0]];
-                let top = col.surface_height.clamp(6, world.dims[1] as i32 - 4);
-                if ly >= top - 4 {
+                let top_world = config.world_origin[1] + col.surface_height;
+                if wy >= top_world - 4 {
                     continue;
                 }
                 let depth_profile = smoothstep(((deep_cave_start - world_y) as f32) / 26.0);
@@ -598,7 +651,7 @@ fn surface_layering_pass(
             let weights = col.weights;
 
             let desert = weights[biome_index(BiomeType::Desert)];
-            let desert_surface = if top_y <= config.sea_level {
+            let desert_surface = if top_y <= config.sea_level_local() {
                 0.0
             } else {
                 desert
@@ -626,7 +679,7 @@ fn surface_layering_pass(
                     .clamp(0.0, 1.0);
                 let rock_bias = (highlands * 0.75 + slope * 0.12).clamp(0.0, 1.0);
                 let block = if d == 0 {
-                    if rock_bias > 0.62 && top_y > config.sea_level + 4 {
+                    if rock_bias > 0.62 && top_y > config.sea_level_local() + 4 {
                         STONE
                     } else if sand_bias > 0.50 {
                         SAND
@@ -669,7 +722,7 @@ fn shoreline_transition_pass(
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("shoreline_transition_pass");
-    let sea = config.sea_level;
+    let sea = config.sea_level_local();
     for lz in 1..world.dims[2] as i32 - 1 {
         for lx in 1..world.dims[0] as i32 - 1 {
             let col = &columns[lx as usize + lz as usize * world.dims[0]];
@@ -742,7 +795,7 @@ fn biome_water_pass(
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("basin_filling");
-    let sea_level = config.sea_level;
+    let sea_level = config.sea_level_local();
     let heights = build_surface_heightmap_from_world(world);
     let width = world.dims[0];
     let depth = world.dims[2];
@@ -879,7 +932,7 @@ fn enforce_subsea_materials_pass(
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("enforce_subsea_materials_pass");
-    let sea = config.sea_level;
+    let sea = config.sea_level_local();
     for z in 0..world.dims[2] as i32 {
         for x in 0..world.dims[0] as i32 {
             for y in 1..=sea.min(world.dims[1] as i32 - 2) {
@@ -1025,9 +1078,11 @@ fn sampled_surface_height(
     }
     let w0 = cached_weights.unwrap_or_else(|| biome_weights(config.seed, x, z));
     let raw = terrain_height(config, x, z, w0) as f32;
-    (raw * 0.6 + (sum / n) * 0.4)
+    let world_surface = (raw * 0.6 + (sum / n) * 0.4)
         .round()
-        .clamp(6.0, (config.dims[1] as i32 - 4) as f32) as i32
+        .clamp(config.global_min_y as f32, config.global_max_y as f32)
+        as i32;
+    world_surface - config.world_origin[1]
 }
 
 fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_COUNT]) -> i32 {
@@ -1066,7 +1121,8 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     let rough = (ridge - 0.5) * (8.5 + biome_amp * 0.32);
     let micro = (detail - 0.5) * (2.8 + biome_rough * 8.0);
 
-    let mut inland = config.sea_level as f32 + broad + rough + micro;
+    let sea_level_world = config.sea_level_world() as f32;
+    let mut inland = sea_level_world + broad + rough + micro;
     inland += highlands * 9.0;
     inland += forest * 1.6;
     inland += desert * 0.8;
@@ -1084,16 +1140,16 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
         3,
     ) - 0.5)
         * 3.0;
-    let ocean_floor_target = config.sea_level as f32 - 11.0 + ocean_depth_shape;
+    let ocean_floor_target = sea_level_world - 11.0 + ocean_depth_shape;
     let coast_w = smoothstep((ocean_w - 0.58) / 0.28);
-    let coast_target = config.sea_level as f32 - 1.0;
+    let coast_target = sea_level_world - 1.0;
 
     let mut h = inland;
     h = h * (1.0 - ocean_w * 0.74) + ocean_floor_target * ocean_w * 0.74;
     h = h * (1.0 - coast_w * 0.24) + coast_target * coast_w * 0.24;
 
     if ocean_w > 0.76 {
-        h = h.min(config.sea_level as f32 - 1.0);
+        h = h.min(sea_level_world - 1.0);
     }
 
     h.round() as i32

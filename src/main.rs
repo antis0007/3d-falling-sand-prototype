@@ -7,6 +7,7 @@ mod sim;
 mod streaming_manager;
 mod ui;
 mod world;
+mod world_bounds;
 mod world_manager;
 mod world_stream;
 
