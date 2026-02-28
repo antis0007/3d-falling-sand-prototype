@@ -3,7 +3,9 @@ use crate::player::{
     camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
-use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
+use crate::procgen::{
+    biome_hint_at_world, find_safe_spawn, generate_world_cancellable, ProcGenConfig,
+};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
 use crate::ui::{
@@ -16,8 +18,11 @@ use crate::world::{
 };
 use anyhow::Context;
 use glam::Vec3;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
@@ -48,20 +53,92 @@ struct RaycastResult {
     place: [i32; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcgenPriority {
+    Prefetch,
+    Urgent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcgenJobStatus {
+    Queued,
+    InFlight,
+    Ready,
+    Cancelled,
+}
+
 #[derive(Clone, Copy)]
 struct ProcgenJobSpec {
-    generation_id: u64,
     config: ProcGenConfig,
     prefer_safe_spawn: bool,
     target_global_pos: [i32; 3],
+    priority: ProcgenPriority,
+    epoch: u64,
 }
 
 struct ProcgenJobResult {
-    generation_id: u64,
+    key: [i32; 3],
+    epoch: u64,
     config: ProcGenConfig,
-    world: World,
+    world: Option<World>,
     prefer_safe_spawn: bool,
     target_global_pos: [i32; 3],
+    status: ProcgenJobStatus,
+}
+
+#[derive(Clone)]
+struct ProcgenJobSystem {
+    shared: Arc<(Mutex<ProcgenQueueState>, Condvar)>,
+    epoch: Arc<AtomicU64>,
+}
+
+struct ProcgenQueueState {
+    queue: BinaryHeap<QueuedProcgenJob>,
+    queued_keys: HashSet<[i32; 3]>,
+    in_flight: HashSet<[i32; 3]>,
+    statuses: HashMap<[i32; 3], ProcgenJobStatus>,
+    queued_limit: usize,
+}
+
+#[derive(Clone, Copy)]
+struct QueuedProcgenJob {
+    spec: ProcgenJobSpec,
+    seq: u64,
+}
+
+impl PartialEq for QueuedProcgenJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq
+    }
+}
+
+impl Eq for QueuedProcgenJob {}
+
+impl PartialOrd for QueuedProcgenJob {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QueuedProcgenJob {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.spec
+            .priority
+            .cmp(&other.spec.priority)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl Ord for ProcgenPriority {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (*self as u8).cmp(&(*other as u8))
+    }
+}
+
+impl PartialOrd for ProcgenPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -95,10 +172,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut active_procgen_origin: [i32; 3] = [0, 0, 0];
     let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
         mpsc::channel();
-    let mut requested_procgen_id: Option<u64> = None;
-    let mut requested_procgen_origin: Option<[i32; 3]> = None;
-    let mut next_procgen_id: u64 = 1;
+    let procgen_jobs = ProcgenJobSystem::new(procgen_tx, 2, 12);
     let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
+    let mut residency_plan: BTreeSet<[i32; 3]> = BTreeSet::new();
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -326,11 +402,19 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
 
                         while let Ok(result) = procgen_rx.try_recv() {
-                            if requested_procgen_id != Some(result.generation_id) {
+                            procgen_jobs.record_result_status(&result);
+                            if result.status != ProcgenJobStatus::Ready {
                                 continue;
                             }
-                            requested_procgen_id = None;
-                            requested_procgen_origin = None;
+                            if result.epoch != procgen_jobs.current_epoch() {
+                                continue;
+                            }
+                            if !residency_plan.contains(&result.key) {
+                                continue;
+                            }
+                            let Some(incoming_world) = result.world else {
+                                continue;
+                            };
 
                             let previous_origin = active_procgen_origin;
                             let frac_x = ctrl.position.x - ctrl.position.x.floor();
@@ -345,7 +429,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 result.target_global_pos
                             };
 
-                            let incoming_world = result.world;
                             let chosen_world = if let Some(existing) =
                                 generated_regions.get(&result.config.world_origin)
                             {
@@ -356,24 +439,22 @@ pub async fn run() -> anyhow::Result<()> {
                             generated_regions
                                 .entry(result.config.world_origin)
                                 .or_insert_with(|| incoming_world.clone());
-                            prune_generated_regions(
-                                &mut generated_regions,
-                                result.config.world_origin,
-                                PROCEDURAL_MACROCHUNK_SIZE,
-                                PROCEDURAL_RENDER_DISTANCE_MACROS,
-                            );
-                            active_procgen = Some(result.config);
-                            active_procgen_origin = result.config.world_origin;
-                            world = chosen_world;
-                            if result.prefer_safe_spawn {
-                                let spawn = find_safe_spawn(&world, result.config.seed);
-                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
-                            } else {
-                                ctrl.position = Vec3::new(
-                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + frac_x,
-                                    ctrl.position.y,
-                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + frac_z,
-                                );
+                            if result.key == active_procgen_origin || active_procgen.is_none() {
+                                active_procgen = Some(result.config);
+                                active_procgen_origin = result.config.world_origin;
+                                world = chosen_world;
+                                if result.prefer_safe_spawn {
+                                    let spawn = find_safe_spawn(&world, result.config.seed);
+                                    ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                                } else {
+                                    ctrl.position = Vec3::new(
+                                        (tracked_global[0] - active_procgen_origin[0]) as f32
+                                            + frac_x,
+                                        ctrl.position.y,
+                                        (tracked_global[2] - active_procgen_origin[2]) as f32
+                                            + frac_z,
+                                    );
+                                }
                             }
                         }
 
@@ -388,89 +469,57 @@ pub async fn run() -> anyhow::Result<()> {
                                 0,
                                 floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
                             ];
-                            let origin_macro = [
-                                floor_div(active_procgen_origin[0], PROCEDURAL_MACROCHUNK_SIZE),
-                                floor_div(active_procgen_origin[2], PROCEDURAL_MACROCHUNK_SIZE),
-                            ];
-                            let center_macro = [
-                                origin_macro[0] + PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                origin_macro[1] + PROCEDURAL_RENDER_DISTANCE_MACROS,
-                            ];
-                            let outside_inner_band = (player_macro[0] - center_macro[0]).abs() > 1
-                                || (player_macro[2] - center_macro[1]).abs() > 1;
-                            let desired_origin = if outside_inner_band {
-                                [
-                                    (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
-                                        * PROCEDURAL_MACROCHUNK_SIZE,
-                                    0,
-                                    (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
-                                        * PROCEDURAL_MACROCHUNK_SIZE,
-                                ]
-                            } else {
-                                active_procgen_origin
-                            };
-                            if desired_origin != active_procgen_origin
-                                && requested_procgen_id.is_none()
-                                && requested_procgen_origin != Some(desired_origin)
-                            {
+                            let desired_origin = desired_active_origin(
+                                active_procgen_origin,
+                                player_macro,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
+                            residency_plan = desired_residency_origins(
+                                player_macro,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
+                            procgen_jobs.cancel_unplanned(&residency_plan);
+
+                            if desired_origin != active_procgen_origin {
                                 generated_regions.insert(active_procgen_origin, world.clone());
                                 if let Some(cached) = generated_regions.get(&desired_origin) {
                                     active_procgen_origin = desired_origin;
                                     active_procgen = Some(cfg.with_origin(desired_origin));
                                     world = cached.clone();
-                                    prune_generated_regions(
-                                        &mut generated_regions,
-                                        desired_origin,
-                                        PROCEDURAL_MACROCHUNK_SIZE,
-                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                    );
-                                    let frac_x = ctrl.position.x - ctrl.position.x.floor();
-                                    let frac_z = ctrl.position.z - ctrl.position.z.floor();
-                                    ctrl.position = Vec3::new(
-                                        (global[0] - active_procgen_origin[0]) as f32 + frac_x,
-                                        ctrl.position.y,
-                                        (global[2] - active_procgen_origin[2]) as f32 + frac_z,
-                                    );
                                 } else {
-                                    let next_cfg = cfg.with_origin(desired_origin);
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
-                                        config: next_cfg,
+                                    procgen_jobs.enqueue(ProcgenJobSpec {
+                                        config: cfg.with_origin(desired_origin),
                                         prefer_safe_spawn: false,
                                         target_global_pos: global,
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    requested_procgen_origin = Some(spec.config.world_origin);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                        priority: ProcgenPriority::Urgent,
+                                        epoch: procgen_jobs.current_epoch(),
+                                    });
                                 }
                             }
 
-                            if requested_procgen_id.is_none() {
-                                if let Some(prefetch_origin) = next_missing_region_origin(
-                                    &generated_regions,
-                                    active_procgen_origin,
-                                    player_macro,
-                                    PROCEDURAL_MACROCHUNK_SIZE,
-                                    PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                ) {
-                                    if requested_procgen_origin == Some(prefetch_origin) {
-                                        // avoid reloading the same region repeatedly
-                                    } else {
-                                        let next_cfg = cfg.with_origin(prefetch_origin);
-                                        let spec = ProcgenJobSpec {
-                                            generation_id: next_procgen_id,
-                                            config: next_cfg,
-                                            prefer_safe_spawn: false,
-                                            target_global_pos: global,
-                                        };
-                                        next_procgen_id = next_procgen_id.wrapping_add(1);
-                                        requested_procgen_id = Some(spec.generation_id);
-                                        requested_procgen_origin = Some(spec.config.world_origin);
-                                        queue_procgen_job(&procgen_tx, spec);
-                                    }
-                                }
+                            if let Some(prefetch_origin) = next_missing_region_origin(
+                                &generated_regions,
+                                active_procgen_origin,
+                                player_macro,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            ) {
+                                procgen_jobs.enqueue(ProcgenJobSpec {
+                                    config: cfg.with_origin(prefetch_origin),
+                                    prefer_safe_spawn: false,
+                                    target_global_pos: global,
+                                    priority: ProcgenPriority::Prefetch,
+                                    epoch: procgen_jobs.current_epoch(),
+                                });
                             }
+                            prune_generated_regions(
+                                &mut generated_regions,
+                                active_procgen_origin,
+                                PROCEDURAL_MACROCHUNK_SIZE,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
                         }
 
                         renderer.rebuild_dirty_chunks(&mut world);
@@ -481,7 +530,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 active_procgen_origin[0] + ctrl.position.x.floor() as i32,
                                 active_procgen_origin[2] + ctrl.position.z.floor() as i32,
                             );
-                            if requested_procgen_id.is_some() {
+                            let status = procgen_jobs.status_for(active_procgen_origin);
+                            if matches!(
+                                status,
+                                Some(ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight)
+                            ) {
                                 format!("Biome: {} (generating...)", biome.label())
                             } else {
                                 format!("Biome: {}", biome.label())
@@ -533,21 +586,21 @@ pub async fn run() -> anyhow::Result<()> {
                                     ];
                                     let config = ProcGenConfig::for_size(proc_size, seed)
                                         .with_origin(active_procgen_origin);
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
+                                    procgen_jobs.bump_epoch();
+                                    active_procgen = Some(config);
+                                    residency_plan.clear();
+                                    residency_plan.insert(active_procgen_origin);
+                                    procgen_jobs.enqueue(ProcgenJobSpec {
                                         config,
                                         prefer_safe_spawn: true,
                                         target_global_pos: [0, 0, 0],
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    requested_procgen_origin = Some(spec.config.world_origin);
-                                    active_procgen = Some(config);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                        priority: ProcgenPriority::Urgent,
+                                        epoch: procgen_jobs.current_epoch(),
+                                    });
                                 } else {
-                                    requested_procgen_id = None;
-                                    requested_procgen_origin = None;
+                                    procgen_jobs.bump_epoch();
                                     generated_regions.clear();
+                                    residency_plan.clear();
                                     active_procgen = None;
                                     active_procgen_origin = [0, 0, 0];
                                     world = World::new([n, n, n]);
@@ -565,9 +618,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
-                                        requested_procgen_id = None;
-                                        requested_procgen_origin = None;
+                                        procgen_jobs.bump_epoch();
                                         generated_regions.clear();
+                                        residency_plan.clear();
                                         active_procgen = None;
                                         active_procgen_origin = [0, 0, 0];
                                         let spawn = find_safe_spawn(&world, 1);
@@ -717,18 +770,195 @@ fn texture_for_active_tool(
     Some((texture.texture.id(), texture.size))
 }
 
-fn queue_procgen_job(tx: &Sender<ProcgenJobResult>, spec: ProcgenJobSpec) {
-    let tx = tx.clone();
-    std::thread::spawn(move || {
-        let world = generate_world(spec.config);
-        let _ = tx.send(ProcgenJobResult {
-            generation_id: spec.generation_id,
-            config: spec.config,
-            world,
-            prefer_safe_spawn: spec.prefer_safe_spawn,
-            target_global_pos: spec.target_global_pos,
-        });
-    });
+impl ProcgenJobSystem {
+    fn new(result_tx: Sender<ProcgenJobResult>, workers: usize, queued_limit: usize) -> Self {
+        let shared = Arc::new((
+            Mutex::new(ProcgenQueueState {
+                queue: BinaryHeap::new(),
+                queued_keys: HashSet::new(),
+                in_flight: HashSet::new(),
+                statuses: HashMap::new(),
+                queued_limit,
+            }),
+            Condvar::new(),
+        ));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let seq = Arc::new(AtomicU64::new(1));
+        for _ in 0..workers.max(1) {
+            let shared_c = shared.clone();
+            let tx_c = result_tx.clone();
+            let epoch_c = epoch.clone();
+            let seq_c = seq.clone();
+            std::thread::spawn(move || loop {
+                let spec = {
+                    let (lock, cv) = &*shared_c;
+                    let mut st = lock.lock().expect("procgen queue lock poisoned");
+                    while st.queue.is_empty() {
+                        st = cv.wait(st).expect("procgen queue wait poisoned");
+                    }
+                    let job = st.queue.pop().expect("queue not empty");
+                    let key = job.spec.config.world_origin;
+                    st.queued_keys.remove(&key);
+                    st.in_flight.insert(key);
+                    st.statuses.insert(key, ProcgenJobStatus::InFlight);
+                    job.spec
+                };
+                let key = spec.config.world_origin;
+                let should_cancel = || epoch_c.load(AtomicOrdering::Relaxed) != spec.epoch;
+                let world = generate_world_cancellable(spec.config, &should_cancel);
+                let status = if world.is_some() {
+                    ProcgenJobStatus::Ready
+                } else {
+                    ProcgenJobStatus::Cancelled
+                };
+                let _ = tx_c.send(ProcgenJobResult {
+                    key,
+                    epoch: spec.epoch,
+                    config: spec.config,
+                    world,
+                    prefer_safe_spawn: spec.prefer_safe_spawn,
+                    target_global_pos: spec.target_global_pos,
+                    status,
+                });
+                let (lock, _) = &*shared_c;
+                let mut st = lock.lock().expect("procgen queue lock poisoned");
+                st.in_flight.remove(&key);
+                st.statuses.insert(key, status);
+                let _ = seq_c.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+        }
+        Self { shared, epoch }
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(AtomicOrdering::Relaxed)
+    }
+
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, AtomicOrdering::Relaxed);
+        let (lock, _) = &*self.shared;
+        let mut st = lock.lock().expect("procgen queue lock poisoned");
+        st.queue.clear();
+        st.queued_keys.clear();
+        for status in st.statuses.values_mut() {
+            if matches!(
+                *status,
+                ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight
+            ) {
+                *status = ProcgenJobStatus::Cancelled;
+            }
+        }
+    }
+
+    fn enqueue(&self, spec: ProcgenJobSpec) -> ProcgenJobStatus {
+        let key = spec.config.world_origin;
+        let (lock, cv) = &*self.shared;
+        let mut st = lock.lock().expect("procgen queue lock poisoned");
+        if st.queued_keys.contains(&key) || st.in_flight.contains(&key) {
+            return *st.statuses.get(&key).unwrap_or(&ProcgenJobStatus::Queued);
+        }
+        if st.queue.len() >= st.queued_limit {
+            if spec.priority == ProcgenPriority::Prefetch {
+                st.statuses.insert(key, ProcgenJobStatus::Cancelled);
+                return ProcgenJobStatus::Cancelled;
+            }
+            let mut drained = Vec::new();
+            while let Some(job) = st.queue.pop() {
+                if job.spec.priority == ProcgenPriority::Prefetch {
+                    st.queued_keys.remove(&job.spec.config.world_origin);
+                    st.statuses
+                        .insert(job.spec.config.world_origin, ProcgenJobStatus::Cancelled);
+                    break;
+                }
+                drained.push(job);
+            }
+            for job in drained {
+                st.queue.push(job);
+            }
+            if st.queue.len() >= st.queued_limit {
+                st.statuses.insert(key, ProcgenJobStatus::Cancelled);
+                return ProcgenJobStatus::Cancelled;
+            }
+        }
+        let seq = st.statuses.len() as u64 + st.queue.len() as u64 + 1;
+        st.queue.push(QueuedProcgenJob { spec, seq });
+        st.queued_keys.insert(key);
+        st.statuses.insert(key, ProcgenJobStatus::Queued);
+        cv.notify_one();
+        ProcgenJobStatus::Queued
+    }
+
+    fn cancel_unplanned(&self, plan: &BTreeSet<[i32; 3]>) {
+        let (lock, _) = &*self.shared;
+        let mut st = lock.lock().expect("procgen queue lock poisoned");
+        st.queue
+            .retain(|job| plan.contains(&job.spec.config.world_origin));
+        st.queued_keys.retain(|key| plan.contains(key));
+        for (key, status) in st.statuses.iter_mut() {
+            if !plan.contains(key) && matches!(*status, ProcgenJobStatus::Queued) {
+                *status = ProcgenJobStatus::Cancelled;
+            }
+        }
+    }
+
+    fn status_for(&self, key: [i32; 3]) -> Option<ProcgenJobStatus> {
+        let (lock, _) = &*self.shared;
+        let st = lock.lock().expect("procgen queue lock poisoned");
+        st.statuses.get(&key).copied()
+    }
+
+    fn record_result_status(&self, result: &ProcgenJobResult) {
+        let (lock, _) = &*self.shared;
+        let mut st = lock.lock().expect("procgen queue lock poisoned");
+        st.statuses.insert(result.key, result.status);
+    }
+}
+
+fn desired_active_origin(
+    active_procgen_origin: [i32; 3],
+    player_macro: [i32; 3],
+    macro_size: i32,
+    render_distance_macros: i32,
+) -> [i32; 3] {
+    let origin_macro = [
+        floor_div(active_procgen_origin[0], macro_size),
+        floor_div(active_procgen_origin[2], macro_size),
+    ];
+    let center_macro = [
+        origin_macro[0] + render_distance_macros,
+        origin_macro[1] + render_distance_macros,
+    ];
+    let outside_inner_band = (player_macro[0] - center_macro[0]).abs() > 1
+        || (player_macro[2] - center_macro[1]).abs() > 1;
+    if outside_inner_band {
+        [
+            (player_macro[0] - render_distance_macros) * macro_size,
+            0,
+            (player_macro[2] - render_distance_macros) * macro_size,
+        ]
+    } else {
+        active_procgen_origin
+    }
+}
+
+fn desired_residency_origins(
+    player_macro: [i32; 3],
+    macro_size: i32,
+    render_distance_macros: i32,
+) -> BTreeSet<[i32; 3]> {
+    let mut out = BTreeSet::new();
+    let center_x = player_macro[0] - render_distance_macros;
+    let center_z = player_macro[2] - render_distance_macros;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            out.insert([
+                (center_x + dx) * macro_size,
+                0,
+                (center_z + dz) * macro_size,
+            ]);
+        }
+    }
+    out
 }
 
 fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {
