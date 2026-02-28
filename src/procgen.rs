@@ -72,19 +72,50 @@ impl ProcGenConfig {
 }
 
 pub fn generate_world(config: ProcGenConfig) -> World {
+    generate_world_cancellable(config, &|| false).expect("procgen cancellation is disabled")
+}
+
+pub fn generate_world_cancellable(
+    config: ProcGenConfig,
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<World> {
+    if should_cancel() {
+        return None;
+    }
     let mut world = World::new(config.dims);
     world.clear();
     let heights = build_heightmap(&config);
 
+    if should_cancel() {
+        return None;
+    }
     base_terrain_pass(&mut world, &config, &heights);
+    if should_cancel() {
+        return None;
+    }
     cave_carve_pass(&mut world, &config);
+    if should_cancel() {
+        return None;
+    }
     surface_layering_pass(&mut world, &config, &heights);
+    if should_cancel() {
+        return None;
+    }
     shoreline_transition_pass(&mut world, &config, &heights);
+    if should_cancel() {
+        return None;
+    }
     biome_water_pass(&mut world, &config);
+    if should_cancel() {
+        return None;
+    }
     enforce_subsea_materials_pass(&mut world, &config);
+    if should_cancel() {
+        return None;
+    }
     vegetation_pass(&mut world, &config);
 
-    world
+    Some(world)
 }
 
 pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
