@@ -216,15 +216,26 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                 && lowland_neighbors >= 6
                 && lowland_area >= 0.62
             {
-                let target_depth = 10;
+                let depth_variation = ((fbm2(
+                    config.seed ^ 0x0CEA_0010,
+                    wx as f32 * 0.0032,
+                    wz as f32 * 0.0032,
+                    3,
+                ) - 0.5)
+                    * 3.0)
+                    .round() as i32;
+                let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
-                for y in floor..=sea_level {
+
+                for y in 1..floor {
                     if world.get(lx, y, lz) == EMPTY {
-                        let _ = world.set(lx, y, lz, WATER);
+                        let _ = world.set(lx, y, lz, STONE);
                     }
                 }
-                let shore_depth = if surface < sea_level - 5 { 2 } else { 1 };
-                for y in (floor - shore_depth).max(1)..floor {
+                for y in floor..=sea_level {
+                    let _ = world.set(lx, y, lz, WATER);
+                }
+                for y in (floor - 2).max(1)..floor {
                     let _ = world.set(lx, y, lz, SAND);
                 }
                 continue;
@@ -470,7 +481,21 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 5]) -> 
     h += weights[biome_index(BiomeType::Desert)] * 1.3;
     h -= bank_lower;
     h -= weights[biome_index(BiomeType::Lake)] * 3.2;
+
+    let ocean_depth_shape = (fbm2(
+        config.seed ^ 0x0CEA_0001,
+        x as f32 * 0.003,
+        z as f32 * 0.003,
+        3,
+    ) - 0.5)
+        * 3.0;
+    let ocean_floor_target = config.sea_level as f32 - 12.0 + ocean_depth_shape;
     h = h * (1.0 - ocean_w * 0.55) + (config.sea_level as f32 - 6.0) * ocean_w * 0.55;
+    h = h * (1.0 - ocean_w * 0.85) + ocean_floor_target * ocean_w * 0.85;
+
+    if ocean_w > 0.65 {
+        h = h.min(config.sea_level as f32 - 2.0);
+    }
 
     h.round() as i32
 }
