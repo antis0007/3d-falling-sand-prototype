@@ -329,6 +329,18 @@ pub async fn run() -> anyhow::Result<()> {
                                 continue;
                             }
                             requested_procgen_id = None;
+
+                            let previous_origin = active_procgen_origin;
+                            let tracked_global = if active_procgen.is_some() {
+                                [
+                                    previous_origin[0] + ctrl.position.x.floor() as i32,
+                                    0,
+                                    previous_origin[2] + ctrl.position.z.floor() as i32,
+                                ]
+                            } else {
+                                result.target_global_pos
+                            };
+
                             let incoming_world = result.world;
                             generated_regions
                                 .insert(result.config.world_origin, incoming_world.clone());
@@ -346,11 +358,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                             } else {
                                 ctrl.position = Vec3::new(
-                                    (result.target_global_pos[0] - active_procgen_origin[0]) as f32
-                                        + 0.5,
+                                    (tracked_global[0] - active_procgen_origin[0]) as f32 + 0.5,
                                     ctrl.position.y,
-                                    (result.target_global_pos[2] - active_procgen_origin[2]) as f32
-                                        + 0.5,
+                                    (tracked_global[2] - active_procgen_origin[2]) as f32 + 0.5,
                                 );
                             }
                         }

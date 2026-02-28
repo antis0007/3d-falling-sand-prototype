@@ -89,23 +89,8 @@ fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
         for x in 0..config.dims[0] as i32 {
             let wx = config.world_origin[0] + x;
             let wz = config.world_origin[2] + z;
-            let mut sum = 0.0;
-            let mut n = 0.0;
-            for dz in -1..=1 {
-                for dx in -1..=1 {
-                    let sx = wx + dx;
-                    let sz = wz + dz;
-                    let w = biome_weights(config.seed, sx, sz);
-                    sum += terrain_height(config, sx, sz, w) as f32;
-                    n += 1.0;
-                }
-            }
-            let w0 = biome_weights(config.seed, wx, wz);
-            let raw = terrain_height(config, wx, wz, w0) as f32;
-            let h = (raw * 0.6 + (sum / n) * 0.4)
-                .round()
-                .clamp(6.0, (config.dims[1] as i32 - 4) as f32) as i32;
-            heights[x as usize + z as usize * config.dims[0]] = h;
+            heights[x as usize + z as usize * config.dims[0]] =
+                sampled_surface_height(config, wx, wz);
         }
     }
     heights
@@ -209,8 +194,8 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
 
 fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
     let sea_level = config.sea_level;
-    for lz in 1..world.dims[2] as i32 - 1 {
-        for lx in 1..world.dims[0] as i32 - 1 {
+    for lz in 0..world.dims[2] as i32 {
+        for lx in 0..world.dims[0] as i32 {
             let wx = config.world_origin[0] + lx;
             let wz = config.world_origin[2] + lz;
             let weights = biome_weights(config.seed, wx, wz);
@@ -223,15 +208,23 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
             let lake_w = weights[biome_index(BiomeType::Lake)];
             let surface = heights[lx as usize + lz as usize * world.dims[0]];
 
-            let lowland_neighbors =
-                count_neighbors_below_heightmap(heights, world.dims[0], lx, lz, sea_level - 1);
-            if ocean_w > 0.42 && surface <= sea_level - 1 && lowland_neighbors >= 4 {
-                for y in (sea_level - 12).max(2)..=sea_level {
+            let lowland_neighbors = count_neighbors_below_world(config, wx, wz, sea_level - 1);
+            let lowland_area = local_lowland_fraction(config, wx, wz, sea_level - 1, 3);
+            let ocean_dominant = ocean_w > 0.52;
+            if ocean_dominant
+                && surface <= sea_level - 2
+                && lowland_neighbors >= 6
+                && lowland_area >= 0.62
+            {
+                let target_depth = 10;
+                let floor = (sea_level - target_depth).max(2);
+                for y in floor..=sea_level {
                     if world.get(lx, y, lz) == EMPTY {
                         let _ = world.set(lx, y, lz, WATER);
                     }
                 }
-                for y in (sea_level - 13).max(1)..=(sea_level - 12).max(1) {
+                let shore_depth = if surface < sea_level - 5 { 2 } else { 1 };
+                for y in (floor - shore_depth).max(1)..floor {
                     let _ = world.set(lx, y, lz, SAND);
                 }
                 continue;
@@ -244,8 +237,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
 
             let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let neigh_min =
-                neighbor_min_surface_heightmap(heights, world.dims[0], lx, lz).unwrap_or(surface);
+            let neigh_min = neighbor_min_surface_world(config, wx, wz).unwrap_or(surface);
             let top = (surface - 1).min(sea_level - 1).min(neigh_min - 1);
             if top < floor {
                 continue;
@@ -266,26 +258,15 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
     }
 }
 
-fn count_neighbors_below_heightmap(
-    heights: &[i32],
-    width: usize,
-    x: i32,
-    z: i32,
-    max_height: i32,
-) -> i32 {
+fn count_neighbors_below_world(config: &ProcGenConfig, x: i32, z: i32, max_height: i32) -> i32 {
     let mut count = 0;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            let nx = x + dx;
-            let nz = z + dz;
-            if nx < 0 || nz < 0 || nx >= width as i32 || nz >= (heights.len() / width) as i32 {
-                continue;
-            }
-            let idx = nx as usize + nz as usize * width;
-            if heights[idx] <= max_height {
+            let h = sampled_surface_height(config, x + dx, z + dz);
+            if h <= max_height {
                 count += 1;
             }
         }
@@ -293,20 +274,35 @@ fn count_neighbors_below_heightmap(
     count
 }
 
-fn neighbor_min_surface_heightmap(heights: &[i32], width: usize, x: i32, z: i32) -> Option<i32> {
+fn local_lowland_fraction(
+    config: &ProcGenConfig,
+    x: i32,
+    z: i32,
+    max_height: i32,
+    radius: i32,
+) -> f32 {
+    let mut low = 0;
+    let mut total = 0;
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            total += 1;
+            let h = sampled_surface_height(config, x + dx, z + dz);
+            if h <= max_height {
+                low += 1;
+            }
+        }
+    }
+    low as f32 / total as f32
+}
+
+fn neighbor_min_surface_world(config: &ProcGenConfig, x: i32, z: i32) -> Option<i32> {
     let mut min_h: Option<i32> = None;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            let nx = x + dx;
-            let nz = z + dz;
-            if nx < 0 || nz < 0 || nx >= width as i32 || nz >= (heights.len() / width) as i32 {
-                continue;
-            }
-            let idx = nx as usize + nz as usize * width;
-            let h = heights[idx];
+            let h = sampled_surface_height(config, x + dx, z + dz);
             min_h = Some(match min_h {
                 Some(curr) => curr.min(h),
                 None => h,
@@ -407,6 +403,25 @@ fn valid_surface_spawn_y(world: &World, x: i32, z: i32) -> Option<i32> {
         return None;
     }
     Some(top)
+}
+
+fn sampled_surface_height(config: &ProcGenConfig, x: i32, z: i32) -> i32 {
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let sx = x + dx;
+            let sz = z + dz;
+            let w = biome_weights(config.seed, sx, sz);
+            sum += terrain_height(config, sx, sz, w) as f32;
+            n += 1.0;
+        }
+    }
+    let w0 = biome_weights(config.seed, x, z);
+    let raw = terrain_height(config, x, z, w0) as f32;
+    (raw * 0.6 + (sum / n) * 0.4)
+        .round()
+        .clamp(6.0, (config.dims[1] as i32 - 4) as f32) as i32
 }
 
 fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 5]) -> i32 {
