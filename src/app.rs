@@ -185,6 +185,18 @@ pub async fn run() -> anyhow::Result<()> {
                 } else {
                     egui_state.on_window_event(window, event).consumed
                 };
+                let apply_cursor_mode =
+                    |window: &winit::window::Window,
+                     ui: &UiState,
+                     cursor_is_unlocked: &mut bool| {
+                        let should_unlock =
+                            should_unlock_cursor(ui, false, ui.tab_palette_open);
+                        if should_unlock != *cursor_is_unlocked {
+                            let _ = set_cursor(window, should_unlock);
+                            *cursor_is_unlocked = should_unlock;
+                        }
+                        window.request_redraw();
+                    };
                 input.on_window_event(event);
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
@@ -198,22 +210,36 @@ pub async fn run() -> anyhow::Result<()> {
                             let _ = set_cursor(window, should_unlock);
                             cursor_is_unlocked = should_unlock;
                         }
+                        window.request_redraw();
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
+                            if key == KeyCode::Escape && event.state == ElementState::Pressed {
+                                ui.paused_menu = !ui.paused_menu;
+                                apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
+                            }
                             if event.state == ElementState::Pressed {
                                 let tab_palette_open = ui.tab_palette_open;
                                 let hotbar_slot = key_to_hotbar_slot(key);
                                 match key {
-                                    KeyCode::Escape => ui.paused_menu = !ui.paused_menu,
+                                    KeyCode::Escape => {}
                                     _ if ui.paused_menu => {}
                                     KeyCode::KeyP => sim.running = !sim.running,
-                                    KeyCode::KeyB => ui.show_brush = !ui.show_brush,
+                                    KeyCode::KeyB => {
+                                        ui.show_brush = !ui.show_brush;
+                                        apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
+                                    }
                                     KeyCode::Tab if !event.repeat => {
-                                        ui.tab_palette_open = !ui.tab_palette_open
+                                        ui.tab_palette_open = !ui.tab_palette_open;
+                                        apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
                                     }
                                     RADIAL_MENU_TOGGLE_KEY => {
-                                        ui.show_radial_menu = !ui.show_radial_menu
+                                        ui.show_radial_menu = !ui.show_radial_menu;
+                                        apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
+                                    }
+                                    TOOL_QUICK_MENU_TOGGLE_KEY if !ui.paused_menu => {
+                                        ui.show_tool_quick_menu = true;
+                                        apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
                                     }
                                     KeyCode::KeyF => {
                                         brush.shape = if brush.shape == BrushShape::Sphere {
@@ -243,17 +269,12 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                             if key == TOOL_QUICK_MENU_TOGGLE_KEY
                                 && event.state == ElementState::Released
-                                && ui.show_tool_quick_menu
-                                && !input.lmb
-                                && !input.rmb
                             {
-                                apply_quick_menu_hover_selection(&mut ui, &mut brush);
-                                let should_unlock =
-                                    should_unlock_cursor(&ui, false, ui.tab_palette_open);
-                                if should_unlock != cursor_is_unlocked {
-                                    let _ = set_cursor(window, should_unlock);
-                                    cursor_is_unlocked = should_unlock;
+                                if ui.show_tool_quick_menu && !input.lmb && !input.rmb {
+                                    apply_quick_menu_hover_selection(&mut ui, &mut brush);
                                 }
+                                ui.show_tool_quick_menu = false;
+                                apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
                             }
                         }
                     }
