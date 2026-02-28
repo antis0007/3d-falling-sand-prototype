@@ -216,7 +216,6 @@ struct HydrologyContext {
     width: usize,
     depth: usize,
     cells: Vec<HydrologyContextCell>,
-    by_global: HashMap<(i32, i32), usize>,
 }
 
 impl ProcGenConfig {
@@ -310,7 +309,9 @@ pub fn generate_world_with_control(
         shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
     }
     if stages.channel_extraction || stages.basin_filling {
-        hydrology_fill_pass(&mut world, &config, &columns, &hydrology, &timings);
+        hydrology_fill_pass(
+            &mut world, &config, &heights, &columns, &hydrology, &timings,
+        );
         remove_unsupported_hanging_water_pass(&mut world, &config, &timings);
     }
     enforce_subsea_materials_pass(&mut world, &config, &timings);
@@ -434,7 +435,6 @@ fn build_hydrology_cache(
         width: ctx_width,
         depth: ctx_depth,
         cells: Vec::with_capacity(ctx_width * ctx_depth),
-        by_global: HashMap::with_capacity(ctx_width * ctx_depth),
     };
     for cz in 0..ctx_depth as i32 {
         for cx in 0..ctx_width as i32 {
@@ -469,14 +469,12 @@ fn build_hydrology_cache(
                 ) * 0.25)
                 .clamp(0.0, 1.0);
             let river_weight = (accum_seed * 0.75 + river * 0.4).clamp(0.0, 1.0);
-            let idx = context.cells.len();
             context.cells.push(HydrologyContextCell {
                 local_idx,
                 surface_height,
                 ocean_weight,
                 river_weight,
             });
-            context.by_global.insert((wx, wz), idx);
         }
     }
 
@@ -542,70 +540,32 @@ fn build_hydrology_cache(
         }
     }
 
-    let mut distance = vec![0i32; ctx_len];
-    for &idx in (0..ctx_len).collect::<Vec<_>>().iter().rev() {
-        let mut steps = 0;
+    let mut distance = vec![-1i32; ctx_len];
+    for idx in 0..ctx_len {
+        if distance[idx] >= 0 {
+            continue;
+        }
+        let mut chain = Vec::new();
         let mut cur = idx;
-        for _ in 0..128 {
+        let mut guard = 0;
+        while distance[cur] < 0 && guard < 256 {
+            chain.push(cur);
+            guard += 1;
             match flow_to[cur] {
-                Some(n) => {
-                    steps += 1;
-                    cur = n;
+                Some(next) => cur = next,
+                None => {
+                    distance[cur] = 0;
+                    break;
                 }
-                None => break,
             }
         }
-        distance[idx] = steps;
-    }
-
-    let mut river_level = vec![None; len];
-    let mut river_mask = vec![false; ctx_len];
-    for i in 0..ctx_len {
-        river_mask[i] = context.cells[i].river_weight > 0.45;
-    }
-    let mut visited = vec![false; ctx_len];
-    for z in 0..context.depth as i32 {
-        for x in 0..context.width as i32 {
-            let start = x as usize + z as usize * context.width;
-            if visited[start] || !river_mask[start] {
+        let mut dist = distance[cur].max(0);
+        while let Some(cell) = chain.pop() {
+            if cell == cur {
                 continue;
             }
-            let mut q = VecDeque::new();
-            let mut region = Vec::new();
-            q.push_back((x, z));
-            visited[start] = true;
-            while let Some((cx, cz)) = q.pop_front() {
-                region.push((cx, cz));
-                for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
-                    if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32
-                    {
-                        continue;
-                    }
-                    let nidx = nx as usize + nz as usize * context.width;
-                    if visited[nidx] || !river_mask[nidx] {
-                        continue;
-                    }
-                    visited[nidx] = true;
-                    q.push_back((nx, nz));
-                }
-            }
-            let mut avg = 0.0;
-            for (rx, rz) in &region {
-                let idx = *rx as usize + *rz as usize * context.width;
-                let step_drop = (distance[idx] / 10) as i32;
-                let level = (config.sea_level_local() - step_drop)
-                    .min(context.cells[idx].surface_height - 1);
-                avg += level as f32;
-            }
-            let flat = (avg / region.len() as f32).round() as i32;
-            for (rx, rz) in region {
-                let idx = rx as usize + rz as usize * context.width;
-                let step_drop = (distance[idx] / 10) as i32;
-                let ctrl = flat.min(config.sea_level_local() - step_drop + 1);
-                if let Some(local_idx) = context.cells[idx].local_idx {
-                    river_level[local_idx] = Some(ctrl.min(context.cells[idx].surface_height - 1));
-                }
-            }
+            dist += 1;
+            distance[cell] = dist;
         }
     }
 
@@ -623,6 +583,94 @@ fn build_hydrology_cache(
         }
         sink_owner[i] = sink;
     }
+
+    let mut sink_cells: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, sink) in sink_owner.iter().enumerate() {
+        if let Some(s) = sink {
+            sink_cells.entry(*s).or_default().push(i);
+        }
+    }
+    let mut sink_spill = vec![None::<i32>; ctx_len];
+    for (sink, cells) in &sink_cells {
+        let mut in_sink = vec![false; ctx_len];
+        for &i in cells {
+            in_sink[i] = true;
+        }
+        let mut spill = i32::MAX;
+        for &i in cells {
+            let x = (i % context.width) as i32;
+            let z = (i / context.width) as i32;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
+                    continue;
+                }
+                let ni = nx as usize + nz as usize * context.width;
+                if !in_sink[ni] {
+                    spill = spill.min(context.cells[ni].surface_height);
+                }
+            }
+        }
+        if spill != i32::MAX {
+            sink_spill[*sink] = Some(spill - 1);
+        }
+    }
+
+    let mut river_level = vec![None; len];
+    let mut river_mask = vec![false; ctx_len];
+    for i in 0..ctx_len {
+        river_mask[i] = context.cells[i].river_weight > 0.45;
+    }
+    let mut channel_level_ctx = vec![None::<i32>; ctx_len];
+    for i in 0..ctx_len {
+        if !river_mask[i] {
+            continue;
+        }
+        let surface = context.cells[i].surface_height;
+        let downstream_surface = flow_to[i]
+            .map(|d| context.cells[d].surface_height)
+            .unwrap_or(surface);
+        let local_slope = (surface - downstream_surface).max(0) as f32;
+        let dist_term = (distance[i].max(0) as f32) * 0.16;
+        let slope_term = (1.0 / (local_slope + 1.0)).clamp(0.0, 1.0);
+        let flow_term = flow_accum[i].ln().max(0.0) * 0.34;
+        let incision = (1.0 + dist_term + slope_term + flow_term).round() as i32;
+        let mut level = surface - incision.max(1);
+        if let Some(sink) = sink_owner[i] {
+            if let Some(spill_level) = sink_spill[sink] {
+                level = level.min(spill_level);
+            }
+        }
+        level = level.min(surface - 1);
+        channel_level_ctx[i] = Some(level.max(1));
+    }
+
+    let mut topo = (0..ctx_len).collect::<Vec<_>>();
+    topo.sort_by_key(|&i| std::cmp::Reverse(distance[i]));
+    for idx in topo {
+        let Some(level) = channel_level_ctx[idx] else {
+            continue;
+        };
+        let Some(down) = flow_to[idx] else {
+            continue;
+        };
+        if !river_mask[down] {
+            continue;
+        }
+        if let Some(down_level) = channel_level_ctx[down] {
+            if down_level > level {
+                channel_level_ctx[down] = Some(level);
+            }
+        } else {
+            channel_level_ctx[down] = Some(level);
+        }
+    }
+
+    for i in 0..ctx_len {
+        if let (Some(local_idx), Some(level)) = (context.cells[i].local_idx, channel_level_ctx[i]) {
+            river_level[local_idx] = Some(level.min(context.cells[i].surface_height - 1));
+        }
+    }
+
     let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for i in 0..ctx_len {
@@ -1049,13 +1097,13 @@ fn flood_fill_columns(
 fn hydrology_fill_pass(
     world: &mut World,
     config: &ProcGenConfig,
+    heights: &[i32],
     columns: &[ColumnGenData],
     hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("hydrology_fill_pass");
     let sea_level = config.sea_level_local();
-    let heights = build_surface_heightmap_from_world(world);
     let width = world.dims[0];
     let depth = world.dims[2];
     let len = width * depth;
@@ -1109,6 +1157,9 @@ fn hydrology_fill_pass(
         for x in 0..width as i32 {
             let idx = x as usize + z as usize * width;
             let surface = heights[idx];
+            if surface < 1 || world.get(x, surface, z) == EMPTY {
+                continue;
+            }
             let wx = config.world_origin[0] + x;
             let wz = config.world_origin[2] + z;
             let river_w = hydrology.river_weight[idx];
@@ -1128,7 +1179,13 @@ fn hydrology_fill_pass(
                     }
                     let top = level.max(surface).min(sea_level + 4);
                     let depth_hint = (2.0 + lake_fill * 4.0) as i32;
-                    let floor = (surface - depth_hint).min(top).max(2);
+                    let floor = (surface - depth_hint).min(top);
+                    if floor < 1 || top < floor {
+                        continue;
+                    }
+                    if !estuary && world.get(x, floor - 1, z) == EMPTY {
+                        continue;
+                    }
                     apply_channel_edit(world, x, z, floor, top, 2, SAND, true);
                 }
             }
@@ -1142,11 +1199,17 @@ fn hydrology_fill_pass(
                 if estuary {
                     continue;
                 }
-                let top = level.min(surface).min(sea_level + 1).max(2);
+                let top = level.min(surface).min(sea_level + 1);
                 let channel_depth = (2.0 + river_fill * 4.5).round() as i32;
-                let floor = (top - channel_depth).max(1);
+                let floor = top - channel_depth;
+                if floor < 1 || top < floor {
+                    continue;
+                }
                 let can_fill = open_sky || top >= surface - 1;
                 if !can_fill {
+                    continue;
+                }
+                if !estuary && world.get(x, floor - 1, z) == EMPTY {
                     continue;
                 }
                 let bank_blend = smoothstep(
@@ -2193,6 +2256,56 @@ mod tests {
                     !floating,
                     "floating shoreline water column at ({x},{z}) creates retreat artifact"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn inland_river_channels_can_stay_above_local_sea_level() {
+        let config = ProcGenConfig::for_size(64, 0xD00D_A11E).with_origin([0, 96, 0]);
+        let timings = ProcGenPassTimings::default();
+        let (heights, columns) = build_column_cache(&config, &timings);
+        let hydrology = build_hydrology_cache(&config, &heights, &columns, &timings);
+        let sea = config.sea_level_local();
+
+        let mut saw_river_channel = false;
+        let mut found_above_sea = false;
+        for (idx, level) in hydrology.river_level.iter().enumerate() {
+            let Some(level) = level else {
+                continue;
+            };
+            saw_river_channel = true;
+            if columns[idx].surface_height > sea + 1 && *level > sea {
+                found_above_sea = true;
+                break;
+            }
+        }
+
+        if saw_river_channel {
+            assert!(
+                found_above_sea,
+                "expected inland river levels to remain above local sea level"
+            );
+        }
+    }
+
+    #[test]
+    fn high_altitude_chunks_do_not_spawn_unsupported_water() {
+        let config = ProcGenConfig::for_size(64, 0x51DE_C0DE).with_origin([0, 320, 0]);
+        let world = generate_world(config);
+
+        for z in 0..world.dims[2] as i32 {
+            for y in 1..world.dims[1] as i32 {
+                for x in 0..world.dims[0] as i32 {
+                    if world.get(x, y, z) != WATER {
+                        continue;
+                    }
+                    assert_ne!(
+                        world.get(x, y - 1, z),
+                        EMPTY,
+                        "unsupported floating water at ({x},{y},{z}) in high-altitude chunk"
+                    );
+                }
             }
         }
     }
