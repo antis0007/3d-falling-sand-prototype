@@ -109,13 +109,6 @@ pub async fn run() -> anyhow::Result<()> {
                                     RADIAL_MENU_TOGGLE_KEY => {
                                         ui.show_radial_menu = !ui.show_radial_menu
                                     }
-                                    KeyCode::KeyV => {
-                                        brush.mode = if brush.mode == BrushMode::Place {
-                                            BrushMode::Erase
-                                        } else {
-                                            BrushMode::Place
-                                        }
-                                    }
                                     KeyCode::KeyF => {
                                         brush.shape = if brush.shape == BrushShape::Sphere {
                                             BrushShape::Cube
@@ -218,11 +211,12 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let raycast =
                             target_for_edit(&world, ctrl.position, ctrl.look_dir(), &brush);
+                        let preview_mode = current_action_mode(&input);
                         let preview_blocks = preview_blocks(
                             &world,
                             &brush,
                             raycast,
-                            brush.mode,
+                            preview_mode,
                             ui.active_tool,
                             !cursor_should_unlock || !egui_c,
                         );
@@ -276,6 +270,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 [renderer.config.width, renderer.config.height],
                                 &preview_blocks,
                                 &brush,
+                                preview_mode,
                                 ui.show_radial_menu,
                                 RADIAL_MENU_TOGGLE_LABEL,
                                 VOXEL_SIZE,
@@ -474,13 +469,7 @@ fn apply_mouse_edit(
     raycast: RaycastResult,
     active_tool: ToolKind,
 ) {
-    let requested_mode = if input.just_rmb || input.rmb {
-        Some(BrushMode::Erase)
-    } else if input.just_lmb || input.lmb {
-        Some(BrushMode::Place)
-    } else {
-        None
-    };
+    let requested_mode = held_action_mode(input);
 
     let Some(mode) = requested_mode else {
         edit_runtime.last_edit_mode = None;
@@ -542,6 +531,20 @@ fn apply_mouse_edit(
     edit_runtime.last_edit_mode = Some(mode);
 }
 
+fn held_action_mode(input: &InputState) -> Option<BrushMode> {
+    if input.just_rmb || input.rmb {
+        Some(BrushMode::Erase)
+    } else if input.just_lmb || input.lmb {
+        Some(BrushMode::Place)
+    } else {
+        None
+    }
+}
+
+fn current_action_mode(input: &InputState) -> BrushMode {
+    held_action_mode(input).unwrap_or(BrushMode::Place)
+}
+
 fn preview_blocks(
     world: &World,
     brush: &BrushSettings,
@@ -562,6 +565,12 @@ fn preview_blocks(
     };
     if brush.radius == 0 {
         if active_tool != ToolKind::Brush {
+            if active_tool == ToolKind::BuildersWand && mode != BrushMode::Place {
+                return Vec::new();
+            }
+            if active_tool == ToolKind::DestructorWand && mode != BrushMode::Erase {
+                return Vec::new();
+            }
             return preview_wand_blocks(world, raycast, active_tool, WAND_MAX_BLOCKS);
         }
         if let Some(hit) = raycast.hit {
