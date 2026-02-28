@@ -73,6 +73,7 @@ pub fn generate_world(config: ProcGenConfig) -> World {
     cave_carve_pass(&mut world, &config);
     surface_layering_pass(&mut world, &config, &heights);
     biome_water_pass(&mut world, &config, &heights);
+    enforce_subsea_materials_pass(&mut world, &config);
     vegetation_pass(&mut world, &config);
 
     world
@@ -183,7 +184,13 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     continue;
                 }
                 let block = if d == 0 {
-                    if cliffy_coast {
+                    if top_y <= config.sea_level {
+                        if coastal || river_bank || desert > 0.4 {
+                            SAND
+                        } else {
+                            STONE
+                        }
+                    } else if cliffy_coast {
                         if top_y > config.sea_level + 2 {
                             TURF
                         } else {
@@ -193,6 +200,12 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                         SAND
                     } else {
                         TURF
+                    }
+                } else if y <= config.sea_level {
+                    if d <= sand_depth + 1 {
+                        SAND
+                    } else {
+                        STONE
                     }
                 } else if (desert > 0.58 || coastal || river_bank) && d <= sand_depth {
                     SAND
@@ -377,6 +390,24 @@ fn river_water_level(seed: u64, x: i32, z: i32, sea_level: i32) -> i32 {
     (sea_level - 1 + delta).clamp(sea_level - 3, sea_level + 1)
 }
 
+fn enforce_subsea_materials_pass(world: &mut World, config: &ProcGenConfig) {
+    let sea = config.sea_level;
+    for z in 0..world.dims[2] as i32 {
+        for x in 0..world.dims[0] as i32 {
+            for y in 1..=sea.min(world.dims[1] as i32 - 2) {
+                let m = world.get(x, y, z);
+                if m == TURF || m == DIRT || m == GRASS || m == BUSH {
+                    let replacement = if y >= sea - 2 { SAND } else { STONE };
+                    let _ = world.set(x, y, z, replacement);
+                }
+                if m == WATER && world.get(x, y - 1, z) == EMPTY {
+                    let _ = world.set(x, y - 1, z, STONE);
+                }
+            }
+        }
+    }
+}
+
 fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
     for lz in 2..world.dims[2] as i32 - 2 {
         for lx in 2..world.dims[0] as i32 - 2 {
@@ -546,6 +577,10 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 5]) -> 
     let ocean_floor_target = config.sea_level as f32 - 12.0 + ocean_depth_shape;
     h = h * (1.0 - ocean_w * 0.55) + (config.sea_level as f32 - 6.0) * ocean_w * 0.55;
     h = h * (1.0 - ocean_w * 0.85) + ocean_floor_target * ocean_w * 0.85;
+
+    let coast_w = smoothstep((ocean_w - 0.42) / 0.28);
+    let coast_target = config.sea_level as f32 + 1.0;
+    h = h * (1.0 - coast_w * 0.45) + coast_target * coast_w * 0.45;
 
     if ocean_w > 0.65 {
         h = h.min(config.sea_level as f32 - 2.0);
