@@ -212,7 +212,7 @@ pub fn generate_world(config: ProcGenConfig) -> World {
     )
     .unwrap_or_else(|| {
         let mut world = World::new(config.dims);
-        world.clear();
+        world.clear_empty();
         world
     })
 }
@@ -222,7 +222,7 @@ pub fn generate_world_with_control(
     control: ProcGenControl<'_>,
 ) -> Option<World> {
     let mut world = World::new(config.dims);
-    world.clear();
+    world.clear_empty();
     let timings = ProcGenPassTimings::default();
     let stages = ProcGenStages::default();
     let (heights, columns) = build_column_cache(&config, &timings);

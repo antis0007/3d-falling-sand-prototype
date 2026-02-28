@@ -178,7 +178,7 @@ impl World {
             chunks_dims,
             chunks: vec![Chunk::new(); chunks_dims[0] * chunks_dims[1] * chunks_dims[2]],
         };
-        world.fill_floor(2, 1);
+        world.clear_empty();
         world
     }
 
@@ -329,13 +329,17 @@ impl World {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear_empty(&mut self) {
         for c in &mut self.chunks {
             c.iter_raw_mut().fill(EMPTY);
             c.active.clear();
             c.settled.fill(0);
             c.dirty_mesh = true;
         }
+    }
+
+    pub fn clear(&mut self) {
+        self.clear_empty();
         self.fill_floor(2, 1);
     }
 
