@@ -10,6 +10,7 @@ const BUSH: MaterialId = 18;
 const GRASS: MaterialId = 19;
 const LEAVES: MaterialId = 23;
 const CHUNK_SIZE: i32 = 16;
+const BIOME_ANCHOR_SIZE: i32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiomeType {
@@ -51,7 +52,7 @@ impl ProcGenConfig {
             sea_level,
             terrain_scale: 1.0,
             cave_density: 0.13,
-            tree_density: 0.03,
+            tree_density: 0.012,
         }
     }
 
@@ -102,7 +103,7 @@ fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
                     continue;
                 }
                 let wx = config.world_origin[0] + lx;
-                let wy = config.world_origin[1] + ly;
+                let wy = ly;
                 let wz = config.world_origin[2] + lz;
                 let depth_fade = 1.0 - (ly as f32 / max_y as f32).powf(1.3);
                 let cave = fbm3(
@@ -168,43 +169,42 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig) {
 }
 
 fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
+    let water_level = config.sea_level - 2;
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
             let wx = config.world_origin[0] + lx;
             let wz = config.world_origin[2] + lz;
             let weights = biome_weights(config.seed, wx, wz);
-            let river_w = weights[biome_index(BiomeType::River)];
+            let river_w = weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
+                wx,
+                wz,
+            ));
             let lake_w = weights[biome_index(BiomeType::Lake)];
             let wetness = river_w.max(lake_w);
-            if wetness < 0.42 {
+            if wetness < 0.55 {
                 continue;
             }
-
-            let river_depth = (river_w * 6.0).round() as i32;
-            let lake_depth = (lake_w * 7.0).round() as i32;
-            let water_floor = (config.sea_level - 2 - river_depth - lake_depth).max(2);
 
             let Some(surface) = surface_y(world, lx, lz) else {
                 continue;
             };
-            if surface > config.sea_level + 2 && wetness < 0.7 {
+            let channel_depth = (2.0 + 4.0 * wetness).round() as i32;
+            let floor = (water_level - channel_depth).max(2);
+            if surface < floor {
                 continue;
             }
 
-            let carve_top = config.sea_level.min(surface + 1);
-            for y in water_floor..=carve_top {
-                if world.get(lx, y, lz) != WATER {
-                    let _ = world.set(lx, y, lz, EMPTY);
-                }
+            for y in floor..=surface {
+                let _ = world.set(lx, y, lz, EMPTY);
             }
 
-            for y in water_floor..=config.sea_level {
-                if world.get(lx, y, lz) == EMPTY {
-                    let _ = world.set(lx, y, lz, WATER);
-                }
+            let fill_top = water_level.min(surface);
+            for y in floor..=fill_top {
+                let _ = world.set(lx, y, lz, WATER);
             }
 
-            for y in (water_floor - 1).max(1)..=water_floor {
+            for y in (floor - 1).max(1)..=floor {
                 if world.get(lx, y, lz) != WATER {
                     let _ = world.set(lx, y, lz, SAND);
                 }
@@ -344,16 +344,29 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 4]) -> 
         h = h * 0.45 + plateau * 0.55;
     }
 
-    h += weights[biome_index(BiomeType::Desert)] * 2.0;
-    h -= weights[biome_index(BiomeType::River)] * 8.0;
-    h -= weights[biome_index(BiomeType::Lake)] * 6.0;
+    let river_signal = river_meander_signal(config.seed, x, z);
+    let river_w = weights[biome_index(BiomeType::River)].max(river_signal);
+    let bank_lower = (river_w * 8.0).clamp(0.0, 8.0);
+
+    h += weights[biome_index(BiomeType::Desert)] * 1.6;
+    h -= bank_lower;
+    h -= weights[biome_index(BiomeType::Lake)] * 5.0;
 
     h.round() as i32
 }
 
+fn river_meander_signal(seed: u64, x: i32, z: i32) -> f32 {
+    let warp_x = (fbm2(seed ^ 0x77110011, x as f32 * 0.004, z as f32 * 0.004, 3) - 0.5) * 180.0;
+    let warp_z = (fbm2(seed ^ 0x77110012, x as f32 * 0.004, z as f32 * 0.004, 3) - 0.5) * 180.0;
+    let nx = (x as f32 + warp_x) * 0.0065;
+    let nz = (z as f32 + warp_z) * 0.0065;
+    let path = ((nx.sin() + 0.6 * (nz * 1.7).cos()) * 0.5 + 0.5).clamp(0.0, 1.0);
+    (1.0 - ((path - 0.5).abs() * 3.4)).clamp(0.0, 1.0)
+}
+
 fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 4] {
-    let fx = x as f32 / CHUNK_SIZE as f32;
-    let fz = z as f32 / CHUNK_SIZE as f32;
+    let fx = x as f32 / BIOME_ANCHOR_SIZE as f32;
+    let fz = z as f32 / BIOME_ANCHOR_SIZE as f32;
     let x0 = fx.floor() as i32;
     let z0 = fz.floor() as i32;
     let tx = fx.fract();
@@ -371,9 +384,10 @@ fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 4] {
         }
     }
 
-    let warp = fbm2(seed ^ 0xF009_1201, x as f32 * 0.007, z as f32 * 0.007, 3) - 0.5;
+    let warp = fbm2(seed ^ 0xF009_1201, x as f32 * 0.0035, z as f32 * 0.0035, 3) - 0.5;
+    let river = river_meander_signal(seed, x, z);
     weights[biome_index(BiomeType::River)] =
-        (weights[biome_index(BiomeType::River)] + warp * 0.28).max(0.0);
+        (weights[biome_index(BiomeType::River)] * 0.5 + river * 0.9 + warp * 0.14).max(0.0);
     weights[biome_index(BiomeType::Lake)] =
         (weights[biome_index(BiomeType::Lake)] + warp * 0.12).max(0.0);
 

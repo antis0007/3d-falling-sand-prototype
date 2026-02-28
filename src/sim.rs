@@ -1,6 +1,6 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
-const MACROCHUNK_SIZE_VOXELS: i32 = 128;
+const MACROCHUNK_SIZE_VOXELS: i32 = 64;
 
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
@@ -520,10 +520,8 @@ pub fn prioritize_chunks_for_player(
                 let dx = (chunk_macro[0] - macro_coord[0]).abs();
                 let dy = (chunk_macro[1] - macro_coord[1]).abs();
                 let dz = (chunk_macro[2] - macro_coord[2]).abs();
-                if dx <= 1 && dy <= 1 && dz <= 1 {
+                if dx == 0 && dy == 0 && dz == 0 {
                     high.push(idx);
-                } else {
-                    low.push(idx);
                 }
             }
         }

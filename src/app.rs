@@ -16,6 +16,7 @@ use crate::world::{
 };
 use anyhow::Context;
 use glam::Vec3;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
@@ -31,7 +32,7 @@ const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
-const PROCEDURAL_MACROCHUNK_SIZE: i32 = 128;
+const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 1;
 
 #[derive(Default)]
@@ -44,6 +45,22 @@ struct EditRuntimeState {
 struct RaycastResult {
     hit: Option<[i32; 3]>,
     place: [i32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct ProcgenJobSpec {
+    generation_id: u64,
+    config: ProcGenConfig,
+    prefer_safe_spawn: bool,
+    target_global_pos: [i32; 3],
+}
+
+struct ProcgenJobResult {
+    generation_id: u64,
+    config: ProcGenConfig,
+    world: World,
+    prefer_safe_spawn: bool,
+    target_global_pos: [i32; 3],
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -75,6 +92,10 @@ pub async fn run() -> anyhow::Result<()> {
     let mut sim_tick: u64 = 0;
     let mut active_procgen: Option<ProcGenConfig> = None;
     let mut active_procgen_origin: [i32; 3] = [0, 0, 0];
+    let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
+        mpsc::channel();
+    let mut requested_procgen_id: Option<u64> = None;
+    let mut next_procgen_id: u64 = 1;
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -300,40 +321,64 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
                         renderer.day = ui.day;
-                        renderer.rebuild_dirty_chunks(&mut world);
 
-                        if let Some(mut cfg) = active_procgen {
+                        while let Ok(result) = procgen_rx.try_recv() {
+                            if requested_procgen_id != Some(result.generation_id) {
+                                continue;
+                            }
+                            requested_procgen_id = None;
+                            active_procgen = Some(result.config);
+                            active_procgen_origin = result.config.world_origin;
+                            world = result.world;
+                            if result.prefer_safe_spawn {
+                                let spawn = find_safe_spawn(&world, result.config.seed);
+                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                            } else {
+                                ctrl.position = Vec3::new(
+                                    (result.target_global_pos[0] - active_procgen_origin[0]) as f32
+                                        + 0.5,
+                                    ctrl.position.y,
+                                    (result.target_global_pos[2] - active_procgen_origin[2]) as f32
+                                        + 0.5,
+                                );
+                            }
+                        }
+
+                        if let Some(cfg) = active_procgen {
                             let global = [
                                 active_procgen_origin[0] + ctrl.position.x.floor() as i32,
-                                active_procgen_origin[1] + ctrl.position.y.floor() as i32,
+                                0,
                                 active_procgen_origin[2] + ctrl.position.z.floor() as i32,
                             ];
                             let player_macro = [
                                 floor_div(global[0], PROCEDURAL_MACROCHUNK_SIZE),
-                                floor_div(global[1], PROCEDURAL_MACROCHUNK_SIZE),
+                                0,
                                 floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
                             ];
                             let desired_origin = [
                                 (player_macro[0] - PROCEDURAL_RENDER_DISTANCE_MACROS)
                                     * PROCEDURAL_MACROCHUNK_SIZE,
-                                (player_macro[1] - PROCEDURAL_RENDER_DISTANCE_MACROS)
-                                    * PROCEDURAL_MACROCHUNK_SIZE,
+                                0,
                                 (player_macro[2] - PROCEDURAL_RENDER_DISTANCE_MACROS)
                                     * PROCEDURAL_MACROCHUNK_SIZE,
                             ];
-                            if desired_origin != active_procgen_origin {
-                                active_procgen_origin = desired_origin;
-                                cfg = cfg.with_origin(active_procgen_origin);
-                                active_procgen = Some(cfg);
-                                world = generate_world(cfg);
-                                ctrl.position = Vec3::new(
-                                    (global[0] - active_procgen_origin[0]) as f32 + 0.5,
-                                    (global[1] - active_procgen_origin[1]) as f32 + 0.5,
-                                    (global[2] - active_procgen_origin[2]) as f32 + 0.5,
-                                );
-                                renderer.rebuild_dirty_chunks(&mut world);
+                            if desired_origin != active_procgen_origin
+                                && requested_procgen_id.is_none()
+                            {
+                                let next_cfg = cfg.with_origin(desired_origin);
+                                let spec = ProcgenJobSpec {
+                                    generation_id: next_procgen_id,
+                                    config: next_cfg,
+                                    prefer_safe_spawn: false,
+                                    target_global_pos: global,
+                                };
+                                next_procgen_id = next_procgen_id.wrapping_add(1);
+                                requested_procgen_id = Some(spec.generation_id);
+                                queue_procgen_job(&procgen_tx, spec);
                             }
                         }
+
+                        renderer.rebuild_dirty_chunks(&mut world);
 
                         ui.biome_hint = if let Some(cfg) = active_procgen {
                             let biome = biome_hint_at_world(
@@ -341,7 +386,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 active_procgen_origin[0] + ctrl.position.x.floor() as i32,
                                 active_procgen_origin[2] + ctrl.position.z.floor() as i32,
                             );
-                            format!("Biome: {}", biome.label())
+                            if requested_procgen_id.is_some() {
+                                format!("Biome: {} (generating...)", biome.label())
+                            } else {
+                                format!("Biome: {}", biome.label())
+                            }
                         } else {
                             "Biome: Flat Test World".to_string()
                         };
@@ -376,31 +425,36 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
-                                world = if actions.new_procedural {
+                                if actions.new_procedural {
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
                                     let proc_size =
                                         (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
                                     active_procgen_origin = [
                                         -PROCEDURAL_MACROCHUNK_SIZE,
-                                        -PROCEDURAL_MACROCHUNK_SIZE,
+                                        0,
                                         -PROCEDURAL_MACROCHUNK_SIZE,
                                     ];
                                     let config = ProcGenConfig::for_size(proc_size, seed)
                                         .with_origin(active_procgen_origin);
+                                    let spec = ProcgenJobSpec {
+                                        generation_id: next_procgen_id,
+                                        config,
+                                        prefer_safe_spawn: true,
+                                        target_global_pos: [0, 0, 0],
+                                    };
+                                    next_procgen_id = next_procgen_id.wrapping_add(1);
+                                    requested_procgen_id = Some(spec.generation_id);
                                     active_procgen = Some(config);
-                                    generate_world(config)
+                                    queue_procgen_job(&procgen_tx, spec);
                                 } else {
+                                    requested_procgen_id = None;
                                     active_procgen = None;
                                     active_procgen_origin = [0, 0, 0];
-                                    World::new([n, n, n])
-                                };
-                                let spawn = if let Some(cfg) = active_procgen {
-                                    find_safe_spawn(&world, cfg.seed)
-                                } else {
-                                    find_safe_spawn(&world, 1)
-                                };
-                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                                    world = World::new([n, n, n]);
+                                    let spawn = find_safe_spawn(&world, 1);
+                                    ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+                                }
                                 sim.running = false;
                             }
                             if actions.save {
@@ -412,7 +466,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
+                                        requested_procgen_id = None;
                                         active_procgen = None;
+                                        active_procgen_origin = [0, 0, 0];
                                         let spawn = find_safe_spawn(&world, 1);
                                         ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                         sim.running = false;
@@ -558,6 +614,20 @@ fn texture_for_active_tool(
 ) -> Option<(egui::TextureId, [usize; 2])> {
     let texture = tool_textures.for_tool(active_tool);
     Some((texture.texture.id(), texture.size))
+}
+
+fn queue_procgen_job(tx: &Sender<ProcgenJobResult>, spec: ProcgenJobSpec) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let world = generate_world(spec.config);
+        let _ = tx.send(ProcgenJobResult {
+            generation_id: spec.generation_id,
+            config: spec.config,
+            world,
+            prefer_safe_spawn: spec.prefer_safe_spawn,
+            target_global_pos: spec.target_global_pos,
+        });
+    });
 }
 
 fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {

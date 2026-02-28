@@ -2,7 +2,7 @@ use crate::procgen::{generate_world, ProcGenConfig};
 use crate::world::World;
 use std::collections::BTreeMap;
 
-pub const MACROCHUNK_SIZE: i32 = 128;
+pub const MACROCHUNK_SIZE: i32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MacroChunkCoord {
