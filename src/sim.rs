@@ -14,6 +14,8 @@ const EMBER_WARM: MaterialId = 14;
 const EMBER_ASH: MaterialId = 15;
 const PLANT: MaterialId = 16;
 const WEED: MaterialId = 17;
+const TREE_SEED: MaterialId = 18;
+const LEAVES: MaterialId = 19;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -46,7 +48,7 @@ pub enum ContactReaction {
     BurnsIntoSmoke,
 }
 
-pub const MATERIALS: [Material; 18] = [
+pub const MATERIALS: [Material; 20] = [
     Material {
         id: 0,
         name: "Empty",
@@ -281,6 +283,32 @@ pub const MATERIALS: [Material; 18] = [
         flow_speed: 0,
         viscosity: 1.0,
     },
+    Material {
+        id: 18,
+        name: "Tree Seed",
+        color: [142, 92, 52, 255],
+        phase: Phase::Solid,
+        density: 55,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
+    Material {
+        id: 19,
+        name: "Leaves",
+        color: [70, 156, 66, 255],
+        phase: Phase::Solid,
+        density: 35,
+        flammable: true,
+        acid_resistant: false,
+        melts_from_lava: false,
+        transforms_on_contact: Some(ContactReaction::BurnsIntoSmoke),
+        flow_speed: 0,
+        viscosity: 1.0,
+    },
 ];
 
 pub fn material(id: MaterialId) -> &'static Material {
@@ -417,6 +445,9 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
     match mat.phase {
         Phase::Solid => false,
         Phase::Powder => {
+            if p[1] == 0 {
+                return world.set(p[0], p[1], p[2], EMPTY);
+            }
             if try_move(world, p, [p[0], p[1] - 1, p[2]], id) {
                 return true;
             }
@@ -434,6 +465,9 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             false
         }
         Phase::Liquid => {
+            if p[1] == 0 {
+                return world.set(p[0], p[1], p[2], EMPTY);
+            }
             if try_move(world, p, [p[0], p[1] - 1, p[2]], id) {
                 return true;
             }
@@ -505,6 +539,9 @@ pub fn step_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorS
             false
         }
         Phase::Gas => {
+            if p[1] >= world.dims[1] as i32 - 1 {
+                return world.set(p[0], p[1], p[2], EMPTY);
+            }
             if try_move(world, p, [p[0], p[1] + 1, p[2]], id) {
                 return true;
             }
@@ -686,20 +723,36 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
 
     if id == PLANT {
         let has_water = has_neighbor(world, p, WATER);
-        if !has_water && rng.chance(0.08) {
+        if !has_water && rng.chance(0.04) {
             reacted |= world.set(p[0], p[1], p[2], WEED);
         } else if has_water {
-            reacted |= try_grow_plant(world, p, PLANT, rng, true);
+            reacted |= try_grow_plant(world, p, PLANT, rng, true, 0.09);
+        }
+
+        if rng.chance(0.012) {
+            reacted |= world.set(p[0], p[1], p[2], WOOD);
         }
     }
 
     if id == WEED {
         let has_water = has_neighbor(world, p, WATER);
-        if has_water && rng.chance(0.12) {
+        if has_water && rng.chance(0.18) {
             reacted |= world.set(p[0], p[1], p[2], PLANT);
-        } else if !has_water {
-            reacted |= try_grow_plant(world, p, WEED, rng, false);
+        } else {
+            reacted |= try_grow_plant(world, p, WEED, rng, false, 0.06);
         }
+
+        if rng.chance(0.01) {
+            reacted |= world.set(p[0], p[1], p[2], WOOD);
+        }
+    }
+
+    if id == TREE_SEED {
+        reacted |= germinate_tree(world, p, rng);
+    }
+
+    if id == WOOD && try_absorb_water_for_tree_growth(world, p, rng) {
+        reacted = true;
     }
 
     if reacted {
@@ -709,7 +762,10 @@ fn react_voxel(world: &mut World, p: [i32; 3], id: MaterialId, rng: &mut XorShif
 }
 
 fn is_reactive_solid(id: MaterialId) -> bool {
-    matches!(id, WOOD | TORCH | EMBER_HOT | EMBER_WARM | PLANT | WEED)
+    matches!(
+        id,
+        WOOD | TORCH | EMBER_HOT | EMBER_WARM | PLANT | WEED | TREE_SEED
+    )
 }
 
 fn has_neighbor(world: &World, p: [i32; 3], target: MaterialId) -> bool {
@@ -731,15 +787,26 @@ fn try_grow_plant(
     plant_id: MaterialId,
     rng: &mut XorShift32,
     needs_water: bool,
+    grow_chance: f32,
 ) -> bool {
     if needs_water && !has_neighbor(world, p, WATER) {
         return false;
     }
 
-    let mut dirs = [[0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+    let mut dirs = [
+        [0, 1, 0],
+        [1, 1, 0],
+        [-1, 1, 0],
+        [0, 1, 1],
+        [0, 1, -1],
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+    ];
     rng.shuffle(&mut dirs);
     for [dx, dy, dz] in dirs {
-        if !rng.chance(0.06) {
+        if !rng.chance(grow_chance) {
             continue;
         }
         let np = [p[0] + dx, p[1] + dy, p[2] + dz];
@@ -753,6 +820,122 @@ fn try_grow_plant(
         return world.set(np[0], np[1], np[2], plant_id);
     }
     false
+}
+
+fn germinate_tree(world: &mut World, p: [i32; 3], rng: &mut XorShift32) -> bool {
+    if !world.set(p[0], p[1], p[2], WOOD) {
+        return false;
+    }
+
+    let trunk_height = 4 + (rng.next() % 6) as i32;
+    let mut top = p;
+    for i in 1..=trunk_height {
+        let np = [p[0], p[1] + i, p[2]];
+        if world.get(np[0], np[1], np[2]) != EMPTY {
+            break;
+        }
+        let _ = world.set(np[0], np[1], np[2], WOOD);
+        top = np;
+    }
+
+    let branch_count = 3 + (rng.next() % 4) as i32;
+    for _ in 0..branch_count {
+        grow_branch(world, top, rng);
+    }
+
+    grow_leaf_crown(world, top, 3 + (rng.next() % 2) as i32, rng);
+    true
+}
+
+fn grow_branch(world: &mut World, from: [i32; 3], rng: &mut XorShift32) {
+    let dirs = [
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+        [1, 0, 1],
+        [1, 0, -1],
+        [-1, 0, 1],
+        [-1, 0, -1],
+    ];
+    let mut pos = from;
+    let dir = dirs[(rng.next() as usize) % dirs.len()];
+    let len = 2 + (rng.next() % 4) as i32;
+    for i in 0..len {
+        pos = [
+            pos[0] + dir[0],
+            pos[1] + if i % 2 == 0 { 1 } else { 0 },
+            pos[2] + dir[2],
+        ];
+        if world.get(pos[0], pos[1], pos[2]) != EMPTY {
+            break;
+        }
+        let _ = world.set(pos[0], pos[1], pos[2], WOOD);
+    }
+    grow_leaf_crown(world, pos, 2, rng);
+}
+
+fn grow_leaf_crown(world: &mut World, center: [i32; 3], radius: i32, rng: &mut XorShift32) {
+    for dz in -radius..=radius {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let dist2 = dx * dx + dy * dy + dz * dz;
+                if dist2 > radius * radius {
+                    continue;
+                }
+                if dist2 > (radius - 1).max(0) * (radius - 1).max(0) && rng.chance(0.25) {
+                    continue;
+                }
+                let np = [center[0] + dx, center[1] + dy, center[2] + dz];
+                if world.get(np[0], np[1], np[2]) == EMPTY {
+                    let _ = world.set(np[0], np[1], np[2], LEAVES);
+                }
+            }
+        }
+    }
+}
+
+fn try_absorb_water_for_tree_growth(world: &mut World, p: [i32; 3], rng: &mut XorShift32) -> bool {
+    let mut water_neighbor: Option<[i32; 3]> = None;
+    for [dx, dy, dz] in neighbor_dirs6() {
+        let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+        if world.get(np[0], np[1], np[2]) == WATER {
+            water_neighbor = Some(np);
+            break;
+        }
+    }
+
+    let Some(water_pos) = water_neighbor else {
+        return false;
+    };
+
+    if !world.set(water_pos[0], water_pos[1], water_pos[2], EMPTY) {
+        return false;
+    }
+
+    let mut growth_dirs = [
+        [0, 1, 0],
+        [1, 1, 0],
+        [-1, 1, 0],
+        [0, 1, 1],
+        [0, 1, -1],
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+    ];
+    rng.shuffle(&mut growth_dirs);
+    for [dx, dy, dz] in growth_dirs {
+        let np = [p[0] + dx, p[1] + dy, p[2] + dz];
+        if world.get(np[0], np[1], np[2]) != EMPTY {
+            continue;
+        }
+        let grow_wood = dy > 0 && rng.chance(0.55);
+        let id = if grow_wood { WOOD } else { LEAVES };
+        return world.set(np[0], np[1], np[2], id);
+    }
+
+    true
 }
 
 fn is_acid_dissolvable(id: MaterialId) -> bool {
