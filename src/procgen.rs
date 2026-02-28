@@ -473,9 +473,9 @@ fn build_hydrology_cache(
         if spill == i32::MAX {
             continue;
         }
-        let level = (spill - 1).min(config.sea_level + 6);
+        let level = (spill - 1).min(config.sea_level + 10);
         for &i in &cells {
-            if heights[i] < level {
+            if heights[i] <= level {
                 lake_level[i] = Some(level);
             }
         }
@@ -569,16 +569,21 @@ fn surface_layering_pass(
             let weights = col.weights;
 
             let desert = weights[biome_index(BiomeType::Desert)];
+            let desert_surface = if top_y <= config.sea_level {
+                0.0
+            } else {
+                desert
+            };
             let plains = weights[biome_index(BiomeType::Plains)];
             let highlands = weights[biome_index(BiomeType::Highlands)];
             let coastal = smoothstep((hydrology.ocean_weight[idx] - 0.35) / 0.45);
             let river_bank = smoothstep((hydrology.river_weight[idx] - 0.30) / 0.55);
             let slope = col.slope as f32;
 
-            let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert) - 0.9 * highlands)
+            let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert_surface) - 0.9 * highlands)
                 .round()
                 .clamp(2.0, 8.0) as i32;
-            let sand_depth = (1.0 + 3.5 * desert + 3.0 * coastal + 2.0 * river_bank)
+            let sand_depth = (1.0 + 3.5 * desert_surface + 3.0 * coastal + 2.0 * river_bank)
                 .round()
                 .clamp(1.0, 10.0) as i32;
 
@@ -587,7 +592,8 @@ fn surface_layering_pass(
                 if y <= 1 {
                     continue;
                 }
-                let sand_bias = (desert * 0.8 + coastal * 0.7 + river_bank * 0.6 - slope * 0.05)
+                let sand_bias = (desert_surface * 0.8 + coastal * 0.7 + river_bank * 0.6
+                    - slope * 0.05)
                     .clamp(0.0, 1.0);
                 let rock_bias = (highlands * 0.75 + slope * 0.12).clamp(0.0, 1.0);
                 let block = if d == 0 {
@@ -721,7 +727,7 @@ fn biome_water_pass(
             let lake_w = columns[idx].weights[biome_index(BiomeType::Lake)];
 
             let ocean_fill = smoothstep((ocean_w - 0.45) / 0.35);
-            if ocean_fill > 0.05 && surface <= sea_level + 2 {
+            if ocean_fill > 0.05 && surface <= sea_level {
                 let depth_target = (7.0 + 5.0 * ocean_fill).round() as i32;
                 let floor = (sea_level - depth_target).max(2);
                 for y in floor..=sea_level {
@@ -735,23 +741,23 @@ fn biome_water_pass(
             if let Some(level) = hydrology.lake_level[idx] {
                 let lake_fill = smoothstep((lake_w + 0.35 - 0.35) / 0.65);
                 if lake_fill > 0.08 {
-                    let floor = (surface - (1.0 + lake_fill * 3.0) as i32).max(2);
-                    let top = level.min(surface.max(level));
+                    let top = level.max(surface).min(sea_level + 4);
+                    let floor = (surface - (2.0 + lake_fill * 4.0) as i32).min(top).max(2);
                     for y in floor..=top {
                         let _ = world.set_raw_no_side_effects(x, y, z, WATER);
                     }
-                    for y in (floor - 1).max(1)..floor {
+                    for y in (floor - 2).max(1)..floor {
                         let _ = world.set_raw_no_side_effects(x, y, z, SAND);
                     }
                 }
             }
 
             if let Some(level) = hydrology.river_level[idx] {
-                let river_fill = smoothstep((river_w - 0.35) / 0.45);
-                if river_fill > 0.05 {
-                    let channel_depth = (1.0 + river_fill * 3.5).round() as i32;
-                    let floor = (surface - channel_depth).max(2);
-                    let top = level.min(surface - 1).max(floor);
+                let river_fill = smoothstep((river_w - 0.24) / 0.50);
+                if river_fill > 0.02 {
+                    let top = level.min(surface).min(sea_level + 1).max(2);
+                    let channel_depth = (2.0 + river_fill * 4.5).round() as i32;
+                    let floor = (top - channel_depth).max(1);
                     for y in floor..=top {
                         let _ = world.set_raw_no_side_effects(x, y, z, WATER);
                     }
@@ -891,13 +897,18 @@ fn vegetation_pass(
             let desert = weights[biome_index(BiomeType::Desert)];
             let wet =
                 weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
+            let ocean = weights[biome_index(BiomeType::Ocean)];
 
             let mut tree_p = config.tree_density
-                * (0.22 + 1.7 * forest + 0.45 * plains)
+                * (0.20 + 1.65 * forest + 0.40 * plains)
                 * (1.0 - desert).powf(2.5)
-                * (1.0 - highlands * 0.45).max(0.35);
+                * (1.0 - highlands * 0.45).max(0.35)
+                * (1.0 - ocean * 0.92).max(0.02);
+            if col.coastal || col.ocean || ground == SAND {
+                tree_p *= 0.03;
+            }
             if near_water(world, lx, top_y, lz) {
-                tree_p *= (1.0 - wet * 0.8).max(0.05);
+                tree_p *= (1.0 - wet * 0.8).max(0.04);
             }
 
             let roll = hash01(config.seed ^ 0x11117777, wx, top_y, wz);
@@ -1019,12 +1030,12 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(config.seed, x, z));
     let ocean_w = weights[biome_index(BiomeType::Ocean)];
 
-    let biome_amp = plains * 7.0 + forest * 9.5 + desert * 6.0 + highlands * 20.0;
-    let biome_rough = plains * 0.25 + forest * 0.45 + desert * 0.35 + highlands * 0.90;
+    let biome_amp = plains * 8.5 + forest * 11.0 + desert * 7.0 + highlands * 25.0;
+    let biome_rough = plains * 0.30 + forest * 0.55 + desert * 0.40 + highlands * 1.10;
 
-    let broad = (continental - 0.45) * (24.0 + highlands * 20.0);
-    let rough = (ridge - 0.5) * (6.0 + biome_amp * 0.25);
-    let micro = (detail - 0.5) * (2.0 + biome_rough * 6.0);
+    let broad = (continental - 0.45) * (30.0 + highlands * 28.0);
+    let rough = (ridge - 0.5) * (8.5 + biome_amp * 0.32);
+    let micro = (detail - 0.5) * (2.8 + biome_rough * 8.0);
 
     let mut inland = config.sea_level as f32 + broad + rough + micro;
     inland += highlands * 9.0;
@@ -1044,15 +1055,15 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
         3,
     ) - 0.5)
         * 3.0;
-    let ocean_floor_target = config.sea_level as f32 - 12.0 + ocean_depth_shape;
-    let coast_w = smoothstep((ocean_w - 0.50) / 0.30);
-    let coast_target = config.sea_level as f32;
+    let ocean_floor_target = config.sea_level as f32 - 11.0 + ocean_depth_shape;
+    let coast_w = smoothstep((ocean_w - 0.58) / 0.28);
+    let coast_target = config.sea_level as f32 - 1.0;
 
     let mut h = inland;
-    h = h * (1.0 - ocean_w * 0.82) + ocean_floor_target * ocean_w * 0.82;
-    h = h * (1.0 - coast_w * 0.30) + coast_target * coast_w * 0.30;
+    h = h * (1.0 - ocean_w * 0.74) + ocean_floor_target * ocean_w * 0.74;
+    h = h * (1.0 - coast_w * 0.24) + coast_target * coast_w * 0.24;
 
-    if ocean_w > 0.70 {
+    if ocean_w > 0.76 {
         h = h.min(config.sea_level as f32 - 1.0);
     }
 
@@ -1103,7 +1114,7 @@ fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; BIOME_COUNT] {
     weights[biome_index(BiomeType::Lake)] =
         (weights[biome_index(BiomeType::Lake)] + warp * 0.08).max(0.0);
     weights[biome_index(BiomeType::Ocean)] =
-        (weights[biome_index(BiomeType::Ocean)] + (continental - 0.60).max(0.0) * 1.5).max(0.0);
+        (weights[biome_index(BiomeType::Ocean)] + (continental - 0.68).max(0.0) * 1.1).max(0.0);
     let relief = fbm2(seed ^ 0xCC99_1010, x as f32 * 0.0025, z as f32 * 0.0025, 3);
     weights[biome_index(BiomeType::Highlands)] =
         (weights[biome_index(BiomeType::Highlands)] + (relief - 0.56).max(0.0) * 1.25).max(0.0);

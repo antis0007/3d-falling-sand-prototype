@@ -40,12 +40,13 @@ const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
 const PROCEDURAL_SIM_DISTANCE_MACROS: i32 = 1;
+const PROCEDURAL_SIM_DISTANCE_MACROS_Y: i32 = 1;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 4;
+const PROCEDURAL_RENDER_DISTANCE_MACROS_Y: i32 = 1;
 const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
 const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 6;
-const STREAM_MESH_TRANSITION_GRACE_FRAMES: u8 = 12;
 const PROCGEN_RESULTS_BUDGET_PER_FRAME: usize = 4;
 
 #[derive(Default)]
@@ -133,8 +134,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut pending_stream_mesh_coords: Vec<[i32; 3]> = Vec::new();
     let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
-    let mut transitioning_render_meshes: HashSet<[i32; 3]> = HashSet::new();
-    let mut transition_grace_frames_remaining: u8 = 0;
+    let mut previous_render_residency: HashSet<[i32; 3]> = HashSet::new();
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -371,50 +371,38 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         if let (Some(cfg), Some(stream_ref)) = (active_procgen, stream.as_mut()) {
-                            let chunk_size = cfg.dims[0] as i32;
+                            let chunk_size_x = cfg.dims[0] as i32;
+                            let chunk_size_y = cfg.dims[1] as i32;
+                            let chunk_size_z = cfg.dims[2] as i32;
                             stream_ref.persist_coord_state(active_stream_coord, &world);
                             let active_origin = stream_ref.chunk_origin(active_stream_coord);
                             let global = [
                                 active_origin[0] + ctrl.position.x.floor() as i32,
-                                0,
+                                active_origin[1] + ctrl.position.y.floor() as i32,
                                 active_origin[2] + ctrl.position.z.floor() as i32,
                             ];
                             let desired_coord = [
-                                floor_div(global[0], chunk_size),
-                                0,
-                                floor_div(global[2], chunk_size),
+                                floor_div(global[0], chunk_size_x),
+                                floor_div(global[1], chunk_size_y),
+                                floor_div(global[2], chunk_size_z),
                             ];
 
-                            let sim_residency =
-                                macro_residency_set(desired_coord, PROCEDURAL_SIM_DISTANCE_MACROS);
+                            let sim_residency = macro_residency_set(
+                                desired_coord,
+                                PROCEDURAL_SIM_DISTANCE_MACROS,
+                                PROCEDURAL_SIM_DISTANCE_MACROS_Y,
+                            );
                             let render_residency = macro_residency_set(
                                 desired_coord,
                                 PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS_Y,
                             );
                             procedural_simulation_allowed =
                                 sim_residency.contains(&active_stream_coord);
 
-                            let replacement_ready = replacement_stream_meshes_ready(
-                                stream_ref,
-                                &renderer,
-                                &render_residency,
-                                active_stream_coord,
-                            );
-                            if replacement_ready {
-                                transition_grace_frames_remaining =
-                                    transition_grace_frames_remaining.saturating_sub(1);
-                                if transition_grace_frames_remaining == 0 {
-                                    transitioning_render_meshes.clear();
-                                }
-                            }
-
-                            let keep_stream_meshes = build_keep_stream_meshes(
-                                &render_residency,
-                                active_stream_coord,
-                                &transitioning_render_meshes,
-                                replacement_ready,
-                                transition_grace_frames_remaining,
-                            );
+                            let mut keep_stream_meshes = render_residency.clone();
+                            keep_stream_meshes.extend(previous_render_residency.iter().copied());
+                            keep_stream_meshes.remove(&active_stream_coord);
                             renderer.prune_stream_meshes(&keep_stream_meshes);
                             pending_stream_mesh_coords
                                 .retain(|coord| keep_stream_meshes.contains(coord));
@@ -425,6 +413,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     continue;
                                 }
                                 if stream_ref.state(coord) == ChunkResidency::Resident
+                                    && !renderer.has_stream_mesh(coord)
                                     && queued_stream_mesh_coords.insert(coord)
                                 {
                                     pending_stream_mesh_coords.push(coord);
@@ -443,36 +432,29 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
-
-                                    let previous_render_residency = macro_residency_set(
-                                        previous_active,
-                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                    renderer.rebuild_dirty_chunks_with_budget(
+                                        &mut world,
+                                        ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME,
+                                        new_origin,
                                     );
-                                    transitioning_render_meshes = previous_render_residency
-                                        .union(&render_residency)
-                                        .copied()
-                                        .collect();
-                                    transitioning_render_meshes.remove(&active_stream_coord);
-                                    transition_grace_frames_remaining =
-                                        STREAM_MESH_TRANSITION_GRACE_FRAMES;
 
-                                    for coord in sorted_residency_coords(
-                                        active_stream_coord,
-                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                    ) {
+                                    for &coord in &render_residency {
                                         if coord == active_stream_coord {
                                             continue;
                                         }
                                         if stream_ref.state(coord) == ChunkResidency::Resident
+                                            && !renderer.has_stream_mesh(coord)
                                             && queued_stream_mesh_coords.insert(coord)
                                         {
                                             pending_stream_mesh_coords.push(coord);
                                         }
                                     }
-                                    reprioritize_pending_stream_meshes(
-                                        &mut pending_stream_mesh_coords,
-                                        active_stream_coord,
-                                    );
+                                    pending_stream_mesh_coords.sort_by_key(|coord| {
+                                        std::cmp::Reverse(macro_distance_sq(
+                                            *coord,
+                                            active_stream_coord,
+                                        ))
+                                    });
                                 }
                             }
 
@@ -535,14 +517,14 @@ pub async fn run() -> anyhow::Result<()> {
                                 global,
                             );
 
-                            reprioritize_pending_stream_meshes(
-                                &mut pending_stream_mesh_coords,
-                                active_stream_coord,
-                            );
+                            pending_stream_mesh_coords.sort_by_key(|coord| {
+                                std::cmp::Reverse(macro_distance_sq(*coord, active_stream_coord))
+                            });
                             for _ in 0..STREAM_MESH_BUILD_BUDGET_PER_FRAME {
                                 let Some(coord) = pending_stream_mesh_coords.pop() else {
                                     break;
                                 };
+                                queued_stream_mesh_coords.remove(&coord);
                                 if coord == active_stream_coord {
                                     continue;
                                 }
@@ -553,6 +535,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     });
                                 }
                             }
+                            previous_render_residency = render_residency;
                         }
 
                         if sim.running && !ui.paused_menu && procedural_simulation_allowed {
@@ -606,13 +589,15 @@ pub async fn run() -> anyhow::Result<()> {
                             .count();
                         ui.stream_debug = if active_procgen.is_some() {
                             format!(
-                                "Stream {:?} | q:{} in-flight:{} ready:{} | sim_r={} render_r={}",
+                                "Stream {:?} | q:{} in-flight:{} ready:{} | sim_r=({}, {}) render_r=({}, {})",
                                 active_stream_coord,
                                 queued_count,
                                 in_flight_count,
                                 ready_count,
                                 PROCEDURAL_SIM_DISTANCE_MACROS,
+                                PROCEDURAL_SIM_DISTANCE_MACROS_Y,
                                 PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS_Y,
                             )
                         } else {
                             "Stream: n/a".to_string()
@@ -644,6 +629,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 cam.view_proj(),
                                 [renderer.config.width, renderer.config.height],
                                 &preview_blocks,
+                                active_render_origin,
                                 &brush,
                                 preview_mode,
                                 ui.show_radial_menu,
@@ -687,15 +673,19 @@ pub async fn run() -> anyhow::Result<()> {
                                         let render_coords = sorted_residency_coords(
                                             start_coord,
                                             PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                            PROCEDURAL_RENDER_DISTANCE_MACROS_Y,
+                                        );
+                                        let start_sim_residency = macro_residency_set(
+                                            start_coord,
+                                            PROCEDURAL_SIM_DISTANCE_MACROS,
+                                            PROCEDURAL_SIM_DISTANCE_MACROS_Y,
                                         );
                                         let urgent_coords: Vec<[i32; 3]> = render_coords
                                             .iter()
                                             .copied()
                                             .filter(|coord| {
                                                 *coord != start_coord
-                                                    && macro_distance_sq(*coord, start_coord)
-                                                        <= (PROCEDURAL_SIM_DISTANCE_MACROS
-                                                            * PROCEDURAL_SIM_DISTANCE_MACROS)
+                                                    && start_sim_residency.contains(coord)
                                             })
                                             .collect();
                                         schedule_procgen_batch(
@@ -713,9 +703,7 @@ pub async fn run() -> anyhow::Result<()> {
                                             .into_iter()
                                             .filter(|coord| {
                                                 *coord != start_coord
-                                                    && macro_distance_sq(*coord, start_coord)
-                                                        > (PROCEDURAL_SIM_DISTANCE_MACROS
-                                                            * PROCEDURAL_SIM_DISTANCE_MACROS)
+                                                    && !start_sim_residency.contains(coord)
                                             })
                                             .collect();
                                         schedule_procgen_batch(
@@ -1105,58 +1093,27 @@ fn worker_loop(
 
 fn macro_distance_sq(a: [i32; 3], b: [i32; 3]) -> i32 {
     let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
     let dz = a[2] - b[2];
-    dx * dx + dz * dz
+    dx * dx + dy * dy + dz * dz
 }
 
-fn macro_residency_set(center: [i32; 3], radius: i32) -> HashSet<[i32; 3]> {
+fn macro_residency_set(center: [i32; 3], radius: i32, vertical_radius: i32) -> HashSet<[i32; 3]> {
     let mut set = HashSet::new();
-    for dz in -radius..=radius {
-        for dx in -radius..=radius {
-            set.insert([center[0] + dx, center[1], center[2] + dz]);
+    for dy in -vertical_radius..=vertical_radius {
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                set.insert([center[0] + dx, center[1] + dy, center[2] + dz]);
+            }
         }
     }
     set
 }
 
-fn replacement_stream_meshes_ready(
-    stream: &WorldStream,
-    renderer: &Renderer,
-    desired_residency: &HashSet<[i32; 3]>,
-    active_stream_coord: [i32; 3],
-) -> bool {
-    desired_residency.iter().all(|coord| {
-        if *coord == active_stream_coord {
-            return true;
-        }
-        stream.state(*coord) != ChunkResidency::Resident || renderer.has_stream_mesh(*coord)
-    })
-}
-
-fn build_keep_stream_meshes(
-    desired_residency: &HashSet<[i32; 3]>,
-    active_stream_coord: [i32; 3],
-    transitioning_render_meshes: &HashSet<[i32; 3]>,
-    replacement_ready: bool,
-    transition_grace_frames_remaining: u8,
-) -> HashSet<[i32; 3]> {
-    let mut keep_stream_meshes = desired_residency.clone();
-    keep_stream_meshes.remove(&active_stream_coord);
-    if !replacement_ready || transition_grace_frames_remaining > 0 {
-        keep_stream_meshes.extend(transitioning_render_meshes.iter().copied());
-    }
-    keep_stream_meshes
-}
-
-fn reprioritize_pending_stream_meshes(
-    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
-    focus_coord: [i32; 3],
-) {
-    pending_stream_mesh_coords.sort_by_key(|coord| Reverse(macro_distance_sq(*coord, focus_coord)));
-}
-
-fn sorted_residency_coords(center: [i32; 3], radius: i32) -> Vec<[i32; 3]> {
-    let mut coords: Vec<[i32; 3]> = macro_residency_set(center, radius).into_iter().collect();
+fn sorted_residency_coords(center: [i32; 3], radius: i32, vertical_radius: i32) -> Vec<[i32; 3]> {
+    let mut coords: Vec<[i32; 3]> = macro_residency_set(center, radius, vertical_radius)
+        .into_iter()
+        .collect();
     coords.sort_by_key(|coord| macro_distance_sq(*coord, center));
     coords
 }
