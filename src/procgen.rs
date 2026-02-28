@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::world::{MaterialId, World, EMPTY};
 
 const STONE: MaterialId = 1;
@@ -319,6 +321,10 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
     let sea_level = config.sea_level;
     let heights = build_surface_heightmap_from_world(world);
     let width = world.dims[0];
+    let depth = world.dims[2];
+    let mut wet_mask = vec![false; width * depth];
+    let mut channel_floor = vec![0i32; width * depth];
+    let mut water_target = vec![0i32; width * depth];
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
             let wx = config.world_origin[0] + lx;
@@ -371,30 +377,156 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
                 continue;
             }
 
-            let river_level = river_water_level(config.seed, wx, wz, sea_level);
-            if surface > river_level + 1 {
+            let global_plane = quantized_water_plane(config, wx, wz);
+            if surface > global_plane + 2 {
                 continue;
             }
 
             let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let top = (surface - 1).min(river_level);
-            if top < floor {
+            if floor >= surface {
                 continue;
             }
 
             for y in floor..=surface {
                 let _ = world.set(lx, y, lz, EMPTY);
             }
-            for y in floor..=top {
-                let _ = world.set(lx, y, lz, WATER);
-            }
             for y in (floor - 1).max(1)..=floor {
                 if world.get(lx, y, lz) != WATER {
                     let _ = world.set(lx, y, lz, SAND);
                 }
             }
+
+            let idx = lx as usize + lz as usize * width;
+            wet_mask[idx] = true;
+            channel_floor[idx] = floor;
+            water_target[idx] = global_plane;
         }
+    }
+
+    let mut visited = vec![false; width * depth];
+    for lz in 0..depth as i32 {
+        for lx in 0..width as i32 {
+            let start = lx as usize + lz as usize * width;
+            if visited[start] || !wet_mask[start] {
+                continue;
+            }
+
+            let mut queue = VecDeque::new();
+            let mut region = Vec::new();
+            queue.push_back((lx, lz));
+            visited[start] = true;
+
+            while let Some((cx, cz)) = queue.pop_front() {
+                region.push((cx, cz));
+                for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
+                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                        continue;
+                    }
+                    let nidx = nx as usize + nz as usize * width;
+                    if visited[nidx] || !wet_mask[nidx] {
+                        continue;
+                    }
+                    visited[nidx] = true;
+                    queue.push_back((nx, nz));
+                }
+            }
+
+            let mut avg_target = 0.0;
+            for (rx, rz) in &region {
+                let ridx = *rx as usize + *rz as usize * width;
+                avg_target += water_target[ridx] as f32;
+            }
+            avg_target /= region.len() as f32;
+
+            let mut spill = i32::MAX;
+            for (rx, rz) in &region {
+                let r_idx = *rx as usize + *rz as usize * width;
+                let r_floor = channel_floor[r_idx] + 1;
+                for (nx, nz) in [
+                    (*rx - 1, *rz),
+                    (*rx + 1, *rz),
+                    (*rx, *rz - 1),
+                    (*rx, *rz + 1),
+                ] {
+                    let n_surface = height_sample_with_fallback(&heights, width, config, nx, nz);
+                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                        spill = spill.min(n_surface.max(r_floor));
+                        continue;
+                    }
+                    let nidx = nx as usize + nz as usize * width;
+                    if !wet_mask[nidx] {
+                        spill = spill.min(n_surface.max(r_floor));
+                    }
+                }
+            }
+
+            let mut basin_target = avg_target.round() as i32;
+            if spill != i32::MAX {
+                basin_target = basin_target.min(spill);
+            }
+
+            for (rx, rz) in region {
+                let ridx = rx as usize + rz as usize * width;
+                let wx = config.world_origin[0] + rx;
+                let wz = config.world_origin[2] + rz;
+                let slope = drainage_step(config.seed, wx, wz);
+                let surface = heights[ridx];
+                let floor = channel_floor[ridx];
+                let mut top = basin_target + slope;
+                top = top.min(surface - 1).max(floor);
+                for y in floor..=top {
+                    let _ = world.set(rx, y, rz, WATER);
+                }
+            }
+        }
+    }
+}
+
+fn sampled_global_water_potential(config: &ProcGenConfig, x: i32, z: i32) -> f32 {
+    let low_noise = fbm2(
+        config.seed ^ 0xD00D_1001,
+        x as f32 * 0.0014,
+        z as f32 * 0.0014,
+        4,
+    );
+    let dir_x = fbm2(
+        config.seed ^ 0xD00D_1002,
+        x as f32 * 0.001,
+        z as f32 * 0.001,
+        2,
+    ) * 2.0
+        - 1.0;
+    let dir_z = fbm2(
+        config.seed ^ 0xD00D_1003,
+        x as f32 * 0.001,
+        z as f32 * 0.001,
+        2,
+    ) * 2.0
+        - 1.0;
+    let len = (dir_x * dir_x + dir_z * dir_z).sqrt().max(1e-4);
+    let flow_x = dir_x / len;
+    let flow_z = dir_z / len;
+    let outlet_proj = (x as f32 * flow_x + z as f32 * flow_z) * 0.0018;
+    low_noise * 0.7 - outlet_proj * 0.3
+}
+
+fn quantized_water_plane(config: &ProcGenConfig, x: i32, z: i32) -> i32 {
+    let potential = sampled_global_water_potential(config, x, z);
+    let plane_size = 2.0;
+    let base = config.sea_level as f32 - 3.0;
+    let raw = base + (potential - 0.5) * 8.0;
+    (raw / plane_size).round() as i32 * plane_size as i32
+}
+
+fn drainage_step(seed: u64, x: i32, z: i32) -> i32 {
+    let g = fbm2(seed ^ 0xD00D_1004, x as f32 * 0.003, z as f32 * 0.003, 2);
+    if g > 0.75 {
+        1
+    } else if g < 0.25 {
+        -1
+    } else {
+        0
     }
 }
 
@@ -460,8 +592,10 @@ fn height_sample_with_fallback(
     sampled_surface_height(config, wx, wz)
 }
 
-fn river_water_level(_seed: u64, _x: i32, _z: i32, sea_level: i32) -> i32 {
-    sea_level - 1
+fn explicit_rapid_or_fall(seed: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> bool {
+    let a = drainage_step(seed, x0, z0);
+    let b = drainage_step(seed, x1, z1);
+    (a - b).abs() >= 2
 }
 
 fn enforce_subsea_materials_pass(world: &mut World, config: &ProcGenConfig) {
@@ -950,4 +1084,78 @@ fn hash_u64(seed: u64, x: i32, y: i32, z: i32) -> u64 {
     v ^= v >> 27;
     v = v.wrapping_mul(0x94D0_49BB_1331_11EB);
     v ^ (v >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn water_surface(world: &World, x: i32, z: i32) -> Option<i32> {
+        for y in (1..world.dims[1] as i32).rev() {
+            if world.get(x, y, z) == WATER {
+                return Some(y);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn adjacent_river_cells_have_continuous_levels() {
+        let config = ProcGenConfig::for_size(64, 0xBADC0FFE).with_origin([0, 0, 0]);
+        let world = generate_world(config);
+        let heights = build_surface_heightmap_from_world(&world);
+
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 {
+                let Some(level) = water_surface(&world, x, z) else {
+                    continue;
+                };
+
+                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
+                    if nx >= world.dims[0] as i32 || nz >= world.dims[2] as i32 {
+                        continue;
+                    }
+                    let Some(other_level) = water_surface(&world, nx, nz) else {
+                        continue;
+                    };
+                    let wx0 = config.world_origin[0] + x;
+                    let wz0 = config.world_origin[2] + z;
+                    let wx1 = config.world_origin[0] + nx;
+                    let wz1 = config.world_origin[2] + nz;
+                    let diff = (level - other_level).abs();
+                    let rapid = explicit_rapid_or_fall(config.seed, wx0, wz0, wx1, wz1);
+                    let terrain_drop = (heights[x as usize + z as usize * world.dims[0]]
+                        - heights[nx as usize + nz as usize * world.dims[0]])
+                        .abs();
+                    if !rapid && terrain_drop < 3 {
+                        assert!(
+                            diff <= 1,
+                            "water step too large at ({x},{z}) -> ({nx},{nz}): {diff}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_border_waterline_uses_global_context() {
+        let size = 64;
+        let seed = 0x1234_5678;
+        let left_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
+        let right_cfg = ProcGenConfig::for_size(size, seed).with_origin([size as i32, 0, 0]);
+        let left = generate_world(left_cfg);
+        let right = generate_world(right_cfg);
+
+        for z in 0..size as i32 {
+            let a = water_surface(&left, size as i32 - 1, z);
+            let b = water_surface(&right, 0, z);
+            if let (Some(al), Some(bl)) = (a, b) {
+                assert!(
+                    (al - bl).abs() <= 1,
+                    "border waterline mismatch at z={z}: {al} vs {bl}"
+                );
+            }
+        }
+    }
 }
