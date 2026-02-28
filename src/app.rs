@@ -32,6 +32,7 @@ const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
+const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
 
@@ -91,7 +92,6 @@ pub async fn run() -> anyhow::Result<()> {
     let mut edit_runtime = EditRuntimeState::default();
     let mut last = Instant::now();
     let start = Instant::now();
-    let mut sim_tick: u64 = 0;
     let mut active_procgen: Option<ProcGenConfig> = None;
     let mut stream: Option<WorldStream> = None;
     let mut active_stream_coord: [i32; 3] = [0, 0, 0];
@@ -314,13 +314,9 @@ pub async fn run() -> anyhow::Result<()> {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
                             while sim.accumulator >= step_dt {
-                                let (high_priority, low_priority) =
+                                let (high_priority, _low_priority) =
                                     prioritize_chunks_for_player(&world, ctrl.position);
                                 step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
-                                if sim_tick % LOW_PRIORITY_THROTTLE_TICKS == 0 {
-                                    step_selected_chunks(&mut world, &mut sim.rng, &low_priority);
-                                }
-                                sim_tick = sim_tick.wrapping_add(1);
                                 sim.accumulator -= step_dt;
                             }
                         }
