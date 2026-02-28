@@ -6,6 +6,7 @@ use crate::player::{
 use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
+use crate::streaming_manager::StreamingManager;
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     ToolTextures, UiState, HOTBAR_SLOTS,
@@ -16,7 +17,6 @@ use crate::world::{
 };
 use anyhow::Context;
 use glam::Vec3;
-use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
@@ -35,6 +35,7 @@ const GRASS_ID: u16 = 19;
 const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
 const PROCEDURAL_MACROCHUNK_SIZE: i32 = 64;
 const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
+const PROCEDURAL_RENDER_BUDGET_CHUNKS: usize = 25;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -98,7 +99,12 @@ pub async fn run() -> anyhow::Result<()> {
     let mut requested_procgen_id: Option<u64> = None;
     let mut requested_procgen_origin: Option<[i32; 3]> = None;
     let mut next_procgen_id: u64 = 1;
-    let mut generated_regions: BTreeMap<[i32; 3], World> = BTreeMap::new();
+    let mut streaming = StreamingManager::new(
+        PROCEDURAL_MACROCHUNK_SIZE,
+        PROCEDURAL_RENDER_DISTANCE_MACROS,
+        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+    );
+    streaming.set_render_radius_from_budget(PROCEDURAL_RENDER_BUDGET_CHUNKS);
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -347,21 +353,13 @@ pub async fn run() -> anyhow::Result<()> {
 
                             let incoming_world = result.world;
                             let chosen_world = if let Some(existing) =
-                                generated_regions.get(&result.config.world_origin)
+                                streaming.get_snapshot(result.config.world_origin)
                             {
                                 existing.clone()
                             } else {
                                 incoming_world.clone()
                             };
-                            generated_regions
-                                .entry(result.config.world_origin)
-                                .or_insert_with(|| incoming_world.clone());
-                            prune_generated_regions(
-                                &mut generated_regions,
-                                result.config.world_origin,
-                                PROCEDURAL_MACROCHUNK_SIZE,
-                                PROCEDURAL_RENDER_DISTANCE_MACROS,
-                            );
+                            streaming.insert_snapshot(result.config.world_origin, incoming_world);
                             active_procgen = Some(result.config);
                             active_procgen_origin = result.config.world_origin;
                             world = chosen_world;
@@ -388,6 +386,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 0,
                                 floor_div(global[2], PROCEDURAL_MACROCHUNK_SIZE),
                             ];
+                            streaming.update_residency(player_macro);
                             let origin_macro = [
                                 floor_div(active_procgen_origin[0], PROCEDURAL_MACROCHUNK_SIZE),
                                 floor_div(active_procgen_origin[2], PROCEDURAL_MACROCHUNK_SIZE),
@@ -413,17 +412,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 && requested_procgen_id.is_none()
                                 && requested_procgen_origin != Some(desired_origin)
                             {
-                                generated_regions.insert(active_procgen_origin, world.clone());
-                                if let Some(cached) = generated_regions.get(&desired_origin) {
+                                streaming.insert_snapshot(active_procgen_origin, world.clone());
+                                if let Some(cached) = streaming.get_snapshot(desired_origin) {
                                     active_procgen_origin = desired_origin;
                                     active_procgen = Some(cfg.with_origin(desired_origin));
                                     world = cached.clone();
-                                    prune_generated_regions(
-                                        &mut generated_regions,
-                                        desired_origin,
-                                        PROCEDURAL_MACROCHUNK_SIZE,
-                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                    );
                                     let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                     let frac_z = ctrl.position.z - ctrl.position.z.floor();
                                     ctrl.position = Vec3::new(
@@ -447,13 +440,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
 
                             if requested_procgen_id.is_none() {
-                                if let Some(prefetch_origin) = next_missing_region_origin(
-                                    &generated_regions,
-                                    active_procgen_origin,
-                                    player_macro,
-                                    PROCEDURAL_MACROCHUNK_SIZE,
-                                    PROCEDURAL_RENDER_DISTANCE_MACROS,
-                                ) {
+                                if let Some(prefetch_origin) =
+                                    streaming.next_missing_render_origin()
+                                {
                                     if requested_procgen_origin == Some(prefetch_origin) {
                                         // avoid reloading the same region repeatedly
                                     } else {
@@ -525,7 +514,14 @@ pub async fn run() -> anyhow::Result<()> {
                                     let macro_span = PROCEDURAL_RENDER_DISTANCE_MACROS * 2 + 1;
                                     let proc_size =
                                         (PROCEDURAL_MACROCHUNK_SIZE * macro_span) as usize;
-                                    generated_regions.clear();
+                                    streaming = StreamingManager::new(
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
+                                    streaming.set_render_radius_from_budget(
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
                                     active_procgen_origin = [
                                         -PROCEDURAL_MACROCHUNK_SIZE,
                                         0,
@@ -547,7 +543,14 @@ pub async fn run() -> anyhow::Result<()> {
                                 } else {
                                     requested_procgen_id = None;
                                     requested_procgen_origin = None;
-                                    generated_regions.clear();
+                                    streaming = StreamingManager::new(
+                                        PROCEDURAL_MACROCHUNK_SIZE,
+                                        PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
+                                    streaming.set_render_radius_from_budget(
+                                        PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                    );
                                     active_procgen = None;
                                     active_procgen_origin = [0, 0, 0];
                                     world = World::new([n, n, n]);
@@ -567,7 +570,17 @@ pub async fn run() -> anyhow::Result<()> {
                                         world = w;
                                         requested_procgen_id = None;
                                         requested_procgen_origin = None;
-                                        generated_regions.clear();
+                                        streaming = StreamingManager::new(
+                                            PROCEDURAL_MACROCHUNK_SIZE,
+                                            PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
+                                        streaming.set_render_radius_from_budget(
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
+                                        streaming.set_render_radius_from_budget(
+                                            PROCEDURAL_RENDER_BUDGET_CHUNKS,
+                                        );
                                         active_procgen = None;
                                         active_procgen_origin = [0, 0, 0];
                                         let spawn = find_safe_spawn(&world, 1);
@@ -755,49 +768,6 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
 
 fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
     ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
-}
-
-fn next_missing_region_origin(
-    generated_regions: &BTreeMap<[i32; 3], World>,
-    active_origin: [i32; 3],
-    player_macro: [i32; 3],
-    macro_size: i32,
-    render_distance_macros: i32,
-) -> Option<[i32; 3]> {
-    let center_x = player_macro[0] - render_distance_macros;
-    let center_z = player_macro[2] - render_distance_macros;
-    let mut candidates = Vec::new();
-    for dz in -1..=1 {
-        for dx in -1..=1 {
-            let origin = [
-                (center_x + dx) * macro_size,
-                0,
-                (center_z + dz) * macro_size,
-            ];
-            if origin == active_origin || generated_regions.contains_key(&origin) {
-                continue;
-            }
-            let manhattan = dx.abs() + dz.abs();
-            candidates.push((manhattan, origin));
-        }
-    }
-    candidates.sort_by_key(|(dist, _)| *dist);
-    candidates.into_iter().map(|(_, origin)| origin).next()
-}
-
-fn prune_generated_regions(
-    generated_regions: &mut BTreeMap<[i32; 3], World>,
-    center_origin: [i32; 3],
-    macro_size: i32,
-    keep_radius: i32,
-) {
-    let center_mx = floor_div(center_origin[0], macro_size);
-    let center_mz = floor_div(center_origin[2], macro_size);
-    generated_regions.retain(|origin, _| {
-        let dx = (floor_div(origin[0], macro_size) - center_mx).abs();
-        let dz = (floor_div(origin[2], macro_size) - center_mz).abs();
-        dx <= keep_radius && dz <= keep_radius
-    });
 }
 
 fn floor_div(a: i32, b: i32) -> i32 {

@@ -216,7 +216,9 @@ impl Renderer {
             .chunks
             .iter()
             .enumerate()
-            .filter_map(|(i, chunk)| chunk.dirty_mesh.then_some(i))
+            .filter_map(|(i, chunk)| {
+                (chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version).then_some(i)
+            })
             .collect();
 
         for i in dirty_chunks {
@@ -224,6 +226,7 @@ impl Renderer {
             if inds.is_empty() {
                 self.meshes.remove(&i);
                 world.chunks[i].dirty_mesh = false;
+                world.chunks[i].meshed_version = world.chunks[i].voxel_version;
                 continue;
             }
             let vb = self
@@ -251,6 +254,7 @@ impl Renderer {
                 },
             );
             world.chunks[i].dirty_mesh = false;
+            world.chunks[i].meshed_version = world.chunks[i].voxel_version;
         }
     }
 
