@@ -77,15 +77,9 @@ pub struct ChunkMesh {
     aabb_max: Vec3,
 }
 
-struct PendingStreamMesh {
-    version: u64,
-    meshes: Vec<ChunkMesh>,
-}
-
 struct StreamMeshEntry {
     active_version: u64,
     active_meshes: Vec<ChunkMesh>,
-    pending: Option<PendingStreamMesh>,
 }
 
 pub struct Renderer {
@@ -246,6 +240,18 @@ impl Renderer {
         budget: usize,
         world_origin: [i32; 3],
     ) {
+        self.rebuild_dirty_chunks_with_budget_and_sampler(world, budget, world_origin, |_| None);
+    }
+
+    pub fn rebuild_dirty_chunks_with_budget_and_sampler<F>(
+        &mut self,
+        world: &mut World,
+        budget: usize,
+        world_origin: [i32; 3],
+        mut sample_global: F,
+    ) where
+        F: FnMut([i32; 3]) -> Option<MaterialId>,
+    {
         let budget = budget.max(1);
         self.mesh_frame = self.mesh_frame.saturating_add(1);
         for (index, chunk) in world.chunks.iter().enumerate() {
@@ -265,8 +271,15 @@ impl Renderer {
 
         for i in dirty_chunks.indices {
             let (verts, inds, aabb_min, aabb_max) =
-                mesh_chunk(world, i, world_origin, |local, _world| {
-                    world.get(local[0], local[1], local[2])
+                mesh_chunk(world, i, world_origin, |local, global| {
+                    let local_id = world.get(local[0], local[1], local[2]);
+                    if local_id != EMPTY {
+                        return local_id;
+                    }
+                    match sample_global(global) {
+                        Some(id) => id,
+                        None => unknown_neighbor_material(self.unknown_neighbor_policy),
+                    }
                 });
             if inds.is_empty() {
                 self.meshes.remove(&i);
@@ -345,10 +358,7 @@ impl Renderer {
                     }
                     match sample_global(global) {
                         Some(id) => id,
-                        None => match self.unknown_neighbor_policy {
-                            UnknownNeighborOcclusionPolicy::Conservative => EMPTY,
-                            UnknownNeighborOcclusionPolicy::Aggressive => 1,
-                        },
+                        None => unknown_neighbor_material(self.unknown_neighbor_policy),
                     }
                 });
             if inds.is_empty() {
@@ -386,13 +396,9 @@ impl Renderer {
             .or_insert(StreamMeshEntry {
                 active_version: 0,
                 active_meshes: Vec::new(),
-                pending: None,
             });
-        entry.pending = Some(PendingStreamMesh { version, meshes });
-        if let Some(pending) = entry.pending.take() {
-            entry.active_meshes = pending.meshes;
-            entry.active_version = pending.version;
-        }
+        entry.active_meshes = meshes;
+        entry.active_version = version;
     }
 
     pub fn prune_stream_meshes(&mut self, keep: &std::collections::HashSet<[i32; 3]>) {
@@ -424,17 +430,18 @@ impl Renderer {
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+        let vp = camera.view_proj();
         self.queue.write_buffer(
             &self.cam_buf,
             0,
             bytemuck::bytes_of(&CameraUniform {
-                vp: camera.view_proj().to_cols_array_2d(),
+                vp: vp.to_cols_array_2d(),
             }),
         );
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
         for mesh in self.meshes.values() {
-            if !aabb_in_view(camera.view_proj(), mesh.aabb_min, mesh.aabb_max) {
+            if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
             }
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
@@ -443,7 +450,7 @@ impl Renderer {
         }
         for entry in self.streamed_meshes.values() {
             for mesh in &entry.active_meshes {
-                if !aabb_in_view(camera.view_proj(), mesh.aabb_min, mesh.aabb_max) {
+                if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                     continue;
                 }
                 pass.set_vertex_buffer(0, mesh.vb.slice(..));
@@ -546,6 +553,13 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
         }
     }
     true
+}
+
+fn unknown_neighbor_material(policy: UnknownNeighborOcclusionPolicy) -> MaterialId {
+    match policy {
+        UnknownNeighborOcclusionPolicy::Conservative => TURF_ID,
+        UnknownNeighborOcclusionPolicy::Aggressive => EMPTY,
+    }
 }
 
 fn mesh_chunk<F>(
@@ -777,15 +791,15 @@ fn add_crossed_billboard<F>(
             b,
             b + 1,
             b + 2,
-            b + 1,
             b,
+            b + 2,
             b + 3,
+            b,
             b + 2,
             b + 1,
             b,
             b + 3,
-            b,
-            b + 1,
+            b + 2,
         ]);
     }
 }
