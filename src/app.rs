@@ -433,6 +433,27 @@ pub async fn run() -> anyhow::Result<()> {
                                     queue_procgen_job(&procgen_tx, spec);
                                 }
                             }
+
+                            if requested_procgen_id.is_none() {
+                                if let Some(prefetch_origin) = next_missing_region_origin(
+                                    &generated_regions,
+                                    active_procgen_origin,
+                                    player_macro,
+                                    PROCEDURAL_MACROCHUNK_SIZE,
+                                    PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                ) {
+                                    let next_cfg = cfg.with_origin(prefetch_origin);
+                                    let spec = ProcgenJobSpec {
+                                        generation_id: next_procgen_id,
+                                        config: next_cfg,
+                                        prefer_safe_spawn: false,
+                                        target_global_pos: global,
+                                    };
+                                    next_procgen_id = next_procgen_id.wrapping_add(1);
+                                    requested_procgen_id = Some(spec.generation_id);
+                                    queue_procgen_job(&procgen_tx, spec);
+                                }
+                            }
                         }
 
                         renderer.rebuild_dirty_chunks(&mut world);
@@ -714,6 +735,34 @@ fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()
 
 fn should_unlock_cursor(ui: &UiState, quick_menu_held: bool, tab_palette_held: bool) -> bool {
     ui.paused_menu || quick_menu_held || tab_palette_held || ui.show_tool_quick_menu
+}
+
+fn next_missing_region_origin(
+    generated_regions: &BTreeMap<[i32; 3], World>,
+    active_origin: [i32; 3],
+    player_macro: [i32; 3],
+    macro_size: i32,
+    render_distance_macros: i32,
+) -> Option<[i32; 3]> {
+    let center_x = player_macro[0] - render_distance_macros;
+    let center_z = player_macro[2] - render_distance_macros;
+    let mut candidates = Vec::new();
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let origin = [
+                (center_x + dx) * macro_size,
+                0,
+                (center_z + dz) * macro_size,
+            ];
+            if origin == active_origin || generated_regions.contains_key(&origin) {
+                continue;
+            }
+            let manhattan = dx.abs() + dz.abs();
+            candidates.push((manhattan, origin));
+        }
+    }
+    candidates.sort_by_key(|(dist, _)| *dist);
+    candidates.into_iter().map(|(_, origin)| origin).next()
 }
 
 fn prune_generated_regions(

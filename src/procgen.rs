@@ -159,8 +159,14 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
 
             let desert = weights[biome_index(BiomeType::Desert)];
             let ocean = weights[biome_index(BiomeType::Ocean)];
+            let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
+                wx,
+                wz,
+            ));
             let shore_w = smoothstep((ocean - 0.22) / 0.35);
             let coastal = shore_w > 0.18 && top_y <= config.sea_level + 3;
+            let river_bank = river > 0.5 && top_y <= config.sea_level + 2;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
             let sand_depth = if coastal {
                 (3.0 + shore_w * 4.0).round() as i32
@@ -174,12 +180,12 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                     continue;
                 }
                 let block = if d == 0 {
-                    if coastal || desert > 0.58 {
+                    if coastal || river_bank || desert > 0.58 {
                         SAND
                     } else {
                         TURF
                     }
-                } else if (desert > 0.58 || coastal) && d <= sand_depth {
+                } else if (desert > 0.58 || coastal || river_bank) && d <= sand_depth {
                     SAND
                 } else if d <= dirt_depth {
                     DIRT
@@ -211,11 +217,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
             let lowland_neighbors = count_neighbors_below_world(config, wx, wz, sea_level - 1);
             let lowland_area = local_lowland_fraction(config, wx, wz, sea_level - 1, 3);
             let ocean_dominant = ocean_w > 0.52;
-            if ocean_dominant
-                && surface <= sea_level - 2
-                && lowland_neighbors >= 6
-                && lowland_area >= 0.62
-            {
+            if ocean_dominant {
                 let depth_variation = ((fbm2(
                     config.seed ^ 0x0CEA_0010,
                     wx as f32 * 0.0032,
@@ -226,19 +228,24 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                     .round() as i32;
                 let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
+                let force_ocean = ocean_w > 0.68;
+                let qualifies = force_ocean
+                    || (surface <= sea_level - 2 && lowland_neighbors >= 6 && lowland_area >= 0.62);
 
-                for y in 1..floor {
-                    if world.get(lx, y, lz) == EMPTY {
-                        let _ = world.set(lx, y, lz, STONE);
+                if qualifies {
+                    for y in 1..floor {
+                        if world.get(lx, y, lz) == EMPTY {
+                            let _ = world.set(lx, y, lz, STONE);
+                        }
                     }
+                    for y in floor..=sea_level {
+                        let _ = world.set(lx, y, lz, WATER);
+                    }
+                    for y in (floor - 2).max(1)..floor {
+                        let _ = world.set(lx, y, lz, SAND);
+                    }
+                    continue;
                 }
-                for y in floor..=sea_level {
-                    let _ = world.set(lx, y, lz, WATER);
-                }
-                for y in (floor - 2).max(1)..floor {
-                    let _ = world.set(lx, y, lz, SAND);
-                }
-                continue;
             }
 
             let wetness = river_w.max(lake_w);
@@ -248,8 +255,8 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
 
             let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let neigh_min = neighbor_min_surface_world(config, wx, wz).unwrap_or(surface);
-            let top = (surface - 1).min(sea_level - 1).min(neigh_min - 1);
+            let river_level = sea_level - 1;
+            let top = (surface - 1).min(river_level);
             if top < floor {
                 continue;
             }
@@ -304,23 +311,6 @@ fn local_lowland_fraction(
         }
     }
     low as f32 / total as f32
-}
-
-fn neighbor_min_surface_world(config: &ProcGenConfig, x: i32, z: i32) -> Option<i32> {
-    let mut min_h: Option<i32> = None;
-    for dz in -1..=1 {
-        for dx in -1..=1 {
-            if dx == 0 && dz == 0 {
-                continue;
-            }
-            let h = sampled_surface_height(config, x + dx, z + dz);
-            min_h = Some(match min_h {
-                Some(curr) => curr.min(h),
-                None => h,
-            });
-        }
-    }
-    min_h
 }
 
 fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {

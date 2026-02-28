@@ -518,8 +518,9 @@ pub fn prioritize_chunks_for_player(
                 let idx = world.chunk_index(cx, cy, cz);
                 let chunk_macro = macrochunk_from_chunk_coord(cx as i32, cy as i32, cz as i32);
                 let dx = (chunk_macro[0] - macro_coord[0]).abs();
+                let dy = (chunk_macro[1] - macro_coord[1]).abs();
                 let dz = (chunk_macro[2] - macro_coord[2]).abs();
-                if dx == 0 && dz == 0 {
+                if dx == 0 && dy == 0 && dz == 0 {
                     high.push(idx);
                 }
             }
