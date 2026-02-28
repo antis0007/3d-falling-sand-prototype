@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::world::{MaterialId, World, EMPTY};
@@ -70,6 +70,27 @@ pub enum BiomeType {
     River,
     Lake,
     Ocean,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HydroFeature {
+    None,
+    RiverChannel,
+    LakeBasin,
+    OceanShelf,
+    Coast,
+}
+
+impl HydroFeature {
+    pub fn label(self) -> &'static str {
+        match self {
+            HydroFeature::None => "None",
+            HydroFeature::RiverChannel => "River channel",
+            HydroFeature::LakeBasin => "Lake basin",
+            HydroFeature::OceanShelf => "Ocean shelf",
+            HydroFeature::Coast => "Coast",
+        }
+    }
 }
 
 impl BiomeType {
@@ -156,6 +177,21 @@ struct HydrologyData {
     ocean_weight: Vec<f32>,
     lake_level: Vec<Option<i32>>,
     river_level: Vec<Option<i32>>,
+}
+
+#[derive(Clone, Copy)]
+struct HydrologyContextCell {
+    local_idx: Option<usize>,
+    surface_height: i32,
+    ocean_weight: f32,
+    river_weight: f32,
+}
+
+struct HydrologyContext {
+    width: usize,
+    depth: usize,
+    cells: Vec<HydrologyContextCell>,
+    by_global: HashMap<(i32, i32), usize>,
 }
 
 impl ProcGenConfig {
@@ -263,8 +299,32 @@ pub fn generate_world_with_control(
 }
 
 pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
+    base_biome_at_world(config, x, z)
+}
+
+pub fn base_biome_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
     let weights = biome_weights(config.seed, x, z);
-    dominant_biome(weights)
+    dominant_base_biome(weights)
+}
+
+pub fn hydro_feature_at_world(config: &ProcGenConfig, x: i32, z: i32) -> HydroFeature {
+    let weights = biome_weights(config.seed, x, z);
+    let ocean = weights[biome_index(BiomeType::Ocean)];
+    if ocean > 0.62 {
+        return HydroFeature::OceanShelf;
+    }
+    if ocean > 0.50 {
+        return HydroFeature::Coast;
+    }
+    let lake = weights[biome_index(BiomeType::Lake)];
+    if lake > 0.54 {
+        return HydroFeature::LakeBasin;
+    }
+    let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(config.seed, x, z));
+    if river > 0.52 {
+        return HydroFeature::RiverChannel;
+    }
+    HydroFeature::None
 }
 
 fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
@@ -333,7 +393,7 @@ fn build_column_cache(
 
 fn build_hydrology_cache(
     config: &ProcGenConfig,
-    heights: &[i32],
+    _heights: &[i32],
     columns: &[ColumnGenData],
     timings: &ProcGenPassTimings,
 ) -> HydrologyData {
@@ -341,32 +401,86 @@ fn build_hydrology_cache(
     let width = config.dims[0];
     let depth = config.dims[2];
     let len = width * depth;
+    let pad_x = width as i32;
+    let pad_z = depth as i32;
+    let ctx_width = width + pad_x as usize * 2;
+    let ctx_depth = depth + pad_z as usize * 2;
+    let mut context = HydrologyContext {
+        width: ctx_width,
+        depth: ctx_depth,
+        cells: Vec::with_capacity(ctx_width * ctx_depth),
+        by_global: HashMap::with_capacity(ctx_width * ctx_depth),
+    };
+    for cz in 0..ctx_depth as i32 {
+        for cx in 0..ctx_width as i32 {
+            let wx = config.world_origin[0] + cx - pad_x;
+            let wz = config.world_origin[2] + cz - pad_z;
+            let local_x = wx - config.world_origin[0];
+            let local_z = wz - config.world_origin[2];
+            let local_idx =
+                if local_x >= 0 && local_z >= 0 && local_x < width as i32 && local_z < depth as i32
+                {
+                    Some(local_x as usize + local_z as usize * width)
+                } else {
+                    None
+                };
+            let local_col = local_idx.map(|idx| columns[idx]);
+            let local_weights = local_col
+                .map(|col| col.weights)
+                .unwrap_or_else(|| biome_weights(config.seed, wx, wz));
+            let surface_height = local_col
+                .map(|col| col.surface_height)
+                .unwrap_or_else(|| sampled_surface_height(config, wx, wz, Some(local_weights)));
+            let ocean = local_weights[biome_index(BiomeType::Ocean)];
+            let river = local_weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
+                wx,
+                wz,
+            ));
+            let accum_seed = smoothstep((river - 0.24) / 0.65);
+            let ocean_weight = (ocean * 0.75
+                + smoothstep(
+                    (config.sea_level_local() as f32 + 3.0 - surface_height as f32) / 7.0,
+                ) * 0.25)
+                .clamp(0.0, 1.0);
+            let river_weight = (accum_seed * 0.75 + river * 0.4).clamp(0.0, 1.0);
+            let idx = context.cells.len();
+            context.cells.push(HydrologyContextCell {
+                local_idx,
+                surface_height,
+                ocean_weight,
+                river_weight,
+            });
+            context.by_global.insert((wx, wz), idx);
+        }
+    }
 
-    let mut flow_to = vec![None; len];
-    for z in 0..depth as i32 {
-        for x in 0..width as i32 {
-            let idx = x as usize + z as usize * width;
-            let center = heights[idx];
+    let ctx_len = context.width * context.depth;
+    let mut flow_to = vec![None; ctx_len];
+    for z in 0..context.depth as i32 {
+        for x in 0..context.width as i32 {
+            let idx = x as usize + z as usize * context.width;
+            let center = context.cells[idx].surface_height;
             let mut best = center;
             let mut best_idx = None;
             for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-                let nh = height_sample_with_fallback(heights, width, config, nx, nz);
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
+                    continue;
+                }
+                let nidx = nx as usize + nz as usize * context.width;
+                let nh = context.cells[nidx].surface_height;
                 if nh < best {
                     best = nh;
-                    if nx >= 0 && nz >= 0 && nx < width as i32 && nz < depth as i32 {
-                        best_idx = Some(nx as usize + nz as usize * width);
-                    } else {
-                        best_idx = None;
-                    }
+                    best_idx = Some(nidx);
                 }
             }
             flow_to[idx] = best_idx;
         }
     }
 
-    let mut order: Vec<usize> = (0..len).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(heights[i]));
-    let mut flow_accum = vec![1.0f32; len];
+    let mut order: Vec<usize> = (0..ctx_len).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(context.cells[i].surface_height));
+    let mut flow_accum = vec![1.0f32; ctx_len];
     for idx in order {
         if let Some(down) = flow_to[idx] {
             flow_accum[down] += flow_accum[idx];
@@ -375,27 +489,18 @@ fn build_hydrology_cache(
 
     let mut ocean_weight = vec![0.0; len];
     let mut river_weight = vec![0.0; len];
-    for z in 0..depth as i32 {
-        for x in 0..width as i32 {
-            let idx = x as usize + z as usize * width;
-            let col = &columns[idx];
-            let accum_norm = (flow_accum[idx].ln() / 5.0).clamp(0.0, 1.0);
-            let ocean_biome = col.weights[biome_index(BiomeType::Ocean)];
-            let coastal_low =
-                smoothstep((config.sea_level_local() as f32 + 3.0 - heights[idx] as f32) / 7.0);
-            ocean_weight[idx] = (ocean_biome * 0.75 + coastal_low * 0.25).clamp(0.0, 1.0);
-
-            let river_biome = col.weights[biome_index(BiomeType::River)].max(river_meander_signal(
-                config.seed,
-                col.wx,
-                col.wz,
-            ));
-            river_weight[idx] = smoothstep((accum_norm * 0.8 + river_biome * 0.7 - 0.42) / 0.45);
+    for idx in 0..ctx_len {
+        if let Some(local_idx) = context.cells[idx].local_idx {
+            let accum_norm = (flow_accum[idx].ln() / 6.0).clamp(0.0, 1.0);
+            ocean_weight[local_idx] = context.cells[idx].ocean_weight;
+            river_weight[local_idx] = smoothstep(
+                (accum_norm * 0.9 + context.cells[idx].river_weight * 0.75 - 0.38) / 0.45,
+            );
         }
     }
 
-    let mut distance = vec![0i32; len];
-    for &idx in (0..len).collect::<Vec<_>>().iter().rev() {
+    let mut distance = vec![0i32; ctx_len];
+    for &idx in (0..ctx_len).collect::<Vec<_>>().iter().rev() {
         let mut steps = 0;
         let mut cur = idx;
         for _ in 0..128 {
@@ -411,16 +516,14 @@ fn build_hydrology_cache(
     }
 
     let mut river_level = vec![None; len];
-    let mut river_mask = vec![false; len];
-    for i in 0..len {
-        if river_weight[i] > 0.45 {
-            river_mask[i] = true;
-        }
+    let mut river_mask = vec![false; ctx_len];
+    for i in 0..ctx_len {
+        river_mask[i] = context.cells[i].river_weight > 0.45;
     }
-    let mut visited = vec![false; len];
-    for z in 0..depth as i32 {
-        for x in 0..width as i32 {
-            let start = x as usize + z as usize * width;
+    let mut visited = vec![false; ctx_len];
+    for z in 0..context.depth as i32 {
+        for x in 0..context.width as i32 {
+            let start = x as usize + z as usize * context.width;
             if visited[start] || !river_mask[start] {
                 continue;
             }
@@ -431,10 +534,11 @@ fn build_hydrology_cache(
             while let Some((cx, cz)) = q.pop_front() {
                 region.push((cx, cz));
                 for (nx, nz) in [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)] {
-                    if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                    if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32
+                    {
                         continue;
                     }
-                    let nidx = nx as usize + nz as usize * width;
+                    let nidx = nx as usize + nz as usize * context.width;
                     if visited[nidx] || !river_mask[nidx] {
                         continue;
                     }
@@ -444,23 +548,26 @@ fn build_hydrology_cache(
             }
             let mut avg = 0.0;
             for (rx, rz) in &region {
-                let idx = *rx as usize + *rz as usize * width;
+                let idx = *rx as usize + *rz as usize * context.width;
                 let step_drop = (distance[idx] / 10) as i32;
-                let level = (config.sea_level_local() - step_drop).min(heights[idx] - 1);
+                let level = (config.sea_level_local() - step_drop)
+                    .min(context.cells[idx].surface_height - 1);
                 avg += level as f32;
             }
             let flat = (avg / region.len() as f32).round() as i32;
             for (rx, rz) in region {
-                let idx = rx as usize + rz as usize * width;
+                let idx = rx as usize + rz as usize * context.width;
                 let step_drop = (distance[idx] / 10) as i32;
                 let ctrl = flat.min(config.sea_level_local() - step_drop + 1);
-                river_level[idx] = Some(ctrl.min(heights[idx] - 1));
+                if let Some(local_idx) = context.cells[idx].local_idx {
+                    river_level[local_idx] = Some(ctrl.min(context.cells[idx].surface_height - 1));
+                }
             }
         }
     }
 
-    let mut sink_owner = vec![None::<usize>; len];
-    for i in 0..len {
+    let mut sink_owner = vec![None::<usize>; ctx_len];
+    for i in 0..ctx_len {
         let mut cur = i;
         let mut sink = None;
         for _ in 0..128 {
@@ -475,8 +582,8 @@ fn build_hydrology_cache(
     }
     let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
-    for i in 0..len {
-        if ocean_weight[i] > 0.55 || river_weight[i] > 0.55 {
+    for i in 0..ctx_len {
+        if context.cells[i].ocean_weight > 0.55 || context.cells[i].river_weight > 0.55 {
             continue;
         }
         if let Some(s) = sink_owner[i] {
@@ -488,21 +595,21 @@ fn build_hydrology_cache(
         if cells.len() < 4 {
             continue;
         }
-        let mut in_basin = vec![false; len];
+        let mut in_basin = vec![false; ctx_len];
         for &i in &cells {
             in_basin[i] = true;
         }
         let mut spill = i32::MAX;
         for &i in &cells {
-            let x = (i % width) as i32;
-            let z = (i / width) as i32;
+            let x = (i % context.width) as i32;
+            let z = (i / context.width) as i32;
             for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
-                if nx < 0 || nz < 0 || nx >= width as i32 || nz >= depth as i32 {
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
                     continue;
                 }
-                let ni = nx as usize + nz as usize * width;
+                let ni = nx as usize + nz as usize * context.width;
                 if !in_basin[ni] {
-                    spill = spill.min(heights[ni]);
+                    spill = spill.min(context.cells[ni].surface_height);
                 }
             }
         }
@@ -511,8 +618,10 @@ fn build_hydrology_cache(
         }
         let level = (spill - 1).min(config.sea_level_local() + 10);
         for &i in &cells {
-            if heights[i] <= level {
-                lake_level[i] = Some(level);
+            if let Some(local_idx) = context.cells[i].local_idx {
+                if context.cells[i].surface_height <= level {
+                    lake_level[local_idx] = Some(level);
+                }
             }
         }
     }
@@ -1037,10 +1146,20 @@ fn hydrology_fill_pass(
 
             if let Some(level) = hydrology.river_level[idx] {
                 let river_fill = smoothstep((river_w - 0.24) / 0.50);
-                if river_fill > 0.02 {
+                let ocean_dominant = hydrology.ocean_weight[idx] > 0.52;
+                let top_solid = world.get(x, surface, z) != EMPTY;
+                let sky_open = (surface + 1..world.dims[1] as i32)
+                    .all(|y| world.get(x, y, z) == EMPTY || world.get(x, y, z) == WATER);
+                if river_fill > 0.02 && !ocean_dominant && top_solid && sky_open {
                     let top = level.min(surface).min(sea_level + 1).max(2);
                     let channel_depth = (2.0 + river_fill * 4.5).round() as i32;
                     let floor = (top - channel_depth).max(1);
+                    for y in floor..=top {
+                        let existing = world.get(x, y, z);
+                        if existing != EMPTY && existing != WATER {
+                            let _ = world.set_raw_no_side_effects(x, y, z, EMPTY);
+                        }
+                    }
                     for y in floor..=top {
                         let _ = world.set_raw_no_side_effects(x, y, z, WATER);
                     }
@@ -1551,8 +1670,12 @@ fn biome_anchor(seed: u64, chunk_x: i32, chunk_z: i32) -> BiomeType {
 }
 
 fn dominant_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
+    dominant_base_biome(weights)
+}
+
+fn dominant_base_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
     let mut best = 0;
-    for i in 1..BIOME_COUNT {
+    for i in 1..=3 {
         if weights[i] > weights[best] {
             best = i;
         }
@@ -1561,10 +1684,7 @@ fn dominant_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
         0 => BiomeType::Forest,
         1 => BiomeType::Plains,
         2 => BiomeType::Highlands,
-        3 => BiomeType::Desert,
-        4 => BiomeType::River,
-        5 => BiomeType::Lake,
-        _ => BiomeType::Ocean,
+        _ => BiomeType::Desert,
     }
 }
 

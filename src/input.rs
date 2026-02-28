@@ -104,7 +104,7 @@ impl Default for FpsController {
             flying: false,
             last_space_t: -10.0,
             move_speed: 8.0,
-            fly_speed: 10.0,
+            fly_speed: 16.0,
             jump_speed: 6.5,
             sensitivity: 0.001,
             double_jump_threshold: 0.28,
