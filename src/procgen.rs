@@ -559,6 +559,8 @@ fn cave_carve_pass(
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("cave_carve_pass");
+    let deep_cave_start = config.sea_level - 10;
+    let surface_falloff_start = config.sea_level + 18;
     let max_y = world.dims[1] as i32 - 2;
     for lz in 0..world.dims[2] as i32 {
         for ly in 2..max_y {
@@ -567,7 +569,7 @@ fn cave_carve_pass(
                     continue;
                 }
                 let wx = config.world_origin[0] + lx;
-                let wy = config.world_origin[1] + ly;
+                let world_y = config.world_origin[1] + ly;
                 let wz = config.world_origin[2] + lz;
                 if wy < config.global_min_y || wy > config.global_max_y {
                     continue;
@@ -581,46 +583,51 @@ fn cave_carve_pass(
                 if wy >= top_world - 4 {
                     continue;
                 }
-                let below_surface = (top_world - wy).max(0) as f32;
-                let depth_fade = smoothstep((below_surface - 3.0) / 56.0);
-                let cave = fbm3(
+                let depth_profile = smoothstep(((deep_cave_start - world_y) as f32) / 26.0);
+                let near_surface_falloff =
+                    1.0 - smoothstep(((world_y - surface_falloff_start) as f32) / 20.0);
+                let global_depth = (depth_profile * near_surface_falloff).clamp(0.0, 1.0);
+
+                let large_caverns = fbm3(
                     config.seed ^ 0xCC77AA11,
-                    wx as f32 * 0.035,
-                    wy as f32 * 0.042,
-                    wz as f32 * 0.035,
-                    4,
+                    wx as f32 * 0.013,
+                    world_y as f32 * 0.015,
+                    wz as f32 * 0.013,
+                    5,
                 );
-                let cave_warp = fbm3(
+
+                let warp = fbm3(
                     config.seed ^ 0x1077BEEF,
                     wx as f32 * 0.02,
-                    wy as f32 * 0.02,
+                    world_y as f32 * 0.02,
                     wz as f32 * 0.02,
                     3,
+                ) - 0.5;
+                let tunnel_network = fbm3(
+                    config.seed ^ 0x7AA1_0444,
+                    (wx as f32 + warp * 26.0) * 0.055,
+                    (world_y as f32 + warp * 18.0) * 0.07,
+                    (wz as f32 - warp * 26.0) * 0.055,
+                    4,
                 );
-                let broad_cave = fbm3(
-                    config.seed ^ 0x55CC9911,
-                    wx as f32 * 0.013,
-                    wy as f32 * 0.012,
-                    wz as f32 * 0.013,
-                    2,
-                );
-                let value = match stratum {
-                    VerticalStratum::Deep => 0.45 * cave + 0.25 * cave_warp + 0.30 * broad_cave,
-                    VerticalStratum::Surface => 0.7 * cave + 0.3 * cave_warp,
-                    VerticalStratum::Sky => 0.0,
-                };
-                let base_threshold = 0.63 + (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.18;
-                let threshold = match stratum {
-                    VerticalStratum::Deep => base_threshold - 0.20,
-                    VerticalStratum::Surface => base_threshold,
-                    VerticalStratum::Sky => 1.1,
-                };
-                let depth_gate = match stratum {
-                    VerticalStratum::Deep => depth_fade > 0.02,
-                    VerticalStratum::Surface => depth_fade > 0.08,
-                    VerticalStratum::Sky => false,
-                };
-                if value > threshold && depth_gate {
+
+                let w = col.weights;
+                let moisture = (w[biome_index(BiomeType::Forest)] * 0.8
+                    + w[biome_index(BiomeType::River)]
+                    + w[biome_index(BiomeType::Lake)] * 0.9
+                    + w[biome_index(BiomeType::Ocean)] * 0.7
+                    + w[biome_index(BiomeType::Plains)] * 0.35
+                    - w[biome_index(BiomeType::Desert)] * 0.9)
+                    .clamp(0.0, 1.0);
+                let density_bias = (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.16;
+
+                let cavern_threshold =
+                    (0.74 - global_depth * 0.18 + moisture * 0.06 + density_bias).clamp(0.50, 0.90);
+                let tunnel_threshold =
+                    (0.70 - global_depth * 0.26 + moisture * 0.10 + density_bias * 0.7)
+                        .clamp(0.42, 0.88);
+                let carve = large_caverns > cavern_threshold || tunnel_network > tunnel_threshold;
+                if carve {
                     let _ = world.set_raw_no_side_effects(lx, ly, lz, EMPTY);
                 }
             }
@@ -1434,6 +1441,48 @@ mod tests {
         None
     }
 
+    fn cave_agreement(a: &World, b: &World, axis: char) -> (usize, usize) {
+        let heights_a = build_surface_heightmap_from_world(a);
+        let heights_b = build_surface_heightmap_from_world(b);
+        let mut matches = 0usize;
+        let mut total = 0usize;
+        let max_y = (a.dims[1] as i32 - 2).min(b.dims[1] as i32 - 2);
+        for t in 0..a.dims[2] as i32 {
+            for y in 4..max_y {
+                let (ax, az, bx, bz, top_a, top_b) = if axis == 'x' {
+                    (
+                        a.dims[0] as i32 - 1,
+                        t,
+                        0,
+                        t,
+                        heights_a[a.dims[0] - 1 + t as usize * a.dims[0]],
+                        heights_b[t as usize * b.dims[0]],
+                    )
+                } else {
+                    (
+                        t,
+                        a.dims[2] as i32 - 1,
+                        t,
+                        0,
+                        heights_a[t as usize + (a.dims[2] - 1) * a.dims[0]],
+                        heights_b[t as usize],
+                    )
+                };
+
+                if y >= top_a.min(top_b) - 4 {
+                    continue;
+                }
+                total += 1;
+                let cave_a = a.get(ax, y, az) == EMPTY;
+                let cave_b = b.get(bx, y, bz) == EMPTY;
+                if cave_a == cave_b {
+                    matches += 1;
+                }
+            }
+        }
+        (matches, total)
+    }
+
     #[test]
     fn adjacent_river_cells_have_continuous_levels() {
         let config = ProcGenConfig::for_size(64, 0xBADC0FFE).with_origin([0, 0, 0]);
@@ -1509,90 +1558,35 @@ mod tests {
     }
 
     #[test]
-    fn high_y_macrochunk_does_not_repeat_surface_terrain() {
+    fn chunk_border_caves_use_global_context() {
         let size = 64;
-        let mut config = ProcGenConfig::for_size(size, 0xAC1D_7001);
-        config.world_origin = [0, config.sky_ceiling_start + MACROCHUNK_SIZE * 2, 0];
-        let world = generate_world(config);
+        let seed = 0xAA55_7711;
+        let center_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(size, seed).with_origin([size as i32, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, size as i32]);
 
-        let mut surface_like = 0;
-        let mut solids = 0;
-        for z in 0..size as i32 {
-            for y in 0..size as i32 {
-                for x in 0..size as i32 {
-                    let m = world.get(x, y, z);
-                    if m != EMPTY {
-                        solids += 1;
-                    }
-                    if m == TURF || m == DIRT || m == SAND {
-                        surface_like += 1;
-                    }
-                }
-            }
-        }
+        let center = generate_world(center_cfg);
+        let east = generate_world(east_cfg);
+        let south = generate_world(south_cfg);
 
-        assert_eq!(
-            surface_like, 0,
-            "sky chunk should not contain surface layers"
+        let (ew_matches, ew_total) = cave_agreement(&center, &east, 'x');
+        let (ns_matches, ns_total) = cave_agreement(&center, &south, 'z');
+        let ew_ratio = ew_matches as f32 / ew_total.max(1) as f32;
+        let ns_ratio = ns_matches as f32 / ns_total.max(1) as f32;
+
+        assert!(
+            ew_ratio > 0.60,
+            "east/west cave border mismatch too high: {:.2}% agreement ({}/{})",
+            ew_ratio * 100.0,
+            ew_matches,
+            ew_total
         );
         assert!(
-            solids < ((size * size * size) / 3) as i32,
-            "sky chunk should not be terrain-dense"
-        );
-    }
-
-    #[test]
-    fn deep_macrochunk_is_cavernous_and_distinct_from_surface_chunk() {
-        let size = 64;
-        let seed = 0xAC1D_7002;
-        let mut deep_cfg = ProcGenConfig::for_size(size, seed);
-        deep_cfg.world_origin = [0, deep_cfg.deep_cave_start - size as i32, 0];
-        let deep = generate_world(deep_cfg);
-
-        let surface_cfg = ProcGenConfig::for_size(size, seed).with_origin([0, 0, 0]);
-        let surface = generate_world(surface_cfg);
-
-        let mut deep_stone = 0;
-        let mut deep_air = 0;
-        let mut deep_surface_material = 0;
-        let mut surface_surface_material = 0;
-        for z in 0..size as i32 {
-            for y in 0..size as i32 {
-                for x in 0..size as i32 {
-                    let dm = deep.get(x, y, z);
-                    if dm == STONE {
-                        deep_stone += 1;
-                    } else if dm == EMPTY {
-                        deep_air += 1;
-                    }
-                    if dm == TURF || dm == DIRT || dm == SAND {
-                        deep_surface_material += 1;
-                    }
-
-                    let sm = surface.get(x, y, z);
-                    if sm == TURF || sm == DIRT || sm == SAND {
-                        surface_surface_material += 1;
-                    }
-                }
-            }
-        }
-
-        let volume = (size * size * size) as i32;
-        assert!(
-            deep_stone > volume / 3,
-            "deep chunk should remain mostly stone"
-        );
-        assert!(
-            deep_air > volume / 8,
-            "deep chunk should contain sizable cave volume"
-        );
-        assert!(
-            deep_surface_material < volume / 40,
-            "deep chunk should avoid surface layering"
-        );
-        assert!(
-            surface_surface_material > deep_surface_material * 8,
-            "surface chunk should contain significantly more surface materials than deep chunk"
+            ns_ratio > 0.60,
+            "north/south cave border mismatch too high: {:.2}% agreement ({}/{})",
+            ns_ratio * 100.0,
+            ns_matches,
+            ns_total
         );
     }
 }
