@@ -3,8 +3,9 @@ use crate::player::{
     camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
+use crate::procgen::{generate_world, ProcGenConfig};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
-use crate::sim::{step, SimState};
+use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     ToolTextures, UiState, HOTBAR_SLOTS,
@@ -29,6 +30,7 @@ const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
+const LOW_PRIORITY_THROTTLE_TICKS: u64 = 6;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -68,6 +70,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut edit_runtime = EditRuntimeState::default();
     let mut last = Instant::now();
     let start = Instant::now();
+    let mut sim_tick: u64 = 0;
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -260,7 +263,13 @@ pub async fn run() -> anyhow::Result<()> {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
                             while sim.accumulator >= step_dt {
-                                step(&mut world, &mut sim.rng);
+                                let (high_priority, low_priority) =
+                                    prioritize_chunks_for_player(&world, ctrl.position);
+                                step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
+                                if sim_tick % LOW_PRIORITY_THROTTLE_TICKS == 0 {
+                                    step_selected_chunks(&mut world, &mut sim.rng, &low_priority);
+                                }
+                                sim_tick = sim_tick.wrapping_add(1);
                                 sim.accumulator -= step_dt;
                             }
                         }
@@ -294,9 +303,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 start.elapsed().as_secs_f32(),
                                 !cursor_should_unlock && (input.lmb || input.rmb),
                             );
-                            if actions.new_world {
+                            if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
-                                world = World::new([n, n, n]);
+                                world = if actions.new_procedural {
+                                    let seed = start.elapsed().as_nanos() as u64;
+                                    let config = ProcGenConfig::for_size(n, seed);
+                                    generate_world(config)
+                                } else {
+                                    World::new([n, n, n])
+                                };
                                 sim.running = false;
                             }
                             if actions.save {

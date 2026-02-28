@@ -128,6 +128,7 @@ impl Default for UiState {
 #[derive(Default)]
 pub struct UiActions {
     pub new_world: bool,
+    pub new_procedural: bool,
     pub save: bool,
     pub load: bool,
     pub toggle_run: bool,
@@ -149,6 +150,9 @@ pub fn draw(
             ui.horizontal(|ui| {
                 if ui.button("New World").clicked() {
                     actions.new_world = true;
+                }
+                if ui.button("New Procedural").clicked() {
+                    actions.new_procedural = true;
                 }
                 if ui.button("Save").clicked() {
                     actions.save = true;
