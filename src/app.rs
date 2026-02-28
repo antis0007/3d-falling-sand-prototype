@@ -1044,8 +1044,12 @@ fn schedule_procgen_batch(
     job_status: &mut HashMap<ProcgenJobKey, ProcgenJobStatus>,
     target_global_pos: [i32; 3],
 ) {
-    for coord in coords.iter().take(budget) {
+    let requested = budget;
+    let mut scheduled = 0;
+    let mut skipped_non_unloaded = 0;
+    for coord in coords {
         if stream.state(*coord) != ChunkResidency::Unloaded {
+            skipped_non_unloaded += 1;
             continue;
         }
         let spec = ProcgenJobSpec {
@@ -1063,7 +1067,18 @@ fn schedule_procgen_batch(
         stream.mark_generating(spec.coord);
         let st = procgen_workers.enqueue_or_coalesce(spec);
         job_status.insert(spec.key, st);
+
+        scheduled += 1;
+        if scheduled == budget {
+            break;
+        }
     }
+    log::debug!(
+        "schedule_procgen_batch: requested={}, scheduled={}, skipped_non_unloaded={}",
+        requested,
+        scheduled,
+        skipped_non_unloaded
+    );
 }
 
 fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {
