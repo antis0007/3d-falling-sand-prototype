@@ -486,12 +486,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     STREAM_HANDOFF_HYSTERESIS,
                                 ) {
                                     delayed_transition_count = delayed_transition_count.saturating_add(1);
-                                } else if !handoff_ready(
-                                    stream_ref,
-                                    &renderer,
-                                    desired_coord,
-                                    &render_residency,
-                                ) {
+                                } else if !handoff_ready(stream_ref, desired_coord) {
                                     unsafe_handoff_prevented_count =
                                         unsafe_handoff_prevented_count.saturating_add(1);
                                     queue_stream_mesh_if_needed(
@@ -1450,28 +1445,8 @@ fn queue_stream_mesh_if_needed(
     }
 }
 
-fn handoff_ready(
-    stream: &WorldStream,
-    renderer: &Renderer,
-    desired_coord: [i32; 3],
-    render_residency: &HashSet<[i32; 3]>,
-) -> bool {
-    if stream.state(desired_coord) != ChunkResidency::Resident
-        || !renderer.has_stream_mesh(desired_coord)
-    {
-        return false;
-    }
-
-    for neighbor in WorldStream::neighbor_coords(desired_coord) {
-        if !render_residency.contains(&neighbor) {
-            continue;
-        }
-        let resident = stream.state(neighbor) == ChunkResidency::Resident;
-        if !resident && !renderer.has_stream_mesh(neighbor) {
-            return false;
-        }
-    }
-    true
+fn handoff_ready(stream: &WorldStream, desired_coord: [i32; 3]) -> bool {
+    stream.state(desired_coord) == ChunkResidency::Resident
 }
 
 fn handle_residency_change_for_meshing<F>(
@@ -2234,6 +2209,22 @@ mod tests {
             [1, 0, 0],
             0.12,
         ));
+    }
+
+    #[test]
+    fn handoff_ready_depends_on_residency_not_stream_meshes() {
+        let cfg = ProcGenConfig::for_size(64, 42);
+        let bounds = ProceduralWorldBounds::new(-2, 2, cfg.dims[1] as i32);
+        let mut stream = WorldStream::new(cfg, bounds);
+        let coord = [1, 0, 0];
+
+        assert!(!handoff_ready(&stream, coord));
+
+        stream.mark_generating(coord);
+        assert!(!handoff_ready(&stream, coord));
+
+        stream.apply_generated(coord, World::new([64, 64, 64]));
+        assert!(handoff_ready(&stream, coord));
     }
 
     #[test]
