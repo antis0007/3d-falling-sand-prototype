@@ -197,7 +197,8 @@ pub async fn run() -> anyhow::Result<()> {
                         }
                         let cursor_should_unlock =
                             ui.paused_menu || quick_menu_held || tab_palette_held;
-                        let gameplay_blocked = ui.paused_menu || quick_menu_held;
+                        let gameplay_blocked =
+                            ui.paused_menu || quick_menu_held || tab_palette_held;
                         let _ = set_cursor(window, cursor_should_unlock);
 
                         if !gameplay_blocked {

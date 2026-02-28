@@ -234,44 +234,53 @@ pub fn draw(
         });
 
     if ui_state.tab_palette_open && !ui_state.paused_menu {
-        egui::Window::new("Materials (TAB)")
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -64.0])
+        egui::Window::new("Material Palette (TAB)")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 18.0])
+            .default_width(860.0)
+            .min_width(780.0)
+            .max_width(960.0)
+            .max_height(430.0)
             .collapsible(false)
             .resizable(false)
-            .title_bar(false)
             .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(20, 22, 28)))
             .show(ctx, |ui| {
                 ui_state.hovered_palette_material = None;
-                ui.horizontal_wrapped(|ui| {
-                    for i in 0..MATERIALS.len() {
-                        let id = MATERIALS[i].id;
-                        let m = material(id);
-                        let response = draw_material_button(
-                            ui,
-                            [120.0, 64.0],
-                            None,
-                            m.name,
-                            m.color,
-                            false,
-                            false,
-                        );
-                        if response.clicked() {
-                            ui_state.hotbar[ui_state.selected_slot] = id;
-                        }
-                        if response.hovered() {
-                            ui_state.hovered_palette_material = Some(id);
-                        }
-                        if response.drag_started() {
-                            ui_state.drag_source = Some(DragSource::Palette(id));
-                        }
-                    }
-                });
+                ui.label("Choose a material to place, or drag one onto a hotbar slot.");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for i in 0..MATERIALS.len() {
+                                let id = MATERIALS[i].id;
+                                let m = material(id);
+                                let response = draw_material_button(
+                                    ui,
+                                    [152.0, 54.0],
+                                    None,
+                                    m.name,
+                                    m.color,
+                                    false,
+                                    false,
+                                );
+                                if response.clicked() {
+                                    ui_state.hotbar[ui_state.selected_slot] = id;
+                                }
+                                if response.hovered() {
+                                    ui_state.hovered_palette_material = Some(id);
+                                }
+                                if response.drag_started() {
+                                    ui_state.drag_source = Some(DragSource::Palette(id));
+                                }
+                            }
+                        });
+                    });
                 if let Some(feedback) = ui_state.drag_feedback_text() {
                     ui.add_space(4.0);
                     ui.colored_label(egui::Color32::from_rgb(120, 220, 255), feedback);
                 }
                 ui.separator();
-                ui.label("TAB Palette Options");
+                ui.label("Palette options");
                 ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Brush radius"));
                 ui.add(
                     egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Area tool radius"),
@@ -280,7 +289,7 @@ pub fn draw(
                     egui::Slider::new(&mut brush.max_distance, 2.0..=48.0)
                         .text("Placement distance"),
                 );
-                ui.label("Press TAB to toggle quick brush options");
+                ui.label("Press TAB to toggle this palette.");
                 ui.label(
                     "Drag materials onto hotbar slots, or press 0-9 while hovering a material.",
                 );
