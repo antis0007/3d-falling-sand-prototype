@@ -1,4 +1,7 @@
+use crate::chunk_store::ChunkStore;
+use crate::meshing::mesh_chunk as mesh_store_chunk;
 use crate::sim::{material, Phase};
+use crate::types::{ChunkCoord, VoxelCoord};
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
@@ -24,8 +27,8 @@ pub enum UnknownNeighborOcclusionPolicy {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
-    pos: [f32; 3],
-    color: [u8; 4],
+    pub(crate) pos: [f32; 3],
+    pub(crate) color: [u8; 4],
 }
 
 impl Vertex {
@@ -94,6 +97,7 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
     meshes: HashMap<usize, ChunkMesh>,
+    store_meshes: HashMap<ChunkCoord, ChunkMesh>,
     streamed_meshes: HashMap<[i32; 3], StreamMeshEntry>,
     stream_mesh_versions: HashMap<[i32; 3], u64>,
     dirty_scan_cursor: usize,
@@ -216,6 +220,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             meshes: HashMap::new(),
+            store_meshes: HashMap::new(),
             streamed_meshes: HashMap::new(),
             stream_mesh_versions: HashMap::new(),
             dirty_scan_cursor: 0,
@@ -323,6 +328,50 @@ impl Renderer {
         });
     }
 
+    pub fn rebuild_dirty_store_chunks(
+        &mut self,
+        store: &mut ChunkStore,
+        origin_voxel: VoxelCoord,
+        budget: usize,
+    ) {
+        let dirty = store.take_dirty_chunks();
+        let mut iter = dirty.into_iter();
+        for coord in iter.by_ref().take(budget) {
+            let (verts, inds, aabb_min, aabb_max) = mesh_store_chunk(store, coord, origin_voxel);
+            if inds.is_empty() {
+                self.store_meshes.remove(&coord);
+                continue;
+            }
+            let vb = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk ib"),
+                    contents: bytemuck::cast_slice(&inds),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            self.store_meshes.insert(
+                coord,
+                ChunkMesh {
+                    vb,
+                    ib,
+                    index_count: inds.len() as u32,
+                    aabb_min,
+                    aabb_max,
+                },
+            );
+        }
+        for coord in iter {
+            store.mark_dirty(coord);
+        }
+    }
+
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
         self.rebuild_dirty_chunks_with_budget(world, usize::MAX, [0, 0, 0]);
     }
@@ -425,6 +474,7 @@ impl Renderer {
 
     pub fn clear_mesh_cache(&mut self) {
         self.meshes.clear();
+        self.store_meshes.clear();
         self.streamed_meshes.clear();
         self.stream_mesh_versions.clear();
         self.dirty_since_frame.clear();
@@ -443,6 +493,14 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
         for mesh in self.meshes.values() {
+            if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
+                continue;
+            }
+            pass.set_vertex_buffer(0, mesh.vb.slice(..));
+            pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        for mesh in self.store_meshes.values() {
             if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
             }

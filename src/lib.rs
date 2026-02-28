@@ -4,6 +4,7 @@ pub mod chunk_store;
 pub mod edits;
 pub mod floating_origin;
 pub mod meshing;
+pub mod renderer;
 pub mod sim;
 pub mod sim_world;
 pub mod streaming;
