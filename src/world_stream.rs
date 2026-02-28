@@ -1,4 +1,4 @@
-use crate::procgen::{generate_world, ProcGenConfig};
+use crate::procgen::ProcGenConfig;
 use crate::world::{MaterialId, World};
 use std::collections::BTreeMap;
 
@@ -69,11 +69,6 @@ impl WorldStream {
     }
 
     pub fn apply_generated(&mut self, coord: [i32; 3], world: World) {
-        let should_validate = self
-            .chunks
-            .get(&coord)
-            .map(|chunk| !chunk.has_persistent_edits)
-            .unwrap_or(true);
         let chunk = self
             .chunks
             .entry(coord)
@@ -83,8 +78,20 @@ impl WorldStream {
         }
         chunk.residency = ChunkResidency::Resident;
         chunk.world = Some(world.clone());
-        if should_validate {
-            self.validate_seams(coord, &world);
+        self.validate_seams(coord, &world);
+    }
+
+    pub fn cancel_generation(&mut self, coord: [i32; 3]) {
+        if let Some(chunk) = self.chunks.get_mut(&coord) {
+            if chunk.residency == ChunkResidency::Generating {
+                chunk.residency = ChunkResidency::Unloaded;
+            }
+            if chunk.residency == ChunkResidency::Unloaded
+                && chunk.world.is_none()
+                && !chunk.has_persistent_edits
+            {
+                self.chunks.remove(&coord);
+            }
         }
     }
 
@@ -184,27 +191,13 @@ impl WorldStream {
             if neighbor.has_persistent_edits {
                 continue;
             }
-            let neighbor_cfg = self.make_config(neighbor_coord);
-            let regen_neighbor = generate_world(neighbor_cfg);
             if Self::deterministic_face_signature(neighbor_world, axis, -side)
-                != Self::deterministic_face_signature(&regen_neighbor, axis, -side)
+                != Self::deterministic_face_signature(world, axis, side)
             {
                 log::warn!(
                     "Seam validation detected neighbor edge mismatch at {:?} vs {:?}",
                     coord,
                     neighbor_coord
-                );
-            }
-            let cfg = self.make_config(coord);
-            let regen = generate_world(cfg);
-            if Self::deterministic_face_signature(world, axis, side)
-                != Self::deterministic_face_signature(&regen, axis, side)
-            {
-                log::warn!(
-                    "Seam validation detected generated edge mismatch at {:?} (axis {}, side {})",
-                    coord,
-                    axis,
-                    side
                 );
             }
         }
