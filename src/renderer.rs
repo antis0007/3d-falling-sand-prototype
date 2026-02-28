@@ -3,7 +3,7 @@ use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -14,6 +14,12 @@ pub const VOXEL_SIZE: f32 = 0.5;
 const TURF_ID: MaterialId = 17;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
+
+#[derive(Clone, Copy)]
+pub enum UnknownNeighborOcclusionPolicy {
+    Conservative,
+    Aggressive,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -84,6 +90,10 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
     meshes: HashMap<usize, ChunkMesh>,
     streamed_meshes: HashMap<[i32; 3], Vec<ChunkMesh>>,
+    dirty_scan_cursor: usize,
+    mesh_frame: u64,
+    dirty_since_frame: HashMap<usize, u64>,
+    unknown_neighbor_policy: UnknownNeighborOcclusionPolicy,
     pub day: bool,
 }
 
@@ -201,6 +211,10 @@ impl Renderer {
             depth_view,
             meshes: HashMap::new(),
             streamed_meshes: HashMap::new(),
+            dirty_scan_cursor: 0,
+            mesh_frame: 0,
+            dirty_since_frame: HashMap::new(),
+            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Conservative,
             day: true,
         })
     }
@@ -220,17 +234,23 @@ impl Renderer {
         world_origin: [i32; 3],
     ) {
         let budget = budget.max(1);
-        let dirty_chunks: Vec<usize> = world
-            .chunks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, chunk)| {
-                (chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version).then_some(i)
-            })
-            .take(budget)
-            .collect();
+        self.mesh_frame = self.mesh_frame.saturating_add(1);
+        for (index, chunk) in world.chunks.iter().enumerate() {
+            if chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version {
+                self.dirty_since_frame
+                    .entry(index)
+                    .or_insert(self.mesh_frame);
+            }
+        }
 
-        for i in dirty_chunks {
+        let dirty_chunks =
+            select_dirty_chunks_fair(world.chunks.len(), budget, self.dirty_scan_cursor, |idx| {
+                let chunk = &world.chunks[idx];
+                chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version
+            });
+        self.dirty_scan_cursor = dirty_chunks.next_cursor;
+
+        for i in dirty_chunks.indices {
             let (verts, inds, aabb_min, aabb_max) =
                 mesh_chunk(world, i, world_origin, |local, _world| {
                     world.get(local[0], local[1], local[2])
@@ -267,7 +287,19 @@ impl Renderer {
             );
             world.chunks[i].dirty_mesh = false;
             world.chunks[i].meshed_version = world.chunks[i].voxel_version;
+            self.dirty_since_frame.remove(&i);
         }
+
+        let dirty_now: HashSet<usize> = world
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, chunk)| {
+                (chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version).then_some(i)
+            })
+            .collect();
+        self.dirty_since_frame
+            .retain(|idx, _| dirty_now.contains(idx));
     }
 
     pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
@@ -281,7 +313,7 @@ impl Renderer {
         world_origin: [i32; 3],
         mut sample_global: F,
     ) where
-        F: FnMut([i32; 3]) -> MaterialId,
+        F: FnMut([i32; 3]) -> Option<MaterialId>,
     {
         let mut meshes = Vec::with_capacity(world.chunks.len());
         for idx in 0..world.chunks.len() {
@@ -291,7 +323,13 @@ impl Renderer {
                     if local_id != EMPTY {
                         return local_id;
                     }
-                    sample_global(global)
+                    match sample_global(global) {
+                        Some(id) => id,
+                        None => match self.unknown_neighbor_policy {
+                            UnknownNeighborOcclusionPolicy::Conservative => EMPTY,
+                            UnknownNeighborOcclusionPolicy::Aggressive => 1,
+                        },
+                    }
                 });
             if inds.is_empty() {
                 continue;
@@ -332,6 +370,8 @@ impl Renderer {
     pub fn clear_mesh_cache(&mut self) {
         self.meshes.clear();
         self.streamed_meshes.clear();
+        self.dirty_since_frame.clear();
+        self.dirty_scan_cursor = 0;
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
@@ -362,6 +402,44 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
+    }
+}
+
+struct DirtySelection {
+    indices: Vec<usize>,
+    next_cursor: usize,
+}
+
+fn select_dirty_chunks_fair<F>(
+    chunk_count: usize,
+    budget: usize,
+    cursor: usize,
+    mut is_dirty: F,
+) -> DirtySelection
+where
+    F: FnMut(usize) -> bool,
+{
+    if chunk_count == 0 {
+        return DirtySelection {
+            indices: Vec::new(),
+            next_cursor: 0,
+        };
+    }
+    let mut indices = Vec::new();
+    let mut scanned = 0usize;
+    let mut index = cursor % chunk_count;
+
+    while scanned < chunk_count && indices.len() < budget {
+        if is_dirty(index) {
+            indices.push(index);
+        }
+        index = (index + 1) % chunk_count;
+        scanned += 1;
+    }
+
+    DirtySelection {
+        indices,
+        next_cursor: index,
     }
 }
 
@@ -707,4 +785,46 @@ fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
         ((color[2] as f32 * shade).min(255.0)) as u8,
         color[3],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fair_dirty_scheduler_is_starvation_free_under_constant_dirty_load() {
+        let chunk_count = 10;
+        let budget = 3;
+        let mut cursor = 0;
+        let mut seen = [0usize; 10];
+
+        for _frame in 0..20 {
+            let selected = select_dirty_chunks_fair(chunk_count, budget, cursor, |_| true);
+            cursor = selected.next_cursor;
+            for idx in selected.indices {
+                seen[idx] += 1;
+            }
+        }
+
+        assert!(seen.iter().all(|count| *count > 0));
+    }
+
+    #[test]
+    fn fair_dirty_scheduler_reaches_late_indices_when_budget_small() {
+        let chunk_count = 8;
+        let budget = 2;
+        let mut cursor = 0;
+        let mut reached = false;
+
+        for _frame in 0..8 {
+            let selected = select_dirty_chunks_fair(chunk_count, budget, cursor, |_| true);
+            cursor = selected.next_cursor;
+            if selected.indices.contains(&7) {
+                reached = true;
+                break;
+            }
+        }
+
+        assert!(reached, "highest index chunk should eventually be selected");
+    }
 }

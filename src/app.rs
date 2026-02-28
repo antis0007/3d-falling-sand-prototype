@@ -18,7 +18,7 @@ use crate::world::{
     BrushShape, World,
 };
 use crate::world_bounds::ProceduralWorldBounds;
-use crate::world_stream::{floor_div, ChunkResidency, WorldStream};
+use crate::world_stream::{floor_div, ChunkResidency, ResidencyChangeEvent, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
 use std::cmp::{Ordering, Reverse};
@@ -52,6 +52,7 @@ const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 const ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME: usize = 6;
 const STREAM_MESH_BUILD_BUDGET_PER_FRAME: usize = 6;
 const PROCGEN_RESULTS_BUDGET_PER_FRAME: usize = 4;
+const STREAM_HANDOFF_HYSTERESIS: f32 = 0.12;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -140,6 +141,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut pending_stream_mesh_coords: Vec<[i32; 3]> = Vec::new();
     let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
+    let mut unsafe_handoff_prevented_count: u64 = 0;
+    let mut delayed_transition_count: u64 = 0;
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -382,6 +385,15 @@ pub async fn run() -> anyhow::Result<()> {
                             let chunk_size_y = cfg.dims[1] as i32;
                             let chunk_size_z = cfg.dims[2] as i32;
                             stream_ref.persist_coord_state(active_stream_coord, &world);
+                            for event in stream_ref.take_residency_changes() {
+                                handle_residency_change_for_meshing(
+                                    event,
+                                    active_stream_coord,
+                                    &mut world,
+                                    &mut pending_stream_mesh_coords,
+                                    &mut queued_stream_mesh_coords,
+                                );
+                            }
                             let active_origin = stream_ref.chunk_origin(active_stream_coord);
                             let global = [
                                 active_origin[0] + ctrl.position.x.floor() as i32,
@@ -432,7 +444,33 @@ pub async fn run() -> anyhow::Result<()> {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                 let frac_y = ctrl.position.y - ctrl.position.y.floor();
                                 let frac_z = ctrl.position.z - ctrl.position.z.floor();
-                                if stream_ref.load_coord_into_world(desired_coord, &mut world) {
+                                let delta_coord = [
+                                    desired_coord[0] - active_stream_coord[0],
+                                    desired_coord[1] - active_stream_coord[1],
+                                    desired_coord[2] - active_stream_coord[2],
+                                ];
+                                if !crossed_boundary_with_hysteresis(
+                                    [frac_x, frac_y, frac_z],
+                                    delta_coord,
+                                    STREAM_HANDOFF_HYSTERESIS,
+                                ) {
+                                    delayed_transition_count = delayed_transition_count.saturating_add(1);
+                                } else if !handoff_ready(
+                                    stream_ref,
+                                    &renderer,
+                                    desired_coord,
+                                    &render_residency,
+                                ) {
+                                    unsafe_handoff_prevented_count =
+                                        unsafe_handoff_prevented_count.saturating_add(1);
+                                    queue_stream_mesh_if_needed(
+                                        desired_coord,
+                                        stream_ref,
+                                        &renderer,
+                                        &mut queued_stream_mesh_coords,
+                                        &mut pending_stream_mesh_coords,
+                                    );
+                                } else if stream_ref.load_coord_into_world(desired_coord, &mut world) {
                                     active_stream_coord = desired_coord;
                                     let new_origin = stream_ref.chunk_origin(active_stream_coord);
                                     ctrl.position = Vec3::new(
@@ -540,7 +578,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Some(chunk_world) = stream_ref.resident_world(coord) {
                                     let origin = stream_ref.chunk_origin(coord);
                                     renderer.upsert_stream_mesh(coord, chunk_world, origin, |p| {
-                                        stream_ref.sample_global_voxel(p)
+                                        stream_ref.sample_global_voxel_known(p)
                                     });
                                 }
                             }
@@ -597,11 +635,13 @@ pub async fn run() -> anyhow::Result<()> {
                             .count();
                         ui.stream_debug = if active_procgen.is_some() {
                             format!(
-                                "Stream {:?} | q:{} in-flight:{} ready:{} | sim_r=({}, {}) render_r=({}, {})",
+                                "Stream {:?} | q:{} in-flight:{} ready:{} | delayed:{} blocked:{} | sim_r=({}, {}) render_r=({}, {})",
                                 active_stream_coord,
                                 queued_count,
                                 in_flight_count,
                                 ready_count,
+                                delayed_transition_count,
+                                unsafe_handoff_prevented_count,
                                 PROCEDURAL_SIM_DISTANCE_MACROS,
                                 PROCEDURAL_SIM_DISTANCE_MACROS_Y,
                                 PROCEDURAL_RENDER_DISTANCE_MACROS,
@@ -1182,6 +1222,89 @@ fn sorted_filtered_residency_coords(
             .collect();
     coords.sort_by_key(|coord| macro_distance_sq(*coord, center));
     coords
+}
+
+fn crossed_boundary_with_hysteresis(
+    local_fraction: [f32; 3],
+    delta_coord: [i32; 3],
+    hysteresis: f32,
+) -> bool {
+    let h = hysteresis.clamp(0.0, 0.49);
+    for axis in 0..3 {
+        let delta = delta_coord[axis];
+        if delta > 0 && local_fraction[axis] < 1.0 - h {
+            return false;
+        }
+        if delta < 0 && local_fraction[axis] > h {
+            return false;
+        }
+    }
+    true
+}
+
+fn queue_stream_mesh_if_needed(
+    coord: [i32; 3],
+    stream: &WorldStream,
+    renderer: &Renderer,
+    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+) {
+    if stream.state(coord) == ChunkResidency::Resident
+        && !renderer.has_stream_mesh(coord)
+        && queued_stream_mesh_coords.insert(coord)
+    {
+        pending_stream_mesh_coords.push(coord);
+    }
+}
+
+fn handoff_ready(
+    stream: &WorldStream,
+    renderer: &Renderer,
+    desired_coord: [i32; 3],
+    render_residency: &HashSet<[i32; 3]>,
+) -> bool {
+    if stream.state(desired_coord) != ChunkResidency::Resident
+        || !renderer.has_stream_mesh(desired_coord)
+    {
+        return false;
+    }
+
+    for neighbor in WorldStream::neighbor_coords(desired_coord) {
+        if !render_residency.contains(&neighbor) {
+            continue;
+        }
+        let resident = stream.state(neighbor) == ChunkResidency::Resident;
+        if !resident && !renderer.has_stream_mesh(neighbor) {
+            return false;
+        }
+    }
+    true
+}
+
+fn handle_residency_change_for_meshing(
+    event: ResidencyChangeEvent,
+    active_stream_coord: [i32; 3],
+    world: &mut World,
+    pending_stream_mesh_coords: &mut Vec<[i32; 3]>,
+    queued_stream_mesh_coords: &mut HashSet<[i32; 3]>,
+) {
+    if event.old == event.new {
+        return;
+    }
+    for neighbor in WorldStream::neighbor_coords(event.coord) {
+        if neighbor == active_stream_coord {
+            for chunk in &mut world.chunks {
+                chunk.dirty_mesh = true;
+                if chunk.meshed_version == chunk.voxel_version {
+                    chunk.meshed_version = chunk.meshed_version.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        if queued_stream_mesh_coords.insert(neighbor) {
+            pending_stream_mesh_coords.push(neighbor);
+        }
+    }
 }
 
 fn schedule_procgen_batch(
@@ -1906,5 +2029,40 @@ mod tests {
         let mut pending = vec![[4, 0, 0], [1, 0, 0], [3, 0, 0], [0, 1, 0]];
         reprioritize_pending_stream_meshes(&mut pending, [0, 0, 0]);
         assert_eq!(pending.pop(), Some([0, 1, 0]));
+    }
+    #[test]
+    fn boundary_hysteresis_blocks_early_transition() {
+        assert!(!crossed_boundary_with_hysteresis(
+            [0.2, 0.5, 0.5],
+            [1, 0, 0],
+            0.12,
+        ));
+        assert!(crossed_boundary_with_hysteresis(
+            [0.95, 0.5, 0.5],
+            [1, 0, 0],
+            0.12,
+        ));
+    }
+
+    #[test]
+    fn residency_change_queues_neighbor_remeshes() {
+        let mut world = World::new([64, 64, 64]);
+        let mut pending = Vec::new();
+        let mut queued = HashSet::new();
+        handle_residency_change_for_meshing(
+            ResidencyChangeEvent {
+                coord: [1, 0, 0],
+                old: ChunkResidency::Generating,
+                new: ChunkResidency::Resident,
+            },
+            [0, 0, 0],
+            &mut world,
+            &mut pending,
+            &mut queued,
+        );
+
+        assert!(pending.contains(&[2, 0, 0]));
+        assert!(pending.contains(&[1, 1, 0]));
+        assert!(world.chunks.iter().all(|c| c.dirty_mesh));
     }
 }

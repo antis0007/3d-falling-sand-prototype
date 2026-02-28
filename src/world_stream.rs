@@ -27,10 +27,18 @@ impl StreamChunk {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyChangeEvent {
+    pub coord: [i32; 3],
+    pub old: ChunkResidency,
+    pub new: ChunkResidency,
+}
+
 pub struct WorldStream {
     base_config: ProcGenConfig,
     bounds: ProceduralWorldBounds,
     chunks: BTreeMap<[i32; 3], StreamChunk>,
+    residency_changes: Vec<ResidencyChangeEvent>,
 }
 
 impl WorldStream {
@@ -39,6 +47,7 @@ impl WorldStream {
             base_config,
             bounds,
             chunks: BTreeMap::new(),
+            residency_changes: Vec::new(),
         }
     }
 
@@ -61,34 +70,65 @@ impl WorldStream {
             .unwrap_or(ChunkResidency::Unloaded)
     }
 
-    pub fn mark_generating(&mut self, coord: [i32; 3]) {
+    pub fn take_residency_changes(&mut self) -> Vec<ResidencyChangeEvent> {
+        std::mem::take(&mut self.residency_changes)
+    }
+
+    pub fn neighbor_coords(coord: [i32; 3]) -> [[i32; 3]; 6] {
+        [
+            [coord[0] + 1, coord[1], coord[2]],
+            [coord[0] - 1, coord[1], coord[2]],
+            [coord[0], coord[1] + 1, coord[2]],
+            [coord[0], coord[1] - 1, coord[2]],
+            [coord[0], coord[1], coord[2] + 1],
+            [coord[0], coord[1], coord[2] - 1],
+        ]
+    }
+
+    fn update_residency(&mut self, coord: [i32; 3], new_residency: ChunkResidency) {
         let chunk = self
             .chunks
             .entry(coord)
             .or_insert_with(StreamChunk::unloaded);
-        if chunk.residency == ChunkResidency::Unloaded {
-            chunk.residency = ChunkResidency::Generating;
+        let old = chunk.residency;
+        if old != new_residency {
+            chunk.residency = new_residency;
+            self.residency_changes.push(ResidencyChangeEvent {
+                coord,
+                old,
+                new: new_residency,
+            });
+        }
+    }
+
+    pub fn mark_generating(&mut self, coord: [i32; 3]) {
+        if self.state(coord) == ChunkResidency::Unloaded {
+            self.update_residency(coord, ChunkResidency::Generating);
         }
     }
 
     pub fn apply_generated(&mut self, coord: [i32; 3], world: World) {
-        let chunk = self
-            .chunks
-            .entry(coord)
-            .or_insert_with(StreamChunk::unloaded);
-        if chunk.residency == ChunkResidency::Resident && chunk.has_persistent_edits {
+        if self.state(coord) == ChunkResidency::Resident
+            && self
+                .chunks
+                .get(&coord)
+                .map(|chunk| chunk.has_persistent_edits)
+                .unwrap_or(false)
+        {
             return;
         }
-        chunk.residency = ChunkResidency::Resident;
-        chunk.world = Some(world.clone());
+        self.update_residency(coord, ChunkResidency::Resident);
+        if let Some(chunk) = self.chunks.get_mut(&coord) {
+            chunk.world = Some(world.clone());
+        }
         self.validate_seams(coord, &world);
     }
 
     pub fn cancel_generation(&mut self, coord: [i32; 3]) {
-        if let Some(chunk) = self.chunks.get_mut(&coord) {
-            if chunk.residency == ChunkResidency::Generating {
-                chunk.residency = ChunkResidency::Unloaded;
-            }
+        if self.state(coord) == ChunkResidency::Generating {
+            self.update_residency(coord, ChunkResidency::Unloaded);
+        }
+        if let Some(chunk) = self.chunks.get(&coord) {
             if chunk.residency == ChunkResidency::Unloaded
                 && chunk.world.is_none()
                 && !chunk.has_persistent_edits
@@ -99,11 +139,11 @@ impl WorldStream {
     }
 
     pub fn persist_coord_state(&mut self, coord: [i32; 3], world: &World) {
+        self.update_residency(coord, ChunkResidency::Resident);
         let chunk = self
             .chunks
             .entry(coord)
             .or_insert_with(StreamChunk::unloaded);
-        chunk.residency = ChunkResidency::Resident;
         chunk.world = Some(world.clone());
         chunk.has_persistent_edits = true;
     }
@@ -137,12 +177,16 @@ impl WorldStream {
     }
 
     pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
+        self.sample_global_voxel_known(global).unwrap_or(EMPTY)
+    }
+
+    pub fn sample_global_voxel_known(&self, global: [i32; 3]) -> Option<MaterialId> {
         let dims = self.base_config.dims;
         if dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
-            return EMPTY;
+            return Some(EMPTY);
         }
         if !self.bounds.contains_global_y(global[1]) {
-            return EMPTY;
+            return Some(EMPTY);
         }
         let dx = dims[0] as i32;
         let dy = dims[1] as i32;
@@ -158,10 +202,8 @@ impl WorldStream {
             global[1] - coord[1] * dy,
             global[2] - coord[2] * dz,
         ];
-        let Some(world) = self.resident_world(coord) else {
-            return EMPTY;
-        };
-        world.get(local[0], local[1], local[2])
+        let world = self.resident_world(coord)?;
+        Some(world.get(local[0], local[1], local[2]))
     }
 
     pub fn deterministic_face_signature(world: &World, axis: usize, side: i32) -> Vec<MaterialId> {
@@ -242,4 +284,33 @@ pub fn floor_div(a: i32, b: i32) -> i32 {
         q -= 1;
     }
     q
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::procgen::ProcGenConfig;
+
+    fn test_stream() -> WorldStream {
+        let cfg = ProcGenConfig::for_size(64, 1234);
+        let bounds = ProceduralWorldBounds::new(-1, 1, cfg.dims[1] as i32);
+        WorldStream::new(cfg, bounds)
+    }
+
+    #[test]
+    fn residency_change_events_include_neighbor_load_transitions() {
+        let mut stream = test_stream();
+        let coord = [1, 0, 0];
+        stream.mark_generating(coord);
+        let world = World::new([64, 64, 64]);
+        stream.apply_generated(coord, world);
+
+        let events = stream.take_residency_changes();
+        assert!(events
+            .iter()
+            .any(|e| e.coord == coord && e.new == ChunkResidency::Generating));
+        assert!(events
+            .iter()
+            .any(|e| e.coord == coord && e.new == ChunkResidency::Resident));
+    }
 }
