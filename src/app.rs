@@ -39,7 +39,10 @@ const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const WAND_MAX_BLOCKS: usize = 512;
 const BUSH_ID: u16 = 18;
 const GRASS_ID: u16 = 19;
-const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 2;
+const PROCEDURAL_SIM_DISTANCE_MACROS: i32 = 1;
+const PROCEDURAL_RENDER_DISTANCE_MACROS: i32 = 4;
+const PROCGEN_URGENT_BUDGET_PER_FRAME: usize = 6;
+const PROCGEN_PREFETCH_BUDGET_PER_FRAME: usize = 8;
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -307,16 +310,7 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                         }
 
-                        if sim.running && !ui.paused_menu {
-                            let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
-                            sim.accumulator += dt;
-                            while sim.accumulator >= step_dt {
-                                let (high_priority, _low_priority) =
-                                    prioritize_chunks_for_player(&world, ctrl.position);
-                                step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
-                                sim.accumulator -= step_dt;
-                            }
-                        }
+                        let mut procedural_simulation_allowed = true;
                         renderer.day = ui.day;
 
                         while let Ok(result) = procgen_rx.try_recv() {
@@ -365,20 +359,16 @@ pub async fn run() -> anyhow::Result<()> {
                                 0,
                                 floor_div(global[2], chunk_size),
                             ];
-                            let mut residency_plan: HashSet<[i32; 3]> = HashSet::new();
-                            for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
-                                ..=PROCEDURAL_RENDER_DISTANCE_MACROS
-                            {
-                                for dx in -PROCEDURAL_RENDER_DISTANCE_MACROS
-                                    ..=PROCEDURAL_RENDER_DISTANCE_MACROS
-                                {
-                                    residency_plan.insert([
-                                        desired_coord[0] + dx,
-                                        0,
-                                        desired_coord[2] + dz,
-                                    ]);
-                                }
-                            }
+
+                            let sim_residency =
+                                macro_residency_set(desired_coord, PROCEDURAL_SIM_DISTANCE_MACROS);
+                            let render_residency = macro_residency_set(
+                                desired_coord,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            );
+                            procedural_simulation_allowed =
+                                sim_residency.contains(&active_stream_coord);
+
                             if desired_coord != active_stream_coord {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                 let frac_z = ctrl.position.z - ctrl.position.z.floor();
@@ -390,29 +380,11 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
-                                } else if stream_ref.state(desired_coord)
-                                    == ChunkResidency::Unloaded
-                                {
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
-                                        key: ProcgenJobKey(desired_coord),
-                                        coord: desired_coord,
-                                        config: stream_ref.make_config(desired_coord),
-                                        prefer_safe_spawn: false,
-                                        target_global_pos: global,
-                                        priority: ProcgenPriority::Urgent,
-                                        epoch: next_epoch,
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    next_epoch = next_epoch.wrapping_add(1);
-                                    stream_ref.mark_generating(spec.coord);
-                                    let st = procgen_workers.enqueue_or_coalesce(spec);
-                                    job_status.insert(spec.key, st);
                                 }
                             }
 
                             for (&key, status) in job_status.clone().iter() {
-                                if !residency_plan.contains(&key.0)
+                                if !render_residency.contains(&key.0)
                                     && matches!(
                                         status,
                                         ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight
@@ -423,39 +395,58 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             }
 
-                            let mut prefetch = None;
-                            for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
-                                ..=PROCEDURAL_RENDER_DISTANCE_MACROS
-                            {
-                                for dx in -PROCEDURAL_RENDER_DISTANCE_MACROS
-                                    ..=PROCEDURAL_RENDER_DISTANCE_MACROS
-                                {
-                                    let coord = [desired_coord[0] + dx, 0, desired_coord[2] + dz];
-                                    if stream_ref.state(coord) == ChunkResidency::Unloaded {
-                                        prefetch = Some(coord);
-                                        break;
-                                    }
-                                }
-                                if prefetch.is_some() {
-                                    break;
-                                }
-                            }
-                            if let Some(coord) = prefetch {
-                                let spec = ProcgenJobSpec {
-                                    generation_id: next_procgen_id,
-                                    key: ProcgenJobKey(coord),
-                                    coord,
-                                    config: stream_ref.make_config(coord),
-                                    prefer_safe_spawn: false,
-                                    target_global_pos: global,
-                                    priority: ProcgenPriority::Prefetch,
-                                    epoch: next_epoch,
-                                };
-                                next_procgen_id = next_procgen_id.wrapping_add(1);
-                                next_epoch = next_epoch.wrapping_add(1);
-                                stream_ref.mark_generating(spec.coord);
-                                let st = procgen_workers.enqueue_or_coalesce(spec);
-                                job_status.insert(spec.key, st);
+                            let mut unloaded_render: Vec<[i32; 3]> = render_residency
+                                .iter()
+                                .copied()
+                                .filter(|&coord| {
+                                    stream_ref.state(coord) == ChunkResidency::Unloaded
+                                })
+                                .collect();
+                            unloaded_render
+                                .sort_by_key(|coord| macro_distance_sq(*coord, desired_coord));
+
+                            let urgent_coords: Vec<[i32; 3]> = unloaded_render
+                                .iter()
+                                .copied()
+                                .filter(|coord| sim_residency.contains(coord))
+                                .collect();
+                            schedule_procgen_batch(
+                                &urgent_coords,
+                                PROCGEN_URGENT_BUDGET_PER_FRAME,
+                                ProcgenPriority::Urgent,
+                                stream_ref,
+                                &procgen_workers,
+                                &mut next_procgen_id,
+                                &mut next_epoch,
+                                &mut job_status,
+                                global,
+                            );
+
+                            let prefetch_coords: Vec<[i32; 3]> = unloaded_render
+                                .into_iter()
+                                .filter(|coord| !sim_residency.contains(coord))
+                                .collect();
+                            schedule_procgen_batch(
+                                &prefetch_coords,
+                                PROCGEN_PREFETCH_BUDGET_PER_FRAME,
+                                ProcgenPriority::Prefetch,
+                                stream_ref,
+                                &procgen_workers,
+                                &mut next_procgen_id,
+                                &mut next_epoch,
+                                &mut job_status,
+                                global,
+                            );
+                        }
+
+                        if sim.running && !ui.paused_menu && procedural_simulation_allowed {
+                            let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
+                            sim.accumulator += dt;
+                            while sim.accumulator >= step_dt {
+                                let (high_priority, _low_priority) =
+                                    prioritize_chunks_for_player(&world, ctrl.position);
+                                step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
+                                sim.accumulator -= step_dt;
                             }
                         }
 
@@ -479,6 +470,32 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         } else {
                             "Biome: Flat Test World".to_string()
+                        };
+
+                        let queued_count = job_status
+                            .values()
+                            .filter(|status| matches!(status, ProcgenJobStatus::Queued))
+                            .count();
+                        let in_flight_count = job_status
+                            .values()
+                            .filter(|status| matches!(status, ProcgenJobStatus::InFlight))
+                            .count();
+                        let ready_count = job_status
+                            .values()
+                            .filter(|status| matches!(status, ProcgenJobStatus::Ready))
+                            .count();
+                        ui.stream_debug = if active_procgen.is_some() {
+                            format!(
+                                "Stream {:?} | q:{} in-flight:{} ready:{} | sim_r={} render_r={}",
+                                active_stream_coord,
+                                queued_count,
+                                in_flight_count,
+                                ready_count,
+                                PROCEDURAL_SIM_DISTANCE_MACROS,
+                                PROCEDURAL_RENDER_DISTANCE_MACROS,
+                            )
+                        } else {
+                            "Stream: n/a".to_string()
                         };
 
                         let raw = egui_state.take_egui_input(window);
@@ -512,28 +529,77 @@ pub async fn run() -> anyhow::Result<()> {
                             if actions.new_world || actions.new_procedural {
                                 let n = ui.new_world_size.max(16) / 16 * 16;
                                 if actions.new_procedural {
+                                    renderer.clear_mesh_cache();
+                                    job_status.clear();
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let config = ProcGenConfig::for_size(64, seed);
                                     let mut new_stream = WorldStream::new(config);
                                     let start_coord = [0, 0, 0];
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
-                                        key: ProcgenJobKey(start_coord),
-                                        coord: start_coord,
-                                        config: new_stream.make_config(start_coord),
-                                        prefer_safe_spawn: true,
-                                        target_global_pos: [0, 0, 0],
-                                        priority: ProcgenPriority::Urgent,
-                                        epoch: next_epoch,
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    next_epoch = next_epoch.wrapping_add(1);
-                                    new_stream.mark_generating(spec.coord);
+                                    let generated_start = generate_world_with_control(
+                                        new_stream.make_config(start_coord),
+                                        ProcGenControl {
+                                            epoch: 0,
+                                            should_cancel: &|_| false,
+                                        },
+                                    )
+                                    .unwrap_or_else(|| World::new(config.dims));
+                                    new_stream.apply_generated(start_coord, generated_start);
+                                    let _ =
+                                        new_stream.load_coord_into_world(start_coord, &mut world);
+                                    let spawn = find_safe_spawn(&world, seed);
+                                    ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
+
                                     active_procgen = Some(config);
                                     active_stream_coord = start_coord;
                                     stream = Some(new_stream);
-                                    let st = procgen_workers.enqueue_or_coalesce(spec);
-                                    job_status.insert(spec.key, st);
+
+                                    if let Some(stream_ref) = stream.as_mut() {
+                                        let render_coords = sorted_residency_coords(
+                                            start_coord,
+                                            PROCEDURAL_RENDER_DISTANCE_MACROS,
+                                        );
+                                        let urgent_coords: Vec<[i32; 3]> = render_coords
+                                            .iter()
+                                            .copied()
+                                            .filter(|coord| {
+                                                *coord != start_coord
+                                                    && macro_distance_sq(*coord, start_coord)
+                                                        <= (PROCEDURAL_SIM_DISTANCE_MACROS
+                                                            * PROCEDURAL_SIM_DISTANCE_MACROS)
+                                            })
+                                            .collect();
+                                        schedule_procgen_batch(
+                                            &urgent_coords,
+                                            PROCGEN_URGENT_BUDGET_PER_FRAME,
+                                            ProcgenPriority::Urgent,
+                                            stream_ref,
+                                            &procgen_workers,
+                                            &mut next_procgen_id,
+                                            &mut next_epoch,
+                                            &mut job_status,
+                                            [0, 0, 0],
+                                        );
+                                        let prefetch_coords: Vec<[i32; 3]> = render_coords
+                                            .into_iter()
+                                            .filter(|coord| {
+                                                *coord != start_coord
+                                                    && macro_distance_sq(*coord, start_coord)
+                                                        > (PROCEDURAL_SIM_DISTANCE_MACROS
+                                                            * PROCEDURAL_SIM_DISTANCE_MACROS)
+                                            })
+                                            .collect();
+                                        schedule_procgen_batch(
+                                            &prefetch_coords,
+                                            PROCGEN_PREFETCH_BUDGET_PER_FRAME,
+                                            ProcgenPriority::Prefetch,
+                                            stream_ref,
+                                            &procgen_workers,
+                                            &mut next_procgen_id,
+                                            &mut next_epoch,
+                                            &mut job_status,
+                                            [0, 0, 0],
+                                        );
+                                    }
                                 } else {
                                     job_status.clear();
                                     active_procgen = None;
@@ -892,6 +958,61 @@ fn worker_loop(
         let mut st = lock.lock().expect("procgen queue lock");
         st.in_flight.remove(&spec.key);
         cv.notify_one();
+    }
+}
+
+fn macro_distance_sq(a: [i32; 3], b: [i32; 3]) -> i32 {
+    let dx = a[0] - b[0];
+    let dz = a[2] - b[2];
+    dx * dx + dz * dz
+}
+
+fn macro_residency_set(center: [i32; 3], radius: i32) -> HashSet<[i32; 3]> {
+    let mut set = HashSet::new();
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            set.insert([center[0] + dx, center[1], center[2] + dz]);
+        }
+    }
+    set
+}
+
+fn sorted_residency_coords(center: [i32; 3], radius: i32) -> Vec<[i32; 3]> {
+    let mut coords: Vec<[i32; 3]> = macro_residency_set(center, radius).into_iter().collect();
+    coords.sort_by_key(|coord| macro_distance_sq(*coord, center));
+    coords
+}
+
+fn schedule_procgen_batch(
+    coords: &[[i32; 3]],
+    budget: usize,
+    priority: ProcgenPriority,
+    stream: &mut WorldStream,
+    procgen_workers: &ProcgenWorkerPool,
+    next_procgen_id: &mut u64,
+    next_epoch: &mut u64,
+    job_status: &mut HashMap<ProcgenJobKey, ProcgenJobStatus>,
+    target_global_pos: [i32; 3],
+) {
+    for coord in coords.iter().take(budget) {
+        if stream.state(*coord) != ChunkResidency::Unloaded {
+            continue;
+        }
+        let spec = ProcgenJobSpec {
+            generation_id: *next_procgen_id,
+            key: ProcgenJobKey(*coord),
+            coord: *coord,
+            config: stream.make_config(*coord),
+            prefer_safe_spawn: false,
+            target_global_pos,
+            priority,
+            epoch: *next_epoch,
+        };
+        *next_procgen_id = next_procgen_id.wrapping_add(1);
+        *next_epoch = next_epoch.wrapping_add(1);
+        stream.mark_generating(spec.coord);
+        let st = procgen_workers.enqueue_or_coalesce(spec);
+        job_status.insert(spec.key, st);
     }
 }
 

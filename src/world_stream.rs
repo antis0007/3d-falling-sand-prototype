@@ -109,6 +109,12 @@ impl WorldStream {
             return false;
         };
         world.chunks.clone_from(&data.chunks);
+        for chunk in &mut world.chunks {
+            chunk.dirty_mesh = true;
+            if chunk.meshed_version == chunk.voxel_version {
+                chunk.meshed_version = chunk.meshed_version.saturating_sub(1);
+            }
+        }
         true
     }
 
