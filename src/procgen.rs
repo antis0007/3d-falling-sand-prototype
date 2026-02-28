@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::world::{MaterialId, World, EMPTY};
 
@@ -14,6 +15,51 @@ const LEAVES: MaterialId = 23;
 const BIOME_CLUSTER_MACROS: i32 = 3;
 const MACROCHUNK_SIZE: i32 = 64;
 const BIOME_COUNT: usize = 7;
+
+#[derive(Default)]
+struct ProcGenPassTimings {
+    rows: std::sync::Mutex<Vec<(&'static str, Duration)>>,
+}
+
+struct ScopedPassTimer<'a> {
+    owner: &'a ProcGenPassTimings,
+    name: &'static str,
+    start: Instant,
+}
+
+impl ProcGenPassTimings {
+    fn scoped(&self, name: &'static str) -> ScopedPassTimer<'_> {
+        ScopedPassTimer {
+            owner: self,
+            name,
+            start: Instant::now(),
+        }
+    }
+
+    fn log_total(&self, origin: [i32; 3]) {
+        let rows = self.rows.lock().expect("procgen timing lock");
+        let total: Duration = rows.iter().map(|(_, d)| *d).sum();
+        log::info!(
+            "procgen {:?} total {:.2}ms",
+            origin,
+            total.as_secs_f64() * 1000.0
+        );
+        for (name, d) in rows.iter() {
+            log::info!("procgen pass {}: {:.2}ms", name, d.as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+impl Drop for ScopedPassTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.owner
+            .rows
+            .lock()
+            .expect("procgen timing lock")
+            .push((self.name, elapsed));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiomeType {
@@ -51,6 +97,24 @@ pub struct ProcGenConfig {
     pub tree_density: f32,
 }
 
+#[derive(Clone, Copy)]
+pub struct ProcGenControl<'a> {
+    pub epoch: u64,
+    pub should_cancel: &'a dyn Fn(u64) -> bool,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnGenData {
+    wx: i32,
+    wz: i32,
+    weights: [f32; BIOME_COUNT],
+    surface_height: i32,
+    slope: i32,
+    coastal: bool,
+    river: bool,
+    ocean: bool,
+}
+
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
         let sea_level = 18.min(size as i32 - 10).max(10);
@@ -72,19 +136,51 @@ impl ProcGenConfig {
 }
 
 pub fn generate_world(config: ProcGenConfig) -> World {
+    let never_cancel = |_epoch: u64| false;
+    generate_world_with_control(
+        config,
+        ProcGenControl {
+            epoch: 0,
+            should_cancel: &never_cancel,
+        },
+    )
+    .unwrap_or_else(|| {
+        let mut world = World::new(config.dims);
+        world.clear();
+        world
+    })
+}
+
+pub fn generate_world_with_control(
+    config: ProcGenConfig,
+    control: ProcGenControl<'_>,
+) -> Option<World> {
     let mut world = World::new(config.dims);
     world.clear();
-    let heights = build_heightmap(&config);
+    let timings = ProcGenPassTimings::default();
+    let (heights, columns) = build_column_cache(&config, &timings);
 
-    base_terrain_pass(&mut world, &config, &heights);
-    cave_carve_pass(&mut world, &config);
-    surface_layering_pass(&mut world, &config, &heights);
-    shoreline_transition_pass(&mut world, &config, &heights);
-    biome_water_pass(&mut world, &config);
-    enforce_subsea_materials_pass(&mut world, &config);
-    vegetation_pass(&mut world, &config);
+    if (control.should_cancel)(control.epoch) {
+        return None;
+    }
 
-    world
+    base_terrain_pass(&mut world, &config, &heights, &timings);
+    if (control.should_cancel)(control.epoch) {
+        return None;
+    }
+    cave_carve_pass(&mut world, &config, &columns, &timings);
+    if (control.should_cancel)(control.epoch) {
+        return None;
+    }
+    surface_layering_pass(&mut world, &config, &columns, &timings);
+    shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
+    biome_water_pass(&mut world, &config, &columns, &timings);
+    enforce_subsea_materials_pass(&mut world, &config, &timings);
+    vegetation_pass(&mut world, &config, &columns, &timings);
+    world.finalize_generation_side_effects();
+    timings.log_total(config.world_origin);
+
+    Some(world)
 }
 
 pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
@@ -93,30 +189,93 @@ pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType 
 }
 
 fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
+    build_column_cache(config, &ProcGenPassTimings::default()).0
+}
+
+fn build_column_cache(
+    config: &ProcGenConfig,
+    timings: &ProcGenPassTimings,
+) -> (Vec<i32>, Vec<ColumnGenData>) {
+    let _timer = timings.scoped("build_column_cache");
     let mut heights = vec![0; config.dims[0] * config.dims[2]];
+    let mut columns = vec![
+        ColumnGenData {
+            wx: 0,
+            wz: 0,
+            weights: [0.0; BIOME_COUNT],
+            surface_height: 0,
+            slope: 0,
+            coastal: false,
+            river: false,
+            ocean: false,
+        };
+        config.dims[0] * config.dims[2]
+    ];
     for z in 0..config.dims[2] as i32 {
         for x in 0..config.dims[0] as i32 {
             let wx = config.world_origin[0] + x;
             let wz = config.world_origin[2] + z;
-            heights[x as usize + z as usize * config.dims[0]] =
-                sampled_surface_height(config, wx, wz);
+            let idx = x as usize + z as usize * config.dims[0];
+            let weights = biome_weights(config.seed, wx, wz);
+            let surface_height = sampled_surface_height(config, wx, wz, Some(weights));
+            heights[idx] = surface_height;
+            columns[idx] = ColumnGenData {
+                wx,
+                wz,
+                weights,
+                surface_height,
+                slope: 0,
+                coastal: false,
+                river: false,
+                ocean: false,
+            };
         }
     }
-    heights
+    for z in 0..config.dims[2] as i32 {
+        for x in 0..config.dims[0] as i32 {
+            let idx = x as usize + z as usize * config.dims[0];
+            let col = &mut columns[idx];
+            let ocean = col.weights[biome_index(BiomeType::Ocean)];
+            let river = col.weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
+                col.wx,
+                col.wz,
+            ));
+            let shore_w = smoothstep((ocean - 0.24) / 0.34);
+            let near_sea_band = col.surface_height <= config.sea_level + 4;
+            col.slope = local_slope_heightmap(&heights, config.dims[0], x, z);
+            col.coastal = shore_w > 0.18 && near_sea_band;
+            col.river = river > 0.48;
+            col.ocean = ocean > 0.55;
+        }
+    }
+    (heights, columns)
 }
 
-fn base_terrain_pass(world: &mut World, _config: &ProcGenConfig, heights: &[i32]) {
+fn base_terrain_pass(
+    world: &mut World,
+    _config: &ProcGenConfig,
+    heights: &[i32],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("base_terrain_pass");
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
             let h = heights[lx as usize + lz as usize * world.dims[0]];
             for y in 0..=h {
-                let _ = world.set(lx, y, lz, STONE);
+                let _ = world.set_raw_no_side_effects(lx, y, lz, STONE);
             }
         }
     }
 }
 
-fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
+fn cave_carve_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("cave_carve_pass");
     let max_y = world.dims[1] as i32 - 2;
     for lz in 0..world.dims[2] as i32 {
         for ly in 4..max_y {
@@ -127,9 +286,8 @@ fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
                 let wx = config.world_origin[0] + lx;
                 let wy = ly;
                 let wz = config.world_origin[2] + lz;
-                let weights = biome_weights(config.seed, wx, wz);
-                let top =
-                    terrain_height(config, wx, wz, weights).clamp(6, world.dims[1] as i32 - 4);
+                let col = &columns[lx as usize + lz as usize * world.dims[0]];
+                let top = col.surface_height.clamp(6, world.dims[1] as i32 - 4);
                 if ly >= top - 4 {
                     continue;
                 }
@@ -151,31 +309,33 @@ fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
                 let value = 0.7 * cave + 0.3 * cave_warp;
                 let threshold = 0.63 + (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.18;
                 if value > threshold && depth_fade > 0.08 {
-                    let _ = world.set(lx, ly, lz, EMPTY);
+                    let _ = world.set_raw_no_side_effects(lx, ly, lz, EMPTY);
                 }
             }
         }
     }
 }
 
-fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
+fn surface_layering_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("surface_layering_pass");
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let top_y = heights[lx as usize + lz as usize * world.dims[0]];
-            let wx = config.world_origin[0] + lx;
-            let wz = config.world_origin[2] + lz;
-            let weights = biome_weights(config.seed, wx, wz);
+            let col = &columns[lx as usize + lz as usize * world.dims[0]];
+            let top_y = col.surface_height;
+            let weights = col.weights;
 
             let desert = weights[biome_index(BiomeType::Desert)];
             let plains = weights[biome_index(BiomeType::Plains)];
             let highlands = weights[biome_index(BiomeType::Highlands)];
             let ocean = weights[biome_index(BiomeType::Ocean)];
-            let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(
-                config.seed,
-                wx,
-                wz,
-            ));
-            let slope = local_slope_heightmap(heights, world.dims[0], lx, lz);
+            let river =
+                weights[biome_index(BiomeType::River)].max(if col.river { 1.0 } else { 0.0 });
+            let slope = col.slope;
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
             let near_sea_band = top_y <= config.sea_level + 4;
             let coastal = shore_w > 0.18 && near_sea_band;
@@ -227,7 +387,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
                 } else {
                     STONE
                 };
-                let _ = world.set(lx, y, lz, block);
+                let _ = world.set_raw_no_side_effects(lx, y, lz, block);
             }
         }
     }
@@ -251,14 +411,19 @@ fn local_slope_heightmap(heights: &[i32], width: usize, x: i32, z: i32) -> i32 {
     max_delta
 }
 
-fn shoreline_transition_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) {
+fn shoreline_transition_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    heights: &[i32],
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("shoreline_transition_pass");
     let sea = config.sea_level;
     for lz in 1..world.dims[2] as i32 - 1 {
         for lx in 1..world.dims[0] as i32 - 1 {
-            let wx = config.world_origin[0] + lx;
-            let wz = config.world_origin[2] + lz;
-            let w = biome_weights(config.seed, wx, wz);
-            let ocean = w[biome_index(BiomeType::Ocean)];
+            let col = &columns[lx as usize + lz as usize * world.dims[0]];
+            let ocean = col.weights[biome_index(BiomeType::Ocean)];
             if ocean > 0.55 {
                 continue;
             }
@@ -269,8 +434,10 @@ fn shoreline_transition_pass(world: &mut World, config: &ProcGenConfig, heights:
                     if dx == 0 && dz == 0 {
                         continue;
                     }
-                    let nw = biome_weights(config.seed, wx + dx, wz + dz);
-                    if nw[biome_index(BiomeType::Ocean)] > 0.62 {
+                    let nx = (lx + dx).clamp(0, world.dims[0] as i32 - 1);
+                    let nz = (lz + dz).clamp(0, world.dims[2] as i32 - 1);
+                    let ncol = &columns[nx as usize + nz as usize * world.dims[0]];
+                    if ncol.weights[biome_index(BiomeType::Ocean)] > 0.62 {
                         near_ocean = true;
                         break;
                     }
@@ -291,10 +458,10 @@ fn shoreline_transition_pass(world: &mut World, config: &ProcGenConfig, heights:
             let berm_top = (sea - 1).min(world.dims[1] as i32 - 2);
             let stone_top = (berm_top - 2).max(2);
             for y in (top + 1).max(2)..=stone_top {
-                let _ = world.set(lx, y, lz, STONE);
+                let _ = world.set_raw_no_side_effects(lx, y, lz, STONE);
             }
             for y in (stone_top + 1).max(2)..=berm_top {
-                let _ = world.set(lx, y, lz, SAND);
+                let _ = world.set_raw_no_side_effects(lx, y, lz, SAND);
             }
         }
     }
@@ -317,7 +484,13 @@ fn build_surface_heightmap_from_world(world: &World) -> Vec<i32> {
     heights
 }
 
-fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
+fn biome_water_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("biome_water_pass");
     let sea_level = config.sea_level;
     let heights = build_surface_heightmap_from_world(world);
     let width = world.dims[0];
@@ -327,9 +500,10 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
     let mut water_target = vec![0i32; width * depth];
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let wx = config.world_origin[0] + lx;
-            let wz = config.world_origin[2] + lz;
-            let weights = biome_weights(config.seed, wx, wz);
+            let col = &columns[lx as usize + lz as usize * width];
+            let wx = col.wx;
+            let wz = col.wz;
+            let weights = col.weights;
             let ocean_w = weights[biome_index(BiomeType::Ocean)];
             let river_w = weights[biome_index(BiomeType::River)].max(river_meander_signal(
                 config.seed,
@@ -360,13 +534,13 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
 
                 if qualifies {
                     for y in 1..floor {
-                        let _ = world.set(lx, y, lz, STONE);
+                        let _ = world.set_raw_no_side_effects(lx, y, lz, STONE);
                     }
                     for y in floor..=sea_level {
-                        let _ = world.set(lx, y, lz, WATER);
+                        let _ = world.set_raw_no_side_effects(lx, y, lz, WATER);
                     }
                     for y in (floor - 2).max(1)..floor {
-                        let _ = world.set(lx, y, lz, SAND);
+                        let _ = world.set_raw_no_side_effects(lx, y, lz, SAND);
                     }
                     continue;
                 }
@@ -389,11 +563,11 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
             }
 
             for y in floor..=surface {
-                let _ = world.set(lx, y, lz, EMPTY);
+                let _ = world.set_raw_no_side_effects(lx, y, lz, EMPTY);
             }
             for y in (floor - 1).max(1)..=floor {
                 if world.get(lx, y, lz) != WATER {
-                    let _ = world.set(lx, y, lz, SAND);
+                    let _ = world.set_raw_no_side_effects(lx, y, lz, SAND);
                 }
             }
 
@@ -476,7 +650,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
                 let mut top = basin_target + slope;
                 top = top.min(surface - 1).max(floor);
                 for y in floor..=top {
-                    let _ = world.set(rx, y, rz, WATER);
+                    let _ = world.set_raw_no_side_effects(rx, y, rz, WATER);
                 }
             }
         }
@@ -589,7 +763,7 @@ fn height_sample_with_fallback(
     }
     let wx = config.world_origin[0] + x;
     let wz = config.world_origin[2] + z;
-    sampled_surface_height(config, wx, wz)
+    sampled_surface_height(config, wx, wz, None)
 }
 
 fn explicit_rapid_or_fall(seed: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> bool {
@@ -598,7 +772,12 @@ fn explicit_rapid_or_fall(seed: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> bool
     (a - b).abs() >= 2
 }
 
-fn enforce_subsea_materials_pass(world: &mut World, config: &ProcGenConfig) {
+fn enforce_subsea_materials_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("enforce_subsea_materials_pass");
     let sea = config.sea_level;
     for z in 0..world.dims[2] as i32 {
         for x in 0..world.dims[0] as i32 {
@@ -606,17 +785,23 @@ fn enforce_subsea_materials_pass(world: &mut World, config: &ProcGenConfig) {
                 let m = world.get(x, y, z);
                 if m == TURF || m == DIRT || m == GRASS || m == BUSH {
                     let replacement = if y >= sea - 2 { SAND } else { STONE };
-                    let _ = world.set(x, y, z, replacement);
+                    let _ = world.set_raw_no_side_effects(x, y, z, replacement);
                 }
                 if m == WATER && world.get(x, y - 1, z) == EMPTY {
-                    let _ = world.set(x, y - 1, z, STONE);
+                    let _ = world.set_raw_no_side_effects(x, y - 1, z, STONE);
                 }
             }
         }
     }
 }
 
-fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
+fn vegetation_pass(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    let _timer = timings.scoped("vegetation_pass");
     for lz in 2..world.dims[2] as i32 - 2 {
         for lx in 2..world.dims[0] as i32 - 2 {
             let Some(top_y) = surface_y(world, lx, lz) else {
@@ -630,9 +815,10 @@ fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
                 continue;
             }
 
-            let wx = config.world_origin[0] + lx;
-            let wz = config.world_origin[2] + lz;
-            let weights = biome_weights(config.seed, wx, wz);
+            let col = &columns[lx as usize + lz as usize * world.dims[0]];
+            let wx = col.wx;
+            let wz = col.wz;
+            let weights = col.weights;
             let forest = weights[biome_index(BiomeType::Forest)];
             let plains = weights[biome_index(BiomeType::Plains)];
             let highlands = weights[biome_index(BiomeType::Highlands)];
@@ -656,7 +842,7 @@ fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
 
             let flora_roll = hash01(config.seed ^ 0x22224444, wx, top_y, wz);
             if (forest > 0.4 || plains > 0.5) && ground != SAND && flora_roll < 0.09 {
-                let _ = world.set(
+                let _ = world.set_raw_no_side_effects(
                     lx,
                     top_y + 1,
                     lz,
@@ -714,7 +900,12 @@ fn valid_surface_spawn_y(world: &World, x: i32, z: i32) -> Option<i32> {
     Some(top)
 }
 
-fn sampled_surface_height(config: &ProcGenConfig, x: i32, z: i32) -> i32 {
+fn sampled_surface_height(
+    config: &ProcGenConfig,
+    x: i32,
+    z: i32,
+    cached_weights: Option<[f32; BIOME_COUNT]>,
+) -> i32 {
     let mut sum = 0.0;
     let mut n = 0.0;
     for dz in -1..=1 {
@@ -726,7 +917,7 @@ fn sampled_surface_height(config: &ProcGenConfig, x: i32, z: i32) -> i32 {
             n += 1.0;
         }
     }
-    let w0 = biome_weights(config.seed, x, z);
+    let w0 = cached_weights.unwrap_or_else(|| biome_weights(config.seed, x, z));
     let raw = terrain_height(config, x, z, w0) as f32;
     (raw * 0.6 + (sum / n) * 0.4)
         .round()
@@ -914,7 +1105,7 @@ fn can_place_tree(world: &World, x: i32, y: i32, z: i32) -> bool {
 fn place_tree(world: &mut World, seed: u64, world_x: i32, x: i32, y: i32, z: i32) {
     let trunk_h = 4 + (hash01(seed ^ 0x71335599, world_x, y, z) * 4.0) as i32;
     for ty in 0..trunk_h {
-        let _ = world.set(x, y + ty, z, WOOD);
+        let _ = world.set_raw_no_side_effects(x, y + ty, z, WOOD);
     }
 
     let top = y + trunk_h;
@@ -938,7 +1129,7 @@ fn place_tree(world: &mut World, seed: u64, world_x: i32, x: i32, y: i32, z: i32
                     continue;
                 }
                 if world.get(px, py, pz) == EMPTY {
-                    let _ = world.set(px, py, pz, LEAVES);
+                    let _ = world.set_raw_no_side_effects(px, py, pz, LEAVES);
                 }
             }
         }

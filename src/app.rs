@@ -3,7 +3,10 @@ use crate::player::{
     camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
-use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
+use crate::procgen::{
+    biome_hint_at_world, find_safe_spawn, generate_world_with_control, ProcGenConfig,
+    ProcGenControl,
+};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
 use crate::ui::{
@@ -17,7 +20,11 @@ use crate::world::{
 use crate::world_stream::{floor_div, ChunkResidency, WorldStream};
 use anyhow::Context;
 use glam::Vec3;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
@@ -46,22 +53,39 @@ struct RaycastResult {
     place: [i32; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ProcgenJobKey([i32; 3]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcgenPriority {
+    Urgent,
+    Prefetch,
+}
+
 #[derive(Clone, Copy)]
 struct ProcgenJobSpec {
     generation_id: u64,
+    key: ProcgenJobKey,
     coord: [i32; 3],
     config: ProcGenConfig,
     prefer_safe_spawn: bool,
     target_global_pos: [i32; 3],
+    priority: ProcgenPriority,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcgenJobStatus {
+    Queued,
+    InFlight,
+    Ready,
+    Cancelled,
 }
 
 struct ProcgenJobResult {
-    generation_id: u64,
-    coord: [i32; 3],
-    config: ProcGenConfig,
-    world: World,
-    prefer_safe_spawn: bool,
-    target_global_pos: [i32; 3],
+    spec: ProcgenJobSpec,
+    status: ProcgenJobStatus,
+    world: Option<World>,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -95,9 +119,10 @@ pub async fn run() -> anyhow::Result<()> {
     let mut active_stream_coord: [i32; 3] = [0, 0, 0];
     let (procgen_tx, procgen_rx): (Sender<ProcgenJobResult>, Receiver<ProcgenJobResult>) =
         mpsc::channel();
-    let mut requested_procgen_id: Option<u64> = None;
-    let mut requested_procgen_coord: Option<[i32; 3]> = None;
     let mut next_procgen_id: u64 = 1;
+    let mut next_epoch: u64 = 1;
+    let mut job_status: HashMap<ProcgenJobKey, ProcgenJobStatus> = HashMap::new();
+    let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -293,32 +318,33 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
 
                         while let Ok(result) = procgen_rx.try_recv() {
-                            if requested_procgen_id != Some(result.generation_id) {
-                                continue;
-                            }
-                            requested_procgen_id = None;
-                            requested_procgen_coord = None;
-
-                            if let Some(stream) = stream.as_mut() {
-                                stream.apply_generated(result.coord, result.world);
-                                if result.coord == active_stream_coord {
-                                    let _ = stream
-                                        .load_coord_into_world(active_stream_coord, &mut world);
-                                    if result.prefer_safe_spawn {
-                                        let spawn = find_safe_spawn(&world, result.config.seed);
-                                        ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
-                                    } else {
-                                        let origin = stream.chunk_origin(active_stream_coord);
-                                        let frac_x = ctrl.position.x - ctrl.position.x.floor();
-                                        let frac_z = ctrl.position.z - ctrl.position.z.floor();
-                                        ctrl.position = Vec3::new(
-                                            (result.target_global_pos[0] - origin[0]) as f32
-                                                + frac_x,
-                                            ctrl.position.y,
-                                            (result.target_global_pos[2] - origin[2]) as f32
-                                                + frac_z,
-                                        );
+                            job_status.insert(result.spec.key, result.status);
+                            if let Some(stream_ref) = stream.as_mut() {
+                                match result.status {
+                                    ProcgenJobStatus::Ready => {
+                                        if let Some(generated) = result.world {
+                                            stream_ref
+                                                .apply_generated(result.spec.coord, generated);
+                                            if result.spec.coord == active_stream_coord {
+                                                let _ = stream_ref.load_coord_into_world(
+                                                    active_stream_coord,
+                                                    &mut world,
+                                                );
+                                                if result.spec.prefer_safe_spawn {
+                                                    let spawn = find_safe_spawn(
+                                                        &world,
+                                                        result.spec.config.seed,
+                                                    );
+                                                    ctrl.position =
+                                                        Vec3::new(spawn[0], spawn[1], spawn[2]);
+                                                }
+                                            }
+                                        }
                                     }
+                                    ProcgenJobStatus::Cancelled => {
+                                        job_status.remove(&result.spec.key);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -337,6 +363,20 @@ pub async fn run() -> anyhow::Result<()> {
                                 0,
                                 floor_div(global[2], chunk_size),
                             ];
+                            let mut residency_plan: HashSet<[i32; 3]> = HashSet::new();
+                            for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
+                                ..=PROCEDURAL_RENDER_DISTANCE_MACROS
+                            {
+                                for dx in -PROCEDURAL_RENDER_DISTANCE_MACROS
+                                    ..=PROCEDURAL_RENDER_DISTANCE_MACROS
+                                {
+                                    residency_plan.insert([
+                                        desired_coord[0] + dx,
+                                        0,
+                                        desired_coord[2] + dz,
+                                    ]);
+                                }
+                            }
                             if desired_coord != active_stream_coord {
                                 let frac_x = ctrl.position.x - ctrl.position.x.floor();
                                 let frac_z = ctrl.position.z - ctrl.position.z.floor();
@@ -348,58 +388,72 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
-                                } else if requested_procgen_id.is_none()
-                                    && requested_procgen_coord != Some(desired_coord)
-                                    && stream_ref.state(desired_coord) == ChunkResidency::Unloaded
+                                } else if stream_ref.state(desired_coord)
+                                    == ChunkResidency::Unloaded
                                 {
                                     let spec = ProcgenJobSpec {
                                         generation_id: next_procgen_id,
+                                        key: ProcgenJobKey(desired_coord),
                                         coord: desired_coord,
                                         config: stream_ref.make_config(desired_coord),
                                         prefer_safe_spawn: false,
                                         target_global_pos: global,
+                                        priority: ProcgenPriority::Urgent,
+                                        epoch: next_epoch,
                                     };
                                     next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    requested_procgen_coord = Some(spec.coord);
+                                    next_epoch = next_epoch.wrapping_add(1);
                                     stream_ref.mark_generating(spec.coord);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                    let st = procgen_workers.enqueue_or_coalesce(spec);
+                                    job_status.insert(spec.key, st);
                                 }
                             }
 
-                            if requested_procgen_id.is_none() {
-                                let mut prefetch = None;
-                                for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
+                            for (&key, status) in job_status.clone().iter() {
+                                if !residency_plan.contains(&key.0)
+                                    && matches!(
+                                        status,
+                                        ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight
+                                    )
+                                {
+                                    next_epoch = next_epoch.wrapping_add(1);
+                                    procgen_workers.cancel_key(key, next_epoch);
+                                }
+                            }
+
+                            let mut prefetch = None;
+                            for dz in -PROCEDURAL_RENDER_DISTANCE_MACROS
+                                ..=PROCEDURAL_RENDER_DISTANCE_MACROS
+                            {
+                                for dx in -PROCEDURAL_RENDER_DISTANCE_MACROS
                                     ..=PROCEDURAL_RENDER_DISTANCE_MACROS
                                 {
-                                    for dx in -PROCEDURAL_RENDER_DISTANCE_MACROS
-                                        ..=PROCEDURAL_RENDER_DISTANCE_MACROS
-                                    {
-                                        let coord =
-                                            [desired_coord[0] + dx, 0, desired_coord[2] + dz];
-                                        if stream_ref.state(coord) == ChunkResidency::Unloaded {
-                                            prefetch = Some(coord);
-                                            break;
-                                        }
-                                    }
-                                    if prefetch.is_some() {
+                                    let coord = [desired_coord[0] + dx, 0, desired_coord[2] + dz];
+                                    if stream_ref.state(coord) == ChunkResidency::Unloaded {
+                                        prefetch = Some(coord);
                                         break;
                                     }
                                 }
-                                if let Some(coord) = prefetch {
-                                    let spec = ProcgenJobSpec {
-                                        generation_id: next_procgen_id,
-                                        coord,
-                                        config: stream_ref.make_config(coord),
-                                        prefer_safe_spawn: false,
-                                        target_global_pos: global,
-                                    };
-                                    next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    requested_procgen_coord = Some(spec.coord);
-                                    stream_ref.mark_generating(spec.coord);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                if prefetch.is_some() {
+                                    break;
                                 }
+                            }
+                            if let Some(coord) = prefetch {
+                                let spec = ProcgenJobSpec {
+                                    generation_id: next_procgen_id,
+                                    key: ProcgenJobKey(coord),
+                                    coord,
+                                    config: stream_ref.make_config(coord),
+                                    prefer_safe_spawn: false,
+                                    target_global_pos: global,
+                                    priority: ProcgenPriority::Prefetch,
+                                    epoch: next_epoch,
+                                };
+                                next_procgen_id = next_procgen_id.wrapping_add(1);
+                                next_epoch = next_epoch.wrapping_add(1);
+                                stream_ref.mark_generating(spec.coord);
+                                let st = procgen_workers.enqueue_or_coalesce(spec);
+                                job_status.insert(spec.key, st);
                             }
                         }
 
@@ -414,7 +468,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 origin[0] + ctrl.position.x.floor() as i32,
                                 origin[2] + ctrl.position.z.floor() as i32,
                             );
-                            if requested_procgen_id.is_some() {
+                            if job_status.values().any(|s| {
+                                matches!(s, ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight)
+                            }) {
                                 format!("Biome: {} (generating...)", biome.label())
                             } else {
                                 format!("Biome: {}", biome.label())
@@ -460,20 +516,27 @@ pub async fn run() -> anyhow::Result<()> {
                                     let start_coord = [0, 0, 0];
                                     let spec = ProcgenJobSpec {
                                         generation_id: next_procgen_id,
+                                        key: ProcgenJobKey(start_coord),
                                         coord: start_coord,
                                         config: new_stream.make_config(start_coord),
                                         prefer_safe_spawn: true,
                                         target_global_pos: [0, 0, 0],
+                                        priority: ProcgenPriority::Urgent,
+                                        epoch: next_epoch,
                                     };
                                     next_procgen_id = next_procgen_id.wrapping_add(1);
-                                    requested_procgen_id = Some(spec.generation_id);
-                                    requested_procgen_coord = Some(spec.coord);
+                                    next_epoch = next_epoch.wrapping_add(1);
                                     new_stream.mark_generating(spec.coord);
                                     active_procgen = Some(config);
                                     active_stream_coord = start_coord;
                                     stream = Some(new_stream);
-                                    queue_procgen_job(&procgen_tx, spec);
+                                    let st = procgen_workers.enqueue_or_coalesce(spec);
+                                    job_status.insert(spec.key, st);
                                 } else {
+                                    job_status.clear();
+                                    active_procgen = None;
+                                    stream = None;
+                                    active_stream_coord = [0, 0, 0];
                                     clear_procedural_streaming_state(
                                         &mut requested_procgen_id,
                                         &mut requested_procgen_coord,
@@ -496,6 +559,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
+                                        job_status.clear();
+                                        active_procgen = None;
+                                        stream = None;
+                                        active_stream_coord = [0, 0, 0];
                                         clear_procedural_streaming_state(
                                             &mut requested_procgen_id,
                                             &mut requested_procgen_coord,
@@ -650,19 +717,180 @@ fn texture_for_active_tool(
     Some((texture.texture.id(), texture.size))
 }
 
-fn queue_procgen_job(tx: &Sender<ProcgenJobResult>, spec: ProcgenJobSpec) {
-    let tx = tx.clone();
-    std::thread::spawn(move || {
-        let world = generate_world(spec.config);
-        let _ = tx.send(ProcgenJobResult {
-            generation_id: spec.generation_id,
-            coord: spec.coord,
-            config: spec.config,
-            world,
-            prefer_safe_spawn: spec.prefer_safe_spawn,
-            target_global_pos: spec.target_global_pos,
+#[derive(Clone)]
+struct ProcgenQueueEntry {
+    spec: ProcgenJobSpec,
+    sequence: u64,
+}
+
+impl PartialEq for ProcgenQueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec.key == other.spec.key && self.sequence == other.sequence
+    }
+}
+impl Eq for ProcgenQueueEntry {}
+impl Ord for ProcgenQueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let rank = |p: ProcgenPriority| match p {
+            ProcgenPriority::Urgent => 1u8,
+            ProcgenPriority::Prefetch => 0u8,
+        };
+        rank(self.spec.priority)
+            .cmp(&rank(other.spec.priority))
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+impl PartialOrd for ProcgenQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct ProcgenQueueState {
+    queue: BinaryHeap<ProcgenQueueEntry>,
+    queued_keys: HashSet<ProcgenJobKey>,
+    in_flight: HashSet<ProcgenJobKey>,
+    max_queue: usize,
+    max_in_flight: usize,
+    sequence: u64,
+}
+
+struct ProcgenWorkerPool {
+    state: Arc<(Mutex<ProcgenQueueState>, Condvar)>,
+    cancel_epochs: Arc<Mutex<HashMap<ProcgenJobKey, u64>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ProcgenWorkerPool {
+    fn new(
+        tx: Sender<ProcgenJobResult>,
+        workers: usize,
+        max_in_flight: usize,
+        max_queue: usize,
+        _max_pending_per_key: usize,
+    ) -> Self {
+        let state = Arc::new((
+            Mutex::new(ProcgenQueueState {
+                queue: BinaryHeap::new(),
+                queued_keys: HashSet::new(),
+                in_flight: HashSet::new(),
+                max_queue,
+                max_in_flight,
+                sequence: 0,
+            }),
+            Condvar::new(),
+        ));
+        let cancel_epochs = Arc::new(Mutex::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let state_c = state.clone();
+            let cancel_c = cancel_epochs.clone();
+            let shutdown_c = shutdown.clone();
+            std::thread::spawn(move || worker_loop(tx, state_c, cancel_c, shutdown_c));
+        }
+        Self {
+            state,
+            cancel_epochs,
+            shutdown,
+        }
+    }
+
+    fn enqueue_or_coalesce(&self, spec: ProcgenJobSpec) -> ProcgenJobStatus {
+        self.cancel_epochs
+            .lock()
+            .expect("cancel lock")
+            .insert(spec.key, spec.epoch);
+        let (lock, cv) = &*self.state;
+        let mut st = lock.lock().expect("procgen queue lock");
+        if st.queued_keys.contains(&spec.key) || st.in_flight.contains(&spec.key) {
+            return ProcgenJobStatus::Queued;
+        }
+        if st.queue.len() >= st.max_queue {
+            if let Some(dropped) = st.queue.pop() {
+                st.queued_keys.remove(&dropped.spec.key);
+            }
+        }
+        st.sequence = st.sequence.wrapping_add(1);
+        let seq = st.sequence;
+        st.queued_keys.insert(spec.key);
+        st.queue.push(ProcgenQueueEntry {
+            spec,
+            sequence: seq,
         });
-    });
+        cv.notify_one();
+        ProcgenJobStatus::Queued
+    }
+
+    fn cancel_key(&self, key: ProcgenJobKey, epoch: u64) {
+        self.cancel_epochs
+            .lock()
+            .expect("cancel lock")
+            .insert(key, epoch);
+    }
+}
+
+fn worker_loop(
+    tx: Sender<ProcgenJobResult>,
+    state: Arc<(Mutex<ProcgenQueueState>, Condvar)>,
+    cancel_epochs: Arc<Mutex<HashMap<ProcgenJobKey, u64>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        let spec = {
+            let (lock, cv) = &*state;
+            let mut st = lock.lock().expect("procgen queue lock");
+            while (st.queue.is_empty() || st.in_flight.len() >= st.max_in_flight)
+                && !shutdown.load(AtomicOrdering::Relaxed)
+            {
+                st = cv.wait(st).expect("condvar wait");
+            }
+            if shutdown.load(AtomicOrdering::Relaxed) {
+                return;
+            }
+            let Some(entry) = st.queue.pop() else {
+                continue;
+            };
+            st.queued_keys.remove(&entry.spec.key);
+            st.in_flight.insert(entry.spec.key);
+            let _ = tx.send(ProcgenJobResult {
+                spec: entry.spec,
+                status: ProcgenJobStatus::InFlight,
+                world: None,
+            });
+            entry.spec
+        };
+
+        let cancel_probe = |epoch: u64| {
+            let map = cancel_epochs.lock().expect("cancel lock");
+            map.get(&spec.key).copied().unwrap_or(epoch) != epoch
+        };
+        let world = generate_world_with_control(
+            spec.config,
+            ProcGenControl {
+                epoch: spec.epoch,
+                should_cancel: &cancel_probe,
+            },
+        );
+        let status = if world.is_some() {
+            ProcgenJobStatus::Ready
+        } else {
+            ProcgenJobStatus::Cancelled
+        };
+        let _ = tx.send(ProcgenJobResult {
+            spec,
+            status,
+            world,
+        });
+
+        let (lock, cv) = &*state;
+        let mut st = lock.lock().expect("procgen queue lock");
+        st.in_flight.remove(&spec.key);
+        cv.notify_one();
+    }
 }
 
 fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool) {
