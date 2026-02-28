@@ -420,6 +420,9 @@ pub async fn run() -> anyhow::Result<()> {
                                         ctrl.position.y,
                                         (global[2] - new_origin[2]) as f32 + frac_z,
                                     );
+                                    renderer.clear_mesh_cache();
+                                    queued_stream_mesh_coords.clear();
+                                    pending_stream_mesh_coords.clear();
                                 }
                             }
 
