@@ -176,6 +176,14 @@ impl WorldStream {
         chunk.world.as_ref()
     }
 
+    pub fn resident_world_mut(&mut self, coord: [i32; 3]) -> Option<&mut World> {
+        let chunk = self.chunks.get_mut(&coord)?;
+        if chunk.residency != ChunkResidency::Resident {
+            return None;
+        }
+        chunk.world.as_mut()
+    }
+
     pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
         self.sample_global_voxel_known(global).unwrap_or(EMPTY)
     }

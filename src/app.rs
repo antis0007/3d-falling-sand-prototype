@@ -4,8 +4,8 @@ use crate::player::{
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
 use crate::procgen::{
-    biome_hint_at_world, find_safe_spawn, generate_world_with_control, ProcGenConfig,
-    ProcGenControl,
+    base_biome_at_world, find_safe_spawn, generate_world_with_control, hydro_feature_at_world,
+    ProcGenConfig, ProcGenControl,
 };
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
@@ -143,6 +143,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut queued_stream_mesh_coords: HashSet<[i32; 3]> = HashSet::new();
     let mut unsafe_handoff_prevented_count: u64 = 0;
     let mut delayed_transition_count: u64 = 0;
+    let mut sim_accumulators_by_coord: HashMap<[i32; 3], f32> = HashMap::new();
     let procgen_workers = ProcgenWorkerPool::new(procgen_tx.clone(), 3, 3, 64, 6);
 
     let _ = set_cursor(window, false);
@@ -367,6 +368,7 @@ pub async fn run() -> anyhow::Result<()> {
                                             {
                                                 pending_stream_mesh_coords.push(result.spec.coord);
                                             }
+                                            job_status.remove(&result.spec.key);
                                         }
                                     }
                                     ProcgenJobStatus::Cancelled => {
@@ -381,6 +383,8 @@ pub async fn run() -> anyhow::Result<()> {
                         if let (Some(cfg), Some(bounds), Some(stream_ref)) =
                             (active_procgen, procedural_bounds, stream.as_mut())
                         {
+                            delayed_transition_count = 0;
+                            unsafe_handoff_prevented_count = 0;
                             let chunk_size_x = cfg.dims[0] as i32;
                             let chunk_size_y = cfg.dims[1] as i32;
                             let chunk_size_z = cfg.dims[2] as i32;
@@ -587,11 +591,62 @@ pub async fn run() -> anyhow::Result<()> {
                         if sim.running && !ui.paused_menu && procedural_simulation_allowed {
                             let step_dt = (sim.fixed_dt / ui.sim_speed).max(1e-4);
                             sim.accumulator += dt;
+                            sim_accumulators_by_coord
+                                .entry(active_stream_coord)
+                                .and_modify(|acc| *acc += dt)
+                                .or_insert(dt);
                             while sim.accumulator >= step_dt {
                                 let (high_priority, _low_priority) =
                                     prioritize_chunks_for_player(&world, ctrl.position);
                                 step_selected_chunks(&mut world, &mut sim.rng, &high_priority);
                                 sim.accumulator -= step_dt;
+                            }
+                            if let (Some(stream_ref), Some(bounds)) =
+                                (stream.as_mut(), procedural_bounds)
+                            {
+                                let active_origin = stream_ref.chunk_origin(active_stream_coord);
+                                let global_player = [
+                                    active_origin[0] + ctrl.position.x.floor() as i32,
+                                    active_origin[1] + ctrl.position.y.floor() as i32,
+                                    active_origin[2] + ctrl.position.z.floor() as i32,
+                                ];
+                                let sim_coords = filtered_macro_residency_set(
+                                    active_stream_coord,
+                                    PROCEDURAL_SIM_DISTANCE_MACROS,
+                                    PROCEDURAL_SIM_DISTANCE_MACROS_Y,
+                                    bounds,
+                                );
+                                let mut coords: Vec<[i32; 3]> = sim_coords
+                                    .iter()
+                                    .copied()
+                                    .filter(|coord| *coord != active_stream_coord)
+                                    .filter(|coord| bounds.contains_macro_coord(*coord))
+                                    .collect();
+                                coords.sort_by_key(|coord| macro_distance_sq(*coord, active_stream_coord));
+                                for coord in coords {
+                                    let distance_sq = macro_distance_sq(coord, active_stream_coord) as f32;
+                                    let cadence_scale = (1.0 + distance_sq.sqrt() * 0.5).clamp(1.0, 3.5);
+                                    let accumulator = sim_accumulators_by_coord.entry(coord).or_insert(0.0);
+                                    *accumulator += dt;
+                                    let coord_origin = stream_ref.chunk_origin(coord);
+                                    let local_player = Vec3::new(
+                                        (global_player[0] - coord_origin[0]) as f32,
+                                        (global_player[1] - coord_origin[1]) as f32,
+                                        (global_player[2] - coord_origin[2]) as f32,
+                                    );
+                                    while *accumulator >= step_dt * cadence_scale {
+                                        let Some(chunk_world) = stream_ref.resident_world_mut(coord) else {
+                                            break;
+                                        };
+                                        let (high_priority, _) =
+                                            prioritize_chunks_for_player(chunk_world, local_player);
+                                        step_selected_chunks(chunk_world, &mut sim.rng, &high_priority);
+                                        *accumulator -= step_dt * cadence_scale;
+                                        if queued_stream_mesh_coords.insert(coord) {
+                                            pending_stream_mesh_coords.push(coord);
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -605,7 +660,12 @@ pub async fn run() -> anyhow::Result<()> {
                             (active_procgen, stream.as_ref())
                         {
                             let origin = stream_ref.chunk_origin(active_stream_coord);
-                            let biome = biome_hint_at_world(
+                            let biome = base_biome_at_world(
+                                &cfg,
+                                origin[0] + ctrl.position.x.floor() as i32,
+                                origin[2] + ctrl.position.z.floor() as i32,
+                            );
+                            let feature = hydro_feature_at_world(
                                 &cfg,
                                 origin[0] + ctrl.position.x.floor() as i32,
                                 origin[2] + ctrl.position.z.floor() as i32,
@@ -613,9 +673,13 @@ pub async fn run() -> anyhow::Result<()> {
                             if job_status.values().any(|s| {
                                 matches!(s, ProcgenJobStatus::Queued | ProcgenJobStatus::InFlight)
                             }) {
-                                format!("Biome: {} (generating...)", biome.label())
+                                format!(
+                                    "Biome: {} | Feature: {} (generating...)",
+                                    biome.label(),
+                                    feature.label()
+                                )
                             } else {
-                                format!("Biome: {}", biome.label())
+                                format!("Biome: {} | Feature: {}", biome.label(), feature.label())
                             }
                         } else {
                             "Biome: Flat Test World".to_string()
@@ -1190,6 +1254,11 @@ fn build_keep_stream_meshes(
     active_stream_coord: [i32; 3],
 ) -> HashSet<[i32; 3]> {
     let mut keep_stream_meshes = render_residency.clone();
+    for &coord in render_residency {
+        for neighbor in WorldStream::neighbor_coords(coord) {
+            keep_stream_meshes.insert(neighbor);
+        }
+    }
     keep_stream_meshes.remove(&active_stream_coord);
     keep_stream_meshes
 }
