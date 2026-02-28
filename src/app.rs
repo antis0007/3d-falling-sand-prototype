@@ -346,8 +346,16 @@ pub async fn run() -> anyhow::Result<()> {
                             };
 
                             let incoming_world = result.world;
+                            let chosen_world = if let Some(existing) =
+                                generated_regions.get(&result.config.world_origin)
+                            {
+                                existing.clone()
+                            } else {
+                                incoming_world.clone()
+                            };
                             generated_regions
-                                .insert(result.config.world_origin, incoming_world.clone());
+                                .entry(result.config.world_origin)
+                                .or_insert_with(|| incoming_world.clone());
                             prune_generated_regions(
                                 &mut generated_regions,
                                 result.config.world_origin,
@@ -356,7 +364,7 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             active_procgen = Some(result.config);
                             active_procgen_origin = result.config.world_origin;
-                            world = incoming_world;
+                            world = chosen_world;
                             if result.prefer_safe_spawn {
                                 let spawn = find_safe_spawn(&world, result.config.seed);
                                 ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
