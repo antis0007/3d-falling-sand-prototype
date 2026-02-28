@@ -58,7 +58,7 @@ pub struct Camera {
 impl Camera {
     pub fn view_proj(&self) -> Mat4 {
         let view = Mat4::look_to_rh(self.pos, self.dir, Vec3::Y);
-        let proj = Mat4::perspective_rh_gl(60f32.to_radians(), self.aspect.max(0.1), 0.1, 300.0);
+        let proj = Mat4::perspective_rh_gl(60f32.to_radians(), self.aspect.max(0.1), 0.1, 1200.0);
         proj * view
     }
 }
@@ -256,6 +256,10 @@ impl Renderer {
             world.chunks[i].dirty_mesh = false;
             world.chunks[i].meshed_version = world.chunks[i].voxel_version;
         }
+    }
+
+    pub fn clear_mesh_cache(&mut self) {
+        self.meshes.clear();
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {

@@ -57,6 +57,7 @@ pub struct UiState {
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
     pub biome_hint: String,
+    pub stream_debug: String,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -121,6 +122,7 @@ impl Default for UiState {
             hovered_palette_material: None,
             tab_palette_open: false,
             biome_hint: "Biome: n/a".to_string(),
+            stream_debug: "Stream: n/a".to_string(),
             drag_source: None,
             drag_target_slot: None,
         }
@@ -240,6 +242,7 @@ pub fn draw(
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(&ui_state.biome_hint).strong());
                     ui.label("Biome under player");
+                    ui.label(&ui_state.stream_debug);
                 });
             });
         });
