@@ -9,6 +9,7 @@ const TURF: MaterialId = 17;
 const BUSH: MaterialId = 18;
 const GRASS: MaterialId = 19;
 const LEAVES: MaterialId = 23;
+const CHUNK_SIZE: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiomeType {
@@ -18,31 +19,45 @@ pub enum BiomeType {
     Lake,
 }
 
+impl BiomeType {
+    pub fn label(self) -> &'static str {
+        match self {
+            BiomeType::Forest => "Forest",
+            BiomeType::Desert => "Desert",
+            BiomeType::River => "River",
+            BiomeType::Lake => "Lake",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ProcGenConfig {
     pub dims: [usize; 3],
+    pub world_origin: [i32; 3],
     pub seed: u64,
-    pub base_height: f32,
-    pub terrain_variation: f32,
+    pub sea_level: i32,
+    pub terrain_scale: f32,
     pub cave_density: f32,
-    pub cave_depth_start: usize,
     pub tree_density: f32,
-    pub water_level: usize,
 }
 
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
-        let water_level = (size / 3).clamp(8, size.saturating_sub(4));
+        let sea_level = (size as i32 * 38 / 100).clamp(16, size as i32 - 8);
         Self {
             dims: [size, size, size],
+            world_origin: [0, 0, 0],
             seed,
-            base_height: size as f32 * 0.32,
-            terrain_variation: size as f32 * 0.14,
-            cave_density: 0.18,
-            cave_depth_start: size / 10,
-            tree_density: 0.035,
-            water_level,
+            sea_level,
+            terrain_scale: 1.0,
+            cave_density: 0.13,
+            tree_density: 0.03,
         }
+    }
+
+    pub fn with_origin(mut self, world_origin: [i32; 3]) -> Self {
+        self.world_origin = world_origin;
+        self
     }
 }
 
@@ -50,51 +65,279 @@ pub fn generate_world(config: ProcGenConfig) -> World {
     let mut world = World::new(config.dims);
     world.clear();
 
-    let biome_grid = build_chunk_biome_field(&config);
-
-    base_terrain_pass(&mut world, &config, &biome_grid);
-    cave_carve_pass(&mut world, &config, &biome_grid);
-    surface_layering_pass(&mut world, &config, &biome_grid);
-    biome_decoration_pass(&mut world, &config, &biome_grid);
-    vegetation_pass(&mut world, &config, &biome_grid);
+    base_terrain_pass(&mut world, &config);
+    cave_carve_pass(&mut world, &config);
+    surface_layering_pass(&mut world, &config);
+    biome_water_pass(&mut world, &config);
+    vegetation_pass(&mut world, &config);
 
     world
 }
 
-fn build_chunk_biome_field(config: &ProcGenConfig) -> Vec<BiomeType> {
-    let chunk_dims = [
-        config.dims[0] / 16,
-        config.dims[1] / 16,
-        config.dims[2] / 16,
-    ];
-    let mut out = vec![BiomeType::Forest; chunk_dims[0] * chunk_dims[2]];
-    for cz in 0..chunk_dims[2] {
-        for cx in 0..chunk_dims[0] {
-            let noise = hash01(config.seed, cx as i32, 0, cz as i32);
-            let biome = if noise < 0.2 {
-                BiomeType::River
-            } else if noise < 0.4 {
-                BiomeType::Desert
-            } else if noise < 0.52 {
-                BiomeType::Lake
-            } else {
-                BiomeType::Forest
-            };
-            out[cx + cz * chunk_dims[0]] = biome;
-        }
-    }
-    out
+pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
+    let weights = biome_weights(config.seed, x, z);
+    dominant_biome(weights)
 }
 
-fn sample_biome_weights(
-    config: &ProcGenConfig,
-    biome_grid: &[BiomeType],
-    x: usize,
-    z: usize,
-) -> [f32; 4] {
-    let chunk_dims_x = config.dims[0] / 16;
-    let fx = x as f32 / 16.0;
-    let fz = z as f32 / 16.0;
+fn base_terrain_pass(world: &mut World, config: &ProcGenConfig) {
+    for lz in 0..world.dims[2] as i32 {
+        for lx in 0..world.dims[0] as i32 {
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let weights = biome_weights(config.seed, wx, wz);
+            let h = terrain_height(config, wx, wz, weights).clamp(6, world.dims[1] as i32 - 4);
+            for y in 0..=h {
+                let _ = world.set(lx, y, lz, STONE);
+            }
+        }
+    }
+}
+
+fn cave_carve_pass(world: &mut World, config: &ProcGenConfig) {
+    let max_y = world.dims[1] as i32 - 2;
+    for lz in 0..world.dims[2] as i32 {
+        for ly in 4..max_y {
+            for lx in 0..world.dims[0] as i32 {
+                if world.get(lx, ly, lz) == EMPTY {
+                    continue;
+                }
+                let wx = config.world_origin[0] + lx;
+                let wy = config.world_origin[1] + ly;
+                let wz = config.world_origin[2] + lz;
+                let depth_fade = 1.0 - (ly as f32 / max_y as f32).powf(1.3);
+                let cave = fbm3(
+                    config.seed ^ 0xCC77AA11,
+                    wx as f32 * 0.035,
+                    wy as f32 * 0.042,
+                    wz as f32 * 0.035,
+                    4,
+                );
+                let cave_warp = fbm3(
+                    config.seed ^ 0x1077BEEF,
+                    wx as f32 * 0.02,
+                    wy as f32 * 0.02,
+                    wz as f32 * 0.02,
+                    3,
+                );
+                let value = 0.7 * cave + 0.3 * cave_warp;
+                let threshold = 0.63 + (1.0 - config.cave_density.clamp(0.05, 0.25)) * 0.18;
+                if value > threshold && depth_fade > 0.08 {
+                    let _ = world.set(lx, ly, lz, EMPTY);
+                }
+            }
+        }
+    }
+}
+
+fn surface_layering_pass(world: &mut World, config: &ProcGenConfig) {
+    for lz in 0..world.dims[2] as i32 {
+        for lx in 0..world.dims[0] as i32 {
+            let Some(top_y) = surface_y(world, lx, lz) else {
+                continue;
+            };
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let weights = biome_weights(config.seed, wx, wz);
+
+            let desert = weights[biome_index(BiomeType::Desert)];
+            let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
+            let sand_depth = (2.0 + 3.0 * desert).round() as i32;
+
+            for d in 0..(dirt_depth + sand_depth + 2) {
+                let y = top_y - d;
+                if y <= 1 {
+                    continue;
+                }
+                let block = if d == 0 {
+                    if desert > 0.58 {
+                        SAND
+                    } else {
+                        TURF
+                    }
+                } else if desert > 0.58 && d <= sand_depth {
+                    SAND
+                } else if d <= dirt_depth {
+                    DIRT
+                } else {
+                    STONE
+                };
+                let _ = world.set(lx, y, lz, block);
+            }
+        }
+    }
+}
+
+fn biome_water_pass(world: &mut World, config: &ProcGenConfig) {
+    for lz in 0..world.dims[2] as i32 {
+        for lx in 0..world.dims[0] as i32 {
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let weights = biome_weights(config.seed, wx, wz);
+            let river_w = weights[biome_index(BiomeType::River)];
+            let lake_w = weights[biome_index(BiomeType::Lake)];
+
+            let river_depth = (river_w * 5.0).round() as i32;
+            let lake_depth = (lake_w * 6.0).round() as i32;
+            let water_floor = (config.sea_level - 1 - river_depth - lake_depth).max(2);
+
+            for y in water_floor..=config.sea_level {
+                if world.get(lx, y, lz) == EMPTY {
+                    let _ = world.set(lx, y, lz, WATER);
+                }
+            }
+
+            if river_w > 0.42 || lake_w > 0.46 {
+                for y in (water_floor - 1).max(1)..=water_floor {
+                    if world.get(lx, y, lz) != WATER {
+                        let _ = world.set(lx, y, lz, SAND);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
+    for lz in 2..world.dims[2] as i32 - 2 {
+        for lx in 2..world.dims[0] as i32 - 2 {
+            let Some(top_y) = surface_y(world, lx, lz) else {
+                continue;
+            };
+            let ground = world.get(lx, top_y, lz);
+            if ground != TURF && ground != DIRT && ground != SAND {
+                continue;
+            }
+            if world.get(lx, top_y + 1, lz) != EMPTY {
+                continue;
+            }
+
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let weights = biome_weights(config.seed, wx, wz);
+            let forest = weights[biome_index(BiomeType::Forest)];
+            let desert = weights[biome_index(BiomeType::Desert)];
+            let wet =
+                weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
+
+            let mut tree_p = config.tree_density * (0.25 + 1.8 * forest) * (1.0 - desert).powf(2.5);
+            if near_water(world, lx, top_y, lz) {
+                tree_p *= (1.0 - wet * 0.8).max(0.05);
+            }
+
+            let roll = hash01(config.seed ^ 0x11117777, wx, top_y, wz);
+            if roll < tree_p && can_place_tree(world, lx, top_y + 1, lz) {
+                place_tree(world, config.seed, wx, lx, top_y + 1, lz);
+                continue;
+            }
+
+            let flora_roll = hash01(config.seed ^ 0x22224444, wx, top_y, wz);
+            if forest > 0.4 && ground != SAND && flora_roll < 0.07 {
+                let _ = world.set(
+                    lx,
+                    top_y + 1,
+                    lz,
+                    if flora_roll < 0.026 { BUSH } else { GRASS },
+                );
+            }
+        }
+    }
+}
+
+pub fn find_safe_spawn(world: &World, seed: u64) -> [f32; 3] {
+    let cx = (world.dims[0] / 2) as i32;
+    let cz = (world.dims[2] / 2) as i32;
+
+    for r in 0..(world.dims[0].min(world.dims[2]) as i32 / 2) {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if r > 0 && dx.abs() < r && dz.abs() < r {
+                    continue;
+                }
+                let x = (cx + dx).clamp(2, world.dims[0] as i32 - 3);
+                let z = (cz + dz).clamp(2, world.dims[2] as i32 - 3);
+                let bias = hash01(seed ^ 0xABCD0001, x, 0, z);
+                if bias < 0.08 {
+                    continue;
+                }
+                if let Some(y) = valid_surface_spawn_y(world, x, z) {
+                    return [x as f32 + 0.5, y as f32 + 3.4, z as f32 + 0.5];
+                }
+            }
+        }
+    }
+
+    [
+        cx as f32 + 0.5,
+        (world.dims[1] as f32 * 0.7).max(8.0),
+        cz as f32 + 0.5,
+    ]
+}
+
+fn valid_surface_spawn_y(world: &World, x: i32, z: i32) -> Option<i32> {
+    let top = surface_y(world, x, z)?;
+    let base = world.get(x, top, z);
+    if base == WATER || base == EMPTY {
+        return None;
+    }
+    for head in 1..=3 {
+        if world.get(x, top + head, z) != EMPTY {
+            return None;
+        }
+    }
+    if near_water(world, x, top, z) {
+        return None;
+    }
+    Some(top)
+}
+
+fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; 4]) -> i32 {
+    let scale = config.terrain_scale.max(0.25);
+    let continental = fbm2(
+        config.seed ^ 0xA1000001,
+        x as f32 * 0.0035 * scale,
+        z as f32 * 0.0035 * scale,
+        5,
+    );
+    let hills = fbm2(
+        config.seed ^ 0xA1000002,
+        x as f32 * 0.008 * scale,
+        z as f32 * 0.008 * scale,
+        4,
+    );
+    let detail = fbm2(
+        config.seed ^ 0xA1000003,
+        x as f32 * 0.022 * scale,
+        z as f32 * 0.022 * scale,
+        2,
+    );
+
+    let broad = (continental - 0.45) * 34.0;
+    let rolling = (hills - 0.5) * 12.0;
+    let micro = (detail - 0.5) * 2.5;
+
+    let mut h = config.sea_level as f32 + broad + rolling + micro;
+
+    let flatness = fbm2(
+        config.seed ^ 0xA1000004,
+        x as f32 * 0.0022,
+        z as f32 * 0.0022,
+        3,
+    );
+    if flatness > 0.55 {
+        let plateau = (h / 3.0).round() * 3.0;
+        h = h * 0.45 + plateau * 0.55;
+    }
+
+    h += weights[biome_index(BiomeType::Desert)] * 2.0;
+    h -= weights[biome_index(BiomeType::River)] * 8.0;
+    h -= weights[biome_index(BiomeType::Lake)] * 6.0;
+
+    h.round() as i32
+}
+
+fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; 4] {
+    let fx = x as f32 / CHUNK_SIZE as f32;
+    let fz = z as f32 / CHUNK_SIZE as f32;
     let x0 = fx.floor() as i32;
     let z0 = fz.floor() as i32;
     let tx = fx.fract();
@@ -103,194 +346,84 @@ fn sample_biome_weights(
     let mut weights = [0.0; 4];
     for oz in 0..=1 {
         for ox in 0..=1 {
-            let sx = (x0 + ox).clamp(0, chunk_dims_x as i32 - 1) as usize;
-            let sz = (z0 + oz).clamp(0, config.dims[2] as i32 / 16 - 1) as usize;
-            let anchor = biome_grid[sx + sz * chunk_dims_x];
+            let ax = x0 + ox;
+            let az = z0 + oz;
+            let biome = biome_anchor(seed, ax, az);
             let wx = if ox == 0 { 1.0 - tx } else { tx };
             let wz = if oz == 0 { 1.0 - tz } else { tz };
-            let w = wx * wz;
-            weights[biome_index(anchor)] += w;
+            weights[biome_index(biome)] += wx * wz;
         }
     }
 
-    let warp = hash_signed(config.seed ^ 0xA02B_DB10, x as i32, 0, z as i32) * 0.15;
+    let warp = fbm2(seed ^ 0xF009_1201, x as f32 * 0.007, z as f32 * 0.007, 3) - 0.5;
     weights[biome_index(BiomeType::River)] =
-        (weights[biome_index(BiomeType::River)] + warp).max(0.0);
-    normalize_weights(weights)
+        (weights[biome_index(BiomeType::River)] + warp * 0.28).max(0.0);
+    weights[biome_index(BiomeType::Lake)] =
+        (weights[biome_index(BiomeType::Lake)] + warp * 0.12).max(0.0);
+
+    normalize(weights)
 }
 
-fn base_terrain_pass(world: &mut World, config: &ProcGenConfig, biome_grid: &[BiomeType]) {
-    for z in 0..config.dims[2] {
-        for x in 0..config.dims[0] {
-            let weights = sample_biome_weights(config, biome_grid, x, z);
-            let terrain_n = hash_signed(config.seed ^ 0x55AA_9102, x as i32, 0, z as i32);
-            let mut height = config.base_height + terrain_n * config.terrain_variation;
-
-            height += weights[biome_index(BiomeType::River)] * -3.0;
-            height += weights[biome_index(BiomeType::Lake)] * -2.0;
-            height += weights[biome_index(BiomeType::Desert)] * 1.5;
-
-            let h = height
-                .round()
-                .clamp(4.0, (config.dims[1].saturating_sub(3)) as f32) as i32;
-            for y in 0..=h {
-                let _ = world.set(x as i32, y, z as i32, STONE);
-            }
-        }
+fn biome_anchor(seed: u64, chunk_x: i32, chunk_z: i32) -> BiomeType {
+    let v = hash01(seed ^ 0xFA112233, chunk_x, 0, chunk_z);
+    if v < 0.18 {
+        BiomeType::River
+    } else if v < 0.33 {
+        BiomeType::Desert
+    } else if v < 0.45 {
+        BiomeType::Lake
+    } else {
+        BiomeType::Forest
     }
 }
 
-fn cave_carve_pass(world: &mut World, config: &ProcGenConfig, biome_grid: &[BiomeType]) {
-    for z in 0..config.dims[2] as i32 {
-        for y in config.cave_depth_start as i32..config.dims[1] as i32 {
-            for x in 0..config.dims[0] as i32 {
-                if world.get(x, y, z) == EMPTY {
-                    continue;
-                }
-                let weights = sample_biome_weights(config, biome_grid, x as usize, z as usize);
-                let cave_bias = 0.06 * weights[biome_index(BiomeType::Desert)];
-                let cave_noise = hash01(config.seed ^ 0xCAFE_BA5E, x, y, z);
-                if cave_noise < (config.cave_density + cave_bias) {
-                    let _ = world.set(x, y, z, EMPTY);
-                }
-            }
+fn dominant_biome(weights: [f32; 4]) -> BiomeType {
+    let mut best = 0;
+    for i in 1..4 {
+        if weights[i] > weights[best] {
+            best = i;
         }
     }
-}
-
-fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, biome_grid: &[BiomeType]) {
-    for z in 0..config.dims[2] as i32 {
-        for x in 0..config.dims[0] as i32 {
-            if let Some(surface_y) = surface_y(world, x, z) {
-                let weights = sample_biome_weights(config, biome_grid, x as usize, z as usize);
-                let sand_depth =
-                    (1.0 + 2.0 * weights[biome_index(BiomeType::Desert)]).round() as i32;
-                for d in 0..3 {
-                    let y = surface_y - d;
-                    if y <= 0 {
-                        continue;
-                    }
-                    if d == 0 {
-                        let top = if weights[biome_index(BiomeType::Desert)] > 0.6 {
-                            SAND
-                        } else {
-                            TURF
-                        };
-                        let _ = world.set(x, y, z, top);
-                    } else if d <= sand_depth {
-                        let fill = if weights[biome_index(BiomeType::Desert)] > 0.5 {
-                            SAND
-                        } else {
-                            DIRT
-                        };
-                        let _ = world.set(x, y, z, fill);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn biome_decoration_pass(world: &mut World, config: &ProcGenConfig, biome_grid: &[BiomeType]) {
-    for z in 0..config.dims[2] as i32 {
-        for x in 0..config.dims[0] as i32 {
-            let weights = sample_biome_weights(config, biome_grid, x as usize, z as usize);
-            if let Some(surface_y) = surface_y(world, x, z) {
-                if weights[biome_index(BiomeType::River)] > 0.45 {
-                    let channel = (config.water_level as i32 - 2).max(2);
-                    for y in channel..=config.water_level as i32 {
-                        if world.get(x, y, z) == EMPTY {
-                            let _ = world.set(x, y, z, WATER);
-                        }
-                    }
-                    for y in channel.saturating_sub(1)..channel {
-                        let _ = world.set(x, y, z, SAND);
-                    }
-                }
-
-                if weights[biome_index(BiomeType::Lake)] > 0.5 {
-                    let basin_floor = (config.water_level as i32 - 3).max(2);
-                    for y in basin_floor..=config.water_level as i32 {
-                        if world.get(x, y, z) == EMPTY || y <= surface_y {
-                            let _ = world.set(x, y, z, WATER);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn vegetation_pass(world: &mut World, config: &ProcGenConfig, biome_grid: &[BiomeType]) {
-    for z in 1..config.dims[2] as i32 - 1 {
-        for x in 1..config.dims[0] as i32 - 1 {
-            let Some(y) = surface_y(world, x, z) else {
-                continue;
-            };
-            let ground = world.get(x, y, z);
-            if !(ground == TURF || ground == DIRT || ground == SAND) {
-                continue;
-            }
-            if world.get(x, y + 1, z) != EMPTY {
-                continue;
-            }
-            let near_water = has_water_neighbor(world, x, y, z);
-            let weights = sample_biome_weights(config, biome_grid, x as usize, z as usize);
-            let forest = weights[biome_index(BiomeType::Forest)];
-            let desert = weights[biome_index(BiomeType::Desert)];
-            let river =
-                weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
-            let mut tree_p = config.tree_density * (0.3 + forest * 1.4);
-            tree_p *= 1.0 - desert * 0.95;
-            if near_water {
-                tree_p *= (1.0 - river * 0.8).max(0.05);
-            }
-
-            let tree_roll = hash01(config.seed ^ 0x0F0E_0D0C, x, y + 1, z);
-            if tree_roll < tree_p && can_place_tree(world, x, y + 1, z) {
-                place_tree(world, config.seed, x, y + 1, z);
-                continue;
-            }
-
-            let flora_roll = hash01(config.seed ^ 0x0BAD_B002, x, y + 1, z);
-            if forest > 0.4 && flora_roll < 0.08 {
-                let _ = world.set(x, y + 1, z, if flora_roll < 0.03 { BUSH } else { GRASS });
-            }
-        }
+    match best {
+        0 => BiomeType::Forest,
+        1 => BiomeType::Desert,
+        2 => BiomeType::River,
+        _ => BiomeType::Lake,
     }
 }
 
 fn can_place_tree(world: &World, x: i32, y: i32, z: i32) -> bool {
-    for ty in 0..8 {
+    for ty in 0..9 {
         if world.get(x, y + ty, z) != EMPTY {
             return false;
         }
     }
-    !has_water_neighbor(world, x, y - 1, z)
+    !near_water(world, x, y - 1, z)
 }
 
-fn place_tree(world: &mut World, seed: u64, x: i32, y: i32, z: i32) {
-    let trunk_h = 4 + (hash01(seed ^ 0x1346_AAA1, x, y, z) * 3.0) as i32;
+fn place_tree(world: &mut World, seed: u64, world_x: i32, x: i32, y: i32, z: i32) {
+    let trunk_h = 4 + (hash01(seed ^ 0x71335599, world_x, y, z) * 4.0) as i32;
     for ty in 0..trunk_h {
         let _ = world.set(x, y + ty, z, WOOD);
     }
+
     let top = y + trunk_h;
     for dz in -2..=2 {
         for dy in -2..=2 {
             for dx in -2..=2 {
-                let dist2 = dx * dx + dy * dy + dz * dz;
-                if dist2 > 6 {
+                let dist = dx * dx + dz * dz + (dy * dy * 2 / 3);
+                if dist > 6 {
                     continue;
                 }
                 let px = x + dx;
                 let py = top + dy;
                 let pz = z + dz;
-                if px <= 0
-                    || py <= 0
-                    || pz <= 0
-                    || px >= world.dims[0] as i32 - 1
-                    || py >= world.dims[1] as i32 - 1
-                    || pz >= world.dims[2] as i32 - 1
+                if px <= 1
+                    || pz <= 1
+                    || py <= 1
+                    || px >= world.dims[0] as i32 - 2
+                    || pz >= world.dims[2] as i32 - 2
+                    || py >= world.dims[1] as i32 - 2
                 {
                     continue;
                 }
@@ -302,9 +435,19 @@ fn place_tree(world: &mut World, seed: u64, x: i32, y: i32, z: i32) {
     }
 }
 
-fn has_water_neighbor(world: &World, x: i32, y: i32, z: i32) -> bool {
-    for dz in -1..=1 {
-        for dx in -1..=1 {
+fn surface_y(world: &World, x: i32, z: i32) -> Option<i32> {
+    for y in (1..world.dims[1] as i32).rev() {
+        let m = world.get(x, y, z);
+        if m != EMPTY && m != WATER {
+            return Some(y);
+        }
+    }
+    None
+}
+
+fn near_water(world: &World, x: i32, y: i32, z: i32) -> bool {
+    for dz in -2..=2 {
+        for dx in -2..=2 {
             if world.get(x + dx, y, z + dz) == WATER || world.get(x + dx, y + 1, z + dz) == WATER {
                 return true;
             }
@@ -313,17 +456,8 @@ fn has_water_neighbor(world: &World, x: i32, y: i32, z: i32) -> bool {
     false
 }
 
-fn surface_y(world: &World, x: i32, z: i32) -> Option<i32> {
-    for y in (0..world.dims[1] as i32).rev() {
-        if world.get(x, y, z) != EMPTY && world.get(x, y, z) != WATER {
-            return Some(y);
-        }
-    }
-    None
-}
-
-fn biome_index(biome: BiomeType) -> usize {
-    match biome {
+fn biome_index(b: BiomeType) -> usize {
+    match b {
         BiomeType::Forest => 0,
         BiomeType::Desert => 1,
         BiomeType::River => 2,
@@ -331,21 +465,100 @@ fn biome_index(biome: BiomeType) -> usize {
     }
 }
 
-fn normalize_weights(mut w: [f32; 4]) -> [f32; 4] {
-    let sum = w.iter().sum::<f32>().max(1e-6);
+fn normalize(mut w: [f32; 4]) -> [f32; 4] {
+    let s = w.iter().sum::<f32>().max(1e-6);
     for v in &mut w {
-        *v /= sum;
+        *v /= s;
     }
     w
+}
+
+fn fbm2(seed: u64, mut x: f32, mut z: f32, octaves: u32) -> f32 {
+    let mut amp = 0.5;
+    let mut freq = 1.0;
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    for _ in 0..octaves {
+        sum += amp * value_noise_2d(seed, x * freq, z * freq);
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+        x += 17.0;
+        z += 29.0;
+    }
+    (sum / norm).clamp(0.0, 1.0)
+}
+
+fn fbm3(seed: u64, x: f32, y: f32, z: f32, octaves: u32) -> f32 {
+    let mut amp = 0.5;
+    let mut freq = 1.0;
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    for i in 0..octaves {
+        sum += amp * value_noise_3d(seed ^ (i as u64 * 0x9E37), x * freq, y * freq, z * freq);
+        norm += amp;
+        amp *= 0.55;
+        freq *= 1.95;
+    }
+    (sum / norm).clamp(0.0, 1.0)
+}
+
+fn value_noise_2d(seed: u64, x: f32, z: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let zi = z.floor() as i32;
+    let tx = smoothstep(x - xi as f32);
+    let tz = smoothstep(z - zi as f32);
+
+    let v00 = hash01(seed, xi, 0, zi);
+    let v10 = hash01(seed, xi + 1, 0, zi);
+    let v01 = hash01(seed, xi, 0, zi + 1);
+    let v11 = hash01(seed, xi + 1, 0, zi + 1);
+
+    let a = lerp(v00, v10, tx);
+    let b = lerp(v01, v11, tx);
+    lerp(a, b, tz)
+}
+
+fn value_noise_3d(seed: u64, x: f32, y: f32, z: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let zi = z.floor() as i32;
+    let tx = smoothstep(x - xi as f32);
+    let ty = smoothstep(y - yi as f32);
+    let tz = smoothstep(z - zi as f32);
+
+    let mut c = [0.0f32; 8];
+    let mut idx = 0;
+    for oz in 0..=1 {
+        for oy in 0..=1 {
+            for ox in 0..=1 {
+                c[idx] = hash01(seed, xi + ox, yi + oy, zi + oz);
+                idx += 1;
+            }
+        }
+    }
+
+    let x00 = lerp(c[0], c[1], tx);
+    let x10 = lerp(c[2], c[3], tx);
+    let x01 = lerp(c[4], c[5], tx);
+    let x11 = lerp(c[6], c[7], tx);
+    let y0 = lerp(x00, x10, ty);
+    let y1 = lerp(x01, x11, ty);
+    lerp(y0, y1, tz)
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
 }
 
 fn hash01(seed: u64, x: i32, y: i32, z: i32) -> f32 {
     let h = hash_u64(seed, x, y, z);
     (h as f64 / u64::MAX as f64) as f32
-}
-
-fn hash_signed(seed: u64, x: i32, y: i32, z: i32) -> f32 {
-    hash01(seed, x, y, z) * 2.0 - 1.0
 }
 
 fn hash_u64(seed: u64, x: i32, y: i32, z: i32) -> u64 {

@@ -1,3 +1,4 @@
+use crate::procgen::{generate_world, ProcGenConfig};
 use crate::world::World;
 use std::collections::BTreeMap;
 
@@ -18,6 +19,14 @@ impl MacroChunkCoord {
             z: floor_div(z, MACROCHUNK_SIZE),
         }
     }
+
+    pub fn world_origin(self) -> [i32; 3] {
+        [
+            self.x * MACROCHUNK_SIZE,
+            self.y * MACROCHUNK_SIZE,
+            self.z * MACROCHUNK_SIZE,
+        ]
+    }
 }
 
 #[derive(Clone)]
@@ -27,42 +36,60 @@ pub struct MacroChunk {
 }
 
 impl MacroChunk {
-    pub fn new(coord: MacroChunkCoord) -> Self {
+    pub fn generate(coord: MacroChunkCoord, seed: u64) -> Self {
+        let config = ProcGenConfig::for_size(MACROCHUNK_SIZE as usize, seed)
+            .with_origin(coord.world_origin());
         Self {
             coord,
-            world: World::new([
-                MACROCHUNK_SIZE as usize,
-                MACROCHUNK_SIZE as usize,
-                MACROCHUNK_SIZE as usize,
-            ]),
+            world: generate_world(config),
         }
     }
 }
 
 pub struct WorldManager {
     loaded: BTreeMap<MacroChunkCoord, MacroChunk>,
+    pub seed: u64,
 }
 
 impl WorldManager {
-    pub fn with_origin_radius(radius: i32) -> Self {
-        let mut loaded = BTreeMap::new();
-        for z in -radius..=radius {
-            for y in -radius..=radius {
-                for x in -radius..=radius {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            loaded: BTreeMap::new(),
+            seed,
+        }
+    }
+
+    pub fn ensure_player_neighborhood(&mut self, player_world_pos: [i32; 3]) {
+        let center = MacroChunkCoord::from_world_voxel(
+            player_world_pos[0],
+            player_world_pos[1],
+            player_world_pos[2],
+        );
+
+        for z in (center.z - 1)..=(center.z + 1) {
+            for y in (center.y - 1)..=(center.y + 1) {
+                for x in (center.x - 1)..=(center.x + 1) {
                     let coord = MacroChunkCoord { x, y, z };
-                    loaded.insert(coord, MacroChunk::new(coord));
+                    self.loaded
+                        .entry(coord)
+                        .or_insert_with(|| MacroChunk::generate(coord, self.seed));
                 }
             }
         }
-        Self { loaded }
-    }
 
-    pub fn get_macrochunk_mut(&mut self, coord: MacroChunkCoord) -> Option<&mut MacroChunk> {
-        self.loaded.get_mut(&coord)
+        self.loaded.retain(|coord, _| {
+            (coord.x - center.x).abs() <= 1
+                && (coord.y - center.y).abs() <= 1
+                && (coord.z - center.z).abs() <= 1
+        });
     }
 
     pub fn iter_loaded(&self) -> impl Iterator<Item = (&MacroChunkCoord, &MacroChunk)> {
         self.loaded.iter()
+    }
+
+    pub fn loaded_len(&self) -> usize {
+        self.loaded.len()
     }
 
     pub fn global_to_local(

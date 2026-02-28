@@ -3,7 +3,7 @@ use crate::player::{
     camera_world_pos_from_blocks, eye_height_world_meters, PLAYER_EYE_HEIGHT_BLOCKS,
     PLAYER_HEIGHT_BLOCKS, PLAYER_WIDTH_BLOCKS,
 };
-use crate::procgen::{generate_world, ProcGenConfig};
+use crate::procgen::{biome_hint_at_world, find_safe_spawn, generate_world, ProcGenConfig};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim::{prioritize_chunks_for_player, step, step_selected_chunks, SimState};
 use crate::ui::{
@@ -71,6 +71,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last = Instant::now();
     let start = Instant::now();
     let mut sim_tick: u64 = 0;
+    let mut active_procgen: Option<ProcGenConfig> = None;
 
     let _ = set_cursor(window, false);
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
@@ -276,6 +277,17 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.day = ui.day;
                         renderer.rebuild_dirty_chunks(&mut world);
 
+                        ui.biome_hint = if let Some(cfg) = active_procgen {
+                            let biome = biome_hint_at_world(
+                                &cfg,
+                                ctrl.position.x.floor() as i32,
+                                ctrl.position.z.floor() as i32,
+                            );
+                            format!("Biome: {}", biome.label())
+                        } else {
+                            "Biome: Flat Test World".to_string()
+                        };
+
                         let raw = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw, |ctx| {
                             let actions =
@@ -308,10 +320,18 @@ pub async fn run() -> anyhow::Result<()> {
                                 world = if actions.new_procedural {
                                     let seed = start.elapsed().as_nanos() as u64;
                                     let config = ProcGenConfig::for_size(n, seed);
+                                    active_procgen = Some(config);
                                     generate_world(config)
                                 } else {
+                                    active_procgen = None;
                                     World::new([n, n, n])
                                 };
+                                let spawn = if let Some(cfg) = active_procgen {
+                                    find_safe_spawn(&world, cfg.seed)
+                                } else {
+                                    find_safe_spawn(&world, 1)
+                                };
+                                ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                 sim.running = false;
                             }
                             if actions.save {
@@ -323,6 +343,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Ok(path) = default_save_path() {
                                     if let Ok(w) = load_world(&path) {
                                         world = w;
+                                        active_procgen = None;
+                                        let spawn = find_safe_spawn(&world, 1);
+                                        ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                         sim.running = false;
                                     }
                                 }

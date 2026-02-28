@@ -56,6 +56,7 @@ pub struct UiState {
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
+    pub biome_hint: String,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -119,6 +120,7 @@ impl Default for UiState {
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
+            biome_hint: "Biome: n/a".to_string(),
             drag_source: None,
             drag_target_slot: None,
         }
@@ -234,6 +236,11 @@ pub fn draw(
                         ui_state.drag_target_slot = Some(i);
                     }
                 }
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(&ui_state.biome_hint).strong());
+                    ui.label("Biome under player");
+                });
             });
         });
 
