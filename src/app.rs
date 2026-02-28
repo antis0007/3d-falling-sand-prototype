@@ -169,6 +169,7 @@ pub async fn run() -> anyhow::Result<()> {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             if event.state == ElementState::Pressed {
                                 let tab_palette_open = ui.tab_palette_open;
+                                let hotbar_slot = key_to_hotbar_slot(key);
                                 match key {
                                     KeyCode::Escape => ui.paused_menu = !ui.paused_menu,
                                     _ if ui.paused_menu => {}
@@ -190,35 +191,14 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
-                                    KeyCode::Digit0 => {
-                                        assign_or_select_hotbar(&mut ui, 0, tab_palette_open)
-                                    }
-                                    KeyCode::Digit1 => {
-                                        assign_or_select_hotbar(&mut ui, 1, tab_palette_open)
-                                    }
-                                    KeyCode::Digit2 => {
-                                        assign_or_select_hotbar(&mut ui, 2, tab_palette_open)
-                                    }
-                                    KeyCode::Digit3 => {
-                                        assign_or_select_hotbar(&mut ui, 3, tab_palette_open)
-                                    }
-                                    KeyCode::Digit4 => {
-                                        assign_or_select_hotbar(&mut ui, 4, tab_palette_open)
-                                    }
-                                    KeyCode::Digit5 => {
-                                        assign_or_select_hotbar(&mut ui, 5, tab_palette_open)
-                                    }
-                                    KeyCode::Digit6 => {
-                                        assign_or_select_hotbar(&mut ui, 6, tab_palette_open)
-                                    }
-                                    KeyCode::Digit7 => {
-                                        assign_or_select_hotbar(&mut ui, 7, tab_palette_open)
-                                    }
-                                    KeyCode::Digit8 => {
-                                        assign_or_select_hotbar(&mut ui, 8, tab_palette_open)
-                                    }
-                                    KeyCode::Digit9 => {
-                                        assign_or_select_hotbar(&mut ui, 9, tab_palette_open)
+                                    _ if hotbar_slot.is_some() => {
+                                        if let Some(slot) = hotbar_slot {
+                                            assign_or_select_hotbar(
+                                                &mut ui,
+                                                slot,
+                                                tab_palette_open,
+                                            );
+                                        }
                                     }
                                     KeyCode::KeyZ => ui.active_tool = ToolKind::Brush,
                                     KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
@@ -233,15 +213,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 && !input.lmb
                                 && !input.rmb
                             {
-                                if let Some(hovered) = ui.hovered_shape.take() {
-                                    brush.shape = hovered;
-                                }
-                                if let Some(hovered) = ui.hovered_area_shape.take() {
-                                    brush.area_tool.shape = hovered;
-                                }
-                                if let Some(hovered) = ui.hovered_tool.take() {
-                                    ui.active_tool = hovered;
-                                }
+                                apply_quick_menu_hover_selection(&mut ui, &mut brush);
                                 let _ = set_cursor(
                                     window,
                                     should_unlock_cursor(&ui, false, ui.tab_palette_open),
@@ -565,6 +537,13 @@ pub async fn run() -> anyhow::Result<()> {
                                     active_procgen = None;
                                     stream = None;
                                     active_stream_coord = [0, 0, 0];
+                                    clear_procedural_streaming_state(
+                                        &mut requested_procgen_id,
+                                        &mut requested_procgen_coord,
+                                        &mut active_procgen,
+                                        &mut stream,
+                                        &mut active_stream_coord,
+                                    );
                                     world = World::new([n, n, n]);
                                     let spawn = find_safe_spawn(&world, 1);
                                     ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
@@ -584,6 +563,13 @@ pub async fn run() -> anyhow::Result<()> {
                                         active_procgen = None;
                                         stream = None;
                                         active_stream_coord = [0, 0, 0];
+                                        clear_procedural_streaming_state(
+                                            &mut requested_procgen_id,
+                                            &mut requested_procgen_coord,
+                                            &mut active_procgen,
+                                            &mut stream,
+                                            &mut active_stream_coord,
+                                        );
                                         let spawn = find_safe_spawn(&world, 1);
                                         ctrl.position = Vec3::new(spawn[0], spawn[1], spawn[2]);
                                         sim.running = false;
@@ -915,6 +901,48 @@ fn assign_or_select_hotbar(ui: &mut UiState, slot: usize, tab_palette_held: bool
         }
     }
     ui.selected_slot = slot.min(HOTBAR_SLOTS - 1);
+}
+
+fn key_to_hotbar_slot(key: KeyCode) -> Option<usize> {
+    match key {
+        KeyCode::Digit0 => Some(0),
+        KeyCode::Digit1 => Some(1),
+        KeyCode::Digit2 => Some(2),
+        KeyCode::Digit3 => Some(3),
+        KeyCode::Digit4 => Some(4),
+        KeyCode::Digit5 => Some(5),
+        KeyCode::Digit6 => Some(6),
+        KeyCode::Digit7 => Some(7),
+        KeyCode::Digit8 => Some(8),
+        KeyCode::Digit9 => Some(9),
+        _ => None,
+    }
+}
+
+fn apply_quick_menu_hover_selection(ui: &mut UiState, brush: &mut BrushSettings) {
+    if let Some(hovered) = ui.hovered_shape.take() {
+        brush.shape = hovered;
+    }
+    if let Some(hovered) = ui.hovered_area_shape.take() {
+        brush.area_tool.shape = hovered;
+    }
+    if let Some(hovered) = ui.hovered_tool.take() {
+        ui.active_tool = hovered;
+    }
+}
+
+fn clear_procedural_streaming_state(
+    requested_procgen_id: &mut Option<u64>,
+    requested_procgen_coord: &mut Option<[i32; 3]>,
+    active_procgen: &mut Option<ProcGenConfig>,
+    stream: &mut Option<WorldStream>,
+    active_stream_coord: &mut [i32; 3],
+) {
+    *requested_procgen_id = None;
+    *requested_procgen_coord = None;
+    *active_procgen = None;
+    *stream = None;
+    *active_stream_coord = [0, 0, 0];
 }
 
 fn set_cursor(window: &winit::window::Window, unlock: bool) -> anyhow::Result<()> {
