@@ -166,7 +166,7 @@ fn surface_layering_pass(world: &mut World, config: &ProcGenConfig, heights: &[i
             ));
             let shore_w = smoothstep((ocean - 0.22) / 0.35);
             let coastal = shore_w > 0.18 && top_y <= config.sea_level + 3;
-            let river_bank = river > 0.5 && top_y <= config.sea_level + 2;
+            let river_bank = river > 0.48 && top_y <= config.sea_level + 3;
             let dirt_depth = (4.0 + 3.0 * (1.0 - desert)).round() as i32;
             let sand_depth = if coastal {
                 (3.0 + shore_w * 4.0).round() as i32
@@ -214,8 +214,16 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
             let lake_w = weights[biome_index(BiomeType::Lake)];
             let surface = heights[lx as usize + lz as usize * world.dims[0]];
 
-            let lowland_neighbors = count_neighbors_below_world(config, wx, wz, sea_level - 1);
-            let lowland_area = local_lowland_fraction(config, wx, wz, sea_level - 1, 3);
+            let lowland_neighbors = count_neighbors_below_heightmap(
+                heights,
+                world.dims[0],
+                config,
+                lx,
+                lz,
+                sea_level - 1,
+            );
+            let lowland_area =
+                local_lowland_fraction(heights, world.dims[0], config, lx, lz, sea_level - 1, 3);
             let ocean_dominant = ocean_w > 0.52;
             if ocean_dominant {
                 let depth_variation = ((fbm2(
@@ -228,9 +236,9 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
                     .round() as i32;
                 let target_depth = (10 + depth_variation).clamp(8, 14);
                 let floor = (sea_level - target_depth).max(2);
-                let force_ocean = ocean_w > 0.68;
-                let qualifies = force_ocean
-                    || (surface <= sea_level - 2 && lowland_neighbors >= 6 && lowland_area >= 0.62);
+                let qualifies = surface <= sea_level + 1
+                    && ((lowland_neighbors >= 6 && lowland_area >= 0.62)
+                        || (ocean_w > 0.72 && lowland_area >= 0.5));
 
                 if qualifies {
                     for y in 1..floor {
@@ -255,7 +263,7 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
 
             let depth = (1.0 + 1.2 * wetness).round() as i32;
             let floor = (surface - depth).max(2);
-            let river_level = sea_level - 1;
+            let river_level = river_water_level(config.seed, wx, wz, sea_level);
             let top = (surface - 1).min(river_level);
             if top < floor {
                 continue;
@@ -276,14 +284,21 @@ fn biome_water_pass(world: &mut World, config: &ProcGenConfig, heights: &[i32]) 
     }
 }
 
-fn count_neighbors_below_world(config: &ProcGenConfig, x: i32, z: i32, max_height: i32) -> i32 {
+fn count_neighbors_below_heightmap(
+    heights: &[i32],
+    width: usize,
+    config: &ProcGenConfig,
+    x: i32,
+    z: i32,
+    max_height: i32,
+) -> i32 {
     let mut count = 0;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            let h = sampled_surface_height(config, x + dx, z + dz);
+            let h = height_sample_with_fallback(heights, width, config, x + dx, z + dz);
             if h <= max_height {
                 count += 1;
             }
@@ -293,6 +308,8 @@ fn count_neighbors_below_world(config: &ProcGenConfig, x: i32, z: i32, max_heigh
 }
 
 fn local_lowland_fraction(
+    heights: &[i32],
+    width: usize,
     config: &ProcGenConfig,
     x: i32,
     z: i32,
@@ -304,13 +321,35 @@ fn local_lowland_fraction(
     for dz in -radius..=radius {
         for dx in -radius..=radius {
             total += 1;
-            let h = sampled_surface_height(config, x + dx, z + dz);
+            let h = height_sample_with_fallback(heights, width, config, x + dx, z + dz);
             if h <= max_height {
                 low += 1;
             }
         }
     }
     low as f32 / total as f32
+}
+
+fn height_sample_with_fallback(
+    heights: &[i32],
+    width: usize,
+    config: &ProcGenConfig,
+    x: i32,
+    z: i32,
+) -> i32 {
+    let depth = heights.len() / width;
+    if x >= 0 && z >= 0 && x < width as i32 && z < depth as i32 {
+        return heights[x as usize + z as usize * width];
+    }
+    let wx = config.world_origin[0] + x;
+    let wz = config.world_origin[2] + z;
+    sampled_surface_height(config, wx, wz)
+}
+
+fn river_water_level(seed: u64, x: i32, z: i32, sea_level: i32) -> i32 {
+    let n = fbm2(seed ^ 0x51EAA001, x as f32 * 0.0012, z as f32 * 0.0012, 2);
+    let delta = ((n - 0.5) * 4.0).round() as i32;
+    (sea_level - 1 + delta).clamp(sea_level - 3, sea_level + 1)
 }
 
 fn vegetation_pass(world: &mut World, config: &ProcGenConfig) {
