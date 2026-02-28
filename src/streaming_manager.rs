@@ -90,16 +90,28 @@ impl StreamingManager {
         self.frame = self.frame.wrapping_add(1);
 
         let mut next_sim = BTreeSet::new();
-        for dz in -self.sim_radius..=self.sim_radius {
-            for dx in -self.sim_radius..=self.sim_radius {
-                next_sim.insert([player_macro[0] + dx, player_macro[1], player_macro[2] + dz]);
+        for dy in -self.sim_radius..=self.sim_radius {
+            for dz in -self.sim_radius..=self.sim_radius {
+                for dx in -self.sim_radius..=self.sim_radius {
+                    next_sim.insert([
+                        player_macro[0] + dx,
+                        player_macro[1] + dy,
+                        player_macro[2] + dz,
+                    ]);
+                }
             }
         }
 
         let mut next_render = BTreeSet::new();
-        for dz in -self.render_radius..=self.render_radius {
-            for dx in -self.render_radius..=self.render_radius {
-                next_render.insert([player_macro[0] + dx, player_macro[1], player_macro[2] + dz]);
+        for dy in -self.render_radius..=self.render_radius {
+            for dz in -self.render_radius..=self.render_radius {
+                for dx in -self.render_radius..=self.render_radius {
+                    next_render.insert([
+                        player_macro[0] + dx,
+                        player_macro[1] + dy,
+                        player_macro[2] + dz,
+                    ]);
+                }
             }
         }
 
@@ -117,9 +129,11 @@ impl StreamingManager {
     }
 
     pub fn set_render_radius_from_budget(&mut self, budget_chunks: usize) {
-        self.render_budget = budget_chunks.max(9);
+        self.render_budget = budget_chunks.max(27);
         let mut radius: i32 = 1;
-        while ((radius * 2 + 1) * (radius * 2 + 1)) as usize <= self.render_budget {
+        while ((radius * 2 + 1) * (radius * 2 + 1) * (radius * 2 + 1)) as usize
+            <= self.render_budget
+        {
             radius += 1;
         }
         self.render_radius = radius.saturating_sub(1).max(self.sim_radius);
@@ -133,6 +147,7 @@ impl StreamingManager {
         ];
         let distance = (coord[0] - player_macro[0])
             .abs()
+            .max((coord[1] - player_macro[1]).abs())
             .max((coord[2] - player_macro[2]).abs());
         if distance >= self.extreme_lod_distance {
             MeshDetail::Low
@@ -156,6 +171,7 @@ impl StreamingManager {
                 }
                 let dist = (coord[0] - player_macro[0])
                     .abs()
+                    .max((coord[1] - player_macro[1]).abs())
                     .max((coord[2] - player_macro[2]).abs());
                 Some((*origin, dist, chunk.last_render_frame))
             })
@@ -187,4 +203,45 @@ fn floor_div(a: i32, b: i32) -> i32 {
         q -= 1;
     }
     q
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_residency_radius_one_tracks_27_sim_and_render_coords() {
+        let mut manager = StreamingManager::new(32, 1, 64);
+        manager.sim_radius = 1;
+
+        manager.update_residency([0, 0, 0]);
+
+        assert_eq!(manager.sim_active.len(), 27);
+        assert_eq!(manager.render_active.len(), 27);
+        assert!(manager.sim_active.contains(&[0, 1, 0]));
+        assert!(manager.render_active.contains(&[0, -1, 0]));
+    }
+
+    #[test]
+    fn render_budget_radius_uses_cubic_volume() {
+        let mut manager = StreamingManager::new(32, 1, 8);
+        manager.set_render_radius_from_budget(26);
+        assert_eq!(manager.render_budget, 27);
+        assert_eq!(manager.render_radius, 1);
+
+        manager.set_render_radius_from_budget(125);
+        assert_eq!(manager.render_radius, 2);
+    }
+
+    #[test]
+    fn mesh_detail_is_y_aware() {
+        let manager = StreamingManager::new(32, 4, 512);
+        let player = [0, 0, 0];
+
+        let low_detail_origin = [0, manager.extreme_lod_distance * manager.macro_size, 0];
+        assert_eq!(
+            manager.mesh_detail_for_origin(low_detail_origin, player),
+            MeshDetail::Low
+        );
+    }
 }
