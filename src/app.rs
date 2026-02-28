@@ -138,7 +138,11 @@ pub async fn run() -> anyhow::Result<()> {
     debug_assert!(PLAYER_HEIGHT_BLOCKS > 0.0 && PLAYER_WIDTH_BLOCKS > 0.0);
     debug_assert!(PLAYER_EYE_HEIGHT_BLOCKS <= PLAYER_HEIGHT_BLOCKS);
     debug_assert!((eye_height_world_meters(VOXEL_SIZE) - 1.6).abs() < f32::EPSILON);
-    renderer.rebuild_dirty_chunks_with_budget(&mut world, ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME);
+    renderer.rebuild_dirty_chunks_with_budget(
+        &mut world,
+        ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME,
+        [0, 0, 0],
+    );
 
     event_loop
         .run(move |event, elwt| match &event {
@@ -235,6 +239,11 @@ pub async fn run() -> anyhow::Result<()> {
                         let now = Instant::now();
                         let dt = (now - last).as_secs_f32().min(0.05);
                         last = now;
+
+                        let active_render_origin = stream
+                            .as_ref()
+                            .map(|s| s.chunk_origin(active_stream_coord))
+                            .unwrap_or([0, 0, 0]);
 
                         let quick_menu_held =
                             input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
@@ -482,7 +491,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                                 if let Some(chunk_world) = stream_ref.resident_world(coord) {
                                     let origin = stream_ref.chunk_origin(coord);
-                                    renderer.upsert_stream_mesh(coord, chunk_world, origin);
+                                    renderer.upsert_stream_mesh(coord, chunk_world, origin, |p| {
+                                        stream_ref.sample_global_voxel(p)
+                                    });
                                 }
                             }
                         }
@@ -501,6 +512,7 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.rebuild_dirty_chunks_with_budget(
                             &mut world,
                             ACTIVE_MESH_REBUILD_BUDGET_PER_FRAME,
+                            active_render_origin,
                         );
 
                         ui.biome_hint = if let (Some(cfg), Some(stream_ref)) =
@@ -554,7 +566,15 @@ pub async fn run() -> anyhow::Result<()> {
                             let actions =
                                 draw(ctx, &mut ui, sim.running, &mut brush, &tool_textures);
                             let cam = Camera {
-                                pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
+                                pos: camera_world_pos_from_blocks(
+                                    ctrl.position
+                                        + Vec3::new(
+                                            active_render_origin[0] as f32,
+                                            active_render_origin[1] as f32,
+                                            active_render_origin[2] as f32,
+                                        ),
+                                    VOXEL_SIZE,
+                                ),
                                 dir: ctrl.look_dir(),
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,
@@ -791,7 +811,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 occlusion_query_set: None,
                             });
                             let cam = Camera {
-                                pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
+                                pos: camera_world_pos_from_blocks(
+                                    ctrl.position
+                                        + Vec3::new(
+                                            active_render_origin[0] as f32,
+                                            active_render_origin[1] as f32,
+                                            active_render_origin[2] as f32,
+                                        ),
+                                    VOXEL_SIZE,
+                                ),
                                 dir: ctrl.look_dir(),
                                 aspect: renderer.config.width as f32
                                     / renderer.config.height.max(1) as f32,

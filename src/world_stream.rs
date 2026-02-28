@@ -1,5 +1,5 @@
 use crate::procgen::ProcGenConfig;
-use crate::world::{MaterialId, World};
+use crate::world::{MaterialId, World, EMPTY};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +131,31 @@ impl WorldStream {
             return None;
         }
         chunk.world.as_ref()
+    }
+
+    pub fn sample_global_voxel(&self, global: [i32; 3]) -> MaterialId {
+        let dims = self.base_config.dims;
+        if dims[0] == 0 || dims[1] == 0 || dims[2] == 0 {
+            return EMPTY;
+        }
+        let dx = dims[0] as i32;
+        let dy = dims[1] as i32;
+        let dz = dims[2] as i32;
+
+        let coord = [
+            floor_div(global[0], dx),
+            floor_div(global[1], dy),
+            floor_div(global[2], dz),
+        ];
+        let local = [
+            global[0] - coord[0] * dx,
+            global[1] - coord[1] * dy,
+            global[2] - coord[2] * dz,
+        ];
+        let Some(world) = self.resident_world(coord) else {
+            return EMPTY;
+        };
+        world.get(local[0], local[1], local[2])
     }
 
     pub fn deterministic_face_signature(world: &World, axis: usize, side: i32) -> Vec<MaterialId> {

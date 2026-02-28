@@ -286,7 +286,7 @@ fn build_column_cache(
             ));
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
             let near_sea_band = col.surface_height <= config.sea_level + 4;
-            col.slope = local_slope_heightmap(&heights, config.dims[0], x, z);
+            col.slope = slope_at_world(config, col.wx, col.wz);
             col.coastal = shore_w > 0.18 && near_sea_band;
             col.river = river > 0.48;
             col.ocean = ocean > 0.55;
@@ -611,18 +611,15 @@ fn surface_layering_pass(
     }
 }
 
-fn local_slope_heightmap(heights: &[i32], width: usize, x: i32, z: i32) -> i32 {
-    let depth = (heights.len() / width) as i32;
-    let center = heights[x as usize + z as usize * width];
+fn slope_at_world(config: &ProcGenConfig, wx: i32, wz: i32) -> i32 {
+    let center = sampled_surface_height(config, wx, wz, None);
     let mut max_delta = 0;
     for dz in -1..=1 {
         for dx in -1..=1 {
             if dx == 0 && dz == 0 {
                 continue;
             }
-            let nx = (x + dx).clamp(0, width as i32 - 1);
-            let nz = (z + dz).clamp(0, depth - 1);
-            let h = heights[nx as usize + nz as usize * width];
+            let h = sampled_surface_height(config, wx + dx, wz + dz, None);
             max_delta = max_delta.max((h - center).abs());
         }
     }
@@ -1072,15 +1069,15 @@ fn river_meander_signal(seed: u64, x: i32, z: i32) -> f32 {
 }
 
 fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; BIOME_COUNT] {
-    let macro_x = floor_div(x, MACROCHUNK_SIZE);
-    let macro_z = floor_div(z, MACROCHUNK_SIZE);
+    let macro_x = x as f32 / MACROCHUNK_SIZE as f32;
+    let macro_z = z as f32 / MACROCHUNK_SIZE as f32;
     let cluster_scale = BIOME_CLUSTER_MACROS as f32;
 
     let warp_x = (fbm2(seed ^ 0x5522AA11, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
     let warp_z = (fbm2(seed ^ 0x5522AA12, x as f32 * 0.0018, z as f32 * 0.0018, 3) - 0.5) * 1.2;
 
-    let fx = macro_x as f32 / cluster_scale + warp_x;
-    let fz = macro_z as f32 / cluster_scale + warp_z;
+    let fx = macro_x / cluster_scale + warp_x;
+    let fz = macro_z / cluster_scale + warp_z;
     let x0 = fx.floor() as i32;
     let z0 = fz.floor() as i32;
     let tx = (fx - x0 as f32).clamp(0.0, 1.0);
@@ -1131,15 +1128,6 @@ fn biome_anchor(seed: u64, chunk_x: i32, chunk_z: i32) -> BiomeType {
     } else {
         BiomeType::Ocean
     }
-}
-
-fn floor_div(a: i32, b: i32) -> i32 {
-    let mut q = a / b;
-    let r = a % b;
-    if r != 0 && ((r > 0) != (b > 0)) {
-        q -= 1;
-    }
-    q
 }
 
 fn dominant_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
