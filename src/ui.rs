@@ -15,6 +15,7 @@ pub struct ProfilerStats {
     pub gen_request_count: usize,
     pub gen_inflight_count: usize,
     pub gen_completed_count: usize,
+    pub gen_completed_total: u64,
     pub apply_ms: f32,
     pub apply_count: usize,
     pub evict_ms: f32,
@@ -366,6 +367,10 @@ pub fn draw(
                     ui_state.profiler.gen_request_count,
                     ui_state.profiler.gen_inflight_count,
                     ui_state.profiler.gen_completed_count
+                ));
+                ui.monospace(format!(
+                    "gen completed total: {}",
+                    ui_state.profiler.gen_completed_total
                 ));
                 ui.monospace(format!(
                     "apply: {:.2} ms ({}) | evict: {:.2} ms ({})",

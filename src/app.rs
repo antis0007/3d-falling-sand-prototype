@@ -229,6 +229,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
     let mut stream_debug = String::new();
     let mut frame_counter: u64 = 0;
+    let mut total_generated_chunks: u64 = 0;
     let mut collision_freeze_active = false;
     let mut collision_used_unloaded_chunks = false;
 
@@ -564,6 +565,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
+                        total_generated_chunks = total_generated_chunks
+                            .saturating_add(gen_completed_count as u64);
+
                         let apply_budget_items = scaled_budget(
                             stream_tuning.base_apply_budget_items,
                             stream_tuning.max_apply_budget_items,
@@ -713,6 +717,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.gen_request_count = gen_request_count;
                         ui.profiler.gen_inflight_count = streaming.generating.len();
                         ui.profiler.gen_completed_count = gen_completed_count;
+                        ui.profiler.gen_completed_total = total_generated_chunks;
                         ui.profiler.apply_ms = apply_ms;
                         ui.profiler.apply_count = apply_count;
                         ui.profiler.evict_ms = evict_ms;
@@ -743,6 +748,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_desired = DesiredChunks::default();
                                 cached_sim_region.clear();
                                 generated_ready.clear();
+                                total_generated_chunks = 0;
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
