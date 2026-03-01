@@ -749,7 +749,8 @@ pub fn draw(
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("ESC to return to game");
+                ui.label("ESC toggles this menu");
+                ui.label("P toggles simulation run/pause");
                 if ui.button("Resume").clicked() {
                     ui_state.paused_menu = false;
                 }
