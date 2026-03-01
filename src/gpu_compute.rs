@@ -189,10 +189,10 @@ impl GpuComputeRuntime {
 
         #[cfg(feature = "gpu-compute")]
         {
-            let volume = job.snapshot.voxels.len();
+            let volume = job.snapshot.center_voxels.len();
             let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("gpu input voxels"),
-                contents: bytemuck::cast_slice(&job.snapshot.voxels),
+                contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let material_field = device.create_buffer(&wgpu::BufferDescriptor {
@@ -405,8 +405,8 @@ fn map_readback<T: Pod>(device: &wgpu::Device, buffer: &wgpu::Buffer) -> anyhow:
 }
 
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
-    let mut out = vec![EMPTY; job.snapshot.voxels.len()];
-    out.copy_from_slice(&job.snapshot.voxels);
+    let mut out = vec![EMPTY; job.snapshot.center_voxels.len()];
+    out.copy_from_slice(job.snapshot.center_voxels.as_ref());
     let surface = out.iter().filter(|v| **v != EMPTY).count() as u32;
     ComputedChunkArtifacts {
         generated_materials: out,
@@ -423,9 +423,5 @@ pub(crate) fn rebuilt_snapshot_from_materials(
     job: &MeshJob,
     materials: Vec<MaterialId>,
 ) -> crate::renderer::ChunkSnapshot {
-    crate::renderer::ChunkSnapshot {
-        world_min: job.snapshot.world_min,
-        dim: job.snapshot.dim,
-        voxels: materials,
-    }
+    job.snapshot.with_center_materials(materials)
 }
