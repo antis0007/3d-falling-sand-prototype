@@ -36,6 +36,13 @@ pub enum WorkItem {
     Evict(ChunkCoord),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerateJobClass {
+    Urgent,
+    Near,
+    Background,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StreamingUpdateStats {
     pub newly_desired: usize,
@@ -548,11 +555,43 @@ impl ChunkStreaming {
     }
 
     pub fn mark_dispatch_failed_or_deferred(&mut self, coord: ChunkCoord) {
-        if !self.scheduled_generate.contains(&coord) {
-            self.scheduled_generate.insert(coord);
+        self.defer_generation_dispatch(coord, GenerateJobClass::Background);
+    }
+
+    pub fn dispatch_generation_for_class<F>(
+        &mut self,
+        coord: ChunkCoord,
+        class: GenerateJobClass,
+        mut try_dispatch: F,
+    ) -> bool
+    where
+        F: FnMut(ChunkCoord) -> bool,
+    {
+        if self.resident.contains(&coord) || self.dispatched_generate.contains(&coord) {
+            return false;
         }
-        if !self.pending_generate.contains(&coord) {
-            self.pending_generate.push_back(coord);
+
+        self.scheduled_generate.insert(coord);
+
+        if try_dispatch(coord) {
+            self.mark_dispatch_succeeded(coord);
+            true
+        } else {
+            self.defer_generation_dispatch(coord, class);
+            false
+        }
+    }
+
+    fn defer_generation_dispatch(&mut self, coord: ChunkCoord, class: GenerateJobClass) {
+        self.scheduled_generate.insert(coord);
+        if self.pending_generate.contains(&coord) {
+            return;
+        }
+        match class {
+            GenerateJobClass::Urgent => self.pending_generate.push_front(coord),
+            GenerateJobClass::Near | GenerateJobClass::Background => {
+                self.pending_generate.push_back(coord)
+            }
         }
     }
 
@@ -590,12 +629,6 @@ impl ChunkStreaming {
     }
 
     pub fn mark_generation_dropped(&mut self, coord: ChunkCoord) {
-        self.dispatched_generate.remove(&coord);
-        self.scheduled_generate.remove(&coord);
-        self.pending_generate.retain(|queued| *queued != coord);
-    }
-
-    pub fn mark_canceled(&mut self, coord: ChunkCoord) {
         self.dispatched_generate.remove(&coord);
         self.scheduled_generate.remove(&coord);
         self.pending_generate.retain(|queued| *queued != coord);
@@ -710,7 +743,7 @@ mod tests {
     use crate::types::ChunkCoord;
 
     use super::Residency;
-    use super::{is_urgent_chunk, ChunkStreaming};
+    use super::{is_urgent_chunk, ChunkStreaming, GenerateJobClass};
 
     #[test]
     fn scheduling_budget_limits_queued_chunks_not_scan_count() {
@@ -839,6 +872,40 @@ mod tests {
     }
 
     #[test]
+    fn deferred_urgent_dispatch_stays_queued_at_front() {
+        let mut streaming = ChunkStreaming::new(1);
+        let urgent = ChunkCoord { x: 1, y: 0, z: 1 };
+        let other = ChunkCoord { x: 4, y: 0, z: 0 };
+
+        streaming.pending_generate.push_back(other);
+
+        assert!(!streaming.dispatch_generation_for_class(
+            urgent,
+            GenerateJobClass::Urgent,
+            |_coord| false,
+        ));
+
+        assert!(streaming.scheduled_generate.contains(&urgent));
+        assert_eq!(streaming.pending_generate.pop_front(), Some(urgent));
+        assert_eq!(streaming.pending_generate.pop_front(), Some(other));
+    }
+
+    #[test]
+    fn deferred_background_dispatch_remains_pending() {
+        let mut streaming = ChunkStreaming::new(1);
+        let coord = ChunkCoord { x: 5, y: 0, z: 0 };
+
+        assert!(!streaming.dispatch_generation_for_class(
+            coord,
+            GenerateJobClass::Background,
+            |_coord| false,
+        ));
+
+        assert!(streaming.scheduled_generate.contains(&coord));
+        assert_eq!(streaming.next_generation_job(), Some(coord));
+    }
+
+    #[test]
     fn residency_reports_scheduled_state() {
         let mut streaming = ChunkStreaming::new(1);
         let c = ChunkCoord { x: 3, y: 0, z: 0 };
@@ -932,11 +999,12 @@ mod tests {
         let deep_below = ChunkCoord { x: 1, y: -9, z: 4 };
         assert!(desired.generation_scores[&near_above] > desired.generation_scores[&deep_below]);
 
-        let desired_pair = if desired.generation_scores[&near_above] >= desired.generation_scores[&deep_below] {
-            vec![near_above, deep_below]
-        } else {
-            vec![deep_below, near_above]
-        };
+        let desired_pair =
+            if desired.generation_scores[&near_above] >= desired.generation_scores[&deep_below] {
+                vec![near_above, deep_below]
+            } else {
+                vec![deep_below, near_above]
+            };
         let keep_pair: HashSet<_> = desired_pair.iter().copied().collect();
         let stats = streaming.update(&desired_pair, &keep_pair, player, 1);
 
