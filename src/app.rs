@@ -50,10 +50,11 @@ const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
-const GEN_PAUSE_QUEUE_HIGH: usize = 1800;
-const GEN_PAUSE_QUEUE_LOW: usize = 980;
-const GEN_PAUSE_DIRTY_HIGH: usize = 1700;
-const GEN_PAUSE_DIRTY_LOW: usize = 900;
+const GEN_THROTTLE_DIRTY_HIGH: usize = 1700;
+const GEN_THROTTLE_QUEUE_HIGH: usize = 1800;
+const GEN_MIN_THROTTLED_BUDGET: usize = 1;
+const URGENT_GENERATION_BUDGET: usize = 4;
+const NEAR_GENERATION_BUDGET: usize = 24;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
 const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
 const AUTO_TUNE_RAMP_UP_PER_SEC: f32 = 3.5;
@@ -61,10 +62,9 @@ const AUTO_TUNE_RECOVER_PER_SEC: f32 = 0.6;
 const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
-const FREEZE_UNTIL_COLLISION_RESIDENT: bool = false;
-const COLLISION_FREEZE_MAX_DURATION: Duration = Duration::from_millis(1500);
-const COLLISION_FREEZE_BACKOFF_DURATION: Duration = Duration::from_millis(900);
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
+const HITCH_CAPTURE_FRAME_MS: f32 = 120.0;
+const HITCH_CAPTURE_RING_SIZE: usize = 64;
 const SPAWN_SEARCH_RADIUS: i32 = 48;
 const SPAWN_HEADROOM: i32 = 3;
 const SPAWN_CLEARANCE: f32 = 3.4;
@@ -207,21 +207,27 @@ impl AutoTuneState {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct GenBackpressureState {
-    paused_by_mesh_pressure: bool,
+struct GenThrottleState {
+    pressure: f32,
+    budget_scale: f32,
 }
 
-impl GenBackpressureState {
+impl GenThrottleState {
     fn update(&mut self, meshing_queue_depth: usize, dirty_backlog: usize) {
-        if self.paused_by_mesh_pressure {
-            if meshing_queue_depth <= GEN_PAUSE_QUEUE_LOW && dirty_backlog <= GEN_PAUSE_DIRTY_LOW {
-                self.paused_by_mesh_pressure = false;
-            }
-        } else if meshing_queue_depth >= GEN_PAUSE_QUEUE_HIGH
-            || dirty_backlog >= GEN_PAUSE_DIRTY_HIGH
-        {
-            self.paused_by_mesh_pressure = true;
-        }
+        let dirty_pressure = dirty_backlog as f32 / GEN_THROTTLE_DIRTY_HIGH.max(1) as f32;
+        let queue_pressure = meshing_queue_depth as f32 / GEN_THROTTLE_QUEUE_HIGH.max(1) as f32;
+        self.pressure = dirty_pressure.max(queue_pressure);
+        self.budget_scale = if self.pressure < 1.0 {
+            1.0
+        } else if self.pressure < 2.0 {
+            2.0 - self.pressure
+        } else {
+            0.25
+        };
+    }
+
+    fn scaled_budget(self, budget: usize) -> usize {
+        (budget as f32 * self.budget_scale).round() as usize
     }
 }
 
@@ -476,18 +482,17 @@ pub async fn run() -> anyhow::Result<()> {
     let mut stream_debug = String::new();
     let mut frame_counter: u64 = 0;
     let mut total_generated_chunks: u64 = 0;
-    let mut collision_freeze_active = false;
+    let collision_freeze_active = false;
     let mut collision_used_unloaded_chunks = false;
-    let mut collision_freeze_started_at: Option<Instant> = None;
-    let mut collision_freeze_backoff_until: Option<Instant> = None;
-    let mut collision_freeze_last_duration_ms: f32 = 0.0;
-    let mut previous_collision_freeze_active = false;
+    let mut collision_unknown_samples = 0usize;
+    let mut collision_unknown_blocks_as_solid = 0usize;
+    let mut collision_axis_reverts = 0usize;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
     let mut prior_dirty_backlog = 0usize;
     let mut prior_meshing_queue_depth = 0usize;
     let mut prior_upload_latency_ms = 0.0f32;
-    let mut gen_backpressure_state = GenBackpressureState::default();
+    let mut gen_throttle_state = GenThrottleState::default();
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
 
@@ -707,9 +712,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 );
                                 spawn_pending = !neighborhood_loaded;
                                 if !spawn_pending {
-                                    collision_freeze_started_at = None;
-                                    collision_freeze_backoff_until = None;
-                                    previous_collision_freeze_active = false;
                                     last_player_chunk = None;
                                     cached_desired = DesiredChunks::default();
                                     cached_sim_region.clear();
@@ -754,6 +756,7 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         origin_voxel = origin_update.origin_translation;
                         ctrl.position = origin_update.player_local_position;
+                        renderer.set_origin_voxel(origin_voxel);
                         if origin_update.recentered {
                             // Avoid global remesh storms on recenter.
                             renderer.clear_mesh_cache();
@@ -770,32 +773,7 @@ pub async fn run() -> anyhow::Result<()> {
                             COLLISION_SAFETY_RADIUS_VOXELS,
                         );
 
-                        let should_consider_freeze = FREEZE_UNTIL_COLLISION_RESIDENT
-                            && !collision_neighborhood_loaded
-                            && !(gameplay_blocked || spawn_pending)
-                            && !egui_c;
-                        let within_backoff = collision_freeze_backoff_until
-                            .is_some_and(|until| now_instant < until);
-                        collision_freeze_active = should_consider_freeze && !within_backoff;
-
-                        if collision_freeze_active {
-                            let started = collision_freeze_started_at.get_or_insert(now_instant);
-                            if now_instant.duration_since(*started) > COLLISION_FREEZE_MAX_DURATION {
-                                collision_freeze_active = false;
-                                collision_freeze_last_duration_ms =
-                                    now_instant.duration_since(*started).as_secs_f32() * 1000.0;
-                                collision_freeze_started_at = None;
-                                collision_freeze_backoff_until =
-                                    Some(now_instant + COLLISION_FREEZE_BACKOFF_DURATION);
-                            }
-                        } else if let Some(started) = collision_freeze_started_at.take() {
-                            collision_freeze_last_duration_ms =
-                                now_instant.duration_since(started).as_secs_f32() * 1000.0;
-                        }
-
-                        if collision_neighborhood_loaded {
-                            collision_freeze_backoff_until = None;
-                        }
+                        // Soft-fallback collision policy: no hard movement freeze when chunks are missing.
 
                         if !collision_neighborhood_loaded {
                             let missing_coords = collision_neighborhood_missing_chunks(
@@ -832,71 +810,25 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        if collision_freeze_active != previous_collision_freeze_active {
-                            if collision_freeze_active {
-                                ui.log_once_per_second("collision_freeze_enter", start.elapsed().as_secs_f32(), || {
-                                    format!(
-                                        "collision_freeze enter player_chunk=({}, {}, {}) loaded_neighborhood={}",
-                                        player_chunk_for_collision.x,
-                                        player_chunk_for_collision.y,
-                                        player_chunk_for_collision.z,
-                                        collision_neighborhood_loaded,
-                                    )
-                                });
-                            } else {
-                                let backoff_remaining_ms = collision_freeze_backoff_until
-                                    .map(|until| until.saturating_duration_since(now_instant).as_secs_f32() * 1000.0)
-                                    .unwrap_or(0.0);
-                                ui.log_once_per_second("collision_freeze_exit", start.elapsed().as_secs_f32(), || {
-                                    format!(
-                                        "collision_freeze exit duration_ms={:.1} neighborhood_loaded={} backoff_remaining_ms={:.1}",
-                                        collision_freeze_last_duration_ms,
-                                        collision_neighborhood_loaded,
-                                        backoff_remaining_ms,
-                                    )
-                                });
-                            }
-                            previous_collision_freeze_active = collision_freeze_active;
-                        }
-
-                        if collision_freeze_active {
-                            let freeze_ms = collision_freeze_started_at
-                                .map(|started| now_instant.duration_since(started).as_secs_f32() * 1000.0)
-                                .unwrap_or(0.0);
-                            ui.log_once_per_second("collision_freeze_active", start.elapsed().as_secs_f32(), || {
-                                format!(
-                                    "collision_freeze active_ms={:.1} max_ms={:.1} backoff_ms={:.1} missing_neighborhood={}",
-                                    freeze_ms,
-                                    COLLISION_FREEZE_MAX_DURATION.as_secs_f32() * 1000.0,
-                                    COLLISION_FREEZE_BACKOFF_DURATION.as_secs_f32() * 1000.0,
-                                    !collision_neighborhood_loaded,
-                                )
-                            });
-                        }
 
                         collision_used_unloaded_chunks = false;
+                        collision_unknown_samples = 0;
+                        collision_unknown_blocks_as_solid = 0;
                         let look_active = !(gameplay_blocked || spawn_pending) && !egui_c;
-                        let mut ctrl_input = input.clone();
-                        if collision_freeze_active {
-                            ctrl_input.pressed.remove(&KeyCode::KeyW);
-                            ctrl_input.pressed.remove(&KeyCode::KeyA);
-                            ctrl_input.pressed.remove(&KeyCode::KeyS);
-                            ctrl_input.pressed.remove(&KeyCode::KeyD);
-                            ctrl_input.pressed.remove(&KeyCode::Space);
-                            ctrl_input.pressed.remove(&KeyCode::ShiftLeft);
-                        }
+                        let ctrl_input = input.clone();
                         let origin_for_ctrl = origin_voxel;
-                        ctrl.step(
+                        let collision_step = ctrl.step(
                             |x, y, z| {
                                 let voxel = VoxelCoord { x, y, z };
                                 if store.is_voxel_chunk_loaded(voxel) {
                                     return store.get_voxel(voxel);
                                 }
-
+                                collision_unknown_samples = collision_unknown_samples.saturating_add(1);
                                 let near_player =
                                     within_collision_safety_radius(voxel, player_local_for_collision, origin_for_ctrl, COLLISION_SAFETY_RADIUS_VOXELS);
                                 if near_player {
                                     collision_used_unloaded_chunks = true;
+                                    collision_unknown_blocks_as_solid = collision_unknown_blocks_as_solid.saturating_add(1);
                                     return 1u16;
                                 }
 
@@ -908,6 +840,7 @@ pub async fn run() -> anyhow::Result<()> {
                             start.elapsed().as_secs_f32(),
                             origin_for_ctrl,
                         );
+                        collision_axis_reverts = collision_step.axis_reverts;
 
                         // Streaming regions in WORLD voxel space
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
@@ -1039,29 +972,80 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             frame_counter,
                         );
-                        gen_backpressure_state
-                            .update(prior_meshing_queue_depth, prior_dirty_backlog);
+                        gen_throttle_state.update(prior_meshing_queue_depth, prior_dirty_backlog);
+
                         let mut gen_request_count = 0usize;
-                        let generate_drain_budget = scaled_budget(
+                        let mut urgent_missing = 0usize;
+                        let urgent_vertical = 1;
+                        let urgent_radius = 1;
+                        let mut dispatch_urgent = Vec::new();
+                        let mut dispatch_near = Vec::new();
+                        let mut dispatch_far = Vec::new();
+
+                        for &coord in &generation_priority {
+                            if streaming.resident.contains(&coord)
+                                || streaming.generating.contains(&coord)
+                                || streaming.scheduled.contains(&coord)
+                            {
+                                continue;
+                            }
+                            if chebyshev_from_player(player_chunk, coord) <= urgent_radius
+                                && (coord.y - player_chunk.y).abs() <= urgent_vertical
+                            {
+                                urgent_missing += 1;
+                                dispatch_urgent.push(coord);
+                            } else if cached_desired.near.contains(&coord) {
+                                dispatch_near.push(coord);
+                            } else {
+                                dispatch_far.push(coord);
+                            }
+                        }
+
+                        for coord in dispatch_urgent {
+                            if streaming.scheduled.insert(coord) {
+                                streaming.mark_canceled(coord);
+                                streaming.scheduled.insert(coord);
+                            }
+                            if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatched(coord);
+                                gen_request_count += 1;
+                            }
+                        }
+
+                        let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
                             stream_tuning.max_generate_drain_items,
                             streaming.pending_generate_count() + generated_ready.len(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        if !gen_backpressure_state.paused_by_mesh_pressure {
-                            for coord in streaming.drain_generate_requests(generate_drain_budget) {
-                                if let Some(chunk) = cached_modified_chunks.remove(&coord) {
-                                    generated_ready.push_back(GenResult { coord, chunk });
-                                    continue;
-                                }
-                                if chunk_generator.try_request(coord) {
-                                    gen_request_count += 1;
-                                } else {
-                                    streaming.mark_generation_dropped(coord);
-                                }
+                        let generate_drain_budget = gen_throttle_state
+                            .scaled_budget(base_generate_drain_budget)
+                            .max(GEN_MIN_THROTTLED_BUDGET);
+
+                        let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
+                        let mut near_sent = 0usize;
+                        while near_sent < near_budget {
+                            let Some(coord) = streaming.next_generation_job() else { break; };
+                            if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatched(coord);
+                                gen_request_count += 1;
+                                near_sent += 1;
+                            } else {
+                                break;
                             }
                         }
 
+                        let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
+                        while far_budget > 0 {
+                            let Some(coord) = streaming.next_generation_job() else { break; };
+                            if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatched(coord);
+                                gen_request_count += 1;
+                                far_budget -= 1;
+                            } else {
+                                break;
+                            }
+                        }
                         let gen_recv_t0 = Instant::now();
                         let mut gen_completed_count = 0usize;
                         let mut gen_recv_empty = false;
@@ -1089,8 +1073,8 @@ pub async fn run() -> anyhow::Result<()> {
                         let gen_inflight = streaming.generating.len();
                         if gen_inflight >= 96 && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
-                            let starvation_reason = if gen_backpressure_state.paused_by_mesh_pressure {
-                                "paused_by_mesh_pressure"
+                            let starvation_reason = if gen_throttle_state.pressure > 1.0 {
+                                "pressure > 1.0"
                             } else if gen_recv_disconnected {
                                 "generator_channel_disconnected"
                             } else if gen_recv_empty {
@@ -1192,7 +1176,7 @@ pub async fn run() -> anyhow::Result<()> {
                             cached_desired.far.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
-                            gen_backpressure_state.paused_by_mesh_pressure,
+                            gen_throttle_state.pressure > 1.0,
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
@@ -1347,7 +1331,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
-                        ui.profiler.gen_paused_by_mesh_pressure = gen_backpressure_state.paused_by_mesh_pressure;
+                        ui.profiler.gen_paused_by_mesh_pressure = gen_throttle_state.pressure > 1.0;
                         ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
@@ -1396,10 +1380,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 renderer.set_origin_voxel(origin_voxel);
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
-                                collision_freeze_active = false;
-                                collision_freeze_started_at = None;
-                                collision_freeze_backoff_until = None;
-                                previous_collision_freeze_active = false;
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);

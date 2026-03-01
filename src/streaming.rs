@@ -45,6 +45,7 @@ struct ChunkLifecycle {
 pub struct ChunkStreaming {
     pub seed: u64,
     pub resident: HashSet<ChunkCoord>,
+    pub scheduled: HashSet<ChunkCoord>,
     pub generating: HashSet<ChunkCoord>,
     pending_generate: VecDeque<ChunkCoord>,
     pending_evict: VecDeque<ChunkCoord>,
@@ -64,6 +65,7 @@ impl ChunkStreaming {
         Self {
             seed,
             resident: HashSet::new(),
+            scheduled: HashSet::new(),
             generating: HashSet::new(),
             pending_generate: VecDeque::new(),
             pending_evict: VecDeque::new(),
@@ -245,7 +247,10 @@ impl ChunkStreaming {
         for &coord in desired_sorted {
             let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
             lifecycle.last_visible_frame = frame_index;
-            if self.resident.contains(&coord) || self.generating.contains(&coord) {
+            if self.resident.contains(&coord)
+                || self.generating.contains(&coord)
+                || self.scheduled.contains(&coord)
+            {
                 continue;
             }
             if frame_index.saturating_sub(lifecycle.last_evicted_frame) < self.regen_cooldown_frames
@@ -255,7 +260,7 @@ impl ChunkStreaming {
             if queued_this_frame >= self.max_generate_schedule_per_update {
                 continue;
             }
-            self.generating.insert(coord);
+            self.scheduled.insert(coord);
             self.pending_generate.push_back(coord);
             self.work_items.push(WorkItem::Generate(coord));
             queued_this_frame += 1;
@@ -264,7 +269,11 @@ impl ChunkStreaming {
 
         stats.newly_desired = desired_sorted
             .iter()
-            .filter(|coord| !self.resident.contains(coord) && !self.generating.contains(coord))
+            .filter(|coord| {
+                !self.resident.contains(coord)
+                    && !self.generating.contains(coord)
+                    && !self.scheduled.contains(coord)
+            })
             .count();
 
         let mut resident_sorted: Vec<ChunkCoord> = self.resident.iter().copied().collect();
@@ -317,6 +326,16 @@ impl ChunkStreaming {
         out
     }
 
+    pub fn next_generation_job(&mut self) -> Option<ChunkCoord> {
+        self.pending_generate.pop_front()
+    }
+
+    pub fn mark_dispatched(&mut self, coord: ChunkCoord) {
+        if self.scheduled.remove(&coord) {
+            self.generating.insert(coord);
+        }
+    }
+
     pub fn drain_evict_requests(&mut self, limit: usize) -> Vec<ChunkCoord> {
         let take = limit.min(self.pending_evict.len());
         let mut out = Vec::with_capacity(take);
@@ -339,6 +358,7 @@ impl ChunkStreaming {
 
     pub fn mark_generated(&mut self, coord: ChunkCoord, frame_index: u64) {
         self.generating.remove(&coord);
+        self.scheduled.remove(&coord);
         self.resident.insert(coord);
         self.chunk_lifecycle
             .entry(coord)
@@ -348,10 +368,17 @@ impl ChunkStreaming {
 
     pub fn mark_generation_dropped(&mut self, coord: ChunkCoord) {
         self.generating.remove(&coord);
+        self.scheduled.remove(&coord);
+    }
+
+    pub fn mark_canceled(&mut self, coord: ChunkCoord) {
+        self.generating.remove(&coord);
+        self.scheduled.remove(&coord);
     }
 
     pub fn mark_evicted(&mut self, coord: ChunkCoord, frame_index: u64) {
         self.generating.remove(&coord);
+        self.scheduled.remove(&coord);
         self.resident.remove(&coord);
         self.evict_not_desired_since.remove(&coord);
         self.queued_evict_set.remove(&coord);
@@ -367,6 +394,7 @@ impl ChunkStreaming {
 
     pub fn clear(&mut self) {
         self.resident.clear();
+        self.scheduled.clear();
         self.generating.clear();
         self.pending_generate.clear();
         self.pending_evict.clear();
@@ -447,7 +475,7 @@ mod tests {
         let stats = streaming.update(&desired_sorted, &resident_keep, near_1, 100);
 
         assert_eq!(stats.queued_generate, 1);
-        assert!(streaming.generating.contains(&far));
+        assert!(streaming.scheduled.contains(&far));
         assert_eq!(streaming.drain_generate_requests(8), vec![far]);
     }
 }

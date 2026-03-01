@@ -79,6 +79,11 @@ impl InputState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CollisionStepStats {
+    pub axis_reverts: usize,
+}
+
 #[derive(Clone)]
 pub struct FpsController {
     pub position: Vec3,
@@ -142,6 +147,7 @@ impl FpsController {
 
         (min_coord, max_coord)
     }
+
     pub fn look_dir(&self) -> Vec3 {
         Vec3::new(
             self.yaw.cos() * self.pitch.cos(),
@@ -155,21 +161,12 @@ impl FpsController {
     where
         F: FnMut(i32, i32, i32) -> u16,
     {
-        // Convert local player position -> world space for collision queries
         let pos = pos_local + Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
-
         let (min, max) = Self::collision_sample_bounds_world(pos);
 
-        let min_x = min.x;
-        let min_y = min.y;
-        let min_z = min.z;
-        let max_x = max.x;
-        let max_y = max.y;
-        let max_z = max.z;
-
-        for z in min_z..=max_z {
-            for y in min_y..=max_y {
-                for x in min_x..=max_x {
+        for z in min.z..=max.z {
+            for y in min.y..=max.y {
+                for x in min.x..=max.x {
                     let id = get_voxel(x, y, z);
                     if id == 0 {
                         continue;
@@ -190,6 +187,7 @@ impl FpsController {
         origin: VoxelCoord,
         axis_delta: Vec3,
         allow_step: bool,
+        stats: &mut CollisionStepStats,
     ) where
         F: FnMut(i32, i32, i32) -> u16,
     {
@@ -210,8 +208,11 @@ impl FpsController {
                 && !Self::collides(get_voxel, origin, stair_candidate)
             {
                 self.position = stair_candidate;
+                return;
             }
         }
+
+        stats.axis_reverts = stats.axis_reverts.saturating_add(1);
     }
 
     pub fn step<F>(
@@ -222,10 +223,11 @@ impl FpsController {
         active: bool,
         now_s: f32,
         origin: VoxelCoord,
-    ) where
+    ) -> CollisionStepStats
+    where
         F: FnMut(i32, i32, i32) -> u16,
     {
-        // Only apply mouse-look + movement when gameplay owns input
+        let mut collision_stats = CollisionStepStats::default();
         if active {
             self.yaw += input.mouse_delta.x * self.sensitivity;
             self.pitch -= input.mouse_delta.y * self.sensitivity;
@@ -271,18 +273,21 @@ impl FpsController {
                 origin,
                 Vec3::new(fly_delta.x, 0.0, 0.0),
                 false,
+                &mut collision_stats,
             );
             self.try_move_axis(
                 &mut get_voxel,
                 origin,
                 Vec3::new(0.0, 0.0, fly_delta.z),
                 false,
+                &mut collision_stats,
             );
             self.try_move_axis(
                 &mut get_voxel,
                 origin,
                 Vec3::new(0.0, fly_delta.y, 0.0),
                 false,
+                &mut collision_stats,
             );
         } else {
             let horizontal = move_dir * self.move_speed * dt;
@@ -291,12 +296,14 @@ impl FpsController {
                 origin,
                 Vec3::new(horizontal.x, 0.0, 0.0),
                 true,
+                &mut collision_stats,
             );
             self.try_move_axis(
                 &mut get_voxel,
                 origin,
                 Vec3::new(0.0, 0.0, horizontal.z),
                 true,
+                &mut collision_stats,
             );
 
             let on_ground = Self::collides(
@@ -317,10 +324,10 @@ impl FpsController {
                 self.position = vertical_candidate;
             } else {
                 self.vel_y = 0.0;
+                collision_stats.axis_reverts = collision_stats.axis_reverts.saturating_add(1);
             }
         }
 
-        // Double-tap space toggles flying (only if active so UI doesn’t toggle it)
         if active && input.just_pressed.contains(&KeyCode::Space) {
             if (now_s - self.last_space_t) < self.double_jump_threshold {
                 self.flying = !self.flying;
@@ -330,5 +337,7 @@ impl FpsController {
                 self.last_space_t = now_s;
             }
         }
+
+        collision_stats
     }
 }
