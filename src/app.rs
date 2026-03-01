@@ -8,7 +8,7 @@ use crate::renderer::{
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::{step_region_profiled, Rng};
-use crate::streaming::{ChunkStreaming, DesiredChunks};
+use crate::streaming::{is_urgent_chunk, ChunkStreaming, DesiredChunks};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
@@ -831,8 +831,18 @@ pub async fn run() -> anyhow::Result<()> {
                                 COLLISION_SAFETY_RADIUS_VOXELS,
                             );
                             let mut forced_local_requests = 0usize;
-                            for coord in missing_coords
+                            let mut urgent_missing = Vec::new();
+                            let mut non_urgent_missing = Vec::new();
+                            for coord in missing_coords {
+                                if is_urgent_chunk(player_chunk_for_collision, coord) {
+                                    urgent_missing.push(coord);
+                                } else {
+                                    non_urgent_missing.push(coord);
+                                }
+                            }
+                            for coord in urgent_missing
                                 .into_iter()
+                                .chain(non_urgent_missing.into_iter())
                                 .take(COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET)
                             {
                                 if streaming.resident.contains(&coord)
@@ -1043,8 +1053,6 @@ pub async fn run() -> anyhow::Result<()> {
                         };
 
                         let mut gen_request_count = 0usize;
-                        let urgent_vertical = 1;
-                        let urgent_radius = 1;
                         let mut dispatch_urgent = Vec::new();
                         let mut dispatch_near = Vec::new();
                         let mut dispatch_far = Vec::new();
@@ -1056,9 +1064,7 @@ pub async fn run() -> anyhow::Result<()> {
                             {
                                 continue;
                             }
-                            if chebyshev_from_player(player_chunk, coord) <= urgent_radius
-                                && (coord.y - player_chunk.y).abs() <= urgent_vertical
-                            {
+                            if is_urgent_chunk(player_chunk, coord) {
                                 dispatch_urgent.push(coord);
                             } else if cached_desired.near.contains(&coord) {
                                 dispatch_near.push(coord);

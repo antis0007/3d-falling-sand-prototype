@@ -4,6 +4,18 @@ use glam::Vec3;
 
 use crate::types::ChunkCoord;
 
+pub const URGENT_CHUNK_CHEBYSHEV_RADIUS: i32 = 1;
+pub const URGENT_CHUNK_VERTICAL_RADIUS: i32 = 1;
+
+pub fn is_urgent_chunk(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
+    let chebyshev = (coord.x - player_chunk.x)
+        .abs()
+        .max((coord.y - player_chunk.y).abs())
+        .max((coord.z - player_chunk.z).abs());
+    chebyshev <= URGENT_CHUNK_CHEBYSHEV_RADIUS
+        && (coord.y - player_chunk.y).abs() <= URGENT_CHUNK_VERTICAL_RADIUS
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residency {
     Unloaded,
@@ -273,7 +285,8 @@ impl ChunkStreaming {
             {
                 continue;
             }
-            if lifecycle.last_evicted_frame > 0
+            if !is_urgent_chunk(player_chunk, coord)
+                && lifecycle.last_evicted_frame > 0
                 && frame_index.saturating_sub(lifecycle.last_evicted_frame)
                     < self.regen_cooldown_frames
             {
@@ -510,8 +523,8 @@ mod tests {
 
     use crate::types::ChunkCoord;
 
-    use super::ChunkStreaming;
     use super::Residency;
+    use super::{is_urgent_chunk, ChunkStreaming};
 
     #[test]
     fn scheduling_budget_limits_queued_chunks_not_scan_count() {
@@ -606,16 +619,37 @@ mod tests {
         streaming.max_generate_schedule_per_update = 4;
         streaming.regen_cooldown_frames = 10;
 
-        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        let player_chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let c = ChunkCoord { x: 4, y: 0, z: 0 };
+        assert!(!is_urgent_chunk(player_chunk, c));
         streaming.mark_evicted(c, 5);
 
         let desired = vec![c];
         let keep = HashSet::from([c]);
-        let blocked = streaming.update(&desired, &keep, c, 10);
+        let blocked = streaming.update(&desired, &keep, player_chunk, 10);
         assert_eq!(blocked.queued_generate, 0);
 
-        let allowed = streaming.update(&desired, &keep, c, 15);
+        let allowed = streaming.update(&desired, &keep, player_chunk, 15);
         assert_eq!(allowed.queued_generate, 1);
+    }
+
+    #[test]
+    fn regen_cooldown_allows_recently_evicted_urgent_chunk() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 4;
+        streaming.regen_cooldown_frames = 10;
+
+        let player_chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let urgent = ChunkCoord { x: 1, y: 0, z: 1 };
+        assert!(is_urgent_chunk(player_chunk, urgent));
+        streaming.mark_evicted(urgent, 5);
+
+        let desired = vec![urgent];
+        let keep = HashSet::from([urgent]);
+        let stats = streaming.update(&desired, &keep, player_chunk, 10);
+
+        assert_eq!(stats.queued_generate, 1);
+        assert!(streaming.scheduled_generate.contains(&urgent));
     }
 
     #[test]
