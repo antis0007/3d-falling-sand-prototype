@@ -4,7 +4,7 @@ use crate::types::{ChunkCoord, VoxelCoord};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -90,8 +90,17 @@ pub struct Renderer {
 
     // IMPORTANT: Persistent queue so we don't O(N) re-mark remaining dirty chunks every frame.
     pending_dirty: VecDeque<ChunkCoord>,
+    pending_dirty_set: HashSet<ChunkCoord>,
 
     pub day: bool,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct MeshRebuildStats {
+    pub max_ms: f32,
+    pub total_ms: f32,
+    pub mesh_count: usize,
+    pub dirty_backlog: usize,
 }
 
 impl Renderer {
@@ -216,6 +225,7 @@ impl Renderer {
             depth_view,
             store_meshes: HashMap::new(),
             pending_dirty: VecDeque::new(),
+            pending_dirty_set: HashSet::new(),
             day: true,
         })
     }
@@ -237,35 +247,48 @@ impl Renderer {
         store: &mut ChunkStore,
         origin_voxel: VoxelCoord,
         budget: usize,
-    ) -> f32 {
-        let dirty = store.take_dirty_chunks();
-        let mut iter = dirty.into_iter();
+    ) -> MeshRebuildStats {
+        for coord in store.take_dirty_chunks() {
+            if self.pending_dirty_set.insert(coord) {
+                self.pending_dirty.push_back(coord);
+            }
+        }
 
-        let mut max_ms = 0.0f32;
+        let mut stats = MeshRebuildStats::default();
+        for _ in 0..budget {
+            let Some(coord) = self.pending_dirty.pop_front() else {
+                break;
+            };
+            self.pending_dirty_set.remove(&coord);
 
-        for coord in iter.by_ref().take(budget) {
             let t0 = std::time::Instant::now();
             let (verts, inds, aabb_min, aabb_max) = mesh_store_chunk(store, coord, origin_voxel);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
-            if ms > max_ms {
-                max_ms = ms;
+            if ms > stats.max_ms {
+                stats.max_ms = ms;
             }
+            stats.total_ms += ms;
+            stats.mesh_count += 1;
 
             if inds.is_empty() {
                 self.store_meshes.remove(&coord);
                 continue;
             }
 
-            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("store chunk vb"),
-                contents: bytemuck::cast_slice(&verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("store chunk ib"),
-                contents: bytemuck::cast_slice(&inds),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+            let vb = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk ib"),
+                    contents: bytemuck::cast_slice(&inds),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
 
             self.store_meshes.insert(
                 coord,
@@ -278,16 +301,13 @@ impl Renderer {
                 },
             );
         }
-
-        for coord in iter {
-            store.mark_dirty(coord);
-        }
-
-        max_ms
+        stats.dirty_backlog = self.pending_dirty.len();
+        stats
     }
     pub fn clear_mesh_cache(&mut self) {
         self.store_meshes.clear();
         self.pending_dirty.clear();
+        self.pending_dirty_set.clear();
     }
     pub fn mesh_draw_stats(&self, vp: glam::Mat4) -> (usize, u64) {
         let mut chunks = 0usize;

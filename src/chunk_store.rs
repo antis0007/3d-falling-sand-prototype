@@ -80,22 +80,46 @@ impl ChunkStore {
 
         let last = (CHUNK_SIZE_VOXELS - 1) as usize;
         if x == 0 {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x - 1, y: chunk_coord.y, z: chunk_coord.z });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x - 1,
+                y: chunk_coord.y,
+                z: chunk_coord.z,
+            });
         }
         if x == last {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x + 1, y: chunk_coord.y, z: chunk_coord.z });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x + 1,
+                y: chunk_coord.y,
+                z: chunk_coord.z,
+            });
         }
         if y == 0 {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y - 1, z: chunk_coord.z });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x,
+                y: chunk_coord.y - 1,
+                z: chunk_coord.z,
+            });
         }
         if y == last {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y + 1, z: chunk_coord.z });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x,
+                y: chunk_coord.y + 1,
+                z: chunk_coord.z,
+            });
         }
         if z == 0 {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y, z: chunk_coord.z - 1 });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x,
+                y: chunk_coord.y,
+                z: chunk_coord.z - 1,
+            });
         }
         if z == last {
-            self.mark_neighbor_dirty(ChunkCoord { x: chunk_coord.x, y: chunk_coord.y, z: chunk_coord.z + 1 });
+            self.mark_neighbor_dirty(ChunkCoord {
+                x: chunk_coord.x,
+                y: chunk_coord.y,
+                z: chunk_coord.z + 1,
+            });
         }
     }
 
@@ -150,6 +174,10 @@ impl ChunkStore {
 
     pub fn iter_loaded_chunks(&self) -> impl Iterator<Item = &ChunkCoord> {
         self.chunks.keys()
+    }
+
+    pub fn dirty_count(&self) -> usize {
+        self.dirty_chunks.len()
     }
 
     fn mark_neighbor_dirty(&mut self, coord: ChunkCoord) {
