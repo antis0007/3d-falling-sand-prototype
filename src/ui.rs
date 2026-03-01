@@ -157,6 +157,19 @@ pub struct UiState {
     log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
+    biome_hint_state: BiomeHintState,
+    ui_frame_counter: u64,
+    biome_hint_last_update_frame: u64,
+}
+
+#[derive(Clone)]
+enum BiomeHintState {
+    UnknownChunkNotLoaded,
+    Known {
+        biome_name: String,
+        world_x: i32,
+        world_z: i32,
+    },
 }
 
 impl UiState {
@@ -169,6 +182,7 @@ impl UiState {
     pub const SIM_ACC_CAP_FRAMES_MAX: f32 = 6.0;
     pub const SIM_ADAPTIVE_THRESHOLD_MIN: f32 = 1.0;
     pub const SIM_ADAPTIVE_THRESHOLD_MAX: f32 = 2.5;
+    const BIOME_HINT_STALE_AFTER_FRAMES: u64 = 30;
 
     pub fn clamp_quantize_sim_speed(value: f32) -> f32 {
         let steps = (value / Self::SIM_SPEED_STEP).round();
@@ -234,6 +248,48 @@ impl UiState {
         self.chunks_drawn = chunks_drawn;
         self.total_indices = total_indices;
     }
+
+    pub fn set_biome_hint(&mut self, biome_name: &str, world_x: i32, world_z: i32) {
+        self.biome_hint_state = BiomeHintState::Known {
+            biome_name: biome_name.to_string(),
+            world_x,
+            world_z,
+        };
+        self.biome_hint_last_update_frame = self.ui_frame_counter;
+        self.sync_biome_hint_display();
+    }
+
+    pub fn clear_biome_hint_stale(&mut self) {
+        self.biome_hint_state = BiomeHintState::UnknownChunkNotLoaded;
+        self.biome_hint_last_update_frame = self.ui_frame_counter;
+        self.sync_biome_hint_display();
+    }
+
+    fn tick_ui_frame(&mut self) {
+        self.ui_frame_counter = self.ui_frame_counter.saturating_add(1);
+        if self
+            .ui_frame_counter
+            .saturating_sub(self.biome_hint_last_update_frame)
+            > Self::BIOME_HINT_STALE_AFTER_FRAMES
+        {
+            self.clear_biome_hint_stale();
+        } else {
+            self.sync_biome_hint_display();
+        }
+    }
+
+    fn sync_biome_hint_display(&mut self) {
+        self.biome_hint = match &self.biome_hint_state {
+            BiomeHintState::UnknownChunkNotLoaded => {
+                "Biome: Unknown (chunk not loaded)".to_string()
+            }
+            BiomeHintState::Known {
+                biome_name,
+                world_x,
+                world_z,
+            } => format!("Biome: {biome_name} @ ({world_x}, {world_z})"),
+        };
+    }
 }
 
 impl Default for UiState {
@@ -259,7 +315,7 @@ impl Default for UiState {
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
-            biome_hint: "Biome: n/a".to_string(),
+            biome_hint: "Biome: Unknown (chunk not loaded)".to_string(),
             stream_debug: "Stream: n/a".to_string(),
 
             show_debug: false,
@@ -279,6 +335,9 @@ impl Default for UiState {
             log_last_seconds: HashMap::new(),
             drag_source: None,
             drag_target_slot: None,
+            biome_hint_state: BiomeHintState::UnknownChunkNotLoaded,
+            ui_frame_counter: 0,
+            biome_hint_last_update_frame: 0,
         }
     }
 }
@@ -301,6 +360,7 @@ pub fn draw(
     tool_textures: &ToolTextures,
 ) -> UiActions {
     let mut actions = UiActions::default();
+    ui_state.tick_ui_frame();
     let opaque_panel = egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 26));
 
     egui::TopBottomPanel::top("top")
@@ -1633,4 +1693,36 @@ fn fallback_tool_texture(color: [u8; 4]) -> egui::ColorImage {
         }
     }
     egui::ColorImage { size, pixels }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiState;
+
+    #[test]
+    fn biome_hint_transitions_default_known_then_stale() {
+        let mut ui = UiState::default();
+        assert_eq!(ui.biome_hint, "Biome: Unknown (chunk not loaded)");
+
+        ui.set_biome_hint("Desert", 12, -7);
+        assert_eq!(ui.biome_hint, "Biome: Desert @ (12, -7)");
+
+        for _ in 0..=UiState::BIOME_HINT_STALE_AFTER_FRAMES {
+            ui.tick_ui_frame();
+        }
+        assert_eq!(ui.biome_hint, "Biome: Unknown (chunk not loaded)");
+    }
+
+    #[test]
+    fn clear_biome_hint_stale_is_deterministic() {
+        let mut ui = UiState::default();
+        ui.set_biome_hint("Forest", 0, 0);
+        assert_eq!(ui.biome_hint, "Biome: Forest @ (0, 0)");
+
+        ui.clear_biome_hint_stale();
+        assert_eq!(ui.biome_hint, "Biome: Unknown (chunk not loaded)");
+
+        ui.set_biome_hint("Tundra", -32, 64);
+        assert_eq!(ui.biome_hint, "Biome: Tundra @ (-32, 64)");
+    }
 }
