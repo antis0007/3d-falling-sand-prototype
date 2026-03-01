@@ -803,10 +803,12 @@ pub async fn run() -> anyhow::Result<()> {
                         origin_voxel = origin_update.origin_translation;
                         ctrl.position = origin_update.player_local_position;
                         renderer.set_origin_voxel(origin_voxel);
-                        if origin_update.recentered {
-                            // Avoid global remesh storms on recenter.
-                            renderer.clear_mesh_cache();
-                        }
+                        // Keep resident meshes across recenter events.
+                        //
+                        // Chunk meshes are authored in world-space voxel coordinates, and the
+                        // renderer applies origin_voxel as a render-space offset. Clearing the
+                        // cache here drops all mesh rebuild/version state without re-dirtying
+                        // already-resident chunks, which can leave the nearby world invisible.
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
                         let player_local_for_collision = ctrl.position;
