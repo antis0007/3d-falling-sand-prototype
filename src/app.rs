@@ -63,11 +63,11 @@ struct StreamingTuning {
 impl Default for StreamingTuning {
     fn default() -> Self {
         Self {
-            guaranteed_radius_xz: 3,
-            render_radius_xz: 6,
-            prefetch_radius_xz: 9,
+            guaranteed_radius_xz: 6,
+            render_radius_xz: 12,
+            prefetch_radius_xz: 16,
             prefetch_enabled: true,
-            vertical_radius: 2,
+            vertical_radius: 4,
             base_apply_budget_items: 8,
             max_apply_budget_items: 48,
             base_generate_drain_items: 24,

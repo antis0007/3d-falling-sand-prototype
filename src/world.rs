@@ -7,7 +7,7 @@ use std::path::Path;
 
 pub type MaterialId = u16;
 pub const EMPTY: MaterialId = 0;
-pub const CHUNK_SIZE: usize = 16;
+pub const CHUNK_SIZE: usize = 32;
 const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

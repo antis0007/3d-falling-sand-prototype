@@ -35,17 +35,18 @@ fn hash3(seed: u64, x: i32, y: i32, z: i32) -> u64 {
 }
 
 pub fn generate_chunk(seed: u64, c: ChunkCoord) -> Chunk {
-    let chunk_origin = [
-        c.x * CHUNK_SIZE as i32,
-        c.y * CHUNK_SIZE as i32,
-        c.z * CHUNK_SIZE as i32,
+    let chunk_size = CHUNK_SIZE as i32;
+    let padded_size = CHUNK_SIZE * 3;
+    let padded_origin = [
+        c.x * chunk_size - chunk_size,
+        c.y * chunk_size - chunk_size,
+        c.z * chunk_size - chunk_size,
     ];
-    let config = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin(chunk_origin);
-    generate_world(config)
-        .chunks
-        .into_iter()
-        .next()
-        .unwrap_or_else(Chunk::new)
+
+    let config = ProcGenConfig::for_size(padded_size, seed).with_origin(padded_origin);
+    let world = generate_world(config);
+    let center = world.chunk_index(1, 1, 1);
+    world.chunks.get(center).cloned().unwrap_or_else(Chunk::new)
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
