@@ -185,13 +185,13 @@ impl ChunkSnapshot {
 }
 
 #[derive(Clone)]
-struct MeshJob {
-    coord: ChunkCoord,
-    lod: ChunkLod,
-    version: u64,
-    origin_voxel: VoxelCoord,
-    queued_at: Instant,
-    snapshot: ChunkSnapshot,
+pub(crate) struct MeshJob {
+    pub(crate) coord: ChunkCoord,
+    pub(crate) lod: ChunkLod,
+    pub(crate) version: u64,
+    pub(crate) origin_voxel: VoxelCoord,
+    pub(crate) queued_at: Instant,
+    pub(crate) snapshot: ChunkSnapshot,
 }
 
 struct MeshResult {
@@ -243,7 +243,7 @@ impl BackgroundMeshQueue {
                     let snapshot =
                         rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
                     let (verts, inds, aabb_min, aabb_max) =
-                        mesh_chunk_snapshot(job.coord, job.origin_voxel, &job.snapshot, job.lod);
+                        mesh_chunk_snapshot(job.coord, job.origin_voxel, &snapshot, job.lod);
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
@@ -426,7 +426,7 @@ impl Renderer {
             pending_dirty_set: HashSet::new(),
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
-            mesh_queue: BackgroundMeshQueue::new(2, 256),
+            mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
             day: true,
             mesh_backend,
@@ -488,46 +488,6 @@ impl Renderer {
                     queued_at: Instant::now(),
                     snapshot: snapshot.clone(),
                 });
-            stats.mesh_count += 1;
-
-            if inds.is_empty() {
-                self.store_meshes.remove(&coord);
-                store.mark_chunk_meshed(coord);
-                continue;
-            }
-
-            let vb = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("store chunk vb"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ib = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("store chunk ib"),
-                    contents: bytemuck::cast_slice(&inds),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-
-            self.store_meshes.insert(
-                coord,
-                ChunkMesh {
-                    vb,
-                    ib,
-                    index_count: inds.len() as u32,
-                    aabb_min,
-                    aabb_max,
-                },
-            );
-            store.mark_chunk_meshed(coord);
-            let job = MeshJob {
-                coord,
-                version,
-                origin_voxel,
-                queued_at: Instant::now(),
-                snapshot,
             };
             push_job(ChunkLod::Near, &mut near_jobs);
             push_job(ChunkLod::Mid, &mut mid_jobs);

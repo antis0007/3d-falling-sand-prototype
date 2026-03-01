@@ -29,6 +29,7 @@ const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
 const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
 const MESH_UPLOAD_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
+const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 
 const GENERATOR_THREADS: usize = 3;
 const GENERATOR_QUEUE_BOUND: usize = 192;
@@ -226,7 +227,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
     let mut last_player_chunk: Option<ChunkCoord> = None;
-    let mut cached_sim_region: HashSet<ChunkCoord> = HashSet::new();
+    let mut cached_sim_region: HashSet<ChunkCoord> =
+        chunk_cube(ChunkCoord { x: 0, y: 0, z: 0 }, SIMULATION_RADIUS_CHUNKS);
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
         ChunkCoord { x: 0, y: 0, z: 0 },
         stream_tuning.near_radius_xz,
@@ -527,7 +529,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 Some(stream_tuning.far_radius_xz),
                                 stream_tuning.vertical_radius,
                             );
-                            cached_sim_region = chunk_cube(player_chunk, stream_tuning.near_radius_xz);
+                            cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = stream_tuning.clone();
                         }
