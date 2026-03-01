@@ -1,4 +1,8 @@
 use crate::chunk_store::ChunkStore;
+use crate::gpu_compute::{
+    cpu_generate_material_field, rebuilt_snapshot_from_materials, GpuComputeRuntime,
+    MeshPipelineBackend,
+};
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
@@ -133,6 +137,7 @@ pub struct Renderer {
     completed_meshes: Vec<MeshResult>,
 
     pub day: bool,
+    pub mesh_backend: MeshPipelineBackend,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -153,10 +158,10 @@ pub struct MeshRebuildStats {
 }
 
 #[derive(Clone)]
-struct ChunkSnapshot {
-    world_min: VoxelCoord,
-    dim: i32,
-    voxels: Vec<MaterialId>,
+pub(crate) struct ChunkSnapshot {
+    pub(crate) world_min: VoxelCoord,
+    pub(crate) dim: i32,
+    pub(crate) voxels: Vec<MaterialId>,
 }
 
 impl ChunkSnapshot {
@@ -207,7 +212,7 @@ struct BackgroundMeshQueue {
 }
 
 impl BackgroundMeshQueue {
-    fn new(worker_count: usize, queue_bound: usize) -> Self {
+    fn new(worker_count: usize, queue_bound: usize, mesh_backend: MeshPipelineBackend) -> Self {
         let (tx, job_rx) = sync_channel::<MeshJob>(queue_bound);
         let (result_tx, rx) = sync_channel::<MeshResult>(queue_bound);
         let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
@@ -225,6 +230,18 @@ impl BackgroundMeshQueue {
                     let Ok(job) = job else {
                         break;
                     };
+
+                    let material_output = match mesh_backend {
+                        MeshPipelineBackend::Cpu => cpu_generate_material_field(&job),
+                        #[cfg(feature = "gpu-compute")]
+                        MeshPipelineBackend::Gpu => {
+                            crate::gpu_compute::run_chunk_job_on_worker(&job)
+                                .unwrap_or_else(|_| cpu_generate_material_field(&job))
+                        }
+                    };
+
+                    let snapshot =
+                        rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
                     let (verts, inds, aabb_min, aabb_max) =
                         mesh_chunk_snapshot(job.coord, job.origin_voxel, &job.snapshot, job.lod);
                     if worker_tx
@@ -290,6 +307,18 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await?;
 
+        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter) {
+            #[cfg(feature = "gpu-compute")]
+            {
+                MeshPipelineBackend::Gpu
+            }
+            #[cfg(not(feature = "gpu-compute"))]
+            {
+                MeshPipelineBackend::Cpu
+            }
+        } else {
+            MeshPipelineBackend::Cpu
+        };
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
 
@@ -400,6 +429,7 @@ impl Renderer {
             mesh_queue: BackgroundMeshQueue::new(2, 256),
             completed_meshes: Vec::new(),
             day: true,
+            mesh_backend,
         })
     }
 

@@ -2,6 +2,7 @@ mod app;
 mod chunk_store;
 mod edits;
 mod floating_origin;
+mod gpu_compute;
 mod input;
 mod meshing;
 mod player;
