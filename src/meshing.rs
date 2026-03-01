@@ -102,6 +102,10 @@ pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoor
                     continue;
                 }
 
+                if voxel_touches_unknown_neighbor(&mesh_input, lx_u, ly_u, lz_u) {
+                    continue;
+                }
+
                 if matches!(id, BUSH_ID | GRASS_ID) {
                     add_crossed_billboard(
                         &mesh_input,
@@ -147,6 +151,21 @@ pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoor
         min,
         max,
     }
+}
+
+fn voxel_touches_unknown_neighbor(
+    mesh_input: &ChunkMeshingInput<'_>,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> bool {
+    let last = CHUNK_SIDE - 1;
+    (x == 0 && (mesh_input.known_neighbor_mask & (1 << 0)) == 0)
+        || (x == last && (mesh_input.known_neighbor_mask & (1 << 1)) == 0)
+        || (y == 0 && (mesh_input.known_neighbor_mask & (1 << 2)) == 0)
+        || (y == last && (mesh_input.known_neighbor_mask & (1 << 3)) == 0)
+        || (z == 0 && (mesh_input.known_neighbor_mask & (1 << 4)) == 0)
+        || (z == last && (mesh_input.known_neighbor_mask & (1 << 5)) == 0)
 }
 
 fn add_voxel_faces(
@@ -852,6 +871,17 @@ mod tests {
         );
         let with_known_empty = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
         assert!(!with_known_empty.opaque_verts.is_empty());
+    }
+
+    #[test]
+    fn unknown_neighbor_only_culls_voxels_touching_unknown_boundary() {
+        let mut store = ChunkStore::new();
+        let mut chunk = Chunk::new_empty();
+        chunk.set(CHUNK_SIDE / 2, CHUNK_SIDE / 2, CHUNK_SIDE / 2, 1);
+        store.insert_chunk_with_policy(coord(), chunk, false, NeighborDirtyPolicy::None);
+
+        let mesh = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
+        assert!(!mesh.opaque_verts.is_empty());
     }
 
     #[test]

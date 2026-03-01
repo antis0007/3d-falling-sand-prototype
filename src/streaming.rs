@@ -273,7 +273,9 @@ impl ChunkStreaming {
             {
                 continue;
             }
-            if frame_index.saturating_sub(lifecycle.last_evicted_frame) < self.regen_cooldown_frames
+            if lifecycle.last_evicted_frame > 0
+                && frame_index.saturating_sub(lifecycle.last_evicted_frame)
+                    < self.regen_cooldown_frames
             {
                 continue;
             }
@@ -581,6 +583,39 @@ mod tests {
 
         assert_eq!(stats.newly_desired, 2);
         assert_eq!(stats.queued_generate, 1);
+    }
+
+    #[test]
+    fn regen_cooldown_does_not_block_never_evicted_chunks() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 4;
+        streaming.regen_cooldown_frames = 120;
+
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        let desired = vec![c];
+        let keep = HashSet::from([c]);
+        let stats = streaming.update(&desired, &keep, c, 1);
+
+        assert_eq!(stats.queued_generate, 1);
+        assert!(streaming.scheduled_generate.contains(&c));
+    }
+
+    #[test]
+    fn regen_cooldown_blocks_recently_evicted_chunk() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 4;
+        streaming.regen_cooldown_frames = 10;
+
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        streaming.mark_evicted(c, 5);
+
+        let desired = vec![c];
+        let keep = HashSet::from([c]);
+        let blocked = streaming.update(&desired, &keep, c, 10);
+        assert_eq!(blocked.queued_generate, 0);
+
+        let allowed = streaming.update(&desired, &keep, c, 15);
+        assert_eq!(allowed.queued_generate, 1);
     }
 
     #[test]
