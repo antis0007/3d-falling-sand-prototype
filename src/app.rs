@@ -189,7 +189,7 @@ struct RaycastResult {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let mut sim_running = true;
+    let mut sim_running = false;
     let mut step_once = false;
 
     let event_loop = EventLoop::new()?;
@@ -312,7 +312,11 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
-                            if key == KeyCode::Escape && event.state == ElementState::Pressed {
+                            let egui_has_keyboard_focus = egui_ctx.wants_keyboard_input();
+                            let toggle_pause_key = matches!(key, KeyCode::Escape | KeyCode::KeyP);
+                            let toggle_pause_pressed = event.state == ElementState::Pressed
+                                && (!event.repeat || key == KeyCode::Escape);
+                            if toggle_pause_key && toggle_pause_pressed && !egui_has_keyboard_focus {
                                 ui.paused_menu = !ui.paused_menu;
                                 apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
                             }
@@ -322,7 +326,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 let hotbar_slot = key_to_hotbar_slot(key);
 
                                 match key {
-                                    KeyCode::Escape => {}
+                                    KeyCode::Escape | KeyCode::KeyP => {}
                                     _ if ui.paused_menu => {}
                                     KeyCode::KeyB => {
                                         ui.show_brush = !ui.show_brush;
