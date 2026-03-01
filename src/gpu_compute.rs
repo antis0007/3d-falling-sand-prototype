@@ -9,6 +9,9 @@ use std::sync::Mutex;
 #[cfg(feature = "gpu-compute")]
 use wgpu::util::DeviceExt;
 
+#[cfg(feature = "gpu-compute")]
+const GPU_PAGE_CAPACITY: u32 = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
     Cpu,
@@ -224,7 +227,8 @@ impl GpuComputeRuntime {
         &self,
         state: &WorkerGpuState,
         job: &MeshJob,
-    ) -> anyhow::Result<ComputedChunkArtifacts> {
+        page_index: u32,
+    ) -> anyhow::Result<DrawIndirectArgs> {
         #[cfg(not(feature = "gpu-compute"))]
         {
             let _ = (device, queue, job);
@@ -233,110 +237,112 @@ impl GpuComputeRuntime {
 
         #[cfg(feature = "gpu-compute")]
         {
-            let volume = job.snapshot.center_voxels.len();
-            let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpu input voxels"),
-                contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
-                usage: wgpu::BufferUsages::STORAGE,
+            let input = state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("gpu input voxels"),
+                    contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let page_params = device_page_params(job, page_index);
+            let page_params_buf =
+                state
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("gpu page params"),
+                        contents: bytemuck::cast_slice(&page_params),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            state
+                .queue
+                .write_buffer(&state.frontier, 0, bytemuck::cast_slice(&[page_index]));
+
+            let simulation_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("simulation bg"),
+                layout: &self.simulation_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: state.atlas_voxels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: state.frontier.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: page_params_buf.as_entire_binding(),
+                    },
+                ],
             });
-        let frontier_buf = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpu active frontier"),
-                contents: bytemuck::cast_slice(&[page_index]),
-                usage: wgpu::BufferUsages::STORAGE,
+
+            let meshing_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("meshing bg"),
+                layout: &self.meshing_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: state.atlas_voxels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: state.frontier.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: state.page_indirect.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: state.diagnostics.as_entire_binding(),
+                    },
+                ],
             });
 
-        let input = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpu input voxels"),
-                contents: bytemuck::cast_slice(&job.snapshot.voxels),
-                usage: wgpu::BufferUsages::STORAGE,
+            let mut encoder = state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_pipeline(&self.simulation_pipeline);
+                pass.set_bind_group(0, &simulation_bg, &[]);
+                let groups = (job.snapshot.center_voxels.len() as u32).div_ceil(64);
+                pass.dispatch_workgroups(groups, 1, 1);
+
+                pass.set_pipeline(&self.meshing_pipeline);
+                pass.set_bind_group(0, &meshing_bg, &[]);
+                pass.dispatch_workgroups(groups, 1, 1);
+            }
+
+            let diag_readback = state.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("diag readback"),
+                size: std::mem::size_of::<DrawIndirectArgs>() as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
             });
+            let page_offset = (page_index as u64) * std::mem::size_of::<DrawIndirectArgs>() as u64;
+            encoder.copy_buffer_to_buffer(
+                &state.page_indirect,
+                page_offset,
+                &diag_readback,
+                0,
+                diag_readback.size(),
+            );
 
-        let simulation_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("simulation bg"),
-            layout: &self.simulation_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: state.atlas_voxels.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: frontier_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: page_params_buf.as_entire_binding(),
-                },
-            ],
-        });
+            let submission = state.queue.submit(Some(encoder.finish()));
+            state
+                .device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
 
-        let meshing_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("meshing bg"),
-            layout: &self.meshing_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: state.atlas_voxels.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: frontier_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: state.page_indirect.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: state.diagnostics.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&self.simulation_pipeline);
-            pass.set_bind_group(0, &simulation_bg, &[]);
-            let groups = (job.snapshot.voxels.len() as u32).div_ceil(64);
-            pass.dispatch_workgroups(groups, 1, 1);
-
-            pass.set_pipeline(&self.meshing_pipeline);
-            pass.set_bind_group(0, &meshing_bg, &[]);
-            pass.dispatch_workgroups(groups, 1, 1);
+            map_readback::<DrawIndirectArgs>(&state.device, &diag_readback)?
+                .into_iter()
+                .next()
+                .context("missing draw indirect args from readback")
         }
-
-        let diag_readback = state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("diag readback"),
-            size: std::mem::size_of::<DrawIndirectArgs>() as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let page_offset = (page_index as u64) * std::mem::size_of::<DrawIndirectArgs>() as u64;
-        encoder.copy_buffer_to_buffer(
-            &state.page_indirect,
-            page_offset,
-            &diag_readback,
-            0,
-            diag_readback.size(),
-        );
-
-        let submission = state.queue.submit(Some(encoder.finish()));
-        state
-            .device
-            .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
-
-        Ok(map_readback::<DrawIndirectArgs>(&state.device, &diag_readback)?[0])
     }
 }
 
@@ -365,7 +371,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
             )?;
             let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
-            let page_capacity = 256u64;
+            let page_capacity = GPU_PAGE_CAPACITY as u64;
             let page_len = (32u64 * 32u64 * 32u64 * 27u64) as u64;
             let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk atlas voxels"),
@@ -405,11 +411,23 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         let mut atlas = state.atlas.lock().expect("atlas lock");
-        let page_index = *atlas.page_for_chunk.entry(job.coord).or_insert_with(|| {
+        let page_index = if let Some(existing) = atlas.page_for_chunk.get(&job.coord).copied() {
+            existing
+        } else {
             let page = atlas.next_page;
+            if page >= GPU_PAGE_CAPACITY {
+                anyhow::bail!(
+                    "gpu page atlas exhausted: capacity={} coord=({},{},{})",
+                    GPU_PAGE_CAPACITY,
+                    job.coord.x,
+                    job.coord.y,
+                    job.coord.z
+                );
+            }
             atlas.next_page = atlas.next_page.saturating_add(1);
+            atlas.page_for_chunk.insert(job.coord, page);
             page
-        });
+        };
         let last_version = atlas
             .version_for_chunk
             .get(&job.coord)
@@ -425,7 +443,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         };
 
         Ok(ComputedChunkArtifacts {
-            generated_materials: job.snapshot.voxels.clone(),
+            generated_materials: job.snapshot.center_voxels.to_vec(),
             mesh_indirect: indirect,
         })
     }
@@ -443,7 +461,7 @@ struct PageParams {
 fn device_page_params(job: &MeshJob, page_index: u32) -> [PageParams; 1] {
     [PageParams {
         page_index,
-        voxel_count: job.snapshot.voxels.len() as u32,
+        voxel_count: job.snapshot.center_voxels.len() as u32,
         _pad0: 0,
         _pad1: 0,
     }]
