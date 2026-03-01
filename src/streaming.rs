@@ -70,7 +70,7 @@ impl ChunkStreaming {
             evict_not_desired_since: HashMap::new(),
             queued_evict_set: HashSet::new(),
             chunk_lifecycle: HashMap::new(),
-            max_generate_schedule_per_update: 24,
+            max_generate_schedule_per_update: 36,
             max_evict_schedule_per_update: 24,
             eviction_linger_frames: 24,
             boundary_eviction_linger_frames: 96,

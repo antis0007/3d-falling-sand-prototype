@@ -283,6 +283,7 @@ pub enum NeighborDirtyPolicy {
 pub struct ChunkStore {
     chunks: HashMap<ChunkCoord, Chunk>,
     dirty_chunks: HashSet<ChunkCoord>,
+    modified_chunks: HashSet<ChunkCoord>,
     unmeshed_chunks: HashSet<ChunkCoord>,
     deferred_dirty_on_load: HashSet<ChunkCoord>,
     deferred_neighbor_dirty_on_mesh: HashSet<ChunkCoord>,
@@ -293,6 +294,7 @@ impl ChunkStore {
         Self {
             chunks: HashMap::new(),
             dirty_chunks: HashSet::new(),
+            modified_chunks: HashSet::new(),
             unmeshed_chunks: HashSet::new(),
             deferred_dirty_on_load: HashSet::new(),
             deferred_neighbor_dirty_on_mesh: HashSet::new(),
@@ -331,6 +333,7 @@ impl ChunkStore {
         }
         chunk.set(x, y, z, material);
         self.dirty_chunks.insert(chunk_coord);
+        self.modified_chunks.insert(chunk_coord);
 
         let last = (CHUNK_SIZE_VOXELS - 1) as usize;
         if x == 0 {
@@ -487,6 +490,7 @@ impl ChunkStore {
         let old_face_mask = self.chunks.get(&coord).map(Chunk::face_non_empty_mask);
         self.chunks.insert(coord, chunk);
         self.unmeshed_chunks.insert(coord);
+        self.modified_chunks.remove(&coord);
 
         if mark_self_dirty || self.deferred_dirty_on_load.remove(&coord) {
             self.dirty_chunks.insert(coord);
@@ -503,19 +507,27 @@ impl ChunkStore {
     }
 
     pub fn remove_chunk(&mut self, coord: ChunkCoord) {
+        let _ = self.remove_chunk_with_data(coord);
+    }
+
+    pub fn remove_chunk_with_data(&mut self, coord: ChunkCoord) -> Option<(Chunk, bool)> {
         if self.chunk_exists(coord) {
             self.mark_existing_neighbors_dirty(coord);
-            self.chunks.remove(&coord);
+            let removed = self.chunks.remove(&coord);
+            let was_modified = self.modified_chunks.remove(&coord);
             self.dirty_chunks.remove(&coord);
             self.unmeshed_chunks.remove(&coord);
             self.deferred_neighbor_dirty_on_mesh.remove(&coord);
             self.mark_existing_neighbors_dirty(coord);
+            return removed.map(|chunk| (chunk, was_modified));
         }
+        None
     }
 
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.dirty_chunks.clear();
+        self.modified_chunks.clear();
         self.unmeshed_chunks.clear();
         self.deferred_dirty_on_load.clear();
         self.deferred_neighbor_dirty_on_mesh.clear();
