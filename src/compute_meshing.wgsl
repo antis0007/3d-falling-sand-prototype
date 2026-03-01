@@ -1,5 +1,8 @@
-struct ChunkParams {
-    world_min: vec4<i32>,
+struct PageParams {
+    page_index: u32,
+    voxel_count: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 struct DrawIndirectArgs {
@@ -10,41 +13,44 @@ struct DrawIndirectArgs {
 };
 
 @group(0) @binding(0) var<storage, read> input_voxels: array<u32>;
-@group(0) @binding(1) var<storage, read_write> material_field: array<u32>;
-@group(0) @binding(2) var<uniform> params: ChunkParams;
+@group(0) @binding(1) var<storage, read_write> atlas_voxels: array<u32>;
+@group(0) @binding(2) var<storage, read> active_frontier: array<u32>;
+@group(0) @binding(3) var<storage, read> page_params: array<PageParams>;
 
 @compute @workgroup_size(64)
-fn density_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn simulation_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= arrayLength(&input_voxels)) {
+    let params = page_params[0u];
+    if (idx >= params.voxel_count || active_frontier[0u] != params.page_index) {
         return;
     }
-    let mat = input_voxels[idx];
-    material_field[idx] = mat;
+
+    let dst = params.page_index * params.voxel_count + idx;
+    atlas_voxels[dst] = input_voxels[idx];
 }
 
-@group(0) @binding(0) var<storage, read> compact_source: array<u32>;
-@group(0) @binding(1) var<storage, read_write> compacted_voxels: array<u32>;
-@group(0) @binding(2) var<storage, read_write> indirect_args: DrawIndirectArgs;
+@group(0) @binding(0) var<storage, read> meshing_atlas: array<u32>;
+@group(0) @binding(1) var<storage, read> meshing_frontier: array<u32>;
+@group(0) @binding(2) var<storage, read_write> page_indirect: array<DrawIndirectArgs>;
+@group(0) @binding(3) var<storage, read_write> diagnostics: array<u32>;
 
 @compute @workgroup_size(64)
-fn compact_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    if (idx >= arrayLength(&compact_source)) {
-        return;
-    }
+    let page = meshing_frontier[0u];
     if (idx == 0u) {
-        atomicStore(&indirect_args.vertex_count, 0u);
-        indirect_args.instance_count = 1u;
-        indirect_args.first_vertex = 0u;
-        indirect_args.first_instance = 0u;
+        atomicStore(&page_indirect[page].vertex_count, 0u);
+        page_indirect[page].instance_count = 1u;
+        page_indirect[page].first_vertex = 0u;
+        page_indirect[page].first_instance = 0u;
+        diagnostics[0u] = 1u;
     }
-    let mat = compact_source[idx];
-    if (mat == 0u) {
+
+    if (idx >= arrayLength(&meshing_atlas)) {
         return;
     }
-    let out_idx = atomicAdd(&indirect_args.vertex_count, 6u) / 6u;
-    if (out_idx < arrayLength(&compacted_voxels)) {
-        compacted_voxels[out_idx] = idx;
+
+    if (meshing_atlas[idx] != 0u) {
+        atomicAdd(&page_indirect[page].vertex_count, 6u);
     }
 }

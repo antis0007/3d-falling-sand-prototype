@@ -58,6 +58,16 @@ struct CameraUniform {
     vp: [[f32; 4]; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DrawIndexedIndirectPod {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+
 pub struct Camera {
     pub pos: Vec3,
     pub dir: Vec3,
@@ -75,6 +85,7 @@ impl Camera {
 pub struct ChunkMesh {
     vb: wgpu::Buffer,
     ib: wgpu::Buffer,
+    indirect: wgpu::Buffer,
     index_count: u32,
     aabb_min: Vec3,
     aabb_max: Vec3,
@@ -597,6 +608,19 @@ impl Renderer {
                     ChunkMesh {
                         vb,
                         ib,
+                        indirect: self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("store chunk indirect"),
+                                contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
+                                    index_count: result.inds.len() as u32,
+                                    instance_count: 1,
+                                    first_index: 0,
+                                    base_vertex: 0,
+                                    first_instance: 0,
+                                }),
+                                usage: wgpu::BufferUsages::INDIRECT,
+                            },
+                        ),
                         index_count: result.inds.len() as u32,
                         aabb_min: result.aabb_min,
                         aabb_max: result.aabb_max,
@@ -703,7 +727,7 @@ impl Renderer {
             }
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed_indirect(&mesh.indirect, 0);
         }
     }
 }
