@@ -9,7 +9,9 @@ use crate::renderer::{
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::{step_region_profiled, Rng};
-use crate::streaming::{is_urgent_chunk, ChunkStreaming, DesiredChunks, VisibilityContext};
+use crate::streaming::{
+    is_urgent_chunk, ChunkStreaming, DesiredChunks, GenerateJobClass, VisibilityContext,
+};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material,
@@ -1051,8 +1053,6 @@ pub async fn run() -> anyhow::Result<()> {
 
                         if !collision_neighborhood_loaded {
                             let missing_coords = missing_collision_chunks.clone();
-                            let local_dispatch_budget = COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET
-                                .max(URGENT_GENERATION_BUDGET + COLLISION_URGENT_DISPATCH_BOOST);
                             let mut forced_local_requests = 0usize;
                             let mut urgent_missing = Vec::new();
                             let mut non_urgent_missing = Vec::new();
@@ -1074,15 +1074,21 @@ pub async fn run() -> anyhow::Result<()> {
                                 {
                                     continue;
                                 }
+                                let class = if is_urgent_chunk(player_chunk_for_collision, coord) {
+                                    GenerateJobClass::Urgent
+                                } else {
+                                    GenerateJobClass::Near
+                                };
                                 if let Some(chunk) = cached_modified_chunks.take(coord) {
                                     apply_generated_chunk(&mut store, coord, chunk);
                                     streaming.mark_generated(coord, frame_counter);
                                     forced_local_requests += 1;
-                                } else if chunk_generator.try_request(coord) {
-                                    streaming.mark_dispatch_succeeded(coord);
+                                } else if streaming.dispatch_generation_for_class(
+                                    coord,
+                                    class,
+                                    |coord| chunk_generator.try_request(coord),
+                                ) {
                                     forced_local_requests += 1;
-                                } else {
-                                    streaming.mark_dispatch_failed_or_deferred(coord);
                                 }
                             }
                             if forced_local_requests > 0 {
@@ -1345,6 +1351,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         let dispatch_coord = |coord: ChunkCoord,
+                                              class: GenerateJobClass,
                                               gen_request_count: &mut usize,
                                               gen_worker_inflight: &mut usize,
                                               store: &mut ChunkStore,
@@ -1354,16 +1361,17 @@ pub async fn run() -> anyhow::Result<()> {
                             if let Some(chunk) = cached_modified_chunks.take(coord) {
                                 apply_generated_chunk(store, coord, chunk);
                                 streaming.mark_generated(coord, frame_counter);
-                                true
-                            } else if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
-                                *gen_request_count += 1;
-                                *gen_worker_inflight += 1;
-                                true
-                            } else {
-                                streaming.mark_dispatch_failed_or_deferred(coord);
-                                false
+                                return true;
                             }
+                            streaming.dispatch_generation_for_class(coord, class, |coord| {
+                                if chunk_generator.try_request(coord) {
+                                    *gen_request_count += 1;
+                                    *gen_worker_inflight += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            })
                         };
 
                         let urgent_dispatch_budget =
@@ -1372,6 +1380,7 @@ pub async fn run() -> anyhow::Result<()> {
                             for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
                                 if !dispatch_coord(
                                     coord,
+                                    GenerateJobClass::Urgent,
                                     &mut gen_request_count,
                                     &mut gen_worker_inflight,
                                     &mut store,
@@ -1400,6 +1409,7 @@ pub async fn run() -> anyhow::Result<()> {
                         for coord in dispatch_near.into_iter().take(near_budget) {
                             if !dispatch_coord(
                                 coord,
+                                GenerateJobClass::Near,
                                 &mut gen_request_count,
                                 &mut gen_worker_inflight,
                                 &mut store,
@@ -1418,6 +1428,7 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                             if !dispatch_coord(
                                 coord,
+                                GenerateJobClass::Background,
                                 &mut gen_request_count,
                                 &mut gen_worker_inflight,
                                 &mut store,
@@ -1435,6 +1446,7 @@ pub async fn run() -> anyhow::Result<()> {
                             };
                             if !dispatch_coord(
                                 coord,
+                                GenerateJobClass::Background,
                                 &mut gen_request_count,
                                 &mut gen_worker_inflight,
                                 &mut store,
