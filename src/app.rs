@@ -328,12 +328,22 @@ pub async fn run() -> anyhow::Result<()> {
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             let egui_has_keyboard_focus = egui_ctx.wants_keyboard_input();
-                            let toggle_pause_key = matches!(key, KeyCode::Escape | KeyCode::KeyP);
-                            let toggle_pause_pressed = event.state == ElementState::Pressed
-                                && (!event.repeat || key == KeyCode::Escape);
+                            let toggle_pause_key = key == KeyCode::Escape;
+                            let toggle_pause_pressed =
+                                event.state == ElementState::Pressed && !event.repeat;
                             if toggle_pause_key && toggle_pause_pressed && !egui_has_keyboard_focus {
                                 ui.paused_menu = !ui.paused_menu;
                                 apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
+                            }
+
+                            let toggle_sim_key = key == KeyCode::KeyP;
+                            let toggle_sim_pressed =
+                                event.state == ElementState::Pressed && !event.repeat;
+                            if toggle_sim_key && toggle_sim_pressed && !egui_has_keyboard_focus {
+                                sim_running = !sim_running;
+                                if !sim_running {
+                                    step_once = false;
+                                }
                             }
 
                             if event.state == ElementState::Pressed {
