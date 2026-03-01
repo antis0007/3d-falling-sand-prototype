@@ -364,7 +364,7 @@ pub fn draw(
 
     // === Debug panel ===
     // NOTE: This is intentionally simple/cheap to draw.
-    if ui_state.show_debug && !ui_state.paused_menu {
+    if ui_state.show_debug {
         egui::Window::new("Debug / Performance")
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 52.0])
             .default_width(420.0)
@@ -749,8 +749,18 @@ pub fn draw(
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("ESC toggles this menu");
-                ui.label("P toggles simulation run/pause");
+                ui.label("ESC to return to game");
+                ui.horizontal(|ui| {
+                    ui.label("Debug info:");
+                    let debug_label = if ui_state.show_debug {
+                        "Hide Debug Window"
+                    } else {
+                        "Show Debug Window"
+                    };
+                    if ui.button(debug_label).clicked() {
+                        ui_state.show_debug = !ui_state.show_debug;
+                    }
+                });
                 if ui.button("Resume").clicked() {
                     ui_state.paused_menu = false;
                 }
