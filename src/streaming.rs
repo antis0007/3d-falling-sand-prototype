@@ -7,6 +7,7 @@ use crate::types::ChunkCoord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residency {
     Unloaded,
+    Scheduled,
     Generating,
     Resident,
 }
@@ -51,6 +52,7 @@ pub struct ChunkStreaming {
     pending_evict: VecDeque<ChunkCoord>,
     evict_not_desired_since: HashMap<ChunkCoord, u64>,
     queued_evict_set: HashSet<ChunkCoord>,
+    desired_resident_keep: HashSet<ChunkCoord>,
     chunk_lifecycle: HashMap<ChunkCoord, ChunkLifecycle>,
     pub max_generate_schedule_per_update: usize,
     pub max_evict_schedule_per_update: usize,
@@ -71,6 +73,7 @@ impl ChunkStreaming {
             pending_evict: VecDeque::new(),
             evict_not_desired_since: HashMap::new(),
             queued_evict_set: HashSet::new(),
+            desired_resident_keep: HashSet::new(),
             chunk_lifecycle: HashMap::new(),
             max_generate_schedule_per_update: 36,
             max_evict_schedule_per_update: 24,
@@ -91,9 +94,9 @@ impl ChunkStreaming {
     pub fn residency_of(&self, coord: ChunkCoord) -> Residency {
         if self.resident.contains(&coord) {
             Residency::Resident
-        } else if self.scheduled_generate.contains(&coord)
-            || self.dispatched_generate.contains(&coord)
-        {
+        } else if self.scheduled_generate.contains(&coord) {
+            Residency::Scheduled
+        } else if self.dispatched_generate.contains(&coord) {
             Residency::Generating
         } else {
             Residency::Unloaded
@@ -246,6 +249,21 @@ impl ChunkStreaming {
         let mut stats = StreamingUpdateStats::default();
         let mut queued_this_frame = 0usize;
 
+        stats.newly_desired = desired_sorted
+            .iter()
+            .filter(|coord| {
+                !self.resident.contains(coord)
+                    && !self.dispatched_generate.contains(coord)
+                    && !self.scheduled_generate.contains(coord)
+            })
+            .count();
+
+        self.desired_resident_keep = resident_keep.clone();
+        for &coord in resident_keep {
+            self.cancel_queued_evict(coord);
+            self.evict_not_desired_since.remove(&coord);
+        }
+
         for &coord in desired_sorted {
             let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
             lifecycle.last_visible_frame = frame_index;
@@ -268,15 +286,6 @@ impl ChunkStreaming {
             queued_this_frame += 1;
             stats.queued_generate += 1;
         }
-
-        stats.newly_desired = desired_sorted
-            .iter()
-            .filter(|coord| {
-                !self.resident.contains(coord)
-                    && !self.dispatched_generate.contains(coord)
-                    && !self.scheduled_generate.contains(coord)
-            })
-            .count();
 
         let mut resident_sorted: Vec<ChunkCoord> = self.resident.iter().copied().collect();
         resident_sorted.sort_by_key(|&coord| Self::sort_key(player_chunk, coord));
@@ -355,12 +364,15 @@ impl ChunkStreaming {
     }
 
     pub fn drain_evict_requests(&mut self, limit: usize) -> Vec<ChunkCoord> {
-        let take = limit.min(self.pending_evict.len());
-        let mut out = Vec::with_capacity(take);
-        for _ in 0..take {
+        let mut out = Vec::with_capacity(limit.min(self.pending_evict.len()));
+        while out.len() < limit {
             if let Some(coord) = self.pending_evict.pop_front() {
                 self.queued_evict_set.remove(&coord);
-                out.push(coord);
+                if self.is_valid_evict(coord) {
+                    out.push(coord);
+                }
+            } else {
+                break;
             }
         }
         out
@@ -403,6 +415,7 @@ impl ChunkStreaming {
         self.resident.remove(&coord);
         self.evict_not_desired_since.remove(&coord);
         self.queued_evict_set.remove(&coord);
+        self.desired_resident_keep.remove(&coord);
         self.chunk_lifecycle
             .entry(coord)
             .or_default()
@@ -421,6 +434,7 @@ impl ChunkStreaming {
         self.pending_evict.clear();
         self.evict_not_desired_since.clear();
         self.queued_evict_set.clear();
+        self.desired_resident_keep.clear();
         self.chunk_lifecycle.clear();
         self.work_items.clear();
     }
@@ -441,6 +455,24 @@ impl ChunkStreaming {
                 }
             })
             .collect()
+    }
+}
+
+impl ChunkStreaming {
+    fn cancel_queued_evict(&mut self, coord: ChunkCoord) {
+        if !self.queued_evict_set.remove(&coord) {
+            return;
+        }
+        self.pending_evict.retain(|queued| *queued != coord);
+        self.work_items
+            .retain(|item| !matches!(item, WorkItem::Evict(c) if *c == coord));
+    }
+
+    fn is_valid_evict(&self, coord: ChunkCoord) -> bool {
+        self.resident.contains(&coord)
+            && !self.desired_resident_keep.contains(&coord)
+            && !self.scheduled_generate.contains(&coord)
+            && !self.dispatched_generate.contains(&coord)
     }
 }
 
@@ -477,6 +509,7 @@ mod tests {
     use crate::types::ChunkCoord;
 
     use super::ChunkStreaming;
+    use super::Residency;
 
     #[test]
     fn scheduling_budget_limits_queued_chunks_not_scan_count() {
@@ -499,5 +532,62 @@ mod tests {
         assert!(streaming.scheduled_generate.contains(&far));
         assert_eq!(streaming.drain_generate_requests(8), vec![far]);
         assert!(streaming.dispatched_generate.contains(&far));
+    }
+
+    #[test]
+    fn stale_queued_eviction_is_canceled_when_chunk_becomes_desired_again() {
+        let mut streaming = ChunkStreaming::new(1);
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        streaming.eviction_linger_frames = 0;
+        streaming.boundary_eviction_linger_frames = 0;
+        streaming.max_evict_schedule_per_update = 8;
+        streaming.resident.insert(c);
+
+        streaming.update(&[], &HashSet::new(), c, 1);
+        assert_eq!(streaming.pending_evict_count(), 1);
+
+        let keep = HashSet::from([c]);
+        streaming.update(&[c], &keep, c, 2);
+        assert_eq!(streaming.pending_evict_count(), 0);
+        assert!(streaming.drain_evict_requests(1).is_empty());
+    }
+
+    #[test]
+    fn stale_evict_request_is_revalidated_at_drain_time() {
+        let mut streaming = ChunkStreaming::new(1);
+        let c = ChunkCoord { x: 1, y: 0, z: 0 };
+        streaming.eviction_linger_frames = 0;
+        streaming.boundary_eviction_linger_frames = 0;
+        streaming.max_evict_schedule_per_update = 8;
+        streaming.resident.insert(c);
+
+        streaming.update(&[], &HashSet::new(), c, 1);
+        assert_eq!(streaming.pending_evict_count(), 1);
+
+        streaming.scheduled_generate.insert(c);
+        assert!(streaming.drain_evict_requests(1).is_empty());
+    }
+
+    #[test]
+    fn newly_desired_stat_is_computed_before_scheduling_mutation() {
+        let mut streaming = ChunkStreaming::new(1);
+        let a = ChunkCoord { x: 0, y: 0, z: 0 };
+        let b = ChunkCoord { x: 2, y: 0, z: 0 };
+        streaming.max_generate_schedule_per_update = 1;
+
+        let desired = vec![a, b];
+        let keep: HashSet<_> = desired.iter().copied().collect();
+        let stats = streaming.update(&desired, &keep, a, 10);
+
+        assert_eq!(stats.newly_desired, 2);
+        assert_eq!(stats.queued_generate, 1);
+    }
+
+    #[test]
+    fn residency_reports_scheduled_state() {
+        let mut streaming = ChunkStreaming::new(1);
+        let c = ChunkCoord { x: 3, y: 0, z: 0 };
+        streaming.scheduled_generate.insert(c);
+        assert_eq!(streaming.residency_of(c), Residency::Scheduled);
     }
 }
