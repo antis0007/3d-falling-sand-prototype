@@ -34,14 +34,23 @@ pub fn region_sorted_by_distance(
     chunks
 }
 
-pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &mut Rng) {
+pub fn step_region_profiled(
+    store: &mut ChunkStore,
+    region: &HashSet<ChunkCoord>,
+    center: ChunkCoord,
+    rng: &mut Rng,
+) -> usize {
     let mut snapshot: HashMap<VoxelCoord, u16> = HashMap::new();
     let mut active_voxels = Vec::new();
 
-    for chunk_coord in region.iter().copied() {
+    let sorted = region_sorted_by_distance(center, region);
+    let mut stepped_chunks = 0usize;
+
+    for chunk_coord in sorted {
         let Some(chunk) = store.get_chunk(chunk_coord) else {
             continue;
         };
+        stepped_chunks += 1;
 
         let base = chunk_to_world_min(chunk_coord);
         for (idx, &mat) in chunk.iter_raw().iter().enumerate() {
@@ -110,6 +119,12 @@ pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &m
     for (coord, mat_id) in pending {
         store.set_voxel(coord, mat_id);
     }
+
+    stepped_chunks
+}
+
+pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &mut Rng) {
+    let _ = step_region_profiled(store, region, ChunkCoord { x: 0, y: 0, z: 0 }, rng);
 }
 
 fn movement_candidates(source: VoxelCoord, phase: Phase, rng: &mut Rng) -> Vec<VoxelCoord> {

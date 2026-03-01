@@ -1,11 +1,32 @@
 use crate::sim::{material, MATERIALS};
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, MaterialId};
 use glam::{Mat4, Vec2, Vec3};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 pub const HOTBAR_SLOTS: usize = 10;
 pub const HOTBAR_DISPLAY_ORDER: [usize; HOTBAR_SLOTS] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+
+#[derive(Clone, Default)]
+pub struct ProfilerStats {
+    pub frame_ms: f32,
+    pub desired_ms: f32,
+    pub streaming_ms: f32,
+    pub gen_request_count: usize,
+    pub gen_inflight_count: usize,
+    pub gen_completed_count: usize,
+    pub apply_ms: f32,
+    pub apply_count: usize,
+    pub evict_ms: f32,
+    pub evict_count: usize,
+    pub mesh_ms: f32,
+    pub mesh_count: usize,
+    pub dirty_backlog: usize,
+    pub sim_ms: f32,
+    pub sim_chunk_steps: usize,
+    pub render_submit_ms: f32,
+    pub egui_ms: f32,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum DragSource {
@@ -68,8 +89,10 @@ pub struct UiState {
     pub total_indices: u64,
     pub chunks_drawn: usize,
     pub disable_preview_outlines: bool, // reduces CPU in egui overlay if needed
-    pub preview_max_blocks: usize,       // clamps overlay work
+    pub preview_max_blocks: usize,      // clamps overlay work
+    pub profiler: ProfilerStats,
 
+    log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -121,6 +144,17 @@ impl UiState {
         self.log_lines.push_back(msg.into());
     }
 
+    pub fn log_once_per_second(&mut self, key: &str, now_secs: f32, msg: impl FnOnce() -> String) {
+        let should_log = match self.log_last_seconds.get(key) {
+            Some(last_secs) => now_secs - *last_secs >= 1.0,
+            None => true,
+        };
+        if should_log {
+            self.log_last_seconds.insert(key.to_string(), now_secs);
+            self.log(msg());
+        }
+    }
+
     pub fn set_mesh_timing(&mut self, last_ms: f32) {
         self.mesh_ms_last = last_ms;
         if last_ms > self.mesh_ms_max {
@@ -164,7 +198,9 @@ impl Default for UiState {
             chunks_drawn: 0,
             disable_preview_outlines: false,
             preview_max_blocks: 1024,
+            profiler: ProfilerStats::default(),
 
+            log_last_seconds: HashMap::new(),
             drag_source: None,
             drag_target_slot: None,
         }
@@ -319,25 +355,56 @@ pub fn draw(
                 ui.label("These toggles help isolate CPU-heavy overlays and show key stats.");
                 ui.separator();
 
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Meshing last: {:.2} ms | max: {:.2} ms",
-                        ui_state.mesh_ms_last, ui_state.mesh_ms_max
-                    ));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "Chunks drawn: {} | Total indices: {}",
-                        ui_state.chunks_drawn, ui_state.total_indices
-                    ));
-                });
+                ui.heading("Profiler");
+                ui.monospace(format!("frame_ms: {:.2}", ui_state.profiler.frame_ms));
+                ui.monospace(format!(
+                    "desired_ms: {:.2} | streaming_ms: {:.2}",
+                    ui_state.profiler.desired_ms, ui_state.profiler.streaming_ms
+                ));
+                ui.monospace(format!(
+                    "gen requested/inflight/completed: {}/{}/{}",
+                    ui_state.profiler.gen_request_count,
+                    ui_state.profiler.gen_inflight_count,
+                    ui_state.profiler.gen_completed_count
+                ));
+                ui.monospace(format!(
+                    "apply: {:.2} ms ({}) | evict: {:.2} ms ({})",
+                    ui_state.profiler.apply_ms,
+                    ui_state.profiler.apply_count,
+                    ui_state.profiler.evict_ms,
+                    ui_state.profiler.evict_count
+                ));
+                ui.monospace(format!(
+                    "mesh: {:.2} ms ({}) | dirty backlog: {}",
+                    ui_state.profiler.mesh_ms,
+                    ui_state.profiler.mesh_count,
+                    ui_state.profiler.dirty_backlog
+                ));
+                ui.monospace(format!(
+                    "sim: {:.2} ms | chunk_steps: {}",
+                    ui_state.profiler.sim_ms, ui_state.profiler.sim_chunk_steps
+                ));
+                ui.monospace(format!(
+                    "render_submit_ms: {:.2} | egui_ms: {:.2}",
+                    ui_state.profiler.render_submit_ms, ui_state.profiler.egui_ms
+                ));
+                ui.monospace(format!(
+                    "chunks_drawn: {} | total_indices: {}",
+                    ui_state.chunks_drawn, ui_state.total_indices
+                ));
+                ui.monospace(format!(
+                    "meshing last/max: {:.2}/{:.2}",
+                    ui_state.mesh_ms_last, ui_state.mesh_ms_max
+                ));
 
                 ui.separator();
                 ui.checkbox(
                     &mut ui_state.disable_preview_outlines,
                     "Disable block preview outlines (CPU saver)",
                 )
-                .on_hover_text("If outlines are expensive, disable to isolate rendering/meshing issues.");
+                .on_hover_text(
+                    "If outlines are expensive, disable to isolate rendering/meshing issues.",
+                );
 
                 ui.add(
                     egui::Slider::new(&mut ui_state.preview_max_blocks, 0..=8192)
@@ -347,11 +414,13 @@ pub fn draw(
 
                 ui.separator();
                 ui.label("Log");
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    for line in ui_state.log_lines.iter().rev() {
-                        ui.monospace(line);
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        for line in ui_state.log_lines.iter().rev() {
+                            ui.monospace(line);
+                        }
+                    });
             });
     }
 
@@ -1189,7 +1258,11 @@ fn parse_ppm_image(bytes: &[u8]) -> Option<egui::ColorImage> {
         let r = data[px * 3];
         let g = data[px * 3 + 1];
         let b = data[px * 3 + 2];
-        let alpha = if r >= 250 && g >= 250 && b >= 250 { 0 } else { 255 };
+        let alpha = if r >= 250 && g >= 250 && b >= 250 {
+            0
+        } else {
+            255
+        };
         rgba[px * 4] = r;
         rgba[px * 4 + 1] = g;
         rgba[px * 4 + 2] = b;

@@ -3,7 +3,7 @@ use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
-use crate::sim_world::{step_region, Rng};
+use crate::sim_world::{step_region_profiled, Rng};
 use crate::streaming::ChunkStreaming;
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
@@ -12,8 +12,10 @@ use crate::ui::{
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape};
 use glam::Vec3;
-use std::collections::HashSet;
-use std::time::Instant;
+use std::collections::{HashSet, VecDeque};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::thread;
+use std::time::{Duration, Instant};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -28,6 +30,77 @@ const SIM_RADIUS_CHUNKS: i32 = 2;
 const RENDER_RADIUS_CHUNKS: i32 = 4;
 const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
 const REMESH_BUDGET_PER_FRAME: usize = 24;
+
+const GENERATOR_THREADS: usize = 3;
+const GENERATOR_QUEUE_BOUND: usize = 192;
+const APPLY_BUDGET_MS: f32 = 1.5;
+const APPLY_BUDGET_ITEMS: usize = 6;
+const EVICT_BUDGET_MS: f32 = 1.0;
+const EVICT_BUDGET_ITEMS: usize = 8;
+
+#[derive(Clone)]
+struct GenJob {
+    coord: ChunkCoord,
+}
+
+struct GenResult {
+    coord: ChunkCoord,
+    chunk: crate::world::Chunk,
+}
+
+struct BackgroundGenerator {
+    tx: SyncSender<GenJob>,
+    rx: Receiver<GenResult>,
+}
+
+impl BackgroundGenerator {
+    fn new(seed: u64) -> Self {
+        let (tx, job_rx) = sync_channel::<GenJob>(GENERATOR_QUEUE_BOUND);
+        let (result_tx, rx) = sync_channel::<GenResult>(GENERATOR_QUEUE_BOUND);
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+
+        for i in 0..GENERATOR_THREADS {
+            let worker_rx = std::sync::Arc::clone(&job_rx);
+            let worker_tx = result_tx.clone();
+            thread::Builder::new()
+                .name(format!("chunk-gen-{i}"))
+                .spawn(move || loop {
+                    let job = {
+                        let lock = worker_rx.lock().expect("gen worker rx lock");
+                        lock.recv()
+                    };
+                    let Ok(job) = job else {
+                        break;
+                    };
+                    let chunk = generate_chunk(seed, job.coord);
+                    if worker_tx
+                        .send(GenResult {
+                            coord: job.coord,
+                            chunk,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                })
+                .expect("spawn chunk generation worker");
+        }
+
+        Self { tx, rx }
+    }
+
+    fn try_request(&self, coord: ChunkCoord) -> bool {
+        match self.tx.try_send(GenJob { coord }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn try_recv(&self) -> Result<GenResult, TryRecvError> {
+        self.rx.try_recv()
+    }
+}
 
 #[derive(Default)]
 struct EditRuntimeState {
@@ -62,6 +135,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut store = ChunkStore::new();
     let mut streaming = ChunkStreaming::new(1337);
+    let chunk_generator = BackgroundGenerator::new(streaming.seed);
+    let mut generated_ready: VecDeque<GenResult> = VecDeque::new();
     let mut rng = Rng::new(0x1234_5678);
     let mut sim_acc = 0.0f32;
 
@@ -85,8 +160,9 @@ pub async fn run() -> anyhow::Result<()> {
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
     let mut last_player_chunk: Option<ChunkCoord> = None;
     let mut cached_sim_region: HashSet<ChunkCoord> = HashSet::new();
-    let mut cached_desired: HashSet<ChunkCoord> = HashSet::new();
+    let mut cached_desired: Vec<ChunkCoord> = Vec::new();
     let mut stream_debug = String::new();
+    let mut frame_counter: u64 = 0;
 
     let _ = set_cursor(window, false);
 
@@ -300,48 +376,105 @@ pub async fn run() -> anyhow::Result<()> {
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
                         let (player_chunk, _) = voxel_to_chunk(player_world_voxel);
 
-                        // Cache desired/sim_region to avoid rebuilding HashSets every frame
-                        if last_player_chunk != Some(player_chunk) {
+                        // Cache desired/sim_region to avoid rebuilding allocations every frame
+                        let desired_t0 = Instant::now();
+                        let player_chunk_changed = last_player_chunk != Some(player_chunk);
+                        if player_chunk_changed {
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
                                 SIM_RADIUS_CHUNKS,
                                 RENDER_RADIUS_CHUNKS,
-                                1, // vertical radius: try 1 first
+                                1,
                             );
                             cached_sim_region = chunk_cube(player_chunk, SIM_RADIUS_CHUNKS);
                             last_player_chunk = Some(player_chunk);
                         }
+                        let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
-                        let (to_generate, to_evict) = streaming.update(&cached_desired);
-                        if ui.show_debug {
-                            static mut LAST_LOG: f32 = 0.0;
-                            let t = start.elapsed().as_secs_f32();
-                            let should_log = unsafe {
-                                if t - LAST_LOG > 1.0 { LAST_LOG = t; true } else { false }
-                            };
-                            if should_log {
-                                ui.log(format!(
-                                    "player_chunk=({}, {}, {})  resident={} desired={}",
-                                    player_chunk.x, player_chunk.y, player_chunk.z,
-                                    streaming.resident.len(),
-                                    cached_desired.len()
-                                ));
+                        let streaming_t0 = Instant::now();
+                        let stream_stats = streaming.update(&cached_desired, player_chunk, frame_counter);
+                        let mut gen_request_count = 0usize;
+                        for coord in streaming.drain_generate_requests(streaming.max_generate_schedule_per_update) {
+                            if chunk_generator.try_request(coord) {
+                                gen_request_count += 1;
+                            } else {
+                                streaming.mark_generation_dropped(coord);
                             }
                         }
-                        for coord in to_generate {
-                            let chunk = generate_chunk(streaming.seed, coord);
-                            apply_generated_chunk(&mut store, coord, chunk);
-                            streaming.mark_generated(coord);
+
+                        let mut gen_completed_count = 0usize;
+                        loop {
+                            match chunk_generator.try_recv() {
+                                Ok(res) => {
+                                    generated_ready.push_back(res);
+                                    gen_completed_count += 1;
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => break,
+                            }
                         }
-                        for coord in to_evict {
+
+                        let apply_t0 = Instant::now();
+                        let mut apply_count = 0usize;
+                        while apply_count < APPLY_BUDGET_ITEMS
+                            && apply_t0.elapsed() < Duration::from_secs_f32(APPLY_BUDGET_MS / 1000.0)
+                        {
+                            let Some(done) = generated_ready.pop_front() else { break; };
+                            apply_generated_chunk(&mut store, done.coord, done.chunk);
+                            streaming.mark_generated(done.coord);
+                            apply_count += 1;
+                        }
+                        let apply_ms = apply_t0.elapsed().as_secs_f32() * 1000.0;
+
+                        let evict_t0 = Instant::now();
+                        let mut evict_count = 0usize;
+                        while evict_count < EVICT_BUDGET_ITEMS
+                            && evict_t0.elapsed() < Duration::from_secs_f32(EVICT_BUDGET_MS / 1000.0)
+                        {
+                            let mut one = streaming.drain_evict_requests(1);
+                            let Some(coord) = one.pop() else {
+                                break;
+                            };
                             store.remove_chunk(coord);
                             streaming.mark_evicted(coord);
+                            evict_count += 1;
+                        }
+                        let evict_ms = evict_t0.elapsed().as_secs_f32() * 1000.0;
+
+                        let streaming_ms = streaming_t0.elapsed().as_secs_f32() * 1000.0;
+                        let now_secs = start.elapsed().as_secs_f32();
+                        if player_chunk_changed {
+                            ui.log_once_per_second("chunk_change", now_secs, || format!(
+                                "chunk_change player=({}, {}, {}) desired={} newly_desired={} requested={} applied={} evicted={} pending_apply={} pending_evict={}",
+                                player_chunk.x,
+                                player_chunk.y,
+                                player_chunk.z,
+                                cached_desired.len(),
+                                stream_stats.newly_desired,
+                                gen_request_count,
+                                apply_count,
+                                evict_count,
+                                generated_ready.len(),
+                                streaming.pending_evict_count()
+                            ));
+                        }
+                        if generated_ready.len() >= APPLY_BUDGET_ITEMS {
+                            ui.log_once_per_second("apply_budget", now_secs, || {
+                                format!("apply budget hit: remaining queue={}", generated_ready.len())
+                            });
+                        }
+                        if streaming.pending_evict_count() > EVICT_BUDGET_ITEMS {
+                            ui.log_once_per_second("evict_budget", now_secs, || {
+                                format!("evict budget hit: remaining queue={}", streaming.pending_evict_count())
+                            });
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} desired={} player_chunk=({}, {}, {})",
+                            "Stream: resident={} desired={} gen_pending={} apply_queue={} player_chunk=({}, {}, {})",
                             streaming.resident.len(),
                             cached_desired.len(),
+                            streaming.pending_generate_count(),
+                            generated_ready.len(),
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z
@@ -376,37 +509,55 @@ pub async fn run() -> anyhow::Result<()> {
                             // dirtied by set_voxel
                         }
 
-                        // Simulation stepping
-                        let do_step =
-                            sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
-
-                        let sim_t0 = std::time::Instant::now();
-
+                        let do_step = sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
+                        let sim_t0 = Instant::now();
+                        let mut sim_chunk_steps = 0usize;
                         if do_step {
                             sim_acc += dt * ui.sim_speed;
                             while sim_acc >= 1.0 / 60.0 {
-                                step_region(&mut store, &cached_sim_region, &mut rng);
+                                sim_chunk_steps += step_region_profiled(
+                                    &mut store,
+                                    &cached_sim_region,
+                                    player_chunk,
+                                    &mut rng,
+                                );
                                 sim_acc -= 1.0 / 60.0;
                             }
                         } else if step_once && !ui.paused_menu {
-                            step_region(&mut store, &cached_sim_region, &mut rng);
+                            sim_chunk_steps += step_region_profiled(
+                                &mut store,
+                                &cached_sim_region,
+                                player_chunk,
+                                &mut rng,
+                            );
                             step_once = false;
                         }
-
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
-                        if ui.show_debug {
-                            ui.log(format!("sim_step_ms={sim_ms:.2}"));
-                        }
 
                         renderer.day = ui.day;
-                        let mesh_ms = renderer.rebuild_dirty_store_chunks(
+                        let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
                             origin_voxel,
                             REMESH_BUDGET_PER_FRAME,
                         );
-                        ui.set_mesh_timing(mesh_ms);
+                        ui.set_mesh_timing(mesh_stats.max_ms);
+                        ui.profiler.desired_ms = desired_ms;
+                        ui.profiler.streaming_ms = streaming_ms;
+                        ui.profiler.gen_request_count = gen_request_count;
+                        ui.profiler.gen_inflight_count = streaming.generating.len();
+                        ui.profiler.gen_completed_count = gen_completed_count;
+                        ui.profiler.apply_ms = apply_ms;
+                        ui.profiler.apply_count = apply_count;
+                        ui.profiler.evict_ms = evict_ms;
+                        ui.profiler.evict_count = evict_count;
+                        ui.profiler.mesh_ms = mesh_stats.total_ms;
+                        ui.profiler.mesh_count = mesh_stats.mesh_count;
+                        ui.profiler.dirty_backlog = mesh_stats.dirty_backlog + store.dirty_count();
+                        ui.profiler.sim_ms = sim_ms;
+                        ui.profiler.sim_chunk_steps = sim_chunk_steps;
 
                         // Egui
+                        let egui_t0 = Instant::now();
                         let raw_input = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw_input, |ctx| {
                             let actions =
@@ -424,9 +575,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 last_player_chunk = None;
                                 cached_desired.clear();
                                 cached_sim_region.clear();
+                                generated_ready.clear();
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
+                        ui.profiler.egui_ms = egui_t0.elapsed().as_secs_f32() * 1000.0;
 
                         for (id, delta) in &out.textures_delta.set {
                             egui_rpass.update_texture(
@@ -478,6 +631,7 @@ pub async fn run() -> anyhow::Result<()> {
                         );
 
                         // Render
+                        let render_submit_t0 = Instant::now();
                         let paint_jobs =
                             egui_ctx.tessellate(out.shapes, window.scale_factor() as f32);
                         let screen_desc = egui_wgpu::ScreenDescriptor {
@@ -578,6 +732,9 @@ pub async fn run() -> anyhow::Result<()> {
 
                         renderer.queue.submit(Some(encoder.finish()));
                         frame.present();
+                        ui.profiler.render_submit_ms = render_submit_t0.elapsed().as_secs_f32() * 1000.0;
+                        ui.profiler.frame_ms = now.elapsed().as_secs_f32() * 1000.0;
+                        frame_counter = frame_counter.wrapping_add(1);
 
                         for id in &out.textures_delta.free {
                             egui_rpass.free_texture(id);
