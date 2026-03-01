@@ -24,9 +24,9 @@ pub struct StreamingUpdateStats {
 
 #[derive(Debug, Clone, Default)]
 pub struct DesiredChunks {
-    pub guaranteed: Vec<ChunkCoord>,
-    pub render: Vec<ChunkCoord>,
-    pub prefetch: Vec<ChunkCoord>,
+    pub near: Vec<ChunkCoord>,
+    pub mid: Vec<ChunkCoord>,
+    pub far: Vec<ChunkCoord>,
     pub generation_order: Vec<ChunkCoord>,
     pub resident_keep: HashSet<ChunkCoord>,
 }
@@ -82,38 +82,34 @@ impl ChunkStreaming {
 
     pub fn desired_set(
         player_chunk: ChunkCoord,
-        guaranteed_radius_xz: i32,
-        render_radius_xz: i32,
-        prefetch_radius_xz: Option<i32>,
+        near_radius_xz: i32,
+        mid_radius_xz: i32,
+        far_radius_xz: Option<i32>,
         vertical_radius: i32,
     ) -> DesiredChunks {
-        let guaranteed_radius = guaranteed_radius_xz.max(0);
-        let render_radius = render_radius_xz.max(guaranteed_radius);
-        let prefetch_radius = prefetch_radius_xz
-            .unwrap_or(render_radius)
-            .max(render_radius);
+        let near_radius = near_radius_xz.max(0);
+        let mid_radius = mid_radius_xz.max(near_radius);
+        let far_radius = far_radius_xz.unwrap_or(mid_radius).max(mid_radius);
         let ry = vertical_radius.max(0);
 
-        let guaranteed = Self::ring_sorted_region(player_chunk, guaranteed_radius, ry, 0);
-        let render =
-            Self::ring_sorted_region(player_chunk, render_radius, ry, guaranteed_radius + 1);
-        let prefetch =
-            Self::ring_sorted_region(player_chunk, prefetch_radius, ry, render_radius + 1);
+        let near = Self::ring_sorted_region(player_chunk, near_radius, ry, 0);
+        let mid = Self::ring_sorted_region(player_chunk, mid_radius, ry, near_radius + 1);
+        let far = Self::ring_sorted_region(player_chunk, far_radius, ry, mid_radius + 1);
 
-        let mut generation_order =
-            Vec::with_capacity(guaranteed.len() + render.len() + prefetch.len());
-        generation_order.extend(guaranteed.iter().copied());
-        generation_order.extend(render.iter().copied());
-        generation_order.extend(prefetch.iter().copied());
+        let mut generation_order = Vec::with_capacity(near.len() + mid.len() + far.len());
+        generation_order.extend(near.iter().copied());
+        generation_order.extend(mid.iter().copied());
+        generation_order.extend(far.iter().copied());
 
-        let mut resident_keep = HashSet::with_capacity(guaranteed.len() + render.len());
-        resident_keep.extend(guaranteed.iter().copied());
-        resident_keep.extend(render.iter().copied());
+        let mut resident_keep = HashSet::with_capacity(near.len() + mid.len() + far.len());
+        resident_keep.extend(near.iter().copied());
+        resident_keep.extend(mid.iter().copied());
+        resident_keep.extend(far.iter().copied());
 
         DesiredChunks {
-            guaranteed,
-            render,
-            prefetch,
+            near,
+            mid,
+            far,
             generation_order,
             resident_keep,
         }

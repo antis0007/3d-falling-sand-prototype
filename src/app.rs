@@ -2,7 +2,7 @@ use crate::chunk_store::ChunkStore;
 use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
-use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
+use crate::renderer::{Camera, LodMeshingBudgets, LodRadii, Renderer, VOXEL_SIZE};
 use crate::sim_world::{step_region_profiled, Rng};
 use crate::streaming::{ChunkStreaming, DesiredChunks};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
@@ -50,39 +50,46 @@ struct GenResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StreamingTuning {
-    guaranteed_radius_xz: i32,
-    render_radius_xz: i32,
-    prefetch_radius_xz: i32,
-    prefetch_enabled: bool,
+    near_radius_xz: i32,
+    mid_radius_xz: i32,
+    far_radius_xz: i32,
     vertical_radius: i32,
+    lod_hysteresis: i32,
     base_apply_budget_items: usize,
     max_apply_budget_items: usize,
     base_generate_drain_items: usize,
     max_generate_drain_items: usize,
+    lod_budget_near: usize,
+    lod_budget_mid: usize,
+    lod_budget_far: usize,
 }
 
 impl Default for StreamingTuning {
     fn default() -> Self {
         Self {
-            guaranteed_radius_xz: 6,
-            render_radius_xz: 12,
-            prefetch_radius_xz: 16,
-            prefetch_enabled: true,
+            near_radius_xz: 6,
+            mid_radius_xz: 12,
+            far_radius_xz: 16,
             vertical_radius: 4,
+            lod_hysteresis: 1,
             base_apply_budget_items: 8,
             max_apply_budget_items: 48,
             base_generate_drain_items: 24,
             max_generate_drain_items: 96,
+            lod_budget_near: 8,
+            lod_budget_mid: 6,
+            lod_budget_far: 10,
         }
     }
 }
 
 impl StreamingTuning {
     fn normalized(mut self) -> Self {
-        self.guaranteed_radius_xz = self.guaranteed_radius_xz.max(0);
-        self.render_radius_xz = self.render_radius_xz.max(self.guaranteed_radius_xz);
-        self.prefetch_radius_xz = self.prefetch_radius_xz.max(self.render_radius_xz);
+        self.near_radius_xz = self.near_radius_xz.max(0);
+        self.mid_radius_xz = self.mid_radius_xz.max(self.near_radius_xz);
+        self.far_radius_xz = self.far_radius_xz.max(self.mid_radius_xz);
         self.vertical_radius = self.vertical_radius.max(0);
+        self.lod_hysteresis = self.lod_hysteresis.max(0);
         self.base_apply_budget_items = self.base_apply_budget_items.max(1);
         self.max_apply_budget_items = self
             .max_apply_budget_items
@@ -91,6 +98,9 @@ impl StreamingTuning {
         self.max_generate_drain_items = self
             .max_generate_drain_items
             .max(self.base_generate_drain_items);
+        self.lod_budget_near = self.lod_budget_near.max(1);
+        self.lod_budget_mid = self.lod_budget_mid.max(1);
+        self.lod_budget_far = self.lod_budget_far.max(1);
         self
     }
 }
@@ -219,13 +229,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut cached_sim_region: HashSet<ChunkCoord> = HashSet::new();
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
         ChunkCoord { x: 0, y: 0, z: 0 },
-        stream_tuning.guaranteed_radius_xz,
-        stream_tuning.render_radius_xz,
-        if stream_tuning.prefetch_enabled {
-            Some(stream_tuning.prefetch_radius_xz)
-        } else {
-            None
-        },
+        stream_tuning.near_radius_xz,
+        stream_tuning.mid_radius_xz,
+        Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
     );
     let mut stream_debug = String::new();
@@ -342,26 +348,26 @@ pub async fn run() -> anyhow::Result<()> {
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F5 => {
-                                        stream_tuning.prefetch_radius_xz += 1;
+                                        stream_tuning.far_radius_xz += 1;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
                                     KeyCode::F6 => {
-                                        stream_tuning.guaranteed_radius_xz -= 1;
+                                        stream_tuning.near_radius_xz -= 1;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F7 => {
-                                        stream_tuning.guaranteed_radius_xz += 1;
+                                        stream_tuning.near_radius_xz += 1;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F8 => {
-                                        stream_tuning.render_radius_xz -= 1;
+                                        stream_tuning.mid_radius_xz -= 1;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F9 => {
-                                        stream_tuning.render_radius_xz += 1;
+                                        stream_tuning.mid_radius_xz += 1;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F10 => {
@@ -373,7 +379,7 @@ pub async fn run() -> anyhow::Result<()> {
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     KeyCode::F12 => {
-                                        stream_tuning.prefetch_enabled = !stream_tuning.prefetch_enabled;
+                                        stream_tuning.lod_hysteresis = (stream_tuning.lod_hysteresis + 1) % 4;
                                         stream_tuning = stream_tuning.clone().normalized();
                                     }
                                     _ if hotbar_slot.is_some() => {
@@ -516,16 +522,12 @@ pub async fn run() -> anyhow::Result<()> {
                         if player_chunk_changed || stream_tuning_changed {
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
-                                stream_tuning.guaranteed_radius_xz,
-                                stream_tuning.render_radius_xz,
-                                if stream_tuning.prefetch_enabled {
-                                    Some(stream_tuning.prefetch_radius_xz)
-                                } else {
-                                    None
-                                },
+                                stream_tuning.near_radius_xz,
+                                stream_tuning.mid_radius_xz,
+                                Some(stream_tuning.far_radius_xz),
                                 stream_tuning.vertical_radius,
                             );
-                            cached_sim_region = chunk_cube(player_chunk, stream_tuning.guaranteed_radius_xz);
+                            cached_sim_region = chunk_cube(player_chunk, stream_tuning.near_radius_xz);
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = stream_tuning.clone();
                         }
@@ -631,22 +633,26 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} guaranteed={} render={} prefetch={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[g/r/p/v]={}/{}/{}/{} budgets[gen/app]={}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 prefetch+, F6/F7 g, F8/F9 r, F10/F11 v, F12 prefetch]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
-                            cached_desired.guaranteed.len(),
-                            cached_desired.render.len(),
-                            cached_desired.prefetch.len(),
+                            cached_desired.near.len(),
+                            cached_desired.mid.len(),
+                            cached_desired.far.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
-                            stream_tuning.guaranteed_radius_xz,
-                            stream_tuning.render_radius_xz,
-                            if stream_tuning.prefetch_enabled { stream_tuning.prefetch_radius_xz } else { 0 },
+                            stream_tuning.near_radius_xz,
+                            stream_tuning.mid_radius_xz,
+                            stream_tuning.far_radius_xz,
                             stream_tuning.vertical_radius,
+                            stream_tuning.lod_hysteresis,
                             generate_drain_budget,
                             apply_budget_items,
+                            stream_tuning.lod_budget_near,
+                            stream_tuning.lod_budget_mid,
+                            stream_tuning.lod_budget_far,
                             collision_freeze_active,
                             collision_used_unloaded_chunks,
                             COLLISION_SAFETY_RADIUS_VOXELS,
@@ -713,6 +719,17 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             REMESH_JOB_BUDGET_PER_FRAME,
                             MESH_UPLOAD_BYTES_PER_FRAME,
+                            LodRadii {
+                                near: stream_tuning.near_radius_xz,
+                                mid: stream_tuning.mid_radius_xz,
+                                far: stream_tuning.far_radius_xz,
+                                hysteresis: stream_tuning.lod_hysteresis,
+                            },
+                            LodMeshingBudgets {
+                                near: stream_tuning.lod_budget_near,
+                                mid: stream_tuning.lod_budget_mid,
+                                far: stream_tuning.lod_budget_far,
+                            },
                         );
                         ui.set_mesh_timing(mesh_stats.max_ms);
                         ui.profiler.desired_ms = desired_ms;
@@ -734,6 +751,16 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
+                        ui.profiler.near_radius = stream_tuning.near_radius_xz;
+                        ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
+                        ui.profiler.far_radius = stream_tuning.far_radius_xz;
+                        ui.profiler.lod_hysteresis = stream_tuning.lod_hysteresis;
+                        ui.profiler.lod_budget_near = stream_tuning.lod_budget_near;
+                        ui.profiler.lod_budget_mid = stream_tuning.lod_budget_mid;
+                        ui.profiler.lod_budget_far = stream_tuning.lod_budget_far;
+                        ui.profiler.mesh_near_count = mesh_stats.near_mesh_count;
+                        ui.profiler.mesh_mid_count = mesh_stats.mid_mesh_count;
+                        ui.profiler.mesh_far_count = mesh_stats.far_mesh_count;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
 
