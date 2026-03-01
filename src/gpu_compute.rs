@@ -372,7 +372,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             )?;
             let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
             let page_capacity = GPU_PAGE_CAPACITY as u64;
-            let page_len = (32u64 * 32u64 * 32u64 * 27u64) as u64;
+            // The atlas stores one 32^3 chunk payload per page. Border strips are tracked
+            // separately in CPU snapshot data, so multiplying by a 27-neighborhood here
+            // over-allocates the storage buffer and can exceed backend limits.
+            let page_len = (32u64 * 32u64 * 32u64) as u64;
             let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk atlas voxels"),
                 size: page_capacity * page_len * std::mem::size_of::<u32>() as u64,
