@@ -240,11 +240,9 @@ impl ChunkStreaming {
         frame_index: u64,
     ) -> StreamingUpdateStats {
         let mut stats = StreamingUpdateStats::default();
+        let mut queued_this_frame = 0usize;
 
-        for &coord in desired_sorted
-            .iter()
-            .take(self.max_generate_schedule_per_update)
-        {
+        for &coord in desired_sorted {
             let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
             lifecycle.last_visible_frame = frame_index;
             if self.resident.contains(&coord) || self.generating.contains(&coord) {
@@ -254,9 +252,13 @@ impl ChunkStreaming {
             {
                 continue;
             }
+            if queued_this_frame >= self.max_generate_schedule_per_update {
+                continue;
+            }
             self.generating.insert(coord);
             self.pending_generate.push_back(coord);
             self.work_items.push(WorkItem::Generate(coord));
+            queued_this_frame += 1;
             stats.queued_generate += 1;
         }
 
@@ -416,5 +418,36 @@ impl StreamingState {
 impl Default for StreamingState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use crate::types::ChunkCoord;
+
+    use super::ChunkStreaming;
+
+    #[test]
+    fn scheduling_budget_limits_queued_chunks_not_scan_count() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 1;
+
+        let near_1 = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near_2 = ChunkCoord { x: 1, y: 0, z: 0 };
+        let far = ChunkCoord { x: 4, y: 0, z: 0 };
+
+        streaming.resident.insert(near_1);
+        streaming.resident.insert(near_2);
+
+        let desired_sorted = vec![near_1, near_2, far];
+        let resident_keep: HashSet<_> = desired_sorted.iter().copied().collect();
+
+        let stats = streaming.update(&desired_sorted, &resident_keep, near_1, 100);
+
+        assert_eq!(stats.queued_generate, 1);
+        assert!(streaming.generating.contains(&far));
+        assert_eq!(streaming.drain_generate_requests(8), vec![far]);
     }
 }
