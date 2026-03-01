@@ -30,6 +30,9 @@ pub struct ProfilerStats {
     pub mesh_upload_latency_ms: f32,
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
+    pub mesh_pressure_drop_count: usize,
+    pub gen_paused_by_mesh_pressure: bool,
+    pub desired_budget_drop_count: usize,
     pub near_radius: i32,
     pub mid_radius: i32,
     pub far_radius: i32,
@@ -398,14 +401,16 @@ pub fn draw(
                     ui_state.profiler.desired_ms, ui_state.profiler.streaming_ms
                 ));
                 ui.monospace(format!(
-                    "gen requested/inflight/completed: {}/{}/{}",
+                    "gen requested/inflight/completed: {}/{}/{} | paused_by_mesh_pressure: {}",
                     ui_state.profiler.gen_request_count,
                     ui_state.profiler.gen_inflight_count,
-                    ui_state.profiler.gen_completed_count
+                    ui_state.profiler.gen_completed_count,
+                    ui_state.profiler.gen_paused_by_mesh_pressure
                 ));
                 ui.monospace(format!(
-                    "gen completed total: {}",
-                    ui_state.profiler.gen_completed_total
+                    "gen completed total: {} | desired budget drops: {}",
+                    ui_state.profiler.gen_completed_total,
+                    ui_state.profiler.desired_budget_drop_count
                 ));
                 ui.monospace(format!(
                     "apply: {:.2} ms ({}) | evict: {:.2} ms ({})",
@@ -421,11 +426,12 @@ pub fn draw(
                     ui_state.profiler.dirty_backlog
                 ));
                 ui.monospace(format!(
-                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {}",
+                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {}",
                     ui_state.profiler.mesh_queue_depth,
                     ui_state.profiler.mesh_completed_depth,
                     ui_state.profiler.mesh_stale_drop_count,
                     ui_state.profiler.mesh_age_drop_count,
+                    ui_state.profiler.mesh_pressure_drop_count,
                 ));
                 ui.monospace(format!(
                     "lod radii n/m/f/u: {}/{}/{}/{} | hysteresis: {}",

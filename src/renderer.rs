@@ -198,6 +198,7 @@ pub struct MeshRebuildStats {
     pub upload_latency_ms: f32,
     pub stale_drop_count: usize,
     pub age_drop_count: usize,
+    pub pressure_drop_count: usize,
     pub near_mesh_count: usize,
     pub mid_mesh_count: usize,
     pub far_mesh_count: usize,
@@ -698,6 +699,19 @@ impl Renderer {
         let far_budget = (lod_budgets.far / far_scale).max(usize::from(!far_jobs.is_empty()));
         let ultra_budget = (lod_budgets.ultra / far_scale)
             .max(usize::from(!ultra_jobs.is_empty() && far_scale == 1));
+
+        let sustained_pressure = far_pressure > 2048;
+        if sustained_pressure {
+            let far_keep = far_budget.min(2);
+            if far_jobs.len() > far_keep {
+                stats.pressure_drop_count += far_jobs.len() - far_keep;
+                far_jobs.truncate(far_keep);
+            }
+            if !ultra_jobs.is_empty() {
+                stats.pressure_drop_count += ultra_jobs.len();
+                ultra_jobs.clear();
+            }
+        }
 
         let mut submitted = 0usize;
         let mut submit_from =
