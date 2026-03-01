@@ -34,6 +34,9 @@ const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
 
+const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
+const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
+
 #[derive(Clone)]
 struct GenJob {
     coord: ChunkCoord,
@@ -226,6 +229,8 @@ pub async fn run() -> anyhow::Result<()> {
     );
     let mut stream_debug = String::new();
     let mut frame_counter: u64 = 0;
+    let mut collision_freeze_active = false;
+    let mut collision_used_unloaded_chunks = false;
 
     let _ = set_cursor(window, false);
 
@@ -461,27 +466,42 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
-                        if !gameplay_blocked && !egui_c {
-                            let origin_for_ctrl = origin_voxel;
-                            ctrl.step(
-                                |x, y, z| store.get_voxel(VoxelCoord { x, y, z }),
-                                &input,
-                                dt,
-                                true,
-                                start.elapsed().as_secs_f32(),
-                                origin_for_ctrl,
-                            );
-                        } else {
-                            // still tick controller timers etc (no movement)
-                            ctrl.step(
-                                |_x, _y, _z| 0u16,
-                                &input,
-                                dt,
-                                false,
-                                start.elapsed().as_secs_f32(),
-                                origin_voxel,
-                            );
-                        }
+                        let player_local_for_collision = ctrl.position;
+                        let collision_neighborhood_loaded = collision_neighborhood_loaded(
+                            &store,
+                            player_local_for_collision,
+                            origin_voxel,
+                            COLLISION_SAFETY_RADIUS_VOXELS,
+                        );
+                        collision_freeze_active = FREEZE_UNTIL_COLLISION_RESIDENT
+                            && !collision_neighborhood_loaded
+                            && !gameplay_blocked
+                            && !egui_c;
+                        collision_used_unloaded_chunks = false;
+                        let movement_active = !gameplay_blocked && !egui_c && !collision_freeze_active;
+                        let origin_for_ctrl = origin_voxel;
+                        ctrl.step(
+                            |x, y, z| {
+                                let voxel = VoxelCoord { x, y, z };
+                                if store.is_voxel_chunk_loaded(voxel) {
+                                    return store.get_voxel(voxel);
+                                }
+
+                                let near_player =
+                                    within_collision_safety_radius(voxel, player_local_for_collision, origin_for_ctrl, COLLISION_SAFETY_RADIUS_VOXELS);
+                                if near_player {
+                                    collision_used_unloaded_chunks = true;
+                                    return 1u16;
+                                }
+
+                                0u16
+                            },
+                            &input,
+                            dt,
+                            movement_active,
+                            start.elapsed().as_secs_f32(),
+                            origin_for_ctrl,
+                        );
 
                         // Streaming regions in WORLD voxel space
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
@@ -606,7 +626,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} guaranteed={} render={} prefetch={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[g/r/p/v]={}/{}/{}/{} budgets[gen/app]={}/{} keys[F1/F2 gen, F3/F4 apply, F5 prefetch+, F6/F7 g, F8/F9 r, F10/F11 v, F12 prefetch]",
+                            "Stream: resident={} guaranteed={} render={} prefetch={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[g/r/p/v]={}/{}/{}/{} budgets[gen/app]={}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 prefetch+, F6/F7 g, F8/F9 r, F10/F11 v, F12 prefetch]",
                             streaming.resident.len(),
                             cached_desired.guaranteed.len(),
                             cached_desired.render.len(),
@@ -622,6 +642,9 @@ pub async fn run() -> anyhow::Result<()> {
                             stream_tuning.vertical_radius,
                             generate_drain_budget,
                             apply_budget_items,
+                            collision_freeze_active,
+                            collision_used_unloaded_chunks,
+                            COLLISION_SAFETY_RADIUS_VOXELS,
                         );
                         ui.stream_debug = stream_debug.clone();
 
@@ -924,6 +947,44 @@ fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {
     }
 }
 
+fn within_collision_safety_radius(
+    voxel: VoxelCoord,
+    player_local_pos: Vec3,
+    origin_voxel: VoxelCoord,
+    radius_voxels: i32,
+) -> bool {
+    let player_world_voxel = local_to_world_voxel(player_local_pos, origin_voxel);
+    (voxel.x - player_world_voxel.x).abs() <= radius_voxels
+        && (voxel.y - player_world_voxel.y).abs() <= radius_voxels
+        && (voxel.z - player_world_voxel.z).abs() <= radius_voxels
+}
+
+fn collision_neighborhood_loaded(
+    store: &ChunkStore,
+    player_local_pos: Vec3,
+    origin_voxel: VoxelCoord,
+    safety_radius_voxels: i32,
+) -> bool {
+    let player_world_pos = player_local_pos
+        + Vec3::new(
+            origin_voxel.x as f32,
+            origin_voxel.y as f32,
+            origin_voxel.z as f32,
+        );
+    let (min, max) = FpsController::collision_sample_bounds_world(player_world_pos);
+
+    for z in (min.z - safety_radius_voxels)..=(max.z + safety_radius_voxels) {
+        for y in (min.y - safety_radius_voxels)..=(max.y + safety_radius_voxels) {
+            for x in (min.x - safety_radius_voxels)..=(max.x + safety_radius_voxels) {
+                if !store.is_voxel_chunk_loaded(VoxelCoord { x, y, z }) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
 fn chunk_cube(center: ChunkCoord, radius: i32) -> HashSet<ChunkCoord> {
     let mut out = HashSet::new();
     for dz in -radius..=radius {
