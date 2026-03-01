@@ -8,14 +8,14 @@ use crate::renderer::{
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::{step_region_profiled, Rng};
-use crate::streaming::{ChunkStreaming, DesiredChunks};
+use crate::streaming::{ChunkStreaming, DesiredChunks, VisibilityContext};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     UiState, HOTBAR_SLOTS,
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
-use glam::Vec3;
+use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
@@ -46,6 +46,8 @@ const DESIRED_MID_PER_FRAME_CAP: usize = 320;
 const DESIRED_FAR_PER_FRAME_CAP: usize = 448;
 const DESIRED_MAX_TOTAL_BUDGET: usize = 2600;
 const DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV: i32 = 1;
+const RESIDENT_KEEP_MID_CAP: usize = 512;
+const RESIDENT_KEEP_FAR_CAP: usize = 640;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
@@ -298,6 +300,25 @@ fn chebyshev_from_player(player_chunk: ChunkCoord, coord: ChunkCoord) -> i32 {
         .max((coord.z - player_chunk.z).abs())
 }
 
+fn extract_frustum_planes(vp: Mat4) -> [Vec4; 6] {
+    let m = vp.transpose().to_cols_array();
+    let row = |idx: usize| Vec4::new(m[idx], m[4 + idx], m[8 + idx], m[12 + idx]);
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+
+    let mut planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+    for plane in &mut planes {
+        let normal = plane.truncate();
+        let inv_len = normal.length_recip();
+        if inv_len.is_finite() {
+            *plane *= inv_len;
+        }
+    }
+    planes
+}
+
 fn cap_desired_generation_order(
     desired: &DesiredChunks,
     player_chunk: ChunkCoord,
@@ -518,10 +539,13 @@ pub async fn run() -> anyhow::Result<()> {
         ChunkCoord { x: 0, y: 0, z: 0 },
         Vec3::ZERO,
         Vec3::Z,
+        None,
         stream_tuning.near_radius_xz,
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
+        RESIDENT_KEEP_MID_CAP,
+        RESIDENT_KEEP_FAR_CAP,
         &HashMap::new(),
         0,
     );
@@ -967,14 +991,31 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                             desired_recompute_reason = reasons.join("|");
 
+                            let chunk_size_meters = crate::types::CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
+                            let camera_pos_world = camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE);
+                            let camera_pos_chunks = camera_pos_world / chunk_size_meters;
+                            let chunk_camera = Camera {
+                                pos: camera_pos_chunks,
+                                dir: look_dir,
+                                aspect: renderer.config.width as f32 / renderer.config.height.max(1) as f32,
+                            };
+                            let visibility_context = VisibilityContext {
+                                camera_pos_chunks,
+                                cone_inner_cos: (35.0f32).to_radians().cos(),
+                                cone_outer_cos: (75.0f32).to_radians().cos(),
+                                frustum_planes: Some(extract_frustum_planes(chunk_camera.view_proj())),
+                            };
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
                                 player_velocity_chunks,
                                 look_dir,
+                                Some(&visibility_context),
                                 effective_stream_tuning.near_radius_xz,
                                 effective_stream_tuning.mid_radius_xz,
                                 Some(effective_stream_tuning.far_radius_xz),
                                 effective_stream_tuning.vertical_radius,
+                                RESIDENT_KEEP_MID_CAP,
+                                RESIDENT_KEEP_FAR_CAP,
                                 &visible_history,
                                 frame_counter,
                             );

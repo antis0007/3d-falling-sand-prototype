@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 
 use crate::types::ChunkCoord;
 
@@ -33,6 +33,14 @@ pub struct DesiredChunks {
     pub generation_order: Vec<ChunkCoord>,
     pub generation_scores: HashMap<ChunkCoord, f32>,
     pub resident_keep: HashSet<ChunkCoord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisibilityContext {
+    pub camera_pos_chunks: Vec3,
+    pub cone_inner_cos: f32,
+    pub cone_outer_cos: f32,
+    pub frustum_planes: Option<[Vec4; 6]>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -108,10 +116,13 @@ impl ChunkStreaming {
         player_chunk: ChunkCoord,
         player_velocity: Vec3,
         view_dir: Vec3,
+        visibility: Option<&VisibilityContext>,
         near_radius_xz: i32,
         mid_radius_xz: i32,
         far_radius_xz: Option<i32>,
         vertical_radius: i32,
+        resident_keep_mid_cap: usize,
+        resident_keep_far_cap: usize,
         last_visible_frame: &HashMap<ChunkCoord, u64>,
         frame_index: u64,
     ) -> DesiredChunks {
@@ -127,6 +138,28 @@ impl ChunkStreaming {
         let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len());
         let view_dir = view_dir.normalize_or_zero();
         let velocity_dir = player_velocity.normalize_or_zero();
+        let (cone_inner_cos, cone_outer_cos, frustum_planes, camera_pos_chunks) = visibility
+            .map(|ctx| {
+                (
+                    ctx.cone_inner_cos,
+                    ctx.cone_outer_cos,
+                    ctx.frustum_planes.as_ref(),
+                    ctx.camera_pos_chunks,
+                )
+            })
+            .unwrap_or((
+                0.65,
+                0.1,
+                None,
+                Vec3::new(
+                    player_chunk.x as f32,
+                    player_chunk.y as f32,
+                    player_chunk.z as f32,
+                ),
+            ));
+
+        let near_set: HashSet<_> = near.iter().copied().collect();
+        let mid_set: HashSet<_> = mid.iter().copied().collect();
         for coord in near
             .iter()
             .copied()
@@ -140,6 +173,35 @@ impl ChunkStreaming {
             let to_chunk = Vec3::new(dx as f32, dy as f32, dz as f32).normalize_or_zero();
             let view_alignment = view_dir.dot(to_chunk).max(0.0);
             let velocity_alignment = velocity_dir.dot(to_chunk).max(0.0);
+            let cone_weight = if cone_inner_cos > cone_outer_cos {
+                ((view_alignment - cone_outer_cos) / (cone_inner_cos - cone_outer_cos))
+                    .clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+
+            let frustum_weight = if let Some(planes) = frustum_planes {
+                let chunk_center = Vec3::new(
+                    coord.x as f32 + 0.5,
+                    coord.y as f32 + 0.5,
+                    coord.z as f32 + 0.5,
+                );
+                let relative = chunk_center - camera_pos_chunks;
+                let radius = 0.866_025_4;
+                let mut min_margin = f32::INFINITY;
+                for plane in planes {
+                    let margin = plane.truncate().dot(relative) + plane.w;
+                    min_margin = min_margin.min(margin);
+                }
+                if min_margin < -radius {
+                    0.0
+                } else {
+                    ((min_margin + radius) / (radius * 2.0)).clamp(0.0, 1.0)
+                }
+            } else {
+                1.0
+            };
+
             let recent_age = last_visible_frame
                 .get(&coord)
                 .map(|last| frame_index.saturating_sub(*last))
@@ -161,14 +223,15 @@ impl ChunkStreaming {
                 0.35
             };
             let score = (1.0 / (1.0 + distance2 as f32)) * 0.55
-                + (view_alignment * 0.75 + velocity_alignment * 0.25) * 0.25
+                + (cone_weight * 0.72 + velocity_alignment * 0.28) * 0.25
+                + frustum_weight * 0.08
                 + recent_visibility * 0.12
                 + lod_need * 0.08;
             weighted.push((
                 coord,
                 score,
                 distance2,
-                view_alignment,
+                cone_weight,
                 recent_visibility,
                 lod_need,
             ));
@@ -191,10 +254,32 @@ impl ChunkStreaming {
             generation_scores.insert(coord, score);
         }
 
-        let mut resident_keep = HashSet::with_capacity(near.len() + mid.len() + far.len());
+        let mut resident_keep = HashSet::with_capacity(
+            near.len()
+                + resident_keep_mid_cap.min(mid.len())
+                + resident_keep_far_cap.min(far.len()),
+        );
         resident_keep.extend(near.iter().copied());
-        resident_keep.extend(mid.iter().copied());
-        resident_keep.extend(far.iter().copied());
+
+        let mut mid_kept = 0usize;
+        let mut far_kept = 0usize;
+        for &coord in &generation_order {
+            if resident_keep.contains(&coord) {
+                continue;
+            }
+            if mid_set.contains(&coord) {
+                if mid_kept < resident_keep_mid_cap {
+                    resident_keep.insert(coord);
+                    mid_kept += 1;
+                }
+            } else if !near_set.contains(&coord) && far_kept < resident_keep_far_cap {
+                resident_keep.insert(coord);
+                far_kept += 1;
+            }
+            if mid_kept >= resident_keep_mid_cap && far_kept >= resident_keep_far_cap {
+                break;
+            }
+        }
 
         DesiredChunks {
             near,
