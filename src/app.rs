@@ -65,6 +65,9 @@ const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
+const COLLISION_URGENT_DISPATCH_BOOST: usize = 12;
+const COLLISION_STRICT_FALLBACK_WINDOW_SECS: f32 = 0.35;
+const COLLISION_TIMEOUT_DAMPING_FACTOR: f32 = 0.78;
 const HITCH_CAPTURE_FRAME_MS: f32 = 120.0;
 const HITCH_CAPTURE_RING_SIZE: usize = 64;
 const SPAWN_SEARCH_RADIUS: i32 = 48;
@@ -558,6 +561,11 @@ pub async fn run() -> anyhow::Result<()> {
     let mut collision_unknown_samples = 0usize;
     let mut collision_unknown_blocks_as_solid = 0usize;
     let mut collision_axis_reverts = 0usize;
+    let mut collision_missing_since: HashMap<ChunkCoord, f32> = HashMap::new();
+    let mut collision_local_urgent_boost = 0usize;
+    let mut collision_soft_timeout_active = false;
+    let mut collision_blocked_unloaded_count_total = 0u64;
+    let mut collision_blocked_unloaded_ms_total = 0.0f32;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
     let mut prior_dirty_backlog = 0usize;
@@ -839,26 +847,31 @@ pub async fn run() -> anyhow::Result<()> {
                         let player_local_for_collision = ctrl.position;
                         let player_world_for_collision = local_to_world_voxel(player_local_for_collision, origin_voxel);
                         let (player_chunk_for_collision, _) = voxel_to_chunk(player_world_for_collision);
-                        let collision_neighborhood_loaded = collision_neighborhood_loaded(
+                        let missing_collision_chunks = collision_neighborhood_missing_chunks(
                             &store,
                             player_local_for_collision,
                             origin_voxel,
                             COLLISION_SAFETY_RADIUS_VOXELS,
                         );
+                        let collision_neighborhood_loaded = missing_collision_chunks.is_empty();
+                        let now_secs = start.elapsed().as_secs_f32();
+                        let mut present_missing: HashSet<ChunkCoord> = HashSet::new();
+                        for coord in &missing_collision_chunks {
+                            present_missing.insert(*coord);
+                            collision_missing_since.entry(*coord).or_insert(now_secs);
+                        }
+                        collision_missing_since.retain(|coord, _| present_missing.contains(coord));
 
                         // Soft-fallback collision policy: no hard movement freeze when chunks are missing.
 
                         if !collision_neighborhood_loaded {
-                            let missing_coords = collision_neighborhood_missing_chunks(
-                                &store,
-                                player_local_for_collision,
-                                origin_voxel,
-                                COLLISION_SAFETY_RADIUS_VOXELS,
-                            );
+                            let missing_coords = missing_collision_chunks.clone();
+                            let local_dispatch_budget = COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET
+                                .max(URGENT_GENERATION_BUDGET + COLLISION_URGENT_DISPATCH_BOOST);
                             let mut forced_local_requests = 0usize;
                             for coord in missing_coords
                                 .into_iter()
-                                .take(COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET)
+                                .take(local_dispatch_budget)
                             {
                                 if streaming.resident.contains(&coord)
                                     || streaming.dispatched_generate.contains(&coord)
@@ -888,15 +901,22 @@ pub async fn run() -> anyhow::Result<()> {
                                     )
                                 });
                             }
+                            collision_local_urgent_boost = collision_local_urgent_boost
+                                .max(forced_local_requests)
+                                .max(COLLISION_URGENT_DISPATCH_BOOST);
+                        } else {
+                            collision_local_urgent_boost = 0;
                         }
 
 
                         collision_used_unloaded_chunks = false;
                         collision_unknown_samples = 0;
                         collision_unknown_blocks_as_solid = 0;
+                        collision_soft_timeout_active = false;
                         let look_active = !(gameplay_blocked || spawn_pending) && !egui_c;
                         let ctrl_input = input.clone();
                         let origin_for_ctrl = origin_voxel;
+                        let collision_position_before_step = ctrl.position;
                         let collision_step = ctrl.step(
                             |x, y, z| {
                                 let voxel = VoxelCoord { x, y, z };
@@ -908,8 +928,17 @@ pub async fn run() -> anyhow::Result<()> {
                                     within_collision_safety_radius(voxel, player_local_for_collision, origin_for_ctrl, COLLISION_SAFETY_RADIUS_VOXELS);
                                 if near_player {
                                     collision_used_unloaded_chunks = true;
-                                    collision_unknown_blocks_as_solid = collision_unknown_blocks_as_solid.saturating_add(1);
-                                    return 1u16;
+                                    let (missing_chunk, _) = voxel_to_chunk(voxel);
+                                    let missing_for_secs = collision_missing_since
+                                        .get(&missing_chunk)
+                                        .map(|seen_secs| now_secs - *seen_secs)
+                                        .unwrap_or(0.0);
+                                    if missing_for_secs <= COLLISION_STRICT_FALLBACK_WINDOW_SECS {
+                                        collision_unknown_blocks_as_solid = collision_unknown_blocks_as_solid.saturating_add(1);
+                                        return 1u16;
+                                    }
+
+                                    collision_soft_timeout_active = true;
                                 }
 
                                 0u16
@@ -921,6 +950,16 @@ pub async fn run() -> anyhow::Result<()> {
                             origin_for_ctrl,
                         );
                         collision_axis_reverts = collision_step.axis_reverts;
+                        if collision_soft_timeout_active {
+                            let damped_delta = ctrl.position - collision_position_before_step;
+                            ctrl.position = collision_position_before_step
+                                + damped_delta * COLLISION_TIMEOUT_DAMPING_FACTOR;
+                        }
+                        if collision_unknown_blocks_as_solid > 0 {
+                            collision_blocked_unloaded_count_total = collision_blocked_unloaded_count_total
+                                .saturating_add(collision_unknown_blocks_as_solid as u64);
+                            collision_blocked_unloaded_ms_total += dt * 1000.0;
+                        }
 
                         // Streaming regions in WORLD voxel space
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
@@ -1109,8 +1148,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        if !gen_dispatch_paused {
-                            for coord in dispatch_urgent {
+                        let urgent_dispatch_budget = URGENT_GENERATION_BUDGET + collision_local_urgent_boost;
+                        if !gen_dispatch_paused || collision_local_urgent_boost > 0 {
+                            for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
                                 if let Some(chunk) = cached_modified_chunks.take(coord) {
                                     apply_generated_chunk(&mut store, coord, chunk);
                                     streaming.mark_generated(coord, frame_counter);
@@ -1538,6 +1578,8 @@ pub async fn run() -> anyhow::Result<()> {
                         prior_meshing_queue_depth = mesh_stats.meshing_queue_depth;
                         prior_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_ultra_count = mesh_stats.ultra_mesh_count;
+                        ui.profiler.collision_blocked_unloaded_count = collision_blocked_unloaded_count_total;
+                        ui.profiler.collision_blocked_unloaded_ms = collision_blocked_unloaded_ms_total;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
                         ui.profiler.sim_substeps_executed = sim_substeps_executed;

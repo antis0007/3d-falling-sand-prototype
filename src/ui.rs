@@ -51,6 +51,8 @@ pub struct ProfilerStats {
     pub mesh_mid_count: usize,
     pub mesh_far_count: usize,
     pub mesh_ultra_count: usize,
+    pub collision_blocked_unloaded_count: u64,
+    pub collision_blocked_unloaded_ms: f32,
     pub sim_ms: f32,
     pub sim_chunk_steps: usize,
     pub sim_substeps_executed: usize,
@@ -492,6 +494,11 @@ pub fn draw(
                     ui_state.profiler.mesh_upload_count,
                     ui_state.profiler.mesh_upload_bytes,
                     ui_state.profiler.mesh_upload_latency_ms,
+                ));
+                ui.monospace(format!(
+                    "collision blocked by unloaded chunk: {} samples | {:.1} ms",
+                    ui_state.profiler.collision_blocked_unloaded_count,
+                    ui_state.profiler.collision_blocked_unloaded_ms,
                 ));
                 ui.monospace(format!(
                     "sim: {:.2} ms | chunk_steps: {}",
