@@ -40,6 +40,9 @@ const MESH_BACKPRESSURE_HIGH: usize = 180;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
+const COLLISION_FREEZE_MAX_DURATION: Duration = Duration::from_millis(1500);
+const COLLISION_FREEZE_BACKOFF_DURATION: Duration = Duration::from_millis(900);
+const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
 
 #[derive(Clone)]
 struct GenJob {
@@ -253,6 +256,10 @@ pub async fn run() -> anyhow::Result<()> {
     let mut total_generated_chunks: u64 = 0;
     let mut collision_freeze_active = false;
     let mut collision_used_unloaded_chunks = false;
+    let mut collision_freeze_started_at: Option<Instant> = None;
+    let mut collision_freeze_backoff_until: Option<Instant> = None;
+    let mut collision_freeze_last_duration_ms: f32 = 0.0;
+    let mut previous_collision_freeze_active = false;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
 
@@ -490,19 +497,132 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
+                        let now_instant = Instant::now();
                         let player_local_for_collision = ctrl.position;
+                        let player_world_for_collision = local_to_world_voxel(player_local_for_collision, origin_voxel);
+                        let (player_chunk_for_collision, _) = voxel_to_chunk(player_world_for_collision);
                         let collision_neighborhood_loaded = collision_neighborhood_loaded(
                             &store,
                             player_local_for_collision,
                             origin_voxel,
                             COLLISION_SAFETY_RADIUS_VOXELS,
                         );
-                        collision_freeze_active = FREEZE_UNTIL_COLLISION_RESIDENT
+
+                        let should_consider_freeze = FREEZE_UNTIL_COLLISION_RESIDENT
                             && !collision_neighborhood_loaded
                             && !gameplay_blocked
                             && !egui_c;
+                        let within_backoff = collision_freeze_backoff_until
+                            .is_some_and(|until| now_instant < until);
+                        collision_freeze_active = should_consider_freeze && !within_backoff;
+
+                        if collision_freeze_active {
+                            let started = collision_freeze_started_at.get_or_insert(now_instant);
+                            if now_instant.duration_since(*started) > COLLISION_FREEZE_MAX_DURATION {
+                                collision_freeze_active = false;
+                                collision_freeze_last_duration_ms =
+                                    now_instant.duration_since(*started).as_secs_f32() * 1000.0;
+                                collision_freeze_started_at = None;
+                                collision_freeze_backoff_until =
+                                    Some(now_instant + COLLISION_FREEZE_BACKOFF_DURATION);
+                            }
+                        } else if let Some(started) = collision_freeze_started_at.take() {
+                            collision_freeze_last_duration_ms =
+                                now_instant.duration_since(started).as_secs_f32() * 1000.0;
+                        }
+
+                        if collision_neighborhood_loaded {
+                            collision_freeze_backoff_until = None;
+                        }
+
+                        if !collision_neighborhood_loaded {
+                            let missing_coords = collision_neighborhood_missing_chunks(
+                                &store,
+                                player_local_for_collision,
+                                origin_voxel,
+                                COLLISION_SAFETY_RADIUS_VOXELS,
+                            );
+                            let mut forced_local_requests = 0usize;
+                            for coord in missing_coords
+                                .into_iter()
+                                .take(COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET)
+                            {
+                                if streaming.resident.contains(&coord)
+                                    || streaming.generating.contains(&coord)
+                                {
+                                    continue;
+                                }
+                                if chunk_generator.try_request(coord) {
+                                    streaming.generating.insert(coord);
+                                    forced_local_requests += 1;
+                                }
+                            }
+                            if forced_local_requests > 0 {
+                                ui.log_once_per_second("collision_force_local", start.elapsed().as_secs_f32(), || {
+                                    format!(
+                                        "collision_force_local requested={} player_chunk=({}, {}, {})",
+                                        forced_local_requests,
+                                        player_chunk_for_collision.x,
+                                        player_chunk_for_collision.y,
+                                        player_chunk_for_collision.z,
+                                    )
+                                });
+                            }
+                        }
+
+                        if collision_freeze_active != previous_collision_freeze_active {
+                            if collision_freeze_active {
+                                ui.log_once_per_second("collision_freeze_enter", start.elapsed().as_secs_f32(), || {
+                                    format!(
+                                        "collision_freeze enter player_chunk=({}, {}, {}) loaded_neighborhood={}",
+                                        player_chunk_for_collision.x,
+                                        player_chunk_for_collision.y,
+                                        player_chunk_for_collision.z,
+                                        collision_neighborhood_loaded,
+                                    )
+                                });
+                            } else {
+                                let backoff_remaining_ms = collision_freeze_backoff_until
+                                    .map(|until| until.saturating_duration_since(now_instant).as_secs_f32() * 1000.0)
+                                    .unwrap_or(0.0);
+                                ui.log_once_per_second("collision_freeze_exit", start.elapsed().as_secs_f32(), || {
+                                    format!(
+                                        "collision_freeze exit duration_ms={:.1} neighborhood_loaded={} backoff_remaining_ms={:.1}",
+                                        collision_freeze_last_duration_ms,
+                                        collision_neighborhood_loaded,
+                                        backoff_remaining_ms,
+                                    )
+                                });
+                            }
+                            previous_collision_freeze_active = collision_freeze_active;
+                        }
+
+                        if collision_freeze_active {
+                            let freeze_ms = collision_freeze_started_at
+                                .map(|started| now_instant.duration_since(started).as_secs_f32() * 1000.0)
+                                .unwrap_or(0.0);
+                            ui.log_once_per_second("collision_freeze_active", start.elapsed().as_secs_f32(), || {
+                                format!(
+                                    "collision_freeze active_ms={:.1} max_ms={:.1} backoff_ms={:.1} missing_neighborhood={}",
+                                    freeze_ms,
+                                    COLLISION_FREEZE_MAX_DURATION.as_secs_f32() * 1000.0,
+                                    COLLISION_FREEZE_BACKOFF_DURATION.as_secs_f32() * 1000.0,
+                                    !collision_neighborhood_loaded,
+                                )
+                            });
+                        }
+
                         collision_used_unloaded_chunks = false;
-                        let movement_active = !gameplay_blocked && !egui_c && !collision_freeze_active;
+                        let look_active = !gameplay_blocked && !egui_c;
+                        let mut ctrl_input = input.clone();
+                        if collision_freeze_active {
+                            ctrl_input.pressed.remove(&KeyCode::KeyW);
+                            ctrl_input.pressed.remove(&KeyCode::KeyA);
+                            ctrl_input.pressed.remove(&KeyCode::KeyS);
+                            ctrl_input.pressed.remove(&KeyCode::KeyD);
+                            ctrl_input.pressed.remove(&KeyCode::Space);
+                            ctrl_input.pressed.remove(&KeyCode::ShiftLeft);
+                        }
                         let origin_for_ctrl = origin_voxel;
                         ctrl.step(
                             |x, y, z| {
@@ -520,9 +640,9 @@ pub async fn run() -> anyhow::Result<()> {
 
                                 0u16
                             },
-                            &input,
+                            &ctrl_input,
                             dt,
-                            movement_active,
+                            look_active,
                             start.elapsed().as_secs_f32(),
                             origin_for_ctrl,
                         );
@@ -1085,6 +1205,44 @@ fn collision_neighborhood_loaded(
 
     true
 }
+fn collision_neighborhood_missing_chunks(
+    store: &ChunkStore,
+    player_local_pos: Vec3,
+    origin_voxel: VoxelCoord,
+    safety_radius_voxels: i32,
+) -> Vec<ChunkCoord> {
+    let player_world_pos = player_local_pos
+        + Vec3::new(
+            origin_voxel.x as f32,
+            origin_voxel.y as f32,
+            origin_voxel.z as f32,
+        );
+    let (player_chunk, _) = voxel_to_chunk(VoxelCoord {
+        x: player_world_pos.x.floor() as i32,
+        y: player_world_pos.y.floor() as i32,
+        z: player_world_pos.z.floor() as i32,
+    });
+    let (min, max) = FpsController::collision_sample_bounds_world(player_world_pos);
+
+    let mut missing = HashSet::new();
+    for z in (min.z - safety_radius_voxels)..=(max.z + safety_radius_voxels) {
+        for y in (min.y - safety_radius_voxels)..=(max.y + safety_radius_voxels) {
+            for x in (min.x - safety_radius_voxels)..=(max.x + safety_radius_voxels) {
+                let voxel = VoxelCoord { x, y, z };
+                if store.is_voxel_chunk_loaded(voxel) {
+                    continue;
+                }
+                let (coord, _) = voxel_to_chunk(voxel);
+                missing.insert(coord);
+            }
+        }
+    }
+
+    let mut ordered: Vec<ChunkCoord> = missing.into_iter().collect();
+    ordered.sort_by_key(|&coord| ChunkStreaming::sort_key(player_chunk, coord));
+    ordered
+}
+
 fn chunk_cube(center: ChunkCoord, radius: i32) -> HashSet<ChunkCoord> {
     let mut out = HashSet::new();
     for dz in -radius..=radius {
