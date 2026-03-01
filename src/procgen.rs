@@ -35,18 +35,48 @@ fn hash3(seed: u64, x: i32, y: i32, z: i32) -> u64 {
 }
 
 pub fn generate_chunk(seed: u64, c: ChunkCoord) -> Chunk {
-    let chunk_size = CHUNK_SIZE as i32;
-    let padded_size = CHUNK_SIZE * 3;
-    let padded_origin = [
-        c.x * chunk_size - chunk_size,
-        c.y * chunk_size - chunk_size,
-        c.z * chunk_size - chunk_size,
-    ];
+    generate_chunk_direct(seed, c)
+}
 
-    let config = ProcGenConfig::for_size(padded_size, seed).with_origin(padded_origin);
-    let world = generate_world(config);
-    let center = world.chunk_index(1, 1, 1);
-    world.chunks.get(center).cloned().unwrap_or_else(Chunk::new)
+pub fn generate_chunk_direct(seed: u64, c: ChunkCoord) -> Chunk {
+    let chunk_size = CHUNK_SIZE as i32;
+    let chunk_origin = [c.x * chunk_size, c.y * chunk_size, c.z * chunk_size];
+    let config = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin(chunk_origin);
+    generate_chunk_from_config(config)
+}
+
+fn generate_chunk_from_config(config: ProcGenConfig) -> Chunk {
+    let mut world = World::new(config.dims);
+    world.clear_empty();
+    let timings = ProcGenPassTimings::default();
+    let stages = ProcGenStages::default();
+    let (heights, columns) = build_column_cache(&config, &timings);
+    let hydrology = build_hydrology_cache_for_chunk(&config, &heights, &columns, &timings);
+
+    if stages.base_relief {
+        base_terrain_pass(&mut world, &config, &heights, &timings);
+    }
+    if stages.erosion_valley {
+        cave_carve_pass_chunk(&mut world, &config, &columns, &timings);
+    }
+    if stages.material_painting {
+        surface_layering_pass_chunk(&mut world, &config, &columns, &hydrology, &timings);
+        shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
+    }
+    if stages.channel_extraction || stages.basin_filling {
+        hydrology_fill_pass(
+            &mut world, &config, &heights, &columns, &hydrology, &timings,
+        );
+        remove_unsupported_hanging_water_pass(&mut world, &config, &timings);
+    }
+    enforce_subsea_materials_pass(&mut world, &config, &timings);
+    if stages.vegetation {
+        vegetation_pass_chunk(&mut world, &config, &columns, &hydrology, &timings);
+    }
+    world.finalize_generation_side_effects();
+    timings.log_total(config.world_origin);
+
+    world.chunks.into_iter().next().unwrap_or_else(Chunk::new)
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
@@ -467,6 +497,33 @@ fn build_hydrology_cache(
     let len = width * depth;
     let pad_x = width as i32;
     let pad_z = depth as i32;
+    build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
+}
+
+fn build_hydrology_cache_for_chunk(
+    config: &ProcGenConfig,
+    _heights: &[i32],
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) -> HydrologyData {
+    let _timer = timings.scoped("channel_extraction_chunk");
+    let width = config.dims[0];
+    let depth = config.dims[2];
+    let len = width * depth;
+    let pad_x = 1;
+    let pad_z = 1;
+    build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
+}
+
+fn build_hydrology_cache_impl(
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    len: usize,
+    width: usize,
+    depth: usize,
+    pad_x: i32,
+    pad_z: i32,
+) -> HydrologyData {
     let ctx_width = width + pad_x as usize * 2;
     let ctx_depth = depth + pad_z as usize * 2;
     let mut context = HydrologyContext {
@@ -880,6 +937,15 @@ fn cave_carve_pass(
     }
 }
 
+fn cave_carve_pass_chunk(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    timings: &ProcGenPassTimings,
+) {
+    cave_carve_pass(world, config, columns, timings);
+}
+
 fn surface_layering_pass(
     world: &mut World,
     config: &ProcGenConfig,
@@ -1012,6 +1078,16 @@ fn surface_layering_pass(
             }
         }
     }
+}
+
+fn surface_layering_pass_chunk(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    hydrology: &HydrologyData,
+    timings: &ProcGenPassTimings,
+) {
+    surface_layering_pass(world, config, columns, hydrology, timings);
 }
 
 fn slope_at_world(config: &ProcGenConfig, wx: i32, wz: i32) -> i32 {
@@ -1611,6 +1687,16 @@ fn vegetation_pass(
             }
         }
     }
+}
+
+fn vegetation_pass_chunk(
+    world: &mut World,
+    config: &ProcGenConfig,
+    columns: &[ColumnGenData],
+    hydrology: &HydrologyData,
+    timings: &ProcGenPassTimings,
+) {
+    vegetation_pass(world, config, columns, hydrology, timings);
 }
 
 pub fn find_safe_spawn(world: &World, seed: u64) -> [f32; 3] {
@@ -2379,6 +2465,40 @@ mod tests {
             ns_matches,
             ns_total
         );
+    }
+
+    #[test]
+    fn independently_generated_chunks_keep_boundary_columns_continuous() {
+        let seed = 0xABCD_1234;
+        let center_coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east_coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let south_coord = ChunkCoord { x: 0, y: 0, z: 1 };
+
+        let center = generate_chunk_direct(seed, center_coord);
+        let east = generate_chunk_direct(seed, east_coord);
+        let south = generate_chunk_direct(seed, south_coord);
+
+        for z in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                let a = center.get(CHUNK_SIZE - 1, y, z);
+                let b = east.get(0, y, z);
+                assert_eq!(
+                    a, b,
+                    "east/west seam mismatch at local y={y}, z={z}: {a} != {b}"
+                );
+            }
+        }
+
+        for x in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                let a = center.get(x, y, CHUNK_SIZE - 1);
+                let b = south.get(x, y, 0);
+                assert_eq!(
+                    a, b,
+                    "north/south seam mismatch at local x={x}, y={y}: {a} != {b}"
+                );
+            }
+        }
     }
 
     #[test]
