@@ -1,4 +1,5 @@
 use crate::chunk_store::ChunkStore;
+use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
 use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
@@ -29,7 +30,11 @@ const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
-const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
+const FLOATING_ORIGIN_CONFIG: FloatingOriginConfig = FloatingOriginConfig {
+    recenter_threshold_voxels: 128,
+    recenter_hysteresis_voxels: 16,
+    recenter_cooldown_frames: None,
+};
 const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
 const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
@@ -447,7 +452,7 @@ pub async fn run() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut cursor_is_unlocked = false;
 
-    let mut origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+    let mut floating_origin = FloatingOriginState::new();
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
@@ -476,7 +481,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut collision_freeze_backoff_until: Option<Instant> = None;
     let mut collision_freeze_last_duration_ms: f32 = 0.0;
     let mut previous_collision_freeze_active = false;
-    let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
+    let mut last_player_world_voxel =
+        local_to_world_voxel(ctrl.position, floating_origin.origin_translation);
     let mut prior_mesh_backlog = 0usize;
     let mut prior_dirty_backlog = 0usize;
     let mut prior_meshing_queue_depth = 0usize;
@@ -687,6 +693,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let cursor_should_unlock =
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
+                        let mut origin_voxel = floating_origin.origin_translation;
 
                         if spawn_pending {
                             if let Some(spawn_world) =
@@ -739,14 +746,9 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // Origin shifting to keep float precision stable
-                        let shift = origin_shift_for(ctrl.position);
-                        if shift != [0, 0, 0] {
-                            origin_voxel.x += shift[0];
-                            origin_voxel.y += shift[1];
-                            origin_voxel.z += shift[2];
-                            ctrl.position -=
-                                Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
-
+                        let origin_shift = floating_origin.update(ctrl.position, FLOATING_ORIGIN_CONFIG);
+                        ctrl.position = origin_shift.updated_local_player_offset;
+                        if origin_shift.recentered {
                             // Conservative: mark all loaded chunks dirty (so meshes rebase)
                             let loaded: Vec<ChunkCoord> =
                                 store.iter_loaded_chunks().copied().collect();
@@ -754,6 +756,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 store.mark_dirty(coord);
                             }
                         }
+                        origin_voxel = floating_origin.origin_translation;
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
                         let now_instant = Instant::now();
@@ -1380,7 +1383,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_sim_region.clear();
                                 generated_ready.clear();
                                 total_generated_chunks = 0;
-                                origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                floating_origin = FloatingOriginState::new();
+                                origin_voxel = floating_origin.origin_translation;
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
                                 collision_freeze_active = false;
@@ -1575,20 +1579,6 @@ pub async fn run() -> anyhow::Result<()> {
             _ => {}
         })
         .map_err(anyhow::Error::from)
-}
-
-fn origin_shift_for(pos: Vec3) -> [i32; 3] {
-    let mut shift = [0, 0, 0];
-    if pos.x.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[0] = pos.x.floor() as i32;
-    }
-    if pos.y.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[1] = pos.y.floor() as i32;
-    }
-    if pos.z.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[2] = pos.z.floor() as i32;
-    }
-    shift
 }
 
 fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {
