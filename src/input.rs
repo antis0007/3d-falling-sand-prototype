@@ -119,6 +119,29 @@ impl FpsController {
     const STEP_HEIGHT: f32 = 1.05;
     const GROUND_EPSILON: f32 = 0.05;
 
+    pub fn collision_sample_bounds_world(pos_world: Vec3) -> (VoxelCoord, VoxelCoord) {
+        let min = pos_world
+            + Vec3::new(
+                -Self::PLAYER_RADIUS,
+                -Self::EYE_TO_FEET,
+                -Self::PLAYER_RADIUS,
+            );
+        let max =
+            pos_world + Vec3::new(Self::PLAYER_RADIUS, Self::EYE_TO_HEAD, Self::PLAYER_RADIUS);
+
+        let min_coord = VoxelCoord {
+            x: min.x.floor() as i32,
+            y: min.y.floor() as i32,
+            z: min.z.floor() as i32,
+        };
+        let max_coord = VoxelCoord {
+            x: (max.x - 1e-4).floor() as i32,
+            y: (max.y - 1e-4).floor() as i32,
+            z: (max.z - 1e-4).floor() as i32,
+        };
+
+        (min_coord, max_coord)
+    }
     pub fn look_dir(&self) -> Vec3 {
         Vec3::new(
             self.yaw.cos() * self.pitch.cos(),
@@ -128,83 +151,79 @@ impl FpsController {
         .normalize_or_zero()
     }
 
-    fn collides<F>(get_voxel: &F, origin: VoxelCoord, pos_local: Vec3) -> bool
-        where
-            F: Fn(i32, i32, i32) -> u16,
-        {
-            // Convert local player position -> world space for collision queries
-            let pos = pos_local + Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
+    fn collides<F>(get_voxel: &mut F, origin: VoxelCoord, pos_local: Vec3) -> bool
+    where
+        F: FnMut(i32, i32, i32) -> u16,
+    {
+        // Convert local player position -> world space for collision queries
+        let pos = pos_local + Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
 
-            let min = pos
-                + Vec3::new(
-                    -Self::PLAYER_RADIUS,
-                    -Self::EYE_TO_FEET,
-                    -Self::PLAYER_RADIUS,
-                );
-            let max = pos + Vec3::new(Self::PLAYER_RADIUS, Self::EYE_TO_HEAD, Self::PLAYER_RADIUS);
+        let (min, max) = Self::collision_sample_bounds_world(pos);
 
-            let min_x = min.x.floor() as i32;
-            let min_y = min.y.floor() as i32;
-            let min_z = min.z.floor() as i32;
-            let max_x = (max.x - 1e-4).floor() as i32;
-            let max_y = (max.y - 1e-4).floor() as i32;
-            let max_z = (max.z - 1e-4).floor() as i32;
+        let min_x = min.x;
+        let min_y = min.y;
+        let min_z = min.z;
+        let max_x = max.x;
+        let max_y = max.y;
+        let max_z = max.z;
 
-            for z in min_z..=max_z {
-                for y in min_y..=max_y {
-                    for x in min_x..=max_x {
-                        let id = get_voxel(x, y, z);
-                        if id == 0 {
-                            continue;
-                        }
-                        let phase = material(id).phase;
-                        if matches!(phase, Phase::Solid | Phase::Powder) {
-                            return true;
-                        }
+        for z in min_z..=max_z {
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let id = get_voxel(x, y, z);
+                    if id == 0 {
+                        continue;
+                    }
+                    let phase = material(id).phase;
+                    if matches!(phase, Phase::Solid | Phase::Powder) {
+                        return true;
                     }
                 }
             }
-            false
         }
+        false
+    }
 
     fn try_move_axis<F>(
-            &mut self,
-            get_voxel: &F,
-            origin: VoxelCoord,
-            axis_delta: Vec3,
-            allow_step: bool,
-        ) where
-            F: Fn(i32, i32, i32) -> u16,
-        {
-            if axis_delta.length_squared() <= f32::EPSILON {
-                return;
-            }
+        &mut self,
+        get_voxel: &mut F,
+        origin: VoxelCoord,
+        axis_delta: Vec3,
+        allow_step: bool,
+    ) where
+        F: FnMut(i32, i32, i32) -> u16,
+    {
+        if axis_delta.length_squared() <= f32::EPSILON {
+            return;
+        }
 
-            let candidate = self.position + axis_delta;
-            if !Self::collides(get_voxel, origin, candidate) {
-                self.position = candidate;
-                return;
-            }
+        let candidate = self.position + axis_delta;
+        if !Self::collides(get_voxel, origin, candidate) {
+            self.position = candidate;
+            return;
+        }
 
-            if allow_step {
-                let raised = self.position + Vec3::Y * Self::STEP_HEIGHT;
-                let stair_candidate = raised + axis_delta;
-                if !Self::collides(get_voxel, origin, raised) && !Self::collides(get_voxel, origin, stair_candidate) {
-                    self.position = stair_candidate;
-                }
+        if allow_step {
+            let raised = self.position + Vec3::Y * Self::STEP_HEIGHT;
+            let stair_candidate = raised + axis_delta;
+            if !Self::collides(get_voxel, origin, raised)
+                && !Self::collides(get_voxel, origin, stair_candidate)
+            {
+                self.position = stair_candidate;
             }
         }
+    }
 
     pub fn step<F>(
         &mut self,
-        get_voxel: F,
+        mut get_voxel: F,
         input: &InputState,
         dt: f32,
         active: bool,
         now_s: f32,
         origin: VoxelCoord,
     ) where
-        F: Fn(i32, i32, i32) -> u16,
+        F: FnMut(i32, i32, i32) -> u16,
     {
         // Only apply mouse-look + movement when gameplay owns input
         if active {
@@ -247,15 +266,44 @@ impl FpsController {
             }
 
             let fly_delta = move_dir * self.fly_speed * dt;
-            self.try_move_axis(&get_voxel, origin, Vec3::new(fly_delta.x, 0.0, 0.0), false);
-            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, 0.0, fly_delta.z), false);
-            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, fly_delta.y, 0.0), false);
+            self.try_move_axis(
+                &mut get_voxel,
+                origin,
+                Vec3::new(fly_delta.x, 0.0, 0.0),
+                false,
+            );
+            self.try_move_axis(
+                &mut get_voxel,
+                origin,
+                Vec3::new(0.0, 0.0, fly_delta.z),
+                false,
+            );
+            self.try_move_axis(
+                &mut get_voxel,
+                origin,
+                Vec3::new(0.0, fly_delta.y, 0.0),
+                false,
+            );
         } else {
             let horizontal = move_dir * self.move_speed * dt;
-            self.try_move_axis(&get_voxel, origin, Vec3::new(horizontal.x, 0.0, 0.0), true);
-            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, 0.0, horizontal.z), true);
+            self.try_move_axis(
+                &mut get_voxel,
+                origin,
+                Vec3::new(horizontal.x, 0.0, 0.0),
+                true,
+            );
+            self.try_move_axis(
+                &mut get_voxel,
+                origin,
+                Vec3::new(0.0, 0.0, horizontal.z),
+                true,
+            );
 
-            let on_ground = Self::collides(&get_voxel, origin, self.position - Vec3::Y * Self::GROUND_EPSILON);
+            let on_ground = Self::collides(
+                &mut get_voxel,
+                origin,
+                self.position - Vec3::Y * Self::GROUND_EPSILON,
+            );
             if active && input.key(KeyCode::Space) && on_ground {
                 self.vel_y = self.jump_speed;
             }
@@ -265,7 +313,7 @@ impl FpsController {
             let vertical = Vec3::new(0.0, self.vel_y * dt, 0.0);
             let vertical_candidate = self.position + vertical;
 
-            if !Self::collides(&get_voxel, origin, vertical_candidate) {
+            if !Self::collides(&mut get_voxel, origin, vertical_candidate) {
                 self.position = vertical_candidate;
             } else {
                 self.vel_y = 0.0;

@@ -97,6 +97,15 @@ impl ChunkStore {
             .unwrap_or(EMPTY)
     }
 
+    pub fn is_chunk_loaded(&self, coord: ChunkCoord) -> bool {
+        self.chunks.contains_key(&coord)
+    }
+
+    pub fn is_voxel_chunk_loaded(&self, coord: VoxelCoord) -> bool {
+        let (chunk_coord, _) = voxel_to_chunk(coord);
+        self.is_chunk_loaded(chunk_coord)
+    }
+
     pub fn set_voxel(&mut self, coord: VoxelCoord, material: MaterialId) {
         let (chunk_coord, local) = voxel_to_chunk(coord);
         let (x, y, z) = (local[0] as usize, local[1] as usize, local[2] as usize);
@@ -163,7 +172,7 @@ impl ChunkStore {
     }
 
     pub fn chunk_exists(&self, coord: ChunkCoord) -> bool {
-        self.chunks.contains_key(&coord)
+        self.is_chunk_loaded(coord)
     }
 
     pub fn get_chunk(&self, coord: ChunkCoord) -> Option<&Chunk> {
@@ -278,5 +287,20 @@ mod tests {
 
         assert!(!store.chunk_exists(center));
         assert!(store.is_dirty(east));
+    }
+
+    #[test]
+    fn exposes_chunk_residency_for_world_voxels() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+
+        assert!(!store.is_chunk_loaded(center));
+        assert!(!store.is_voxel_chunk_loaded(VoxelCoord { x: 0, y: 0, z: 0 }));
+
+        store.insert_chunk(center, legacy_chunk_with_fill(1));
+
+        assert!(store.is_chunk_loaded(center));
+        assert!(store.is_voxel_chunk_loaded(VoxelCoord { x: 15, y: 1, z: 15 }));
+        assert!(!store.is_voxel_chunk_loaded(VoxelCoord { x: 16, y: 1, z: 15 }));
     }
 }
