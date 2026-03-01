@@ -25,6 +25,8 @@ A minimal, buildable voxel sandbox prototype inspired by Minecraft-style control
 cargo run
 ```
 
+This repo sets a shared Cargo target directory at `/workspace/.cargo-target/3d-falling-sand-prototype` via `.cargo/config.toml` so dependency artifacts are reused across tasks instead of rebuilt each time.
+
 Requires stable Rust on Linux or Windows.
 
 ## Controls
