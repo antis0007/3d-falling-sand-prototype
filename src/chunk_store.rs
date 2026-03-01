@@ -689,8 +689,16 @@ mod tests {
         assert!(store.is_dirty(center));
         assert!(!store.is_dirty(east));
 
+        let dirty_before_meshing = store.take_dirty_chunks();
+        assert!(dirty_before_meshing.contains(&center));
+        assert!(!dirty_before_meshing.contains(&east));
+
         store.mark_chunk_meshed(center);
         assert!(store.is_dirty(east));
+
+        store.take_dirty_chunks();
+        store.mark_chunk_meshed(center);
+        assert!(!store.is_dirty(east));
     }
 
     #[test]
