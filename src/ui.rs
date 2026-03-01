@@ -191,7 +191,7 @@ impl UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            paused_menu: false,
+            paused_menu: true,
             show_brush: false,
             selected_slot: 3,
             show_radial_menu: false,
