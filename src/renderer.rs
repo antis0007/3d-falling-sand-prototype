@@ -774,12 +774,12 @@ impl Renderer {
         }
 
         self.completed_meshes.sort_by(|a, b| {
-            job_priority(a.coord)
-                .total_cmp(&job_priority(b.coord))
+            job_priority(b.coord)
+                .total_cmp(&job_priority(a.coord))
                 .then_with(|| {
                     let ad = chunk_chebyshev_dist(player_chunk, a.coord);
                     let bd = chunk_chebyshev_dist(player_chunk, b.coord);
-                    bd.cmp(&ad)
+                    ad.cmp(&bd)
                 })
         });
 

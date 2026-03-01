@@ -580,6 +580,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut prior_meshing_queue_depth = 0usize;
     let mut prior_upload_latency_ms = 0.0f32;
     let mut gen_dispatch_paused = false;
+    let mut gen_worker_inflight = 0usize;
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
 
@@ -1131,7 +1132,7 @@ pub async fn run() -> anyhow::Result<()> {
                             &cached_desired.generation_scores,
                         );
 
-                        let gen_inflight_before_dispatch = streaming.dispatched_generate.len();
+                        let gen_inflight_before_dispatch = gen_worker_inflight;
                         if gen_dispatch_paused {
                             if gen_inflight_before_dispatch <= GEN_DISPATCH_LOW {
                                 gen_dispatch_paused = false;
@@ -1166,17 +1167,41 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        let urgent_dispatch_budget = URGENT_GENERATION_BUDGET + collision_local_urgent_boost;
+                        let dispatch_coord = |coord: ChunkCoord,
+                                              gen_request_count: &mut usize,
+                                              gen_worker_inflight: &mut usize,
+                                              store: &mut ChunkStore,
+                                              streaming: &mut ChunkStreaming,
+                                              cached_modified_chunks: &mut ModifiedChunkCache|
+                         -> bool {
+                            if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                apply_generated_chunk(store, coord, chunk);
+                                streaming.mark_generated(coord, frame_counter);
+                                true
+                            } else if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatch_succeeded(coord);
+                                *gen_request_count += 1;
+                                *gen_worker_inflight += 1;
+                                true
+                            } else {
+                                streaming.mark_dispatch_failed_or_deferred(coord);
+                                false
+                            }
+                        };
+
+                        let urgent_dispatch_budget =
+                            URGENT_GENERATION_BUDGET + collision_local_urgent_boost;
                         if !gen_dispatch_paused || collision_local_urgent_boost > 0 {
                             for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
-                                if let Some(chunk) = cached_modified_chunks.take(coord) {
-                                    apply_generated_chunk(&mut store, coord, chunk);
-                                    streaming.mark_generated(coord, frame_counter);
-                                } else if chunk_generator.try_request(coord) {
-                                    streaming.mark_dispatch_succeeded(coord);
-                                    gen_request_count += 1;
-                                } else {
-                                    streaming.mark_dispatch_failed_or_deferred(coord);
+                                if !dispatch_coord(
+                                    coord,
+                                    &mut gen_request_count,
+                                    &mut gen_worker_inflight,
+                                    &mut store,
+                                    &mut streaming,
+                                    &mut cached_modified_chunks,
+                                ) {
+                                    break;
                                 }
                             }
                         }
@@ -1195,37 +1220,53 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
                         let mut near_sent = 0usize;
-                        while near_sent < near_budget {
-                            let Some(coord) = streaming.next_generation_job() else { break; };
-                            if let Some(chunk) = cached_modified_chunks.take(coord) {
-                                apply_generated_chunk(&mut store, coord, chunk);
-                                streaming.mark_generated(coord, frame_counter);
-                                near_sent += 1;
-                            } else if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
-                                gen_request_count += 1;
-                                near_sent += 1;
-                            } else {
-                                streaming.mark_dispatch_failed_or_deferred(coord);
+                        for coord in dispatch_near.into_iter().take(near_budget) {
+                            if !dispatch_coord(
+                                coord,
+                                &mut gen_request_count,
+                                &mut gen_worker_inflight,
+                                &mut store,
+                                &mut streaming,
+                                &mut cached_modified_chunks,
+                            ) {
                                 break;
                             }
+                            near_sent += 1;
                         }
 
                         let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
-                        while far_budget > 0 {
-                            let Some(coord) = streaming.next_generation_job() else { break; };
-                            if let Some(chunk) = cached_modified_chunks.take(coord) {
-                                apply_generated_chunk(&mut store, coord, chunk);
-                                streaming.mark_generated(coord, frame_counter);
-                                far_budget -= 1;
-                            } else if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
-                                gen_request_count += 1;
-                                far_budget -= 1;
-                            } else {
-                                streaming.mark_dispatch_failed_or_deferred(coord);
+                        for coord in dispatch_far {
+                            if far_budget == 0 {
                                 break;
                             }
+                            if !dispatch_coord(
+                                coord,
+                                &mut gen_request_count,
+                                &mut gen_worker_inflight,
+                                &mut store,
+                                &mut streaming,
+                                &mut cached_modified_chunks,
+                            ) {
+                                break;
+                            }
+                            far_budget = far_budget.saturating_sub(1);
+                        }
+
+                        while far_budget > 0 {
+                            let Some(coord) = streaming.next_generation_job() else {
+                                break;
+                            };
+                            if !dispatch_coord(
+                                coord,
+                                &mut gen_request_count,
+                                &mut gen_worker_inflight,
+                                &mut store,
+                                &mut streaming,
+                                &mut cached_modified_chunks,
+                            ) {
+                                break;
+                            }
+                            far_budget = far_budget.saturating_sub(1);
                         }
                         let gen_recv_t0 = Instant::now();
                         let mut gen_completed_count = 0usize;
@@ -1236,6 +1277,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 Ok(res) => {
                                     generated_ready.push_back(res);
                                     gen_completed_count += 1;
+                                    gen_worker_inflight = gen_worker_inflight.saturating_sub(1);
                                 }
                                 Err(TryRecvError::Empty) => {
                                     gen_recv_empty = true;
@@ -1251,7 +1293,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         total_generated_chunks = total_generated_chunks
                             .saturating_add(gen_completed_count as u64);
-                        let gen_inflight = streaming.dispatched_generate.len();
+                        let gen_inflight = gen_worker_inflight;
                         if gen_inflight >= 96 && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
                             let starvation_reason = if gen_dispatch_paused {
@@ -1570,7 +1612,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.desired_ms = desired_ms;
                         ui.profiler.streaming_ms = streaming_ms;
                         ui.profiler.gen_request_count = gen_request_count;
-                        ui.profiler.gen_inflight_count = streaming.dispatched_generate.len();
+                        ui.profiler.gen_inflight_count = gen_worker_inflight;
                         ui.profiler.gen_completed_count = gen_completed_count;
                         ui.profiler.gen_completed_total = total_generated_chunks;
                         ui.profiler.apply_ms = apply_ms;
