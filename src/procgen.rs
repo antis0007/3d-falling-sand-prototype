@@ -21,6 +21,15 @@ const MACROCHUNK_SIZE: i32 = 64;
 const BIOME_COUNT: usize = 7;
 const DEFAULT_WORLD_MIN_Y: i32 = -256;
 const DEFAULT_WORLD_MAX_Y: i32 = 384;
+const CHUNK_HYDROLOGY_MIN_HALO_RADIUS: i32 = 8;
+const CHUNK_HYDROLOGY_MAX_HALO_RADIUS: i32 = 16;
+const CHUNK_HYDROLOGY_HALO_DIVISOR: i32 = 4;
+
+// Hydrology thresholds tuned with chunk-scale halo sampling.
+const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.43;
+const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.58;
+const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.58;
+const HYDRO_BASIN_MIN_CELL_COUNT: usize = 9;
 
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name)
@@ -834,12 +843,16 @@ fn build_hydrology_cache_for_chunk(
     build_hydrology_cache_impl(config, cache)
 }
 
-fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache) -> HydrologyData {
+fn build_hydrology_cache_impl(
+    config: &ProcGenConfig,
+    cache: &ProcGenFieldCache,
+) -> HydrologyData {
     let width = cache.width;
     let depth = cache.depth;
     let len = width * depth;
     let ctx_width = cache.span_width;
     let ctx_depth = cache.span_depth;
+
     let mut context = HydrologyContext {
         width: ctx_width,
         depth: ctx_depth,
@@ -857,7 +870,8 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
                     (config.sea_level_local() as f32 + 3.0 - field.surface_height as f32) / 7.0,
                 ) * 0.25)
                 .clamp(0.0, 1.0);
-            let river_weight = (field.accum_seed * 0.75 + field.river_prior * 0.4).clamp(0.0, 1.0);
+            let river_weight =
+                (field.accum_seed * 0.75 + field.river_prior * 0.4).clamp(0.0, 1.0);
             context.cells.push(HydrologyContextCell {
                 local_idx,
                 surface_height: field.surface_height,
@@ -898,6 +912,24 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
             flow_accum[down] += flow_accum[idx];
         }
     }
+
+    let mut seam_hints: HashMap<SeamDirection, Vec<SeamHydrologyHint>> = HashMap::new();
+    seam_hints.insert(
+        SeamDirection::North,
+        vec![SeamHydrologyHint::default(); width],
+    );
+    seam_hints.insert(
+        SeamDirection::South,
+        vec![SeamHydrologyHint::default(); width],
+    );
+    seam_hints.insert(
+        SeamDirection::West,
+        vec![SeamHydrologyHint::default(); depth],
+    );
+    seam_hints.insert(
+        SeamDirection::East,
+        vec![SeamHydrologyHint::default(); depth],
+    );
 
     let mut ocean_weight = vec![0.0; len];
     let mut river_weight = vec![0.0; len];
@@ -1042,8 +1074,7 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
         }
     }
 
-    let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut basin_cells: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..ctx_len {
         if context.cells[i].ocean_weight > 0.55 || context.cells[i].river_weight > 0.55 {
             continue;
@@ -1055,6 +1086,238 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
     let mut lake_level = vec![None; len];
     for (_sink, cells) in basin_cells {
         if cells.len() < 4 {
+            continue;
+        }
+        let mut in_basin = vec![false; ctx_len];
+        for &i in &cells {
+            in_basin[i] = true;
+        }
+        let mut spill = i32::MAX;
+        for &i in &cells {
+            let x = (i % context.width) as i32;
+            let z = (i / context.width) as i32;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
+                    continue;
+                }
+                let ni = nx as usize + nz as usize * context.width;
+                if !in_basin[ni] {
+                    spill = spill.min(context.cells[ni].surface_height);
+                }
+            }
+        }
+        if spill == i32::MAX {
+            continue;
+        }
+        let level = (spill - 1).min(config.sea_level_local() + 10);
+        for &i in &cells {
+            if let Some(local_idx) = context.cells[i].local_idx {
+                if context.cells[i].surface_height <= level {
+                    lake_level[local_idx] = Some(level);
+                }
+            }
+        }
+    }
+
+    HydrologyData {
+        river_weight,
+        ocean_weight,
+        lake_level,
+        river_level,
+        seam_hints,
+    }
+}
+
+    let ctx_len = context.width * context.depth;
+    let mut flow_to = vec![None; ctx_len];
+    for z in 0..context.depth as i32 {
+        for x in 0..context.width as i32 {
+            let idx = x as usize + z as usize * context.width;
+            let center = context.cells[idx].surface_height;
+            let mut best = center;
+            let mut best_idx = None;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
+                    continue;
+                }
+                let nidx = nx as usize + nz as usize * context.width;
+                let nh = context.cells[nidx].surface_height;
+                if nh < best {
+                    best = nh;
+                    best_idx = Some(nidx);
+                }
+            }
+            flow_to[idx] = best_idx;
+        }
+    }
+
+    let mut order: Vec<usize> = (0..ctx_len).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(context.cells[i].surface_height));
+    let mut flow_accum = vec![1.0f32; ctx_len];
+    for idx in order {
+        if let Some(down) = flow_to[idx] {
+            flow_accum[down] += flow_accum[idx];
+        }
+    }
+
+    let mut ocean_weight = vec![0.0; len];
+    let mut river_weight = vec![0.0; len];
+    for idx in 0..ctx_len {
+        if let Some(local_idx) = context.cells[idx].local_idx {
+            let accum_norm = (flow_accum[idx].ln() / 6.0).clamp(0.0, 1.0);
+            ocean_weight[local_idx] = context.cells[idx].ocean_weight;
+            river_weight[local_idx] = smoothstep(
+                (accum_norm * 0.88 + context.cells[idx].river_weight * 0.72 - 0.40) / 0.42,
+            );
+        }
+    }
+
+    let mut distance = vec![-1i32; ctx_len];
+    for idx in 0..ctx_len {
+        if distance[idx] >= 0 {
+            continue;
+        }
+        let mut chain = Vec::new();
+        let mut cur = idx;
+        let mut guard = 0;
+        while distance[cur] < 0 && guard < 256 {
+            chain.push(cur);
+            guard += 1;
+            match flow_to[cur] {
+                Some(next) => cur = next,
+                None => {
+                    distance[cur] = 0;
+                    break;
+                }
+            }
+        }
+        let mut dist = distance[cur].max(0);
+        while let Some(cell) = chain.pop() {
+            if cell == cur {
+                continue;
+            }
+            dist += 1;
+            distance[cell] = dist;
+        }
+    }
+
+    let mut sink_owner = vec![None::<usize>; ctx_len];
+    for i in 0..ctx_len {
+        let mut cur = i;
+        let mut sink = None;
+        for _ in 0..128 {
+            if let Some(n) = flow_to[cur] {
+                cur = n;
+            } else {
+                sink = Some(cur);
+                break;
+            }
+        }
+        sink_owner[i] = sink;
+    }
+
+    let mut sink_cells: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, sink) in sink_owner.iter().enumerate() {
+        if let Some(s) = sink {
+            sink_cells.entry(*s).or_default().push(i);
+        }
+    }
+    let mut sink_spill = vec![None::<i32>; ctx_len];
+    for (sink, cells) in &sink_cells {
+        let mut in_sink = vec![false; ctx_len];
+        for &i in cells {
+            in_sink[i] = true;
+        }
+        let mut spill = i32::MAX;
+        for &i in cells {
+            let x = (i % context.width) as i32;
+            let z = (i / context.width) as i32;
+            for (nx, nz) in [(x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)] {
+                if nx < 0 || nz < 0 || nx >= context.width as i32 || nz >= context.depth as i32 {
+                    continue;
+                }
+                let ni = nx as usize + nz as usize * context.width;
+                if !in_sink[ni] {
+                    spill = spill.min(context.cells[ni].surface_height);
+                }
+            }
+        }
+        if spill != i32::MAX {
+            sink_spill[*sink] = Some(spill - 1);
+        }
+    }
+
+    let mut river_level = vec![None; len];
+    let mut river_mask = vec![false; ctx_len];
+    for i in 0..ctx_len {
+        river_mask[i] = context.cells[i].river_weight > HYDRO_RIVER_MASK_THRESHOLD;
+    }
+    let mut channel_level_ctx = vec![None::<i32>; ctx_len];
+    for i in 0..ctx_len {
+        if !river_mask[i] {
+            continue;
+        }
+        let surface = context.cells[i].surface_height;
+        let downstream_surface = flow_to[i]
+            .map(|d| context.cells[d].surface_height)
+            .unwrap_or(surface);
+        let local_slope = (surface - downstream_surface).max(0) as f32;
+        let dist_term = (distance[i].max(0) as f32) * 0.14;
+        let slope_term = (1.0 / (local_slope + 1.0)).clamp(0.0, 1.0);
+        let flow_term = flow_accum[i].ln().max(0.0) * 0.34;
+        let incision = (1.0 + dist_term + slope_term + flow_term).round() as i32;
+        let mut level = surface - incision.max(1);
+        if let Some(sink) = sink_owner[i] {
+            if let Some(spill_level) = sink_spill[sink] {
+                level = level.min(spill_level);
+            }
+        }
+        level = level.min(surface - 1);
+        channel_level_ctx[i] = Some(level.max(1));
+    }
+
+    let mut topo = (0..ctx_len).collect::<Vec<_>>();
+    topo.sort_by_key(|&i| std::cmp::Reverse(distance[i]));
+    for idx in topo {
+        let Some(level) = channel_level_ctx[idx] else {
+            continue;
+        };
+        let Some(down) = flow_to[idx] else {
+            continue;
+        };
+        if !river_mask[down] {
+            continue;
+        }
+        if let Some(down_level) = channel_level_ctx[down] {
+            if down_level > level {
+                channel_level_ctx[down] = Some(level);
+            }
+        } else {
+            channel_level_ctx[down] = Some(level);
+        }
+    }
+
+    for i in 0..ctx_len {
+        if let (Some(local_idx), Some(level)) = (context.cells[i].local_idx, channel_level_ctx[i]) {
+            river_level[local_idx] = Some(level.min(context.cells[i].surface_height - 1));
+        }
+    }
+
+    let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..ctx_len {
+        if context.cells[i].ocean_weight > HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD
+            || context.cells[i].river_weight > HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD
+        {
+            continue;
+        }
+        if let Some(s) = sink_owner[i] {
+            basin_cells.entry(s).or_default().push(i);
+        }
+    }
+    let mut lake_level = vec![None; len];
+    for (_sink, cells) in basin_cells {
+        if cells.len() < HYDRO_BASIN_MIN_CELL_COUNT {
             continue;
         }
         let mut in_basin = vec![false; ctx_len];
@@ -2693,6 +2956,18 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Instant;
 
+    fn river_width_bucket(weight: f32) -> u8 {
+        if weight > 0.82 {
+            3
+        } else if weight > 0.67 {
+            2
+        } else if weight > HYDRO_RIVER_MASK_THRESHOLD {
+            1
+        } else {
+            0
+        }
+    }
+
     fn is_surface_material(mat: MaterialId) -> bool {
         matches!(mat, TURF | SAND | STONE)
     }
@@ -3239,6 +3514,79 @@ mod tests {
             reuse_time <= resample_time,
             "cache reuse regressed: build={build_time:?} reuse={reuse_time:?} resample={resample_time:?}"
         );
+    fn chunk_hydrology_seams_keep_river_presence_level_and_width_continuous() {
+        let size = 64i32;
+        let seed = 0x7135_AA91;
+        let center_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([size, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, size]);
+        let timings = ProcGenPassTimings::default();
+
+        let (center_h, center_cols) = build_column_cache(&center_cfg, &timings);
+        let (east_h, east_cols) = build_column_cache(&east_cfg, &timings);
+        let (south_h, south_cols) = build_column_cache(&south_cfg, &timings);
+
+        let center =
+            build_hydrology_cache_for_chunk(&center_cfg, &center_h, &center_cols, &timings);
+        let east = build_hydrology_cache_for_chunk(&east_cfg, &east_h, &east_cols, &timings);
+        let south = build_hydrology_cache_for_chunk(&south_cfg, &south_h, &south_cols, &timings);
+
+        for z in 0..size as usize {
+            let center_idx = (size as usize - 1) + z * size as usize;
+            let east_idx = z * size as usize;
+
+            let center_present = center.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let east_present = east.river_weight[east_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_present, east_present,
+                "east/west river presence mismatch at z={z}: {:.3} vs {:.3}",
+                center.river_weight[center_idx], east.river_weight[east_idx]
+            );
+
+            if let (Some(a), Some(b)) = (center.river_level[center_idx], east.river_level[east_idx])
+            {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "east/west river level mismatch at z={z}: {a} vs {b}"
+                );
+            }
+
+            let a_width = river_width_bucket(center.river_weight[center_idx]);
+            let b_width = river_width_bucket(east.river_weight[east_idx]);
+            assert!(
+                (a_width as i32 - b_width as i32).abs() <= 1,
+                "east/west river width bucket mismatch at z={z}: {a_width} vs {b_width}"
+            );
+        }
+
+        for x in 0..size as usize {
+            let center_idx = x + (size as usize - 1) * size as usize;
+            let south_idx = x;
+
+            let center_present = center.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let south_present = south.river_weight[south_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_present, south_present,
+                "north/south river presence mismatch at x={x}: {:.3} vs {:.3}",
+                center.river_weight[center_idx], south.river_weight[south_idx]
+            );
+
+            if let (Some(a), Some(b)) =
+                (center.river_level[center_idx], south.river_level[south_idx])
+            {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "north/south river level mismatch at x={x}: {a} vs {b}"
+                );
+            }
+
+            let a_width = river_width_bucket(center.river_weight[center_idx]);
+            let b_width = river_width_bucket(south.river_weight[south_idx]);
+            assert!(
+                (a_width as i32 - b_width as i32).abs() <= 1,
+                "north/south river width bucket mismatch at x={x}: {a_width} vs {b_width}"
+            );
+        }
     }
 
     #[test]
