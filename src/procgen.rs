@@ -61,28 +61,33 @@ fn generate_chunk_from_config(config: ProcGenConfig) -> Chunk {
     world.clear_empty();
     let timings = ProcGenPassTimings::default();
     let stages = ProcGenStages::default();
-    let (heights, columns) = build_column_cache(&config, &timings);
-    let hydrology = build_hydrology_cache_for_chunk(&config, &heights, &columns, &timings);
+    let cache = build_procgen_field_cache(&config, 16, &timings);
+    let hydrology = build_hydrology_cache_for_chunk(&config, &cache, &timings);
 
     if stages.base_relief {
-        base_terrain_pass(&mut world, &config, &heights, &timings);
+        base_terrain_pass(&mut world, &config, &cache, &timings);
     }
     if stages.erosion_valley {
-        cave_carve_pass_chunk(&mut world, &config, &columns, &timings);
+        cave_carve_pass_chunk(&mut world, &config, &cache, &timings);
     }
     if stages.material_painting {
-        surface_layering_pass_chunk(&mut world, &config, &columns, &hydrology, &timings);
-        shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
+        surface_layering_pass_chunk(&mut world, &config, &cache, &hydrology, &timings);
+        shoreline_transition_pass(&mut world, &config, &cache, &timings);
     }
     if stages.channel_extraction || stages.basin_filling {
         hydrology_fill_pass(
-            &mut world, &config, &heights, &columns, &hydrology, &timings,
+            &mut world,
+            &config,
+            &cache.local_heights,
+            &cache.local_columns,
+            &hydrology,
+            &timings,
         );
         remove_unsupported_hanging_water_pass(&mut world, &config, &timings);
     }
     enforce_subsea_materials_pass(&mut world, &config, &timings);
     if stages.vegetation {
-        vegetation_pass_chunk(&mut world, &config, &columns, &hydrology, &timings);
+        vegetation_pass_chunk(&mut world, &config, &cache, &hydrology, &timings);
     }
     world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
@@ -343,6 +348,68 @@ struct HydrologyContext {
     cells: Vec<HydrologyContextCell>,
 }
 
+#[derive(Clone, Copy)]
+struct ProcGenFieldCell {
+    climate: ClimateSample,
+    weights: [f32; BIOME_COUNT],
+    surface_height: i32,
+    slope: i32,
+    ocean_prior: f32,
+    river_prior: f32,
+    accum_seed: f32,
+    vegetation_anchor: bool,
+}
+
+struct ProcGenFieldCache {
+    halo: i32,
+    width: usize,
+    depth: usize,
+    span_width: usize,
+    span_depth: usize,
+    cells: Vec<ProcGenFieldCell>,
+    local_heights: Vec<i32>,
+    local_columns: Vec<ColumnGenData>,
+}
+
+impl ProcGenFieldCache {
+    fn local_idx(&self, lx: i32, lz: i32) -> Option<usize> {
+        if lx < 0 || lz < 0 || lx >= self.width as i32 || lz >= self.depth as i32 {
+            return None;
+        }
+        Some(lx as usize + lz as usize * self.width)
+    }
+
+    fn span_idx_local(&self, lx: i32, lz: i32) -> Option<usize> {
+        self.span_idx_with_halo(lx + self.halo, lz + self.halo)
+    }
+
+    fn span_idx_world(&self, config: &ProcGenConfig, wx: i32, wz: i32) -> Option<usize> {
+        let lx = wx - config.world_origin[0];
+        let lz = wz - config.world_origin[2];
+        self.span_idx_local(lx, lz)
+    }
+
+    fn span_idx_with_halo(&self, hx: i32, hz: i32) -> Option<usize> {
+        if hx < 0 || hz < 0 || hx >= self.span_width as i32 || hz >= self.span_depth as i32 {
+            return None;
+        }
+        Some(hx as usize + hz as usize * self.span_width)
+    }
+
+    fn cell_local(&self, lx: i32, lz: i32) -> Option<&ProcGenFieldCell> {
+        self.span_idx_local(lx, lz).map(|idx| &self.cells[idx])
+    }
+
+    fn cell_world(&self, config: &ProcGenConfig, wx: i32, wz: i32) -> Option<&ProcGenFieldCell> {
+        self.span_idx_world(config, wx, wz)
+            .map(|idx| &self.cells[idx])
+    }
+
+    fn local_column(&self, lx: i32, lz: i32) -> Option<&ColumnGenData> {
+        self.local_idx(lx, lz).map(|idx| &self.local_columns[idx])
+    }
+}
+
 fn sample_climate(seed: u64, wx: i32, wz: i32) -> ClimateSample {
     let temperature = (fbm2(
         seed ^ 0x6C11_A001,
@@ -528,38 +595,58 @@ fn generate_world_with_control(
     world.clear_empty();
     let timings = ProcGenPassTimings::default();
     let stages = ProcGenStages::default();
-    let (heights, columns) = build_column_cache(&config, &timings);
-    let hydrology = build_hydrology_cache(&config, &heights, &columns, &timings);
+    let cache = build_procgen_field_cache(
+        &config,
+        (config.dims[0] as i32).max(config.dims[2] as i32),
+        &timings,
+    );
+    let hydrology = build_hydrology_cache(
+        &config,
+        &cache.local_heights,
+        &cache.local_columns,
+        &timings,
+    );
 
     if (control.should_cancel)(control.epoch) {
         return None;
     }
 
     if stages.base_relief {
-        base_terrain_pass(&mut world, &config, &heights, &timings);
+        base_terrain_pass(&mut world, &config, &cache, &timings);
     }
     if (control.should_cancel)(control.epoch) {
         return None;
     }
     if stages.erosion_valley {
-        cave_carve_pass(&mut world, &config, &columns, &timings);
+        cave_carve_pass(&mut world, &config, &cache, &timings);
     }
     if (control.should_cancel)(control.epoch) {
         return None;
     }
     if stages.material_painting {
-        surface_layering_pass(&mut world, &config, &columns, &hydrology, &timings);
-        shoreline_transition_pass(&mut world, &config, &heights, &columns, &timings);
+        surface_layering_pass(&mut world, &config, &cache, &hydrology, &timings);
+        shoreline_transition_pass(&mut world, &config, &cache, &timings);
     }
     if stages.channel_extraction || stages.basin_filling {
         hydrology_fill_pass(
-            &mut world, &config, &heights, &columns, &hydrology, &timings,
+            &mut world,
+            &config,
+            &cache.local_heights,
+            &cache.local_columns,
+            &hydrology,
+            &timings,
         );
         remove_unsupported_hanging_water_pass(&mut world, &config, &timings);
     }
     enforce_subsea_materials_pass(&mut world, &config, &timings);
     if stages.vegetation {
-        vegetation_pass(&mut world, &config, &columns, &hydrology, &timings);
+        vegetation_pass(
+            &mut world,
+            &config,
+            &cache.local_columns,
+            &hydrology,
+            &timings,
+        );
     }
     world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
@@ -597,119 +684,162 @@ pub fn hydro_feature_at_world(config: &ProcGenConfig, x: i32, z: i32) -> HydroFe
 }
 
 fn build_heightmap(config: &ProcGenConfig) -> Vec<i32> {
-    build_column_cache(config, &ProcGenPassTimings::default()).0
+    let cache = build_procgen_field_cache(config, 1, &ProcGenPassTimings::default());
+    cache.local_heights
 }
 
 fn build_column_cache(
     config: &ProcGenConfig,
     timings: &ProcGenPassTimings,
 ) -> (Vec<i32>, Vec<ColumnGenData>) {
+    let cache = build_procgen_field_cache(config, 1, timings);
+    (cache.local_heights, cache.local_columns)
+}
+
+fn build_procgen_field_cache(
+    config: &ProcGenConfig,
+    halo: i32,
+    timings: &ProcGenPassTimings,
+) -> ProcGenFieldCache {
     let _timer = timings.scoped("build_column_cache");
-    let mut heights = vec![0; config.dims[0] * config.dims[2]];
-    let mut columns = vec![
-        ColumnGenData {
-            wx: 0,
-            wz: 0,
-            weights: [0.0; BIOME_COUNT],
+    let width = config.dims[0];
+    let depth = config.dims[2];
+    let span_width = width + (halo as usize * 2);
+    let span_depth = depth + (halo as usize * 2);
+    let mut cells = vec![
+        ProcGenFieldCell {
             climate: ClimateSample::default(),
+            weights: [0.0; BIOME_COUNT],
             surface_height: 0,
             slope: 0,
-            coastal: false,
-            river: false,
-            ocean: false,
-            stratum: VerticalBiomeStratum::Lowland,
-            landmark: None,
+            ocean_prior: 0.0,
+            river_prior: 0.0,
+            accum_seed: 0.0,
+            vegetation_anchor: false,
         };
-        config.dims[0] * config.dims[2]
+        span_width * span_depth
     ];
-    for z in 0..config.dims[2] as i32 {
-        for x in 0..config.dims[0] as i32 {
-            let wx = config.world_origin[0] + x;
-            let wz = config.world_origin[2] + z;
-            let idx = x as usize + z as usize * config.dims[0];
+
+    for hz in 0..span_depth as i32 {
+        for hx in 0..span_width as i32 {
+            let wx = config.world_origin[0] + hx - halo;
+            let wz = config.world_origin[2] + hz - halo;
+            let idx = hx as usize + hz as usize * span_width;
             let climate = sample_climate(config.seed, wx, wz);
             let weights = biome_weights(config.seed, wx, wz, climate);
             let surface_height = sampled_surface_height(config, wx, wz, Some(weights));
-            heights[idx] = surface_height;
-            columns[idx] = ColumnGenData {
+            let ocean = weights[biome_index(BiomeType::Ocean)];
+            let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                config.seed,
                 wx,
                 wz,
-                weights,
+            ));
+            cells[idx] = ProcGenFieldCell {
                 climate,
+                weights,
                 surface_height,
                 slope: 0,
-                coastal: false,
-                river: false,
-                ocean: false,
-                stratum: VerticalBiomeStratum::Lowland,
-                landmark: None,
+                ocean_prior: ocean,
+                river_prior: river,
+                accum_seed: smoothstep((river - 0.24) / 0.65),
+                vegetation_anchor: hash01(config.seed ^ 0x1111_7777, wx, surface_height, wz) < 0.5,
             };
         }
     }
-    for z in 0..config.dims[2] as i32 {
-        for x in 0..config.dims[0] as i32 {
-            let idx = x as usize + z as usize * config.dims[0];
-            let col = &mut columns[idx];
-            let ocean = col.weights[biome_index(BiomeType::Ocean)];
-            let river = col.weights[biome_index(BiomeType::River)].max(river_meander_signal(
-                config.seed,
-                col.wx,
-                col.wz,
-            ));
-            let shore_w = smoothstep((ocean - 0.24) / 0.34);
-            let near_sea_band = col.surface_height <= config.sea_level_local() + 4;
-            col.slope = slope_at_world(config, col.wx, col.wz);
-            col.coastal = shore_w > 0.18 && near_sea_band;
-            col.river = river > 0.48;
-            col.ocean = ocean > 0.55;
-            col.stratum = classify_vertical_biome_stratum(config, col, col.surface_height);
-            col.landmark = sample_landmark(config.seed, col.wx, col.wz, col.climate, col.slope);
+
+    for hz in 0..span_depth as i32 {
+        for hx in 0..span_width as i32 {
+            let center_idx = hx as usize + hz as usize * span_width;
+            let center_h = cells[center_idx].surface_height;
+            let mut max_delta = 0;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nh = (hx + dx).clamp(0, span_width as i32 - 1);
+                    let nz = (hz + dz).clamp(0, span_depth as i32 - 1);
+                    let nidx = nh as usize + nz as usize * span_width;
+                    max_delta = max_delta.max((cells[nidx].surface_height - center_h).abs());
+                }
+            }
+            cells[center_idx].slope = max_delta;
         }
     }
-    (heights, columns)
+
+    let mut local_heights = vec![0; width * depth];
+    let mut local_columns = Vec::with_capacity(width * depth);
+    for lz in 0..depth as i32 {
+        for lx in 0..width as i32 {
+            let idx = lx as usize + lz as usize * width;
+            let span_idx = (lx + halo) as usize + (lz + halo) as usize * span_width;
+            let cell = cells[span_idx];
+            local_heights[idx] = cell.surface_height;
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let shore_w = smoothstep((cell.ocean_prior - 0.24) / 0.34);
+            let near_sea_band = cell.surface_height <= config.sea_level_local() + 4;
+            let coastal = shore_w > 0.18 && near_sea_band;
+            let river = cell.river_prior > 0.48;
+            let ocean = cell.ocean_prior > 0.55;
+            let mut col = ColumnGenData {
+                wx,
+                wz,
+                weights: cell.weights,
+                climate: cell.climate,
+                surface_height: cell.surface_height,
+                slope: cell.slope,
+                coastal,
+                river,
+                ocean,
+                stratum: VerticalBiomeStratum::Lowland,
+                landmark: None,
+            };
+            col.stratum = classify_vertical_biome_stratum(config, &col, col.surface_height);
+            col.landmark = sample_landmark(config.seed, col.wx, col.wz, col.climate, col.slope);
+            local_columns.push(col);
+        }
+    }
+
+    ProcGenFieldCache {
+        halo,
+        width,
+        depth,
+        span_width,
+        span_depth,
+        cells,
+        local_heights,
+        local_columns,
+    }
 }
 
 fn build_hydrology_cache(
     config: &ProcGenConfig,
     _heights: &[i32],
-    columns: &[ColumnGenData],
+    _columns: &[ColumnGenData],
     timings: &ProcGenPassTimings,
 ) -> HydrologyData {
+    let halo = (config.dims[0] as i32).max(config.dims[2] as i32);
+    let cache = build_procgen_field_cache(config, halo, timings);
     let _timer = timings.scoped("channel_extraction");
-    let width = config.dims[0];
-    let depth = config.dims[2];
-    let len = width * depth;
-    let pad_x = width as i32;
-    let pad_z = depth as i32;
-    build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
+    build_hydrology_cache_impl(config, &cache)
 }
 
 fn build_hydrology_cache_for_chunk(
     config: &ProcGenConfig,
-    _heights: &[i32],
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
 ) -> HydrologyData {
     let _timer = timings.scoped("channel_extraction_chunk");
-    let width = config.dims[0];
-    let depth = config.dims[2];
-    let len = width * depth;
-    let pad_x = (width as i32).max(16);
-    let pad_z = (depth as i32).max(16);
-    build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
+    build_hydrology_cache_impl(config, cache)
 }
 
-fn build_hydrology_cache_impl(
-    config: &ProcGenConfig,
-    columns: &[ColumnGenData],
-    len: usize,
-    width: usize,
-    depth: usize,
-    pad_x: i32,
-    pad_z: i32,
-) -> HydrologyData {
-    let ctx_width = width + pad_x as usize * 2;
-    let ctx_depth = depth + pad_z as usize * 2;
+fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache) -> HydrologyData {
+    let width = cache.width;
+    let depth = cache.depth;
+    let len = width * depth;
+    let ctx_width = cache.span_width;
+    let ctx_depth = cache.span_depth;
     let mut context = HydrologyContext {
         width: ctx_width,
         depth: ctx_depth,
@@ -717,40 +847,20 @@ fn build_hydrology_cache_impl(
     };
     for cz in 0..ctx_depth as i32 {
         for cx in 0..ctx_width as i32 {
-            let wx = config.world_origin[0] + cx - pad_x;
-            let wz = config.world_origin[2] + cz - pad_z;
-            let local_x = wx - config.world_origin[0];
-            let local_z = wz - config.world_origin[2];
-            let local_idx =
-                if local_x >= 0 && local_z >= 0 && local_x < width as i32 && local_z < depth as i32
-                {
-                    Some(local_x as usize + local_z as usize * width)
-                } else {
-                    None
-                };
-            let local_col = local_idx.map(|idx| columns[idx]);
-            let local_weights = local_col.map(|col| col.weights).unwrap_or_else(|| {
-                biome_weights(config.seed, wx, wz, sample_climate(config.seed, wx, wz))
-            });
-            let surface_height = local_col
-                .map(|col| col.surface_height)
-                .unwrap_or_else(|| sampled_surface_height(config, wx, wz, Some(local_weights)));
-            let ocean = local_weights[biome_index(BiomeType::Ocean)];
-            let river = local_weights[biome_index(BiomeType::River)].max(river_meander_signal(
-                config.seed,
-                wx,
-                wz,
-            ));
-            let accum_seed = smoothstep((river - 0.24) / 0.65);
-            let ocean_weight = (ocean * 0.75
+            let span_idx = cx as usize + cz as usize * ctx_width;
+            let field = cache.cells[span_idx];
+            let lx = cx - cache.halo;
+            let lz = cz - cache.halo;
+            let local_idx = cache.local_idx(lx, lz);
+            let ocean_weight = (field.ocean_prior * 0.75
                 + smoothstep(
-                    (config.sea_level_local() as f32 + 3.0 - surface_height as f32) / 7.0,
+                    (config.sea_level_local() as f32 + 3.0 - field.surface_height as f32) / 7.0,
                 ) * 0.25)
                 .clamp(0.0, 1.0);
-            let river_weight = (accum_seed * 0.75 + river * 0.4).clamp(0.0, 1.0);
+            let river_weight = (field.accum_seed * 0.75 + field.river_prior * 0.4).clamp(0.0, 1.0);
             context.cells.push(HydrologyContextCell {
                 local_idx,
-                surface_height,
+                surface_height: field.surface_height,
                 ocean_weight,
                 river_weight,
             });
@@ -994,13 +1104,16 @@ fn pack_column_key(wx: i32, wz: i32) -> u64 {
 fn base_terrain_pass(
     world: &mut World,
     config: &ProcGenConfig,
-    heights: &[i32],
+    cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("base_terrain_pass");
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
-            let surface_local = heights[lx as usize + lz as usize * world.dims[0]];
+            let surface_local = cache
+                .local_column(lx, lz)
+                .expect("local cache column in bounds")
+                .surface_height;
             let surface_world = config.world_origin[1] + surface_local;
             for ly in 0..world.dims[1] as i32 {
                 let world_y = config.world_origin[1] + ly;
@@ -1022,7 +1135,7 @@ fn base_terrain_pass(
 fn cave_carve_pass(
     world: &mut World,
     config: &ProcGenConfig,
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("cave_carve_pass");
@@ -1045,7 +1158,9 @@ fn cave_carve_pass(
                 if stratum == VerticalStratum::Sky {
                     continue;
                 }
-                let col = &columns[lx as usize + lz as usize * world.dims[0]];
+                let col = cache
+                    .local_column(lx, lz)
+                    .expect("local cache column in bounds");
                 let top_world = config.world_origin[1] + col.surface_height;
                 if world_y >= top_world - 4 {
                     continue;
@@ -1105,16 +1220,16 @@ fn cave_carve_pass(
 fn cave_carve_pass_chunk(
     world: &mut World,
     config: &ProcGenConfig,
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
 ) {
-    cave_carve_pass(world, config, columns, timings);
+    cave_carve_pass(world, config, cache, timings);
 }
 
 fn surface_layering_pass(
     world: &mut World,
     config: &ProcGenConfig,
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
@@ -1122,7 +1237,7 @@ fn surface_layering_pass(
     for lz in 0..world.dims[2] as i32 {
         for lx in 0..world.dims[0] as i32 {
             let idx = lx as usize + lz as usize * world.dims[0];
-            let col = &columns[idx];
+            let col = &cache.local_columns[idx];
             let top_y = col.surface_height;
             let weights = col.weights;
             let wx = config.world_origin[0] + lx;
@@ -1285,11 +1400,11 @@ fn surface_layering_pass(
 fn surface_layering_pass_chunk(
     world: &mut World,
     config: &ProcGenConfig,
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
-    surface_layering_pass(world, config, columns, hydrology, timings);
+    surface_layering_pass(world, config, cache, hydrology, timings);
 }
 
 fn slope_at_world(config: &ProcGenConfig, wx: i32, wz: i32) -> i32 {
@@ -1310,15 +1425,16 @@ fn slope_at_world(config: &ProcGenConfig, wx: i32, wz: i32) -> i32 {
 fn shoreline_transition_pass(
     world: &mut World,
     config: &ProcGenConfig,
-    heights: &[i32],
-    columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
 ) {
     let _timer = timings.scoped("shoreline_transition_pass");
     let sea = config.sea_level_local();
     for lz in 1..world.dims[2] as i32 - 1 {
         for lx in 1..world.dims[0] as i32 - 1 {
-            let col = &columns[lx as usize + lz as usize * world.dims[0]];
+            let col = cache
+                .local_column(lx, lz)
+                .expect("local cache column in bounds");
             let ocean = col.weights[biome_index(BiomeType::Ocean)];
             if ocean > 0.55 {
                 continue;
@@ -1332,7 +1448,9 @@ fn shoreline_transition_pass(
                     }
                     let nx = (lx + dx).clamp(0, world.dims[0] as i32 - 1);
                     let nz = (lz + dz).clamp(0, world.dims[2] as i32 - 1);
-                    let ncol = &columns[nx as usize + nz as usize * world.dims[0]];
+                    let ncol = cache
+                        .local_column(nx, nz)
+                        .expect("local cache column in bounds");
                     if ncol.weights[biome_index(BiomeType::Ocean)] > 0.62 {
                         near_ocean = true;
                         break;
@@ -1346,7 +1464,7 @@ fn shoreline_transition_pass(
                 continue;
             }
 
-            let top = heights[lx as usize + lz as usize * world.dims[0]];
+            let top = col.surface_height;
             if top >= sea - 1 {
                 continue;
             }
@@ -1893,7 +2011,7 @@ fn vegetation_pass(
 fn vegetation_pass_chunk(
     world: &mut World,
     config: &ProcGenConfig,
-    _columns: &[ColumnGenData],
+    cache: &ProcGenFieldCache,
     _hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
@@ -1905,13 +2023,17 @@ fn vegetation_pass_chunk(
         for lx in -chunk_radius..(world.dims[0] as i32 + chunk_radius) {
             let wx = config.world_origin[0] + lx;
             let wz = config.world_origin[2] + lz;
-            let climate = sample_climate(config.seed, wx, wz);
-            let weights = biome_weights(config.seed, wx, wz, climate);
-            let local_surface = sampled_surface_height(config, wx, wz, Some(weights));
+            let Some(field) = cache.cell_world(config, wx, wz) else {
+                continue;
+            };
+            let _anchor_candidate = field.vegetation_anchor;
+            let climate = field.climate;
+            let weights = field.weights;
+            let local_surface = field.surface_height;
             // `local_surface` is chunk-local Y. Convert once to world-space and use that
             // consistently for all tree anchoring/roll decisions.
             let ground_world_y = config.world_origin[1] + local_surface;
-            let slope = slope_at_world(config, wx, wz);
+            let slope = field.slope;
             let ocean = weights[biome_index(BiomeType::Ocean)];
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
             let coastal = shore_w > 0.18 && ground_world_y <= config.sea_level_world() + 4;
@@ -2569,6 +2691,7 @@ fn hash_u64(seed: u64, x: i32, y: i32, z: i32) -> u64 {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::time::Instant;
 
     fn is_surface_material(mat: MaterialId) -> bool {
         matches!(mat, TURF | SAND | STONE)
@@ -3068,6 +3191,54 @@ mod tests {
                 "north/south sampled surface discontinuity at x={x}: {a} vs {b}"
             );
         }
+    }
+
+    #[test]
+    fn procgen_field_cache_reuse_is_not_slower_than_repeated_sampling() {
+        let config = ProcGenConfig::for_size(64, 0x8BAD_F00D).with_origin([64, 0, -64]);
+        let timings = ProcGenPassTimings::default();
+        let halo = 16;
+
+        let t0 = Instant::now();
+        let cache = build_procgen_field_cache(&config, halo, &timings);
+        let build_time = t0.elapsed();
+
+        let t1 = Instant::now();
+        let mut reuse_acc = 0.0f32;
+        for z in -halo..(config.dims[2] as i32 + halo) {
+            for x in -halo..(config.dims[0] as i32 + halo) {
+                if let Some(cell) = cache.cell_local(x, z) {
+                    reuse_acc += cell.ocean_prior + cell.river_prior + cell.slope as f32;
+                }
+            }
+        }
+        let reuse_time = t1.elapsed();
+
+        let t2 = Instant::now();
+        let mut resample_acc = 0.0f32;
+        for z in -halo..(config.dims[2] as i32 + halo) {
+            for x in -halo..(config.dims[0] as i32 + halo) {
+                let wx = config.world_origin[0] + x;
+                let wz = config.world_origin[2] + z;
+                let climate = sample_climate(config.seed, wx, wz);
+                let weights = biome_weights(config.seed, wx, wz, climate);
+                let slope = slope_at_world(&config, wx, wz) as f32;
+                let ocean = weights[biome_index(BiomeType::Ocean)];
+                let river = weights[biome_index(BiomeType::River)].max(river_meander_signal(
+                    config.seed,
+                    wx,
+                    wz,
+                ));
+                resample_acc += ocean + river + slope;
+            }
+        }
+        let resample_time = t2.elapsed();
+
+        assert!(reuse_acc > 0.0 && resample_acc > 0.0 && build_time.as_nanos() > 0);
+        assert!(
+            reuse_time <= resample_time,
+            "cache reuse regressed: build={build_time:?} reuse={reuse_time:?} resample={resample_time:?}"
+        );
     }
 
     #[test]
