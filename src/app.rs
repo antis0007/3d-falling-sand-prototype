@@ -1308,12 +1308,13 @@ pub async fn run() -> anyhow::Result<()> {
                             &cached_desired.generation_scores,
                         );
 
-                        let gen_inflight_before_dispatch = gen_worker_inflight;
+                        let gen_dispatched_inflight_before_dispatch =
+                            streaming.dispatched_generate.len();
                         if gen_dispatch_paused {
-                            if gen_inflight_before_dispatch <= GEN_DISPATCH_LOW {
+                            if gen_dispatched_inflight_before_dispatch <= GEN_DISPATCH_LOW {
                                 gen_dispatch_paused = false;
                             }
-                        } else if gen_inflight_before_dispatch >= GEN_DISPATCH_HIGH {
+                        } else if gen_dispatched_inflight_before_dispatch >= GEN_DISPATCH_HIGH {
                             gen_dispatch_paused = true;
                         }
                         let gen_pause_reason = if gen_dispatch_paused {
@@ -1469,25 +1470,29 @@ pub async fn run() -> anyhow::Result<()> {
 
                         total_generated_chunks = total_generated_chunks
                             .saturating_add(gen_completed_count as u64);
-                        let gen_inflight = gen_worker_inflight;
-                        if gen_inflight >= 96 && gen_completed_count == 0 {
+                        let scheduled_count = streaming.scheduled_generate.len();
+                        let dispatched_count = streaming.dispatched_generate.len();
+                        let pending_count = streaming.pending_generate_count();
+                        let recv_progress = if gen_completed_count > 0 {
+                            "completed"
+                        } else if gen_recv_disconnected {
+                            "disconnected"
+                        } else if gen_recv_empty {
+                            "empty"
+                        } else {
+                            "blocked"
+                        };
+                        if dispatched_count >= GEN_DISPATCH_HIGH && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
-                            let starvation_reason = if gen_dispatch_paused {
-                                "worker_dispatch_paused"
-                            } else if gen_recv_disconnected {
-                                "generator_channel_disconnected"
-                            } else if gen_recv_empty {
-                                "workers_not_finished_or_result_queue_empty"
-                            } else {
-                                "main_thread_drain_not_progressing"
-                            };
                             ui.log_once_per_second("gen_starvation", now_secs, || {
                                 format!(
-                                    "gen starvation inflight={} pending_generate={} recv_ms={:.3} reason={}",
-                                    gen_inflight,
-                                    streaming.pending_generate_count(),
+                                    "gen starvation scheduled={} dispatched={} pending_generate={} gen_paused={} recv_progress={} recv_ms={:.3}",
+                                    scheduled_count,
+                                    dispatched_count,
+                                    pending_count,
+                                    gen_dispatch_paused,
+                                    recv_progress,
                                     gen_recv_ms,
-                                    starvation_reason
                                 )
                             });
                         }
@@ -1621,15 +1626,18 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} gen_pause_reason={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} scheduled={} dispatched={} gen_pending={} apply_queue={} gen_paused={} gen_pause_reason={} recv_progress={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
                             cached_desired.far.len(),
-                            streaming.pending_generate_count(),
+                            scheduled_count,
+                            dispatched_count,
+                            pending_count,
                             generated_ready.len(),
                             gen_dispatch_paused,
                             gen_pause_reason,
+                            recv_progress,
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
