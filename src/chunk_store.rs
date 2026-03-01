@@ -17,6 +17,7 @@ pub struct ChunkBorderStrips {
     pub pos_y: [MaterialId; CHUNK_BORDER_AREA],
     pub neg_z: [MaterialId; CHUNK_BORDER_AREA],
     pub pos_z: [MaterialId; CHUNK_BORDER_AREA],
+    pub known_neighbor_mask: u8,
 }
 
 impl Default for ChunkBorderStrips {
@@ -28,6 +29,7 @@ impl Default for ChunkBorderStrips {
             pos_y: [EMPTY; CHUNK_BORDER_AREA],
             neg_z: [EMPTY; CHUNK_BORDER_AREA],
             pos_z: [EMPTY; CHUNK_BORDER_AREA],
+            known_neighbor_mask: 0,
         }
     }
 }
@@ -41,6 +43,7 @@ pub struct ChunkMeshingInput<'a> {
     pub pos_y: [MaterialId; CHUNK_BORDER_AREA],
     pub neg_z: [MaterialId; CHUNK_BORDER_AREA],
     pub pos_z: [MaterialId; CHUNK_BORDER_AREA],
+    pub known_neighbor_mask: u8,
 }
 
 impl ChunkMeshingInput<'_> {
@@ -155,12 +158,16 @@ fn chunk_neighbor_faces(coord: ChunkCoord) -> [NeighborFace; 6] {
 #[derive(Clone)]
 pub struct Chunk {
     voxels: Box<[MaterialId]>,
+    face_non_empty_counts: [u16; 6],
+    face_non_empty_mask: u8,
 }
 
 impl Chunk {
     pub fn new_empty() -> Self {
         Self {
             voxels: vec![EMPTY; CHUNK_VOLUME].into_boxed_slice(),
+            face_non_empty_counts: [0; 6],
+            face_non_empty_mask: 0,
         }
     }
 
@@ -178,7 +185,12 @@ impl Chunk {
     #[inline]
     pub fn set(&mut self, x: usize, y: usize, z: usize, id: MaterialId) {
         let idx = Self::index(x, y, z);
+        let prev = self.voxels[idx];
+        if prev == id {
+            return;
+        }
         self.voxels[idx] = id;
+        self.update_border_face_cache(x, y, z, prev, id);
     }
 
     pub fn iter_raw(&self) -> &[MaterialId] {
@@ -186,50 +198,93 @@ impl Chunk {
     }
 
     pub fn face_non_empty_mask(&self) -> u8 {
-        let mut mask = 0u8;
-        for (idx, face) in chunk_neighbor_faces(ChunkCoord { x: 0, y: 0, z: 0 })
-            .into_iter()
-            .enumerate()
-        {
-            if self.face_has_non_empty(face.axis, face.edge) {
-                mask |= 1 << idx;
-            }
-        }
-        mask
+        self.face_non_empty_mask
     }
 
-    fn face_has_non_empty(&self, axis: usize, edge: usize) -> bool {
-        let last = CHUNK_SIZE_VOXELS as usize;
-        match axis {
-            0 => {
-                for z in 0..last {
-                    for y in 0..last {
-                        if self.get(edge, y, z) != EMPTY {
-                            return true;
-                        }
-                    }
+    fn update_border_face_cache(
+        &mut self,
+        x: usize,
+        y: usize,
+        z: usize,
+        prev: MaterialId,
+        next: MaterialId,
+    ) {
+        let was_non_empty = prev != EMPTY;
+        let is_non_empty = next != EMPTY;
+        if was_non_empty == is_non_empty {
+            return;
+        }
+
+        let last = CHUNK_SIDE - 1;
+        if x == 0 {
+            self.bump_face_count(0, is_non_empty);
+        }
+        if x == last {
+            self.bump_face_count(1, is_non_empty);
+        }
+        if y == 0 {
+            self.bump_face_count(2, is_non_empty);
+        }
+        if y == last {
+            self.bump_face_count(3, is_non_empty);
+        }
+        if z == 0 {
+            self.bump_face_count(4, is_non_empty);
+        }
+        if z == last {
+            self.bump_face_count(5, is_non_empty);
+        }
+    }
+
+    fn bump_face_count(&mut self, face_idx: usize, became_non_empty: bool) {
+        if became_non_empty {
+            self.face_non_empty_counts[face_idx] =
+                self.face_non_empty_counts[face_idx].saturating_add(1);
+        } else {
+            self.face_non_empty_counts[face_idx] =
+                self.face_non_empty_counts[face_idx].saturating_sub(1);
+        }
+        if self.face_non_empty_counts[face_idx] == 0 {
+            self.face_non_empty_mask &= !(1 << face_idx);
+        } else {
+            self.face_non_empty_mask |= 1 << face_idx;
+        }
+    }
+
+    fn rebuild_face_cache(&mut self) {
+        self.face_non_empty_counts = [0; 6];
+        self.face_non_empty_mask = 0;
+        let last = CHUNK_SIDE - 1;
+        for z in 0..CHUNK_SIDE {
+            for y in 0..CHUNK_SIDE {
+                if self.get(0, y, z) != EMPTY {
+                    self.bump_face_count(0, true);
                 }
-            }
-            1 => {
-                for z in 0..last {
-                    for x in 0..last {
-                        if self.get(x, edge, z) != EMPTY {
-                            return true;
-                        }
-                    }
-                }
-            }
-            _ => {
-                for y in 0..last {
-                    for x in 0..last {
-                        if self.get(x, y, edge) != EMPTY {
-                            return true;
-                        }
-                    }
+                if self.get(last, y, z) != EMPTY {
+                    self.bump_face_count(1, true);
                 }
             }
         }
-        false
+        for z in 0..CHUNK_SIDE {
+            for x in 0..CHUNK_SIDE {
+                if self.get(x, 0, z) != EMPTY {
+                    self.bump_face_count(2, true);
+                }
+                if self.get(x, last, z) != EMPTY {
+                    self.bump_face_count(3, true);
+                }
+            }
+        }
+        for y in 0..CHUNK_SIDE {
+            for x in 0..CHUNK_SIDE {
+                if self.get(x, y, 0) != EMPTY {
+                    self.bump_face_count(4, true);
+                }
+                if self.get(x, y, last) != EMPTY {
+                    self.bump_face_count(5, true);
+                }
+            }
+        }
     }
 
     pub fn fill_face_border(
@@ -267,9 +322,13 @@ impl Chunk {
 
 impl From<LegacyChunk> for Chunk {
     fn from(value: LegacyChunk) -> Self {
-        Self {
+        let mut chunk = Self {
             voxels: value.iter_raw().to_vec().into_boxed_slice(),
-        }
+            face_non_empty_counts: [0; 6],
+            face_non_empty_mask: 0,
+        };
+        chunk.rebuild_face_cache();
+        chunk
     }
 }
 
@@ -404,6 +463,7 @@ impl ChunkStore {
             pos_y: borders.pos_y,
             neg_z: borders.neg_z,
             pos_z: borders.pos_z,
+            known_neighbor_mask: borders.known_neighbor_mask,
         })
     }
 
@@ -422,6 +482,7 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z,
         }) {
+            borders.known_neighbor_mask |= 1 << 0;
             if (chunk.face_non_empty_mask() & (1 << 1)) != 0 {
                 chunk.fill_face_border(0, last, &mut borders.neg_x);
             }
@@ -431,6 +492,7 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z,
         }) {
+            borders.known_neighbor_mask |= 1 << 1;
             if (chunk.face_non_empty_mask() & (1 << 0)) != 0 {
                 chunk.fill_face_border(0, 0, &mut borders.pos_x);
             }
@@ -440,6 +502,7 @@ impl ChunkStore {
             y: coord.y - 1,
             z: coord.z,
         }) {
+            borders.known_neighbor_mask |= 1 << 2;
             if (chunk.face_non_empty_mask() & (1 << 3)) != 0 {
                 chunk.fill_face_border(1, last, &mut borders.neg_y);
             }
@@ -449,6 +512,7 @@ impl ChunkStore {
             y: coord.y + 1,
             z: coord.z,
         }) {
+            borders.known_neighbor_mask |= 1 << 3;
             if (chunk.face_non_empty_mask() & (1 << 2)) != 0 {
                 chunk.fill_face_border(1, 0, &mut borders.pos_y);
             }
@@ -458,6 +522,7 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z - 1,
         }) {
+            borders.known_neighbor_mask |= 1 << 4;
             if (chunk.face_non_empty_mask() & (1 << 5)) != 0 {
                 chunk.fill_face_border(2, last, &mut borders.neg_z);
             }
@@ -467,6 +532,7 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z + 1,
         }) {
+            borders.known_neighbor_mask |= 1 << 5;
             if (chunk.face_non_empty_mask() & (1 << 4)) != 0 {
                 chunk.fill_face_border(2, 0, &mut borders.pos_z);
             }
@@ -518,7 +584,6 @@ impl ChunkStore {
             self.dirty_chunks.remove(&coord);
             self.unmeshed_chunks.remove(&coord);
             self.deferred_neighbor_dirty_on_mesh.remove(&coord);
-            self.mark_existing_neighbors_dirty(coord);
             return removed.map(|chunk| (chunk, was_modified));
         }
         None
@@ -598,12 +663,15 @@ impl ChunkStore {
             NeighborDirtyPolicy::MarkExisting => self.mark_existing_neighbors_dirty(coord),
             NeighborDirtyPolicy::GeneratedConditional => {
                 let old_mask = old_face_mask.unwrap_or(0);
-                let topology_changed = old_face_mask.is_some() && old_mask != new_face_mask;
                 for (idx, face) in chunk_neighbor_faces(coord).into_iter().enumerate() {
                     let face_bit = 1u8 << idx;
-                    let boundary_non_empty = (new_face_mask & face_bit) != 0;
                     let face_changed = (old_mask & face_bit) != (new_face_mask & face_bit);
-                    if boundary_non_empty || (topology_changed && face_changed) {
+                    let should_dirty = if old_face_mask.is_some() {
+                        face_changed
+                    } else {
+                        (new_face_mask & face_bit) != 0
+                    };
+                    if should_dirty {
                         self.mark_neighbor_dirty(face.coord);
                     }
                 }
@@ -781,5 +849,96 @@ mod tests {
 
         store.insert_chunk_with_policy(west, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
         assert!(store.is_dirty(west));
+    }
+
+    #[test]
+    fn meshing_input_marks_missing_neighbors_as_unknown() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        store.insert_chunk_with_policy(
+            center,
+            Chunk::new_empty(),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let input = store.build_meshing_input(center).expect("center input");
+        assert_eq!(input.known_neighbor_mask, 0);
+
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+        store.insert_chunk_with_policy(east, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
+        let input = store
+            .build_meshing_input(center)
+            .expect("center input with east");
+        assert_ne!(input.known_neighbor_mask & (1 << 1), 0);
+    }
+
+    #[test]
+    fn cached_face_mask_updates_after_border_edits() {
+        let mut chunk = Chunk::new_empty();
+        let last = CHUNK_SIDE - 1;
+        assert_eq!(chunk.face_non_empty_mask(), 0);
+
+        chunk.set(0, 0, 0, 4);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 0), 0);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 2), 0);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 4), 0);
+
+        chunk.set(0, 0, 0, EMPTY);
+        assert_eq!(chunk.face_non_empty_mask(), 0);
+
+        chunk.set(last, last, last, 7);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 1), 0);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 3), 0);
+        assert_ne!(chunk.face_non_empty_mask() & (1 << 5), 0);
+    }
+
+    #[test]
+    fn generated_conditional_only_marks_neighbors_when_boundary_changes() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+        let last = CHUNK_SIDE - 1;
+
+        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.take_dirty_chunks();
+
+        let mut first = Chunk::new_empty();
+        first.set(last, 2, 2, 5);
+        store.insert_chunk_with_policy(
+            center,
+            first,
+            false,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+        store.mark_chunk_meshed(center);
+        assert!(store.is_dirty(east));
+
+        store.take_dirty_chunks();
+        let mut second = Chunk::new_empty();
+        second.set(last, 3, 3, 6);
+        store.insert_chunk_with_policy(
+            center,
+            second,
+            false,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+        store.mark_chunk_meshed(center);
+        assert!(!store.is_dirty(east));
+    }
+
+    #[test]
+    fn remove_chunk_only_marks_neighbors_once() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+
+        store.insert_chunk(center, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, legacy_chunk_with_fill(2));
+        store.take_dirty_chunks();
+
+        store.remove_chunk(center);
+        let dirty = store.take_dirty_chunks();
+        assert_eq!(dirty.iter().filter(|&&c| c == east).count(), 1);
     }
 }
