@@ -839,16 +839,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 {
                                     continue;
                                 }
-                                if chunk_generator.try_request(coord) {
-                                    streaming.scheduled_generate.insert(coord);
-                                    streaming.mark_dispatch_succeeded(coord);
                                 if let Some(chunk) = cached_modified_chunks.take(coord) {
                                     apply_generated_chunk(&mut store, coord, chunk);
                                     streaming.mark_generated(coord, frame_counter);
                                     forced_local_requests += 1;
                                 } else if chunk_generator.try_request(coord) {
-                                    streaming.generating.insert(coord);
+                                    streaming.mark_dispatch_succeeded(coord);
                                     forced_local_requests += 1;
+                                } else {
+                                    streaming.mark_dispatch_failed_or_deferred(coord);
                                 }
                             }
                             if forced_local_requests > 0 {
@@ -1027,7 +1026,7 @@ pub async fn run() -> anyhow::Result<()> {
                             frame_counter,
                         );
 
-                        let gen_inflight_before_dispatch = streaming.generating.len();
+                        let gen_inflight_before_dispatch = streaming.dispatched_generate.len();
                         if gen_dispatch_paused {
                             if gen_inflight_before_dispatch <= GEN_DISPATCH_LOW {
                                 gen_dispatch_paused = false;
@@ -1042,7 +1041,6 @@ pub async fn run() -> anyhow::Result<()> {
                         };
 
                         let mut gen_request_count = 0usize;
-                        let mut urgent_missing = 0usize;
                         let urgent_vertical = 1;
                         let urgent_radius = 1;
                         let mut dispatch_urgent = Vec::new();
@@ -1059,7 +1057,6 @@ pub async fn run() -> anyhow::Result<()> {
                             if chebyshev_from_player(player_chunk, coord) <= urgent_radius
                                 && (coord.y - player_chunk.y).abs() <= urgent_vertical
                             {
-                                urgent_missing += 1;
                                 dispatch_urgent.push(coord);
                             } else if cached_desired.near.contains(&coord) {
                                 dispatch_near.push(coord);
@@ -1068,28 +1065,16 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        for coord in dispatch_urgent {
-                            if streaming.scheduled_generate.insert(coord) {
-                                streaming.mark_canceled(coord);
-                                streaming.scheduled_generate.insert(coord);
-                            }
-                            if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
-                                gen_request_count += 1;
-                            } else {
-                                streaming.mark_dispatch_failed_or_deferred(coord);
                         if !gen_dispatch_paused {
                             for coord in dispatch_urgent {
-                                if streaming.scheduled.insert(coord) {
-                                    streaming.mark_canceled(coord);
-                                    streaming.scheduled.insert(coord);
-                                }
                                 if let Some(chunk) = cached_modified_chunks.take(coord) {
                                     apply_generated_chunk(&mut store, coord, chunk);
                                     streaming.mark_generated(coord, frame_counter);
                                 } else if chunk_generator.try_request(coord) {
-                                    streaming.mark_dispatched(coord);
+                                    streaming.mark_dispatch_succeeded(coord);
                                     gen_request_count += 1;
+                                } else {
+                                    streaming.mark_dispatch_failed_or_deferred(coord);
                                 }
                             }
                         }
@@ -1110,14 +1095,12 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut near_sent = 0usize;
                         while near_sent < near_budget {
                             let Some(coord) = streaming.next_generation_job() else { break; };
-                            if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
                             if let Some(chunk) = cached_modified_chunks.take(coord) {
                                 apply_generated_chunk(&mut store, coord, chunk);
                                 streaming.mark_generated(coord, frame_counter);
                                 near_sent += 1;
                             } else if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
+                                streaming.mark_dispatch_succeeded(coord);
                                 gen_request_count += 1;
                                 near_sent += 1;
                             } else {
@@ -1129,14 +1112,12 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
                         while far_budget > 0 {
                             let Some(coord) = streaming.next_generation_job() else { break; };
-                            if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatch_succeeded(coord);
                             if let Some(chunk) = cached_modified_chunks.take(coord) {
                                 apply_generated_chunk(&mut store, coord, chunk);
                                 streaming.mark_generated(coord, frame_counter);
                                 far_budget -= 1;
                             } else if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
+                                streaming.mark_dispatch_succeeded(coord);
                                 gen_request_count += 1;
                                 far_budget -= 1;
                             } else {
