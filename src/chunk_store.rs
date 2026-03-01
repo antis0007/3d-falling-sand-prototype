@@ -345,7 +345,7 @@ pub struct ChunkStore {
     modified_chunks: HashSet<ChunkCoord>,
     unmeshed_chunks: HashSet<ChunkCoord>,
     deferred_dirty_on_load: HashSet<ChunkCoord>,
-    deferred_neighbor_dirty_on_mesh: HashSet<ChunkCoord>,
+    deferred_neighbor_dirty_on_mesh: HashMap<ChunkCoord, Option<u8>>,
 }
 
 impl ChunkStore {
@@ -356,7 +356,7 @@ impl ChunkStore {
             modified_chunks: HashSet::new(),
             unmeshed_chunks: HashSet::new(),
             deferred_dirty_on_load: HashSet::new(),
-            deferred_neighbor_dirty_on_mesh: HashSet::new(),
+            deferred_neighbor_dirty_on_mesh: HashMap::new(),
         }
     }
 
@@ -565,7 +565,8 @@ impl ChunkStore {
         let should_defer_neighbors =
             matches!(neighbor_dirty, NeighborDirtyPolicy::GeneratedConditional);
         if should_defer_neighbors {
-            self.deferred_neighbor_dirty_on_mesh.insert(coord);
+            self.deferred_neighbor_dirty_on_mesh
+                .insert(coord, old_face_mask);
             return;
         }
 
@@ -602,16 +603,16 @@ impl ChunkStore {
         if !self.unmeshed_chunks.remove(&coord) {
             return;
         }
-        if !self.deferred_neighbor_dirty_on_mesh.remove(&coord) {
+        let Some(old_face_mask) = self.deferred_neighbor_dirty_on_mesh.remove(&coord) else {
             return;
-        }
+        };
 
         if let Some(chunk) = self.chunks.get(&coord) {
             self.apply_neighbor_dirty_policy(
                 coord,
                 NeighborDirtyPolicy::GeneratedConditional,
                 chunk.face_non_empty_mask(),
-                None,
+                old_face_mask,
             );
         }
     }
@@ -924,6 +925,38 @@ mod tests {
             NeighborDirtyPolicy::GeneratedConditional,
         );
         store.mark_chunk_meshed(center);
+        assert!(!store.is_dirty(east));
+    }
+
+    #[test]
+    fn generated_conditional_uses_previous_mesh_mask_when_replaced_before_meshed() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+        let last = CHUNK_SIDE - 1;
+
+        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.take_dirty_chunks();
+
+        let mut first = Chunk::new_empty();
+        first.set(last, 1, 1, 4);
+        store.insert_chunk_with_policy(
+            center,
+            first,
+            false,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+
+        let mut second = Chunk::new_empty();
+        second.set(last, 2, 2, 7);
+        store.insert_chunk_with_policy(
+            center,
+            second,
+            false,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+        store.mark_chunk_meshed(center);
+
         assert!(!store.is_dirty(east));
     }
 
