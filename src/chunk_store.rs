@@ -6,6 +6,26 @@ use crate::world::EMPTY;
 
 const CHUNK_VOLUME: usize =
     CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize;
+const CHUNK_SIDE: usize = CHUNK_SIZE_VOXELS as usize;
+const CHUNK_BORDER_AREA: usize = CHUNK_SIDE * CHUNK_SIDE;
+
+#[derive(Clone)]
+pub struct ChunkMeshingInput<'a> {
+    pub voxels: &'a [MaterialId],
+    pub neg_x: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_x: [MaterialId; CHUNK_BORDER_AREA],
+    pub neg_y: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_y: [MaterialId; CHUNK_BORDER_AREA],
+    pub neg_z: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_z: [MaterialId; CHUNK_BORDER_AREA],
+}
+
+impl ChunkMeshingInput<'_> {
+    #[inline]
+    pub fn border_index(u: usize, v: usize) -> usize {
+        u * CHUNK_SIDE + v
+    }
+}
 
 fn chunk_neighbors_6(coord: ChunkCoord) -> [ChunkCoord; 6] {
     [
@@ -177,6 +197,95 @@ impl ChunkStore {
 
     pub fn get_chunk(&self, coord: ChunkCoord) -> Option<&Chunk> {
         self.chunks.get(&coord)
+    }
+
+    pub fn build_meshing_input(&self, coord: ChunkCoord) -> Option<ChunkMeshingInput<'_>> {
+        let current = self.get_chunk(coord)?;
+
+        let mut neg_x = [EMPTY; CHUNK_BORDER_AREA];
+        let mut pos_x = [EMPTY; CHUNK_BORDER_AREA];
+        let mut neg_y = [EMPTY; CHUNK_BORDER_AREA];
+        let mut pos_y = [EMPTY; CHUNK_BORDER_AREA];
+        let mut neg_z = [EMPTY; CHUNK_BORDER_AREA];
+        let mut pos_z = [EMPTY; CHUNK_BORDER_AREA];
+
+        let last = CHUNK_SIDE - 1;
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x - 1,
+            y: coord.y,
+            z: coord.z,
+        }) {
+            for z in 0..CHUNK_SIDE {
+                for y in 0..CHUNK_SIDE {
+                    neg_x[ChunkMeshingInput::border_index(y, z)] = chunk.get(last, y, z);
+                }
+            }
+        }
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x + 1,
+            y: coord.y,
+            z: coord.z,
+        }) {
+            for z in 0..CHUNK_SIDE {
+                for y in 0..CHUNK_SIDE {
+                    pos_x[ChunkMeshingInput::border_index(y, z)] = chunk.get(0, y, z);
+                }
+            }
+        }
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x,
+            y: coord.y - 1,
+            z: coord.z,
+        }) {
+            for z in 0..CHUNK_SIDE {
+                for x in 0..CHUNK_SIDE {
+                    neg_y[ChunkMeshingInput::border_index(x, z)] = chunk.get(x, last, z);
+                }
+            }
+        }
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x,
+            y: coord.y + 1,
+            z: coord.z,
+        }) {
+            for z in 0..CHUNK_SIDE {
+                for x in 0..CHUNK_SIDE {
+                    pos_y[ChunkMeshingInput::border_index(x, z)] = chunk.get(x, 0, z);
+                }
+            }
+        }
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z - 1,
+        }) {
+            for y in 0..CHUNK_SIDE {
+                for x in 0..CHUNK_SIDE {
+                    neg_z[ChunkMeshingInput::border_index(x, y)] = chunk.get(x, y, last);
+                }
+            }
+        }
+        if let Some(chunk) = self.get_chunk(ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z + 1,
+        }) {
+            for y in 0..CHUNK_SIDE {
+                for x in 0..CHUNK_SIDE {
+                    pos_z[ChunkMeshingInput::border_index(x, y)] = chunk.get(x, y, 0);
+                }
+            }
+        }
+
+        Some(ChunkMeshingInput {
+            voxels: current.iter_raw(),
+            neg_x,
+            pos_x,
+            neg_y,
+            pos_y,
+            neg_z,
+            pos_z,
+        })
     }
 
     pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: LegacyChunk) {
