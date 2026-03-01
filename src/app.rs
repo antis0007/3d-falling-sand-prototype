@@ -1,5 +1,6 @@
 use crate::chunk_store::ChunkStore;
 use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
+use crate::gpu_compute::take_gpu_compute_profiler_snapshot;
 use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
@@ -1803,6 +1804,11 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
+                        let gpu_compute = take_gpu_compute_profiler_snapshot(now.elapsed().as_secs_f32());
+                        ui.profiler.gpu_compute_dispatch_ms = gpu_compute.dispatch_ms;
+                        ui.profiler.gpu_compute_bytes_transferred = gpu_compute.bytes_transferred;
+                        ui.profiler.gpu_compute_chunks_completed = gpu_compute.chunks_completed;
+                        ui.profiler.gpu_compute_chunks_per_sec = gpu_compute.chunks_per_sec;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
                         ui.profiler.near_radius = effective_stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = effective_stream_tuning.mid_radius_xz;

@@ -75,6 +75,10 @@ pub struct ProfilerStats {
     pub culled_chunks: usize,
     pub frustum_culled_chunks: usize,
     pub gpu_upload_bytes_frame: usize,
+    pub gpu_compute_dispatch_ms: f32,
+    pub gpu_compute_bytes_transferred: u64,
+    pub gpu_compute_chunks_per_sec: f32,
+    pub gpu_compute_chunks_completed: u64,
     pub loaded_chunks: usize,
     pub resident_chunks: usize,
     pub scheduled_chunks: usize,
@@ -697,6 +701,13 @@ pub fn draw(
                 ui.monospace(format!(
                     "gpu upload bytes/frame: {}",
                     ui_state.profiler.gpu_upload_bytes_frame,
+                ));
+                ui.monospace(format!(
+                    "gpu compute dispatch: {:.2} ms | bytes: {} | chunks: {} ({:.1}/s)",
+                    ui_state.profiler.gpu_compute_dispatch_ms,
+                    ui_state.profiler.gpu_compute_bytes_transferred,
+                    ui_state.profiler.gpu_compute_chunks_completed,
+                    ui_state.profiler.gpu_compute_chunks_per_sec,
                 ));
                 ui.separator();
                 ui.heading("Renderer Debug");
