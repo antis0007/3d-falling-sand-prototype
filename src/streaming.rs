@@ -49,15 +49,17 @@ impl ChunkStreaming {
 
     pub fn desired_set(
         player_chunk: ChunkCoord,
-        sim_radius: i32,
-        render_radius: i32,
+        sim_radius_xz: i32,
+        render_radius_xz: i32,
+        vertical_radius: i32,
     ) -> HashSet<ChunkCoord> {
         let mut desired = HashSet::new();
-        let radius = sim_radius.max(render_radius).max(0);
+        let radius_xz = sim_radius_xz.max(render_radius_xz).max(0);
+        let ry = vertical_radius.max(0);
 
-        for dz in -radius..=radius {
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
+        for dz in -radius_xz..=radius_xz {
+            for dy in -ry..=ry {
+                for dx in -radius_xz..=radius_xz {
                     desired.insert(ChunkCoord {
                         x: player_chunk.x + dx,
                         y: player_chunk.y + dy,
@@ -66,7 +68,6 @@ impl ChunkStreaming {
                 }
             }
         }
-
         desired
     }
 
@@ -116,6 +117,16 @@ impl ChunkStreaming {
 
     pub fn drain_work_items(&mut self) -> Vec<WorkItem> {
         std::mem::take(&mut self.work_items)
+    }
+    pub fn clear(&mut self) {
+        self.resident.clear();
+        self.generating.clear();
+        self.work_items.clear();
+    }
+    /// Optional convenience: clear and set a new seed.
+    pub fn reset_with_seed(&mut self, seed: u64) {
+        self.seed = seed;
+        self.clear();
     }
 }
 

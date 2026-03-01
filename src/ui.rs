@@ -1,6 +1,7 @@
 use crate::sim::{material, MATERIALS};
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, MaterialId};
 use glam::{Mat4, Vec2, Vec3};
+use std::collections::VecDeque;
 use std::path::Path;
 
 pub const HOTBAR_SLOTS: usize = 10;
@@ -58,6 +59,17 @@ pub struct UiState {
     pub tab_palette_open: bool,
     pub biome_hint: String,
     pub stream_debug: String,
+
+    // === Performance/debug UX ===
+    pub show_debug: bool,
+    pub log_lines: VecDeque<String>,
+    pub mesh_ms_last: f32,
+    pub mesh_ms_max: f32,
+    pub total_indices: u64,
+    pub chunks_drawn: usize,
+    pub disable_preview_outlines: bool, // reduces CPU in egui overlay if needed
+    pub preview_max_blocks: usize,       // clamps overlay work
+
     drag_source: Option<DragSource>,
     drag_target_slot: Option<usize>,
 }
@@ -79,6 +91,7 @@ impl UiState {
     pub fn adjust_sim_speed(&mut self, delta_steps: i32) {
         self.set_sim_speed(self.sim_speed + delta_steps as f32 * Self::SIM_SPEED_STEP);
     }
+
     pub fn dragging_palette_material(self: &Self) -> Option<MaterialId> {
         match self.drag_source {
             Some(DragSource::Palette(material_id)) => Some(material_id),
@@ -99,6 +112,25 @@ impl UiState {
                 "Dragging {mat_name} — drop onto a hotbar slot to assign"
             ))
         }
+    }
+
+    pub fn log(&mut self, msg: impl Into<String>) {
+        if self.log_lines.len() >= 240 {
+            self.log_lines.pop_front();
+        }
+        self.log_lines.push_back(msg.into());
+    }
+
+    pub fn set_mesh_timing(&mut self, last_ms: f32) {
+        self.mesh_ms_last = last_ms;
+        if last_ms > self.mesh_ms_max {
+            self.mesh_ms_max = last_ms;
+        }
+    }
+
+    pub fn set_draw_stats(&mut self, chunks_drawn: usize, total_indices: u64) {
+        self.chunks_drawn = chunks_drawn;
+        self.total_indices = total_indices;
     }
 }
 
@@ -123,6 +155,16 @@ impl Default for UiState {
             tab_palette_open: false,
             biome_hint: "Biome: n/a".to_string(),
             stream_debug: "Stream: n/a".to_string(),
+
+            show_debug: false,
+            log_lines: VecDeque::with_capacity(256),
+            mesh_ms_last: 0.0,
+            mesh_ms_max: 0.0,
+            total_indices: 0,
+            chunks_drawn: 0,
+            disable_preview_outlines: false,
+            preview_max_blocks: 1024,
+
             drag_source: None,
             drag_target_slot: None,
         }
@@ -148,6 +190,7 @@ pub fn draw(
 ) -> UiActions {
     let mut actions = UiActions::default();
     let opaque_panel = egui::Frame::none().fill(egui::Color32::from_rgb(18, 20, 26));
+
     egui::TopBottomPanel::top("top")
         .frame(opaque_panel)
         .show(ctx, |ui| {
@@ -207,6 +250,22 @@ pub fn draw(
                 ));
                 ui.label(format!("Brush r={}", brush.radius));
                 ui.label(format!("Tool: {}", ui_state.active_tool.label()));
+
+                // --- Debug toggle pinned to the top-right (perf tools live here) ---
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = egui::RichText::new("Debug")
+                        .color(egui::Color32::from_rgb(220, 240, 255))
+                        .strong();
+
+                    // SelectableLabel can't set text color directly; use RichText.
+                    let resp = ui
+                        .add(egui::SelectableLabel::new(ui_state.show_debug, label))
+                        .on_hover_text("Toggle debug/performance panel");
+
+                    if resp.clicked() {
+                        ui_state.show_debug = !ui_state.show_debug;
+                    }
+                });
             });
         });
 
@@ -247,6 +306,56 @@ pub fn draw(
             });
         });
 
+    // === Debug panel ===
+    // NOTE: This is intentionally simple/cheap to draw.
+    if ui_state.show_debug && !ui_state.paused_menu {
+        egui::Window::new("Debug / Performance")
+            .anchor(egui::Align2::RIGHT_TOP, [-12.0, 52.0])
+            .default_width(420.0)
+            .resizable(true)
+            .collapsible(true)
+            .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(20, 22, 28)))
+            .show(ctx, |ui| {
+                ui.label("These toggles help isolate CPU-heavy overlays and show key stats.");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Meshing last: {:.2} ms | max: {:.2} ms",
+                        ui_state.mesh_ms_last, ui_state.mesh_ms_max
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Chunks drawn: {} | Total indices: {}",
+                        ui_state.chunks_drawn, ui_state.total_indices
+                    ));
+                });
+
+                ui.separator();
+                ui.checkbox(
+                    &mut ui_state.disable_preview_outlines,
+                    "Disable block preview outlines (CPU saver)",
+                )
+                .on_hover_text("If outlines are expensive, disable to isolate rendering/meshing issues.");
+
+                ui.add(
+                    egui::Slider::new(&mut ui_state.preview_max_blocks, 0..=8192)
+                        .text("Preview outline cap"),
+                )
+                .on_hover_text("Limits the number of preview block outlines drawn per frame.");
+
+                ui.separator();
+                ui.label("Log");
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for line in ui_state.log_lines.iter().rev() {
+                        ui.monospace(line);
+                    }
+                });
+            });
+    }
+
+    // Palette window (TAB)
     if ui_state.tab_palette_open && !ui_state.paused_menu {
         egui::Window::new("Material Palette (TAB)")
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 18.0])
@@ -310,6 +419,7 @@ pub fn draw(
             });
     }
 
+    // Drag release handling
     if ui_state.drag_source.is_some() && ctx.input(|i| i.pointer.any_released()) {
         if let (Some(source), Some(target)) =
             (ui_state.drag_source.take(), ui_state.drag_target_slot)
@@ -333,6 +443,7 @@ pub fn draw(
         ui_state.drag_target_slot = None;
     }
 
+    // Drag preview square
     if let Some(material_id) = ui_state.dragging_palette_material() {
         if let Some(pointer_pos) = ctx.input(|i| i.pointer.interact_pos()) {
             let size = egui::vec2(16.0, 16.0);
@@ -355,6 +466,7 @@ pub fn draw(
         }
     }
 
+    // Brush window
     if ui_state.show_brush {
         egui::Window::new("Brush").show(ctx, |ui| {
             ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
@@ -413,6 +525,7 @@ pub fn draw(
         });
     }
 
+    // Tool quick menu
     if ui_state.show_tool_quick_menu && !ui_state.paused_menu {
         egui::Window::new("Tools")
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -506,6 +619,7 @@ pub fn draw(
             });
     }
 
+    // Paused menu
     if ui_state.paused_menu {
         egui::Window::new("Paused")
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -695,6 +809,7 @@ pub fn draw_fps_overlays(
         egui::Color32::from_rgb(255, 120, 120)
     };
 
+    // PERF: caller can clamp preview_blocks. This function stays dumb.
     for block in preview_blocks {
         let world_block = [
             block[0] + preview_origin[0],
@@ -1074,11 +1189,7 @@ fn parse_ppm_image(bytes: &[u8]) -> Option<egui::ColorImage> {
         let r = data[px * 3];
         let g = data[px * 3 + 1];
         let b = data[px * 3 + 2];
-        let alpha = if r >= 250 && g >= 250 && b >= 250 {
-            0
-        } else {
-            255
-        };
+        let alpha = if r >= 250 && g >= 250 && b >= 250 { 0 } else { 255 };
         rgba[px * 4] = r;
         rgba[px * 4 + 1] = g;
         rgba[px * 4 + 2] = b;

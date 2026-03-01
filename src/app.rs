@@ -42,6 +42,9 @@ struct RaycastResult {
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    let mut sim_running = true;
+    let mut step_once = false;
+
     let event_loop = EventLoop::new()?;
     let window: &'static winit::window::Window = Box::leak(Box::new(
         WindowBuilder::new()
@@ -71,11 +74,18 @@ pub async fn run() -> anyhow::Result<()> {
     let mut brush = BrushSettings::default();
     let tool_textures = load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR);
     let mut edit_runtime = EditRuntimeState::default();
+
     let mut last = Instant::now();
     let start = Instant::now();
     let mut cursor_is_unlocked = false;
+
     let mut origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
+
+    // === streaming/perf caches (MUST live outside RedrawRequested) ===
+    let mut last_player_chunk: Option<ChunkCoord> = None;
+    let mut cached_sim_region: HashSet<ChunkCoord> = HashSet::new();
+    let mut cached_desired: HashSet<ChunkCoord> = HashSet::new();
     let mut stream_debug = String::new();
 
     let _ = set_cursor(window, false);
@@ -83,6 +93,7 @@ pub async fn run() -> anyhow::Result<()> {
     event_loop
         .run(move |event, elwt| match &event {
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
+                // Only let egui see Tab/pointer when UI intends to own them.
                 let block_tab_for_egui = matches!(
                     event,
                     WindowEvent::KeyboardInput { event, .. }
@@ -107,7 +118,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                 let apply_cursor_mode =
                     |window: &winit::window::Window, ui: &UiState, unlocked: &mut bool| {
-                        let should_unlock = should_unlock_cursor(ui, false, ui.tab_palette_open);
+                        let should_unlock = should_unlock_cursor(ui, ui.show_tool_quick_menu, ui.tab_palette_open);
                         if should_unlock != *unlocked {
                             let _ = set_cursor(window, should_unlock);
                             *unlocked = should_unlock;
@@ -116,12 +127,15 @@ pub async fn run() -> anyhow::Result<()> {
                     };
 
                 input.on_window_event(event);
+
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => renderer.resize(*size),
                     WindowEvent::Focused(focused) => {
-                        let should_unlock =
-                            !focused || ui.paused_menu || ui.show_tool_quick_menu || ui.tab_palette_open;
+                        let should_unlock = !focused
+                            || ui.paused_menu
+                            || ui.show_tool_quick_menu
+                            || ui.tab_palette_open;
                         if should_unlock != cursor_is_unlocked {
                             let _ = set_cursor(window, should_unlock);
                             cursor_is_unlocked = should_unlock;
@@ -134,9 +148,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 ui.paused_menu = !ui.paused_menu;
                                 apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
                             }
+
                             if event.state == ElementState::Pressed {
                                 let tab_palette_open = ui.tab_palette_open;
                                 let hotbar_slot = key_to_hotbar_slot(key);
+
                                 match key {
                                     KeyCode::Escape => {}
                                     _ if ui.paused_menu => {}
@@ -180,6 +196,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     _ => {}
                                 }
                             }
+
                             if key == TOOL_QUICK_MENU_TOGGLE_KEY
                                 && event.state == ElementState::Released
                             {
@@ -196,57 +213,121 @@ pub async fn run() -> anyhow::Result<()> {
                         let dt = (now - last).as_secs_f32().min(0.05);
                         last = now;
 
-                        let quick_menu_held = input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
+                        // Quick-menu state derived from held key
+                        let quick_menu_held =
+                            input.key(TOOL_QUICK_MENU_TOGGLE_KEY) && !ui.paused_menu;
                         let tab_palette_held = ui.tab_palette_open && !ui.paused_menu;
                         ui.show_tool_quick_menu = quick_menu_held;
+
                         if !quick_menu_held {
                             ui.hovered_shape = None;
                             ui.hovered_area_shape = None;
                             ui.hovered_tool = None;
                         }
+
                         let cursor_should_unlock =
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
+
                         if cursor_should_unlock != cursor_is_unlocked {
                             let _ = set_cursor(window, cursor_should_unlock);
                             cursor_is_unlocked = cursor_should_unlock;
                         }
 
-                        if !gameplay_blocked {
-                            ctrl.sensitivity = ui.mouse_sensitivity;
-                            // Temporary: movement remains free-flight while store-based collision lands.
-                            let dummy_world = crate::world::World::new([1, 1, 1]);
-                            ctrl.step(
-                                &dummy_world,
-                                &input,
-                                dt,
-                                !cursor_should_unlock,
-                                start.elapsed().as_secs_f32(),
-                            );
+                        // Ctrl/Alt wheel controls when gameplay owns input
+                        if !gameplay_blocked && input.wheel.abs() > 0.0 {
+                            let ctrl_held = input.key(KeyCode::ControlLeft)
+                                || input.key(KeyCode::ControlRight);
+                            let alt_held =
+                                input.key(KeyCode::AltLeft) || input.key(KeyCode::AltRight);
+
+                            if ctrl_held {
+                                let delta = input.wheel.signum() as i32;
+                                let r = (brush.radius + delta).clamp(0, 8);
+                                brush.radius = r;
+                            } else if alt_held {
+                                brush.max_distance =
+                                    (brush.max_distance + input.wheel).clamp(2.0, 48.0);
+                            } else {
+                                let dir = if input.wheel > 0.0 { 1 } else { -1 };
+                                ui.selected_slot = ((ui.selected_slot as i32 + dir)
+                                    .rem_euclid(HOTBAR_SLOTS as i32))
+                                    as usize;
+                            }
                         }
 
+                        // Origin shifting to keep float precision stable
                         let shift = origin_shift_for(ctrl.position);
                         if shift != [0, 0, 0] {
                             origin_voxel.x += shift[0];
                             origin_voxel.y += shift[1];
                             origin_voxel.z += shift[2];
-                            ctrl.position -= Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
-                            let loaded: Vec<ChunkCoord> = store.iter_loaded_chunks().copied().collect();
+                            ctrl.position -=
+                                Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
+
+                            // Conservative: mark all loaded chunks dirty (so meshes rebase)
+                            let loaded: Vec<ChunkCoord> =
+                                store.iter_loaded_chunks().copied().collect();
                             for coord in loaded {
                                 store.mark_dirty(coord);
                             }
                         }
 
+                        // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
+                        if !gameplay_blocked && !egui_c {
+                            let origin_for_ctrl = origin_voxel;
+                            ctrl.step(
+                                |x, y, z| store.get_voxel(VoxelCoord { x, y, z }),
+                                &input,
+                                dt,
+                                true,
+                                start.elapsed().as_secs_f32(),
+                                origin_for_ctrl,
+                            );
+                        } else {
+                            // still tick controller timers etc (no movement)
+                            ctrl.step(
+                                |_x, _y, _z| 0u16,
+                                &input,
+                                dt,
+                                false,
+                                start.elapsed().as_secs_f32(),
+                                origin_voxel,
+                            );
+                        }
+
+                        // Streaming regions in WORLD voxel space
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
                         let (player_chunk, _) = voxel_to_chunk(player_world_voxel);
-                        let desired = ChunkStreaming::desired_set(
-                            player_chunk,
-                            SIM_RADIUS_CHUNKS,
-                            RENDER_RADIUS_CHUNKS,
-                        );
-                        let sim_region = chunk_cube(player_chunk, SIM_RADIUS_CHUNKS);
 
-                        let (to_generate, to_evict) = streaming.update(&desired);
+                        // Cache desired/sim_region to avoid rebuilding HashSets every frame
+                        if last_player_chunk != Some(player_chunk) {
+                            cached_desired = ChunkStreaming::desired_set(
+                                player_chunk,
+                                SIM_RADIUS_CHUNKS,
+                                RENDER_RADIUS_CHUNKS,
+                                1, // vertical radius: try 1 first
+                            );
+                            cached_sim_region = chunk_cube(player_chunk, SIM_RADIUS_CHUNKS);
+                            last_player_chunk = Some(player_chunk);
+                        }
+
+                        let (to_generate, to_evict) = streaming.update(&cached_desired);
+                        if ui.show_debug {
+                            static mut LAST_LOG: f32 = 0.0;
+                            let t = start.elapsed().as_secs_f32();
+                            let should_log = unsafe {
+                                if t - LAST_LOG > 1.0 { LAST_LOG = t; true } else { false }
+                            };
+                            if should_log {
+                                ui.log(format!(
+                                    "player_chunk=({}, {}, {})  resident={} desired={}",
+                                    player_chunk.x, player_chunk.y, player_chunk.z,
+                                    streaming.resident.len(),
+                                    cached_desired.len()
+                                ));
+                            }
+                        }
                         for coord in to_generate {
                             let chunk = generate_chunk(streaming.seed, coord);
                             apply_generated_chunk(&mut store, coord, chunk);
@@ -256,19 +337,29 @@ pub async fn run() -> anyhow::Result<()> {
                             store.remove_chunk(coord);
                             streaming.mark_evicted(coord);
                         }
+
                         stream_debug = format!(
                             "Stream: resident={} desired={} player_chunk=({}, {}, {})",
                             streaming.resident.len(),
-                            desired.len(),
+                            cached_desired.len(),
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z
                         );
                         ui.stream_debug = stream_debug.clone();
 
-                        let raycast = target_for_edit(&store, origin_voxel, ctrl.position, ctrl.look_dir(), &brush);
+                        // Editing/raycast in WORLD voxel space
+                        let raycast = target_for_edit(
+                            &store,
+                            origin_voxel,
+                            ctrl.position,
+                            ctrl.look_dir(),
+                            &brush,
+                        );
                         let preview_mode = current_action_mode(&input, raycast, ui.active_tool);
-                        preview_block_list = preview_blocks(&store, &brush, raycast, preview_mode, ui.active_tool);
+
+                        preview_block_list =
+                            preview_blocks(&store, &brush, raycast, preview_mode, ui.active_tool);
 
                         if !gameplay_blocked
                             && apply_mouse_edit(
@@ -285,42 +376,88 @@ pub async fn run() -> anyhow::Result<()> {
                             // dirtied by set_voxel
                         }
 
-                        if ui.sim_speed > 0.0 {
+                        // Simulation stepping
+                        let do_step =
+                            sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
+
+                        let sim_t0 = std::time::Instant::now();
+
+                        if do_step {
                             sim_acc += dt * ui.sim_speed;
                             while sim_acc >= 1.0 / 60.0 {
-                                step_region(&mut store, &sim_region, &mut rng);
+                                step_region(&mut store, &cached_sim_region, &mut rng);
                                 sim_acc -= 1.0 / 60.0;
                             }
+                        } else if step_once && !ui.paused_menu {
+                            step_region(&mut store, &cached_sim_region, &mut rng);
+                            step_once = false;
+                        }
+
+                        let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
+                        if ui.show_debug {
+                            ui.log(format!("sim_step_ms={sim_ms:.2}"));
                         }
 
                         renderer.day = ui.day;
-                        renderer.rebuild_dirty_store_chunks(&mut store, origin_voxel, REMESH_BUDGET_PER_FRAME);
+                        let mesh_ms = renderer.rebuild_dirty_store_chunks(
+                            &mut store,
+                            origin_voxel,
+                            REMESH_BUDGET_PER_FRAME,
+                        );
+                        ui.set_mesh_timing(mesh_ms);
 
+                        // Egui
                         let raw_input = egui_state.take_egui_input(window);
                         let out = egui_ctx.run(raw_input, |ctx| {
-                            let actions = draw(ctx, &mut ui, true, &mut brush, &tool_textures);
+                            let actions =
+                                draw(ctx, &mut ui, sim_running, &mut brush, &tool_textures);
+
                             if actions.toggle_run {
-                                // sim always running at configured speed for now
+                                sim_running = !sim_running;
+                            }
+                            if actions.step_once {
+                                step_once = true;
                             }
                             if actions.new_world || actions.new_procedural {
                                 store.clear();
+                                streaming.clear();
+                                last_player_chunk = None;
+                                cached_desired.clear();
+                                cached_sim_region.clear();
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
 
                         for (id, delta) in &out.textures_delta.set {
-                            egui_rpass.update_texture(&renderer.device, &renderer.queue, *id, delta);
+                            egui_rpass.update_texture(
+                                &renderer.device,
+                                &renderer.queue,
+                                *id,
+                                delta,
+                            );
                         }
+
                         let cam = Camera {
                             pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
                             dir: ctrl.look_dir(),
-                            aspect: renderer.config.width as f32 / renderer.config.height.max(1) as f32,
+                            aspect: renderer.config.width as f32
+                                / renderer.config.height.max(1) as f32,
                         };
+                        let vp = cam.view_proj();
+                        let (chunks_drawn, total_indices) = renderer.mesh_draw_stats(vp);
+                        ui.set_draw_stats(chunks_drawn, total_indices);
 
                         let preview_local: Vec<[i32; 3]> = preview_block_list
                             .iter()
-                            .map(|p| [p[0] - origin_voxel.x, p[1] - origin_voxel.y, p[2] - origin_voxel.z])
+                            .map(|p| {
+                                [
+                                    p[0] - origin_voxel.x,
+                                    p[1] - origin_voxel.y,
+                                    p[2] - origin_voxel.z,
+                                ]
+                            })
                             .collect();
+
                         draw_fps_overlays(
                             &egui_ctx,
                             ui.paused_menu,
@@ -340,22 +477,33 @@ pub async fn run() -> anyhow::Result<()> {
                             None,
                         );
 
-                        let paint_jobs = egui_ctx.tessellate(out.shapes, window.scale_factor() as f32);
+                        // Render
+                        let paint_jobs =
+                            egui_ctx.tessellate(out.shapes, window.scale_factor() as f32);
                         let screen_desc = egui_wgpu::ScreenDescriptor {
                             size_in_pixels: [renderer.config.width, renderer.config.height],
                             pixels_per_point: window.scale_factor() as f32,
                         };
+
                         let frame = match renderer.surface.get_current_texture() {
                             Ok(f) => f,
                             Err(_) => {
-                                renderer.resize(PhysicalSize::new(renderer.config.width, renderer.config.height));
+                                renderer.resize(PhysicalSize::new(
+                                    renderer.config.width,
+                                    renderer.config.height,
+                                ));
                                 return;
                             }
                         };
-                        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-                        let mut encoder = renderer
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("main encoder") });
+                        let view = frame
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+
+                        let mut encoder = renderer.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("main encoder"),
+                            },
+                        );
 
                         egui_rpass.update_buffers(
                             &renderer.device,
@@ -365,36 +513,61 @@ pub async fn run() -> anyhow::Result<()> {
                             &screen_desc,
                         );
 
+                        // World pass
                         {
                             let clear = if renderer.day {
-                                wgpu::Color { r: 0.55, g: 0.72, b: 0.95, a: 1.0 }
+                                wgpu::Color {
+                                    r: 0.55,
+                                    g: 0.72,
+                                    b: 0.95,
+                                    a: 1.0,
+                                }
                             } else {
-                                wgpu::Color { r: 0.03, g: 0.05, b: 0.1, a: 1.0 }
+                                wgpu::Color {
+                                    r: 0.03,
+                                    g: 0.05,
+                                    b: 0.1,
+                                    a: 1.0,
+                                }
                             };
+
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("world pass"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: &view,
                                     resolve_target: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(clear),
+                                        store: wgpu::StoreOp::Store,
+                                    },
                                 })],
-                                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                                    view: &renderer.depth_view,
-                                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                                    stencil_ops: None,
-                                }),
+                                depth_stencil_attachment: Some(
+                                    wgpu::RenderPassDepthStencilAttachment {
+                                        view: &renderer.depth_view,
+                                        depth_ops: Some(wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(1.0),
+                                            store: wgpu::StoreOp::Store,
+                                        }),
+                                        stencil_ops: None,
+                                    },
+                                ),
                                 timestamp_writes: None,
                                 occlusion_query_set: None,
                             });
                             renderer.render_world(&mut pass, &cam);
                         }
+
+                        // UI pass
                         {
                             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("egui"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: &view,
                                     resolve_target: None,
-                                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
                                 })],
                                 depth_stencil_attachment: None,
                                 timestamp_writes: None,
@@ -405,9 +578,11 @@ pub async fn run() -> anyhow::Result<()> {
 
                         renderer.queue.submit(Some(encoder.finish()));
                         frame.present();
+
                         for id in &out.textures_delta.free {
                             egui_rpass.free_texture(id);
                         }
+
                         input.end_frame();
                     }
                     _ => {}
@@ -557,7 +732,9 @@ fn preview_blocks(
     if (tool == ToolKind::BuildersWand || tool == ToolKind::DestructorWand) && brush.radius == 0 {
         return preview_wand_blocks(store, raycast, tool, 256);
     }
-    brush_center(*brush, raycast, mode).map(|c| vec![c]).unwrap_or_default()
+    brush_center(*brush, raycast, mode)
+        .map(|c| vec![c])
+        .unwrap_or_default()
 }
 
 fn apply_mouse_edit(
@@ -576,8 +753,8 @@ fn apply_mouse_edit(
         return false;
     };
 
-    let is_just_click =
-        matches!(mode, BrushMode::Place) && input.just_lmb || matches!(mode, BrushMode::Erase) && input.just_rmb;
+    let is_just_click = (mode == BrushMode::Place && input.just_lmb)
+        || (mode == BrushMode::Erase && input.just_rmb);
     let repeat_interval_s = brush.repeat_interval_s.max(0.0);
     let repeat_ready = edit_runtime.last_edit_mode != Some(mode)
         || edit_runtime
@@ -612,7 +789,12 @@ fn target_for_edit(
     dir: Vec3,
     brush: &BrushSettings,
 ) -> RaycastResult {
-    let world_origin = local_origin + Vec3::new(origin_voxel.x as f32, origin_voxel.y as f32, origin_voxel.z as f32);
+    let world_origin = local_origin
+        + Vec3::new(
+            origin_voxel.x as f32,
+            origin_voxel.y as f32,
+            origin_voxel.z as f32,
+        );
     if brush.fixed_distance && !brush.minecraft_style_placement {
         RaycastResult {
             hit: None,
@@ -642,7 +824,11 @@ fn brush_center(brush: BrushSettings, raycast: RaycastResult, mode: BrushMode) -
 fn fixed_distance_target(origin: Vec3, dir: Vec3, max_dist: f32) -> [i32; 3] {
     let d = dir.normalize_or_zero();
     let point = origin + d * max_dist.max(0.0);
-    [point.x.floor() as i32, point.y.floor() as i32, point.z.floor() as i32]
+    [
+        point.x.floor() as i32,
+        point.y.floor() as i32,
+        point.z.floor() as i32,
+    ]
 }
 
 fn raycast_target(store: &ChunkStore, origin: Vec3, dir: Vec3, max_dist: f32) -> RaycastResult {
@@ -650,7 +836,11 @@ fn raycast_target(store: &ChunkStore, origin: Vec3, dir: Vec3, max_dist: f32) ->
     if d.length_squared() == 0.0 {
         return RaycastResult {
             hit: None,
-            place: [origin.x.floor() as i32, origin.y.floor() as i32, origin.z.floor() as i32],
+            place: [
+                origin.x.floor() as i32,
+                origin.y.floor() as i32,
+                origin.z.floor() as i32,
+            ],
         };
     }
 
@@ -658,18 +848,50 @@ fn raycast_target(store: &ChunkStore, origin: Vec3, dir: Vec3, max_dist: f32) ->
     let mut y = origin.y.floor() as i32;
     let mut z = origin.z.floor() as i32;
     let mut prev = [x, y, z];
+
     let step_x = if d.x >= 0.0 { 1 } else { -1 };
     let step_y = if d.y >= 0.0 { 1 } else { -1 };
     let step_z = if d.z >= 0.0 { 1 } else { -1 };
 
-    let next_boundary = |cell: i32, step: i32| if step > 0 { cell as f32 + 1.0 } else { cell as f32 };
+    let next_boundary = |cell: i32, step: i32| {
+        if step > 0 {
+            cell as f32 + 1.0
+        } else {
+            cell as f32
+        }
+    };
 
-    let mut t_max_x = if d.x.abs() < 1e-6 { f32::INFINITY } else { (next_boundary(x, step_x) - origin.x) / d.x };
-    let mut t_max_y = if d.y.abs() < 1e-6 { f32::INFINITY } else { (next_boundary(y, step_y) - origin.y) / d.y };
-    let mut t_max_z = if d.z.abs() < 1e-6 { f32::INFINITY } else { (next_boundary(z, step_z) - origin.z) / d.z };
-    let t_delta_x = if d.x.abs() < 1e-6 { f32::INFINITY } else { 1.0 / d.x.abs() };
-    let t_delta_y = if d.y.abs() < 1e-6 { f32::INFINITY } else { 1.0 / d.y.abs() };
-    let t_delta_z = if d.z.abs() < 1e-6 { f32::INFINITY } else { 1.0 / d.z.abs() };
+    let mut t_max_x = if d.x.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        (next_boundary(x, step_x) - origin.x) / d.x
+    };
+    let mut t_max_y = if d.y.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        (next_boundary(y, step_y) - origin.y) / d.y
+    };
+    let mut t_max_z = if d.z.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        (next_boundary(z, step_z) - origin.z) / d.z
+    };
+
+    let t_delta_x = if d.x.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        1.0 / d.x.abs()
+    };
+    let t_delta_y = if d.y.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        1.0 / d.y.abs()
+    };
+    let t_delta_z = if d.z.abs() < 1e-6 {
+        f32::INFINITY
+    } else {
+        1.0 / d.z.abs()
+    };
 
     let mut t = 0.0;
     while t <= max_dist {
@@ -704,7 +926,11 @@ fn raycast_target(store: &ChunkStore, origin: Vec3, dir: Vec3, max_dist: f32) ->
     let miss = origin + d * max_dist;
     RaycastResult {
         hit: None,
-        place: [miss.x.floor() as i32, miss.y.floor() as i32, miss.z.floor() as i32],
+        place: [
+            miss.x.floor() as i32,
+            miss.y.floor() as i32,
+            miss.z.floor() as i32,
+        ],
     }
 }
 
@@ -718,11 +944,13 @@ fn preview_area_tool_blocks(
     };
     let radius = brush.area_tool.radius.max(0);
     let thickness = brush.area_tool.thickness.max(1);
+
     let normal = [
         raycast.place[0] - raycast.hit.unwrap_or(raycast.place)[0],
         raycast.place[1] - raycast.hit.unwrap_or(raycast.place)[1],
         raycast.place[2] - raycast.hit.unwrap_or(raycast.place)[2],
     ];
+
     let (axis_u, axis_v) = if normal[1] != 0 {
         ([1, 0, 0], [0, 0, 1])
     } else if normal[0] != 0 {
@@ -772,11 +1000,13 @@ fn preview_wand_blocks(
     let Some(hit) = raycast.hit else {
         return Vec::new();
     };
+
     let normal = [
         raycast.place[0] - hit[0],
         raycast.place[1] - hit[1],
         raycast.place[2] - hit[2],
     ];
+
     let source_mat = store.get_voxel(VoxelCoord {
         x: hit[0],
         y: hit[1],
@@ -786,7 +1016,14 @@ fn preview_wand_blocks(
         return Vec::new();
     }
 
-    let axis = if normal[0] != 0 { 0 } else if normal[1] != 0 { 1 } else { 2 };
+    let axis = if normal[0] != 0 {
+        0
+    } else if normal[1] != 0 {
+        1
+    } else {
+        2
+    };
+
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     let mut out = Vec::new();
@@ -797,6 +1034,7 @@ fn preview_wand_blocks(
         if out.len() >= max_blocks {
             break;
         }
+
         let target = if active_tool == ToolKind::BuildersWand {
             [p[0] + normal[0], p[1] + normal[1], p[2] + normal[2]]
         } else {
@@ -812,7 +1050,14 @@ fn preview_wand_blocks(
             out.push(target);
         }
 
-        for dir in [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]] {
+        for dir in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ] {
             if dir[axis] != 0 {
                 continue;
             }

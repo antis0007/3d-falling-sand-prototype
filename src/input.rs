@@ -4,7 +4,7 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, Win
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::sim::{material, Phase};
-use crate::world::{World, EMPTY};
+use crate::types::VoxelCoord;
 
 #[derive(Default, Clone)]
 pub struct InputState {
@@ -128,68 +128,86 @@ impl FpsController {
         .normalize_or_zero()
     }
 
-    fn collides(world: &World, pos: Vec3) -> bool {
-        let min = pos
-            + Vec3::new(
-                -Self::PLAYER_RADIUS,
-                -Self::EYE_TO_FEET,
-                -Self::PLAYER_RADIUS,
-            );
-        let max = pos + Vec3::new(Self::PLAYER_RADIUS, Self::EYE_TO_HEAD, Self::PLAYER_RADIUS);
+    fn collides<F>(get_voxel: &F, origin: VoxelCoord, pos_local: Vec3) -> bool
+        where
+            F: Fn(i32, i32, i32) -> u16,
+        {
+            // Convert local player position -> world space for collision queries
+            let pos = pos_local + Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
 
-        let min_x = min.x.floor() as i32;
-        let min_y = min.y.floor() as i32;
-        let min_z = min.z.floor() as i32;
-        let max_x = (max.x - 1e-4).floor() as i32;
-        let max_y = (max.y - 1e-4).floor() as i32;
-        let max_z = (max.z - 1e-4).floor() as i32;
+            let min = pos
+                + Vec3::new(
+                    -Self::PLAYER_RADIUS,
+                    -Self::EYE_TO_FEET,
+                    -Self::PLAYER_RADIUS,
+                );
+            let max = pos + Vec3::new(Self::PLAYER_RADIUS, Self::EYE_TO_HEAD, Self::PLAYER_RADIUS);
 
-        for z in min_z..=max_z {
-            for y in min_y..=max_y {
-                for x in min_x..=max_x {
-                    let id = world.get(x, y, z);
-                    if id == EMPTY {
-                        continue;
-                    }
-                    let phase = material(id).phase;
-                    if matches!(phase, Phase::Solid | Phase::Powder) {
-                        return true;
+            let min_x = min.x.floor() as i32;
+            let min_y = min.y.floor() as i32;
+            let min_z = min.z.floor() as i32;
+            let max_x = (max.x - 1e-4).floor() as i32;
+            let max_y = (max.y - 1e-4).floor() as i32;
+            let max_z = (max.z - 1e-4).floor() as i32;
+
+            for z in min_z..=max_z {
+                for y in min_y..=max_y {
+                    for x in min_x..=max_x {
+                        let id = get_voxel(x, y, z);
+                        if id == 0 {
+                            continue;
+                        }
+                        let phase = material(id).phase;
+                        if matches!(phase, Phase::Solid | Phase::Powder) {
+                            return true;
+                        }
                     }
                 }
             }
-        }
-        false
-    }
-
-    fn try_move_axis(&mut self, world: &World, axis_delta: Vec3, allow_step: bool) {
-        if axis_delta.length_squared() <= f32::EPSILON {
-            return;
+            false
         }
 
-        let candidate = self.position + axis_delta;
-        if !Self::collides(world, candidate) {
-            self.position = candidate;
-            return;
-        }
+    fn try_move_axis<F>(
+            &mut self,
+            get_voxel: &F,
+            origin: VoxelCoord,
+            axis_delta: Vec3,
+            allow_step: bool,
+        ) where
+            F: Fn(i32, i32, i32) -> u16,
+        {
+            if axis_delta.length_squared() <= f32::EPSILON {
+                return;
+            }
 
-        if allow_step {
-            let raised = self.position + Vec3::Y * Self::STEP_HEIGHT;
-            let stair_candidate = raised + axis_delta;
-            if !Self::collides(world, raised) && !Self::collides(world, stair_candidate) {
-                self.position = stair_candidate;
+            let candidate = self.position + axis_delta;
+            if !Self::collides(get_voxel, origin, candidate) {
+                self.position = candidate;
+                return;
+            }
+
+            if allow_step {
+                let raised = self.position + Vec3::Y * Self::STEP_HEIGHT;
+                let stair_candidate = raised + axis_delta;
+                if !Self::collides(get_voxel, origin, raised) && !Self::collides(get_voxel, origin, stair_candidate) {
+                    self.position = stair_candidate;
+                }
             }
         }
-    }
 
-    pub fn step(
+    pub fn step<F>(
         &mut self,
-        world: &World,
+        get_voxel: F,
         input: &InputState,
         dt: f32,
-        lock_mouse: bool,
+        active: bool,
         now_s: f32,
-    ) {
-        if lock_mouse {
+        origin: VoxelCoord,
+    ) where
+        F: Fn(i32, i32, i32) -> u16,
+    {
+        // Only apply mouse-look + movement when gameplay owns input
+        if active {
             self.yaw += input.mouse_delta.x * self.sensitivity;
             self.pitch -= input.mouse_delta.y * self.sensitivity;
             self.pitch = self.pitch.clamp(-1.54, 1.54);
@@ -197,55 +215,65 @@ impl FpsController {
 
         let forward = Vec3::new(self.yaw.cos(), 0.0, self.yaw.sin()).normalize_or_zero();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
+
         let mut move_dir = Vec3::ZERO;
-        if input.key(KeyCode::KeyW) {
-            move_dir += forward;
+        if active {
+            if input.key(KeyCode::KeyW) {
+                move_dir += forward;
+            }
+            if input.key(KeyCode::KeyS) {
+                move_dir -= forward;
+            }
+            if input.key(KeyCode::KeyA) {
+                move_dir -= right;
+            }
+            if input.key(KeyCode::KeyD) {
+                move_dir += right;
+            }
         }
-        if input.key(KeyCode::KeyS) {
-            move_dir -= forward;
-        }
-        if input.key(KeyCode::KeyA) {
-            move_dir -= right;
-        }
-        if input.key(KeyCode::KeyD) {
-            move_dir += right;
-        }
+
         if move_dir.length_squared() > 0.0 {
             move_dir = move_dir.normalize();
         }
 
         if self.flying {
-            if input.key(KeyCode::Space) {
-                move_dir += Vec3::Y;
+            if active {
+                if input.key(KeyCode::Space) {
+                    move_dir += Vec3::Y;
+                }
+                if input.key(KeyCode::ShiftLeft) {
+                    move_dir -= Vec3::Y;
+                }
             }
-            if input.key(KeyCode::ShiftLeft) {
-                move_dir -= Vec3::Y;
-            }
+
             let fly_delta = move_dir * self.fly_speed * dt;
-            self.try_move_axis(world, Vec3::new(fly_delta.x, 0.0, 0.0), false);
-            self.try_move_axis(world, Vec3::new(0.0, 0.0, fly_delta.z), false);
-            self.try_move_axis(world, Vec3::new(0.0, fly_delta.y, 0.0), false);
+            self.try_move_axis(&get_voxel, origin, Vec3::new(fly_delta.x, 0.0, 0.0), false);
+            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, 0.0, fly_delta.z), false);
+            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, fly_delta.y, 0.0), false);
         } else {
             let horizontal = move_dir * self.move_speed * dt;
-            self.try_move_axis(world, Vec3::new(horizontal.x, 0.0, 0.0), true);
-            self.try_move_axis(world, Vec3::new(0.0, 0.0, horizontal.z), true);
+            self.try_move_axis(&get_voxel, origin, Vec3::new(horizontal.x, 0.0, 0.0), true);
+            self.try_move_axis(&get_voxel, origin, Vec3::new(0.0, 0.0, horizontal.z), true);
 
-            let on_ground = Self::collides(world, self.position - Vec3::Y * Self::GROUND_EPSILON);
-            if input.key(KeyCode::Space) && on_ground {
+            let on_ground = Self::collides(&get_voxel, origin, self.position - Vec3::Y * Self::GROUND_EPSILON);
+            if active && input.key(KeyCode::Space) && on_ground {
                 self.vel_y = self.jump_speed;
             }
 
             self.vel_y -= 19.6 * dt;
+
             let vertical = Vec3::new(0.0, self.vel_y * dt, 0.0);
             let vertical_candidate = self.position + vertical;
-            if !Self::collides(world, vertical_candidate) {
+
+            if !Self::collides(&get_voxel, origin, vertical_candidate) {
                 self.position = vertical_candidate;
             } else {
                 self.vel_y = 0.0;
             }
         }
 
-        if input.just_pressed.contains(&KeyCode::Space) {
+        // Double-tap space toggles flying (only if active so UI doesn’t toggle it)
+        if active && input.just_pressed.contains(&KeyCode::Space) {
             if (now_s - self.last_space_t) < self.double_jump_threshold {
                 self.flying = !self.flying;
                 self.vel_y = 0.0;

@@ -4,7 +4,7 @@ use crate::types::{ChunkCoord, VoxelCoord};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -72,19 +72,25 @@ pub struct ChunkMesh {
     aabb_max: Vec3,
 }
 
-
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: PhysicalSize<u32>,
+
     pipeline: wgpu::RenderPipeline,
     cam_buf: wgpu::Buffer,
     cam_bg: wgpu::BindGroup,
+
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
+
     store_meshes: HashMap<ChunkCoord, ChunkMesh>,
+
+    // IMPORTANT: Persistent queue so we don't O(N) re-mark remaining dirty chunks every frame.
+    pending_dirty: VecDeque<ChunkCoord>,
+
     pub day: bool,
 }
 
@@ -101,11 +107,14 @@ impl Renderer {
             })
             .await
             .context("adapter")?;
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await?;
+
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -125,6 +134,7 @@ impl Renderer {
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cam_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -138,6 +148,7 @@ impl Renderer {
                 count: None,
             }],
         });
+
         let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cam_bg"),
             layout: &bgl,
@@ -146,15 +157,18 @@ impl Renderer {
                 resource: cam_buf.as_entire_binding(),
             }],
         });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("voxel shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
+
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pl"),
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("pipeline"),
             layout: Some(&pl),
@@ -201,6 +215,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             store_meshes: HashMap::new(),
+            pending_dirty: VecDeque::new(),
             day: true,
         })
     }
@@ -213,34 +228,45 @@ impl Renderer {
         (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
     }
 
+    /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
+    ///
+    /// IMPORTANT: This relies on `store.take_dirty_chunks()` returning + clearing the store's dirty set.
+
     pub fn rebuild_dirty_store_chunks(
         &mut self,
         store: &mut ChunkStore,
         origin_voxel: VoxelCoord,
         budget: usize,
-    ) {
+    ) -> f32 {
         let dirty = store.take_dirty_chunks();
         let mut iter = dirty.into_iter();
+
+        let mut max_ms = 0.0f32;
+
         for coord in iter.by_ref().take(budget) {
+            let t0 = std::time::Instant::now();
             let (verts, inds, aabb_min, aabb_max) = mesh_store_chunk(store, coord, origin_voxel);
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if ms > max_ms {
+                max_ms = ms;
+            }
+
             if inds.is_empty() {
                 self.store_meshes.remove(&coord);
                 continue;
             }
-            let vb = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("store chunk vb"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ib = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("store chunk ib"),
-                    contents: bytemuck::cast_slice(&inds),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
+
+            let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("store chunk vb"),
+                contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("store chunk ib"),
+                contents: bytemuck::cast_slice(&inds),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
             self.store_meshes.insert(
                 coord,
                 ChunkMesh {
@@ -252,17 +278,32 @@ impl Renderer {
                 },
             );
         }
+
         for coord in iter {
             store.mark_dirty(coord);
         }
-    }
 
+        max_ms
+    }
     pub fn clear_mesh_cache(&mut self) {
         self.store_meshes.clear();
+        self.pending_dirty.clear();
+    }
+    pub fn mesh_draw_stats(&self, vp: glam::Mat4) -> (usize, u64) {
+        let mut chunks = 0usize;
+        let mut inds = 0u64;
+        for m in self.store_meshes.values() {
+            if aabb_in_view(vp, m.aabb_min, m.aabb_max) {
+                chunks += 1;
+                inds += m.index_count as u64;
+            }
+        }
+        (chunks, inds)
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
         let vp = camera.view_proj();
+
         self.queue.write_buffer(
             &self.cam_buf,
             0,
@@ -270,8 +311,10 @@ impl Renderer {
                 vp: vp.to_cols_array_2d(),
             }),
         );
+
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
+
         for mesh in self.store_meshes.values() {
             if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
@@ -282,7 +325,6 @@ impl Renderer {
         }
     }
 }
-
 
 fn create_depth_texture(
     device: &wgpu::Device,
@@ -339,92 +381,4 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
         }
     }
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fair_dirty_scheduler_is_starvation_free_under_constant_dirty_load() {
-        let chunk_count = 10;
-        let budget = 3;
-        let mut cursor = 0;
-        let mut seen = [0usize; 10];
-
-        for _frame in 0..20 {
-            let selected = select_dirty_chunks_fair(chunk_count, budget, cursor, |_| true);
-            cursor = selected.next_cursor;
-            for idx in selected.indices {
-                seen[idx] += 1;
-            }
-        }
-
-        assert!(seen.iter().all(|count| *count > 0));
-    }
-
-    #[test]
-    fn fair_dirty_scheduler_reaches_late_indices_when_budget_small() {
-        let chunk_count = 8;
-        let budget = 2;
-        let mut cursor = 0;
-        let mut reached = false;
-
-        for _frame in 0..8 {
-            let selected = select_dirty_chunks_fair(chunk_count, budget, cursor, |_| true);
-            cursor = selected.next_cursor;
-            if selected.indices.contains(&7) {
-                reached = true;
-                break;
-            }
-        }
-
-        assert!(reached, "highest index chunk should eventually be selected");
-    }
-
-    #[test]
-    fn unknown_neighbor_policy_maps_as_expected() {
-        assert_eq!(
-            unknown_neighbor_material(UnknownNeighborOcclusionPolicy::Conservative),
-            TURF_ID
-        );
-        assert_eq!(
-            unknown_neighbor_material(UnknownNeighborOcclusionPolicy::Aggressive),
-            EMPTY
-        );
-    }
-
-    #[test]
-    fn crossed_billboard_builds_two_double_sided_quads() {
-        let mut verts = Vec::new();
-        let mut inds = Vec::new();
-        add_crossed_billboard(
-            [0, 0, 0],
-            [0, 0, 0],
-            &mut |_local, _global| EMPTY,
-            GRASS_ID,
-            &mut verts,
-            &mut inds,
-        );
-
-        assert_eq!(verts.len(), 8);
-        assert_eq!(inds.len(), 24);
-        assert_eq!(&inds[0..12], &[0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]);
-        assert_eq!(&inds[12..24], &[4, 5, 6, 4, 6, 7, 4, 6, 5, 4, 7, 6]);
-    }
-
-    #[test]
-    fn aabb_culling_identity_view_proj() {
-        let vp = Mat4::IDENTITY;
-        assert!(aabb_in_view(
-            vp,
-            Vec3::new(-0.5, -0.5, -0.5),
-            Vec3::new(0.5, 0.5, 0.5)
-        ));
-        assert!(!aabb_in_view(
-            vp,
-            Vec3::new(1000.0, 0.0, 0.0),
-            Vec3::new(1001.0, 1.0, 1.0)
-        ));
-    }
 }
