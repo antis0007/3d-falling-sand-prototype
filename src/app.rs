@@ -35,6 +35,7 @@ const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
 const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
+const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 
 const GENERATOR_THREADS: usize = 3;
@@ -1388,17 +1389,53 @@ pub async fn run() -> anyhow::Result<()> {
                         let do_step = sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
                         let sim_t0 = Instant::now();
                         let mut sim_chunk_steps = 0usize;
+                        let mut sim_substeps_executed = 0usize;
+                        let sim_substeps_budget = ui
+                            .sim_max_substeps_per_frame
+                            .clamp(UiState::SIM_MAX_SUBSTEPS_MIN, UiState::SIM_MAX_SUBSTEPS_MAX);
+                        ui.sim_max_substeps_per_frame = sim_substeps_budget;
+                        let sim_accumulator_cap_frames = ui.sim_accumulator_cap_frames.clamp(
+                            UiState::SIM_ACC_CAP_FRAMES_MIN,
+                            UiState::SIM_ACC_CAP_FRAMES_MAX,
+                        );
+                        ui.sim_accumulator_cap_frames = sim_accumulator_cap_frames;
+                        let adaptive_trigger_ratio = ui.sim_adaptive_frame_time_ratio.clamp(
+                            UiState::SIM_ADAPTIVE_THRESHOLD_MIN,
+                            UiState::SIM_ADAPTIVE_THRESHOLD_MAX,
+                        );
+                        ui.sim_adaptive_frame_time_ratio = adaptive_trigger_ratio;
+                        let sim_accumulator_cap_seconds =
+                            sim_accumulator_cap_frames * FIXED_SIM_STEP_SECONDS;
+                        let mut sim_accumulator_clamped = false;
+                        let mut sim_substeps_budget_effective = sim_substeps_budget;
                         if do_step {
                             sim_acc += dt * ui.sim_speed;
-                            while sim_acc >= 1.0 / 60.0 {
+                            if sim_acc > sim_accumulator_cap_seconds {
+                                sim_acc = sim_accumulator_cap_seconds;
+                                sim_accumulator_clamped = true;
+                            }
+                            if ui.sim_adaptive_substeps {
+                                let frame_ms = dt * 1000.0;
+                                let adaptive_trigger_ms = FRAME_TIME_TARGET_MS * adaptive_trigger_ratio;
+                                if frame_ms > adaptive_trigger_ms {
+                                    let overload = (frame_ms / adaptive_trigger_ms).floor() as usize;
+                                    let reduction = overload.min(sim_substeps_budget.saturating_sub(1));
+                                    sim_substeps_budget_effective =
+                                        sim_substeps_budget.saturating_sub(reduction).max(1);
+                                }
+                            }
+                            let ready_steps = (sim_acc / FIXED_SIM_STEP_SECONDS).floor() as usize;
+                            let steps_to_run = ready_steps.min(sim_substeps_budget_effective);
+                            for _ in 0..steps_to_run {
                                 sim_chunk_steps += step_region_profiled(
                                     &mut store,
                                     &cached_sim_region,
                                     player_chunk,
                                     &mut rng,
                                 );
-                                sim_acc -= 1.0 / 60.0;
                             }
+                            sim_substeps_executed = steps_to_run;
+                            sim_acc -= steps_to_run as f32 * FIXED_SIM_STEP_SECONDS;
                         } else if step_once && !ui.paused_menu {
                             sim_chunk_steps += step_region_profiled(
                                 &mut store,
@@ -1406,6 +1443,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 player_chunk,
                                 &mut rng,
                             );
+                            sim_substeps_executed = 1;
                             step_once = false;
                         }
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
@@ -1502,6 +1540,13 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_ultra_count = mesh_stats.ultra_mesh_count;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
+                        ui.profiler.sim_substeps_executed = sim_substeps_executed;
+                        ui.profiler.sim_substeps_budget = sim_substeps_budget;
+                        ui.profiler.sim_substeps_budget_effective = sim_substeps_budget_effective;
+                        ui.profiler.sim_accumulator_steps = sim_acc / FIXED_SIM_STEP_SECONDS;
+                        ui.profiler.sim_accumulator_cap_steps =
+                            sim_accumulator_cap_seconds / FIXED_SIM_STEP_SECONDS;
+                        ui.profiler.sim_accumulator_clamped = sim_accumulator_clamped;
 
                         // Egui
                         let egui_t0 = Instant::now();
