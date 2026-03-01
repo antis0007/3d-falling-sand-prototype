@@ -170,11 +170,14 @@ pub struct MeshRebuildStats {
     pub upload_bytes: usize,
     pub upload_latency_ms: f32,
     pub stale_drop_count: usize,
+    pub age_drop_count: usize,
     pub near_mesh_count: usize,
     pub mid_mesh_count: usize,
     pub far_mesh_count: usize,
     pub ultra_mesh_count: usize,
 }
+
+const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
 
 #[derive(Clone)]
 pub(crate) struct ChunkSnapshot {
@@ -654,6 +657,40 @@ impl Renderer {
                     bd.cmp(&ad)
                 })
         });
+
+        if self.completed_meshes.len() > COMPLETED_MESH_BACKLOG_THRESHOLD {
+            let mut low_priority_indices: Vec<usize> = self
+                .completed_meshes
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, result)| {
+                    matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra).then_some(idx)
+                })
+                .collect();
+            low_priority_indices.sort_by_key(|idx| self.completed_meshes[*idx].queued_at);
+
+            let mut to_drop = self.completed_meshes.len() - COMPLETED_MESH_BACKLOG_THRESHOLD;
+            let mut drop_mask = vec![false; self.completed_meshes.len()];
+            for idx in low_priority_indices {
+                if to_drop == 0 {
+                    break;
+                }
+                drop_mask[idx] = true;
+                to_drop -= 1;
+            }
+
+            if drop_mask.iter().any(|drop| *drop) {
+                let mut kept = Vec::with_capacity(self.completed_meshes.len());
+                for (idx, result) in self.completed_meshes.drain(..).enumerate() {
+                    if drop_mask[idx] {
+                        stats.age_drop_count += 1;
+                    } else {
+                        kept.push(result);
+                    }
+                }
+                self.completed_meshes = kept;
+            }
+        }
 
         let mut bytes_uploaded = 0usize;
         let mut uploaded = 0usize;

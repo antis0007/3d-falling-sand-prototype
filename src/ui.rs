@@ -29,6 +29,7 @@ pub struct ProfilerStats {
     pub mesh_upload_bytes: usize,
     pub mesh_upload_latency_ms: f32,
     pub mesh_stale_drop_count: usize,
+    pub mesh_age_drop_count: usize,
     pub near_radius: i32,
     pub mid_radius: i32,
     pub far_radius: i32,
@@ -410,10 +411,11 @@ pub fn draw(
                     ui_state.profiler.dirty_backlog
                 ));
                 ui.monospace(format!(
-                    "mesh queue/completed: {}/{} | stale drops: {}",
+                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {}",
                     ui_state.profiler.mesh_queue_depth,
                     ui_state.profiler.mesh_completed_depth,
                     ui_state.profiler.mesh_stale_drop_count,
+                    ui_state.profiler.mesh_age_drop_count,
                 ));
                 ui.monospace(format!(
                     "lod radii n/m/f/u: {}/{}/{}/{} | hysteresis: {}",
