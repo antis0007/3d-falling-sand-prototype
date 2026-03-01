@@ -5,12 +5,16 @@ use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "gpu-compute")]
 use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "gpu-compute")]
 use std::sync::Mutex;
+use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 use wgpu::util::DeviceExt;
 
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
+const CHUNK_VOLUME: usize = 32 * 32 * 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
@@ -45,6 +49,7 @@ pub struct GpuComputeRuntime {
 struct ChunkPageAtlas {
     page_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
     version_for_chunk: HashMap<crate::types::ChunkCoord, u64>,
+    state_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
     next_page: u32,
 }
 
@@ -58,6 +63,43 @@ struct WorkerGpuState {
     page_indirect: wgpu::Buffer,
     frontier: wgpu::Buffer,
     diagnostics: wgpu::Buffer,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct GpuComputeProfilerSnapshot {
+    pub dispatch_ms: f32,
+    pub bytes_transferred: u64,
+    pub chunks_completed: u64,
+    pub chunks_per_sec: f32,
+}
+
+#[cfg(feature = "gpu-compute")]
+static GPU_DISPATCH_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TRANSFER_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfilerSnapshot {
+    #[cfg(not(feature = "gpu-compute"))]
+    {
+        let _ = frame_seconds;
+        GpuComputeProfilerSnapshot::default()
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    {
+        let dispatch_ns = GPU_DISPATCH_NS.swap(0, Ordering::Relaxed);
+        let bytes_transferred = GPU_TRANSFER_BYTES.swap(0, Ordering::Relaxed);
+        let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
+        let frame = frame_seconds.max(0.000_1);
+        GpuComputeProfilerSnapshot {
+            dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
+            bytes_transferred,
+            chunks_completed,
+            chunks_per_sec: chunks_completed as f32 / frame,
+        }
+    }
 }
 
 impl GpuComputeRuntime {
@@ -76,7 +118,8 @@ impl GpuComputeRuntime {
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
                 && limits.max_storage_buffer_binding_size
-                    >= (32usize * 32usize * 32usize * std::mem::size_of::<u32>() * 256) as u32
+                    >= (CHUNK_VOLUME * std::mem::size_of::<u32>() * 2 * GPU_PAGE_CAPACITY as usize)
+                        as u32
         }
     }
 
@@ -94,97 +137,22 @@ impl GpuComputeRuntime {
                 source: wgpu::ShaderSource::Wgsl(include_str!("compute_meshing.wgsl").into()),
             });
 
+            let entries = [
+                bgl_entry(0, true),
+                bgl_entry(1, false),
+                bgl_entry(2, true),
+                bgl_entry(3, true),
+                bgl_entry(4, false),
+                bgl_entry(5, false),
+            ];
             let simulation_bgl =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("simulation bgl"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
+                    entries: &entries,
                 });
-
             let meshing_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("meshing bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
+                entries: &entries,
             });
 
             let simulation_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -228,122 +196,174 @@ impl GpuComputeRuntime {
         state: &WorkerGpuState,
         job: &MeshJob,
         page_index: u32,
+        current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
-        #[cfg(not(feature = "gpu-compute"))]
+        let t0 = Instant::now();
+        let (frontier, _) = build_frontier_with_halo(job.snapshot.center_voxels.as_ref());
+
+        let input = state
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gpu input voxels"),
+                contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let page_params = device_page_params(job, page_index, frontier.len() as u32, current_state);
+        let page_params_buf = state
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gpu page params"),
+                contents: bytemuck::cast_slice(&page_params),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        state.queue.write_buffer(
+            &state.frontier,
+            0,
+            bytemuck::cast_slice(frontier.as_slice()),
+        );
+
+        let simulation_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("simulation bg"),
+            layout: &self.simulation_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: state.atlas_voxels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state.frontier.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: page_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.page_indirect.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: state.diagnostics.as_entire_binding(),
+                },
+            ],
+        });
+
+        let meshing_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("meshing bg"),
+            layout: &self.meshing_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: state.atlas_voxels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state.frontier.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: page_params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: state.page_indirect.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: state.diagnostics.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let groups = (frontier.len() as u32).max(1).div_ceil(64);
         {
-            let _ = (device, queue, job);
-            anyhow::bail!("gpu compute feature disabled")
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.simulation_pipeline);
+            pass.set_bind_group(0, &simulation_bg, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+
+            pass.set_pipeline(&self.meshing_pipeline);
+            pass.set_bind_group(0, &meshing_bg, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
         }
+        state.queue.submit(Some(encoder.finish()));
 
         #[cfg(feature = "gpu-compute")]
         {
-            let input = state
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("gpu input voxels"),
-                    contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            let page_params = device_page_params(job, page_index);
-            let page_params_buf =
-                state
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("gpu page params"),
-                        contents: bytemuck::cast_slice(&page_params),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    });
-            state
-                .queue
-                .write_buffer(&state.frontier, 0, bytemuck::cast_slice(&[page_index]));
-
-            let simulation_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("simulation bg"),
-                layout: &self.simulation_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: input.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: state.atlas_voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: state.frontier.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: page_params_buf.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let meshing_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("meshing bg"),
-                layout: &self.meshing_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: state.atlas_voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: state.frontier.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: state.page_indirect.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: state.diagnostics.as_entire_binding(),
-                    },
-                ],
-            });
-
-            let mut encoder = state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_pipeline(&self.simulation_pipeline);
-                pass.set_bind_group(0, &simulation_bg, &[]);
-                let groups = (job.snapshot.center_voxels.len() as u32).div_ceil(64);
-                pass.dispatch_workgroups(groups, 1, 1);
-
-                pass.set_pipeline(&self.meshing_pipeline);
-                pass.set_bind_group(0, &meshing_bg, &[]);
-                pass.dispatch_workgroups(groups, 1, 1);
-            }
-
-            let diag_readback = state.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("diag readback"),
-                size: std::mem::size_of::<DrawIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let page_offset = (page_index as u64) * std::mem::size_of::<DrawIndirectArgs>() as u64;
-            encoder.copy_buffer_to_buffer(
-                &state.page_indirect,
-                page_offset,
-                &diag_readback,
-                0,
-                diag_readback.size(),
+            GPU_DISPATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            GPU_TRANSFER_BYTES.fetch_add(
+                ((job.snapshot.center_voxels.len() + frontier.len()) * std::mem::size_of::<u32>())
+                    as u64,
+                Ordering::Relaxed,
             );
+            GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        }
 
-            let submission = state.queue.submit(Some(encoder.finish()));
-            state
-                .device
-                .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
+        Ok(DrawIndirectArgs::default())
+    }
+}
 
-            map_readback::<DrawIndirectArgs>(&state.device, &diag_readback)?
-                .into_iter()
-                .next()
-                .context("missing draw indirect args from readback")
+#[cfg(feature = "gpu-compute")]
+fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn build_frontier_with_halo(voxels: &[MaterialId]) -> (Vec<u32>, usize) {
+    let mut mark = vec![false; CHUNK_VOLUME];
+    let mut frontier = Vec::with_capacity(CHUNK_VOLUME / 2);
+    let mut seeds = 0usize;
+    for (idx, id) in voxels.iter().enumerate() {
+        if *id == EMPTY {
+            continue;
+        }
+        seeds += 1;
+        let z = idx / (32 * 32);
+        let rem = idx - z * 32 * 32;
+        let y = rem / 32;
+        let x = rem % 32;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    let nz = z as i32 + dz;
+                    if !(0..32).contains(&nx) || !(0..32).contains(&ny) || !(0..32).contains(&nz) {
+                        continue;
+                    }
+                    let nidx = (nx as usize) + (ny as usize) * 32 + (nz as usize) * 32 * 32;
+                    if !mark[nidx] {
+                        mark[nidx] = true;
+                        frontier.push(nidx as u32);
+                    }
+                }
+            }
         }
     }
+    if frontier.is_empty() {
+        frontier.push(0);
+    }
+    (frontier, seeds)
 }
 
 pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedChunkArtifacts> {
@@ -372,25 +392,22 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             )?;
             let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
             let page_capacity = GPU_PAGE_CAPACITY as u64;
-            // The atlas stores one 32^3 chunk payload per page. Border strips are tracked
-            // separately in CPU snapshot data, so multiplying by a 27-neighborhood here
-            // over-allocates the storage buffer and can exceed backend limits.
-            let page_len = (32u64 * 32u64 * 32u64) as u64;
+            let page_len = CHUNK_VOLUME as u64;
             let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk atlas voxels"),
-                size: page_capacity * page_len * std::mem::size_of::<u32>() as u64,
+                size: page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let page_indirect = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk page indirect"),
                 size: page_capacity * std::mem::size_of::<DrawIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
             let frontier = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk active frontier"),
-                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                size: page_len * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -436,11 +453,17 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .get(&job.coord)
             .copied()
             .unwrap_or(0);
+        let current_state = atlas.state_for_chunk.get(&job.coord).copied().unwrap_or(0);
         atlas.version_for_chunk.insert(job.coord, job.version);
+        atlas
+            .state_for_chunk
+            .insert(job.coord, (current_state + 1) & 1);
         drop(atlas);
 
         let indirect = if last_version != job.version {
-            state.runtime.run_active_frontier(state, job, page_index)?
+            state
+                .runtime
+                .run_active_frontier(state, job, page_index, current_state)?
         } else {
             DrawIndirectArgs::default()
         };
@@ -457,16 +480,21 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 struct PageParams {
     page_index: u32,
     voxel_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    frontier_len: u32,
+    state_index: u32,
 }
 
-fn device_page_params(job: &MeshJob, page_index: u32) -> [PageParams; 1] {
+fn device_page_params(
+    job: &MeshJob,
+    page_index: u32,
+    frontier_len: u32,
+    state_index: u32,
+) -> [PageParams; 1] {
     [PageParams {
         page_index,
         voxel_count: job.snapshot.center_voxels.len() as u32,
-        _pad0: 0,
-        _pad1: 0,
+        frontier_len,
+        state_index,
     }]
 }
 
@@ -488,22 +516,6 @@ impl ComputedChunkArtifacts {
     pub fn has_any_surface(&self) -> bool {
         self.mesh_indirect.vertex_count > 0
     }
-}
-
-fn map_readback<T: Pod>(device: &wgpu::Device, buffer: &wgpu::Buffer) -> anyhow::Result<Vec<T>> {
-    use std::sync::mpsc;
-    let slice = buffer.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv().context("map callback dropped")??;
-    let data = slice.get_mapped_range();
-    let out = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    buffer.unmap();
-    Ok(out)
 }
 
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
