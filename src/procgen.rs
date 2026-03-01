@@ -2015,7 +2015,7 @@ fn vegetation_pass(
             }
         }
     }
-    apply_vegetation_intents(world, config, &intents);
+    apply_vegetation_intents(world, config, &intents, None);
 }
 
 fn vegetation_pass_chunk(
@@ -2099,28 +2099,137 @@ fn vegetation_pass_chunk(
             }
 
             let roll = hash01(config.seed ^ 0x1111_7777, wx, ground_world_y, wz);
-            if roll >= tree_p {
+            if roll < tree_p
+                && has_tree_support_and_headroom(world, config, cache, wx, wz, ground_world_y)
+            {
+                let base_world_y = ground_world_y + 1;
+                stage_tree_intents(
+                    &mut intents,
+                    config.seed,
+                    wx,
+                    wz,
+                    base_world_y,
+                    stratum,
+                    landmark,
+                );
                 continue;
             }
 
-            if !has_tree_support_and_headroom(world, config, cache, wx, wz, ground_world_y) {
-                continue;
-            }
-
-            let base_world_y = ground_world_y + 1;
-            stage_tree_intents(
-                &mut intents,
-                config.seed,
-                wx,
-                wz,
-                base_world_y,
-                stratum,
+            let flora_roll = hash01(config.seed ^ 0x2222_4444, wx, ground_world_y, wz);
+            let mut flora_p = 0.04 + 0.08 * forest + 0.05 * plains + climate.moisture * 0.08;
+            flora_p *= match stratum {
+                VerticalBiomeStratum::WetlandValley => 1.4,
+                VerticalBiomeStratum::Lowland => 1.0,
+                VerticalBiomeStratum::DryPlateau => 0.6,
+                VerticalBiomeStratum::Alpine => 0.4,
+            };
+            if matches!(
                 landmark,
-            );
+                Some(LandmarkKind::BoulderField | LandmarkKind::Ravine)
+            ) {
+                flora_p *= 0.35;
+            }
+            if is_surface_wet_for_tree(config, cache, hydrology, wx, wz, ground_world_y, ocean) {
+                continue;
+            }
+            if flora_roll < flora_p {
+                let ground = if let Some(local_idx) = cache.local_idx(lx, lz) {
+                    world.get(lx, cache.local_heights[local_idx], lz)
+                } else if weights[biome_index(BiomeType::Desert)] > 0.40 {
+                    SAND
+                } else {
+                    TURF
+                };
+                let pseudo_col = ColumnGenData {
+                    wx,
+                    wz,
+                    weights,
+                    climate,
+                    surface_height: ground_world_y,
+                    slope,
+                    coastal,
+                    river: wet > 0.5,
+                    ocean: ocean > 0.55,
+                    stratum,
+                    landmark,
+                };
+                let flora_material = vegetation_ground_cover(&pseudo_col, flora_roll, ground);
+                intents.push(VegetationIntent {
+                    wx,
+                    wy: ground_world_y + 1,
+                    wz,
+                    material: flora_material,
+                });
+            }
         }
     }
 
-    apply_vegetation_intents(world, config, &intents);
+    apply_vegetation_intents(world, config, &intents, Some(cache));
+}
+
+fn is_submerged_or_shoreline_overwater(
+    config: &ProcGenConfig,
+    field: &ProcGenFieldCell,
+    ground_world_y: i32,
+) -> bool {
+    let sea_level_world = config.sea_level_world();
+    let ocean_weight = field.weights[biome_index(BiomeType::Ocean)].max(field.ocean_prior);
+    let river_weight = field.weights[biome_index(BiomeType::River)].max(field.river_prior);
+    let lake_weight = field.weights[biome_index(BiomeType::Lake)];
+
+    let submerged = (ocean_weight > 0.34 || river_weight > 0.52 || lake_weight > 0.50)
+        && ground_world_y <= sea_level_world + 1;
+    let shoreline_overwater = ground_world_y <= sea_level_world + 3
+        && ocean_weight > 0.24
+        && (river_weight > 0.26 || lake_weight > 0.26 || ocean_weight > 0.58);
+
+    submerged || shoreline_overwater
+}
+
+fn has_consistent_neighbor_support(
+    config: &ProcGenConfig,
+    cache: &ProcGenFieldCache,
+    wx: i32,
+    wz: i32,
+    local_ground_y: i32,
+) -> bool {
+    let mut sampled = 0;
+    let mut supported = 0;
+    for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let nwx = wx + dx;
+        let nwz = wz + dz;
+        let Some(nfield) = cache.cell_world(config, nwx, nwz) else {
+            continue;
+        };
+        sampled += 1;
+        let n_ground_world_y = config.world_origin[1] + nfield.surface_height;
+        if nfield.surface_height >= local_ground_y - 1
+            && !is_submerged_or_shoreline_overwater(config, nfield, n_ground_world_y)
+        {
+            supported += 1;
+        }
+    }
+    sampled >= 3 && supported >= 3
+}
+
+fn has_deterministic_tree_support(
+    config: &ProcGenConfig,
+    cache: &ProcGenFieldCache,
+    wx: i32,
+    wz: i32,
+    ground_world_y: i32,
+) -> bool {
+    let Some(field) = cache.cell_world(config, wx, wz) else {
+        return false;
+    };
+    let local_ground_y = ground_world_y - config.world_origin[1];
+    if field.surface_height != local_ground_y {
+        return false;
+    }
+    if is_submerged_or_shoreline_overwater(config, field, ground_world_y) {
+        return false;
+    }
+    has_consistent_neighbor_support(config, cache, wx, wz, local_ground_y)
 }
 
 fn has_tree_support_and_headroom(
@@ -2136,11 +2245,7 @@ fn has_tree_support_and_headroom(
     let lz = wz - config.world_origin[2];
     let local_ground_y = ground_world_y - config.world_origin[1];
 
-    let surface_local_y = cache
-        .cell_world(config, wx, wz)
-        .map(|field| field.surface_height)
-        .unwrap_or(local_ground_y);
-    if local_ground_y != surface_local_y {
+    if !has_deterministic_tree_support(config, cache, wx, wz, ground_world_y) {
         return false;
     }
 
@@ -2198,7 +2303,18 @@ fn apply_vegetation_intents(
     world: &mut World,
     config: &ProcGenConfig,
     intents: &[VegetationIntent],
+    cache: Option<&ProcGenFieldCache>,
 ) {
+    let mut anchors = HashMap::<(i32, i32), i32>::new();
+    for intent in intents {
+        if intent.material == WOOD {
+            anchors
+                .entry((intent.wx, intent.wz))
+                .and_modify(|base| *base = (*base).min(intent.wy))
+                .or_insert(intent.wy);
+        }
+    }
+
     for intent in intents {
         let lx = intent.wx - config.world_origin[0];
         let ly = intent.wy - config.world_origin[1];
@@ -2211,6 +2327,57 @@ fn apply_vegetation_intents(
             || lz >= world.dims[2] as i32
         {
             continue;
+        }
+        if matches!(intent.material, WOOD | LEAVES) {
+            let mut supported = false;
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    let Some(base_world_y) = anchors.get(&(intent.wx + dx, intent.wz + dz)) else {
+                        continue;
+                    };
+                    if *base_world_y > intent.wy {
+                        continue;
+                    }
+                    let ground_world_y = *base_world_y - 1;
+                    let base_lx = intent.wx + dx - config.world_origin[0];
+                    let base_lz = intent.wz + dz - config.world_origin[2];
+
+                    supported = if base_lx >= 0
+                        && base_lz >= 0
+                        && base_lx < world.dims[0] as i32
+                        && base_lz < world.dims[2] as i32
+                    {
+                        let local_ground_y = ground_world_y - config.world_origin[1];
+                        local_ground_y >= 0
+                            && local_ground_y + 1 < world.dims[1] as i32
+                            && matches!(
+                                world.get(base_lx, local_ground_y, base_lz),
+                                TURF | DIRT | SAND
+                            )
+                            && can_place_tree(world, base_lx, local_ground_y + 1, base_lz)
+                    } else {
+                        cache.is_some_and(|field_cache| {
+                            has_deterministic_tree_support(
+                                config,
+                                field_cache,
+                                intent.wx + dx,
+                                intent.wz + dz,
+                                ground_world_y,
+                            )
+                        })
+                    };
+
+                    if supported {
+                        break;
+                    }
+                }
+                if supported {
+                    break;
+                }
+            }
+            if !supported {
+                continue;
+            }
         }
         if world.get(lx, ly, lz) == EMPTY {
             let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
@@ -2405,16 +2572,16 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
 
     let sea_level_world = config.sea_level_world() as f32;
     let inland_core = smoothstep((continental - 0.54) / 0.24);
-    let broad = (continental - 0.44) * (30.0 + highlands * 24.0 + inland_core * 6.0);
+    let broad = (continental - 0.44) * (34.0 + highlands * 29.0 + inland_core * 8.0);
     let continental_target = sea_level_world + broad;
     let desert_continental_scale = smoothstep((continental_target - sea_level_world + 2.0) / 8.0);
     let desert_land = desert * desert_continental_scale;
 
-    let biome_amp = plains * 8.8 + forest * 10.8 + desert_land * 7.0 + highlands * 25.6;
-    let biome_rough = plains * 0.28 + forest * 0.52 + desert_land * 0.38 + highlands * 1.14;
+    let biome_amp = plains * 10.0 + forest * 12.4 + desert_land * 8.8 + highlands * 30.8;
+    let biome_rough = plains * 0.34 + forest * 0.64 + desert_land * 0.46 + highlands * 1.28;
 
-    let rough = (ridge - 0.5) * (8.5 + biome_amp * 0.32);
-    let micro = (detail - 0.5) * (2.8 + biome_rough * 8.0);
+    let rough = (ridge - 0.5) * (10.2 + biome_amp * 0.36);
+    let micro = (detail - 0.5) * (3.2 + biome_rough * 9.2);
 
     let mut inland = sea_level_world + broad + rough + micro;
     let interior_elevation_boost = inland_core * (1.0 - ocean_w).clamp(0.0, 1.0);
@@ -2424,7 +2591,7 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     inland += plains * (0.6 + 2.0 * interior_elevation_boost);
 
     let valley = smoothstep((river - 0.28) / 0.62);
-    let valley_cut = valley * (3.5 + highlands * 2.0 + plains * 1.0);
+    let valley_cut = valley * (4.2 + highlands * 2.4 + plains * 1.2);
     inland -= valley_cut;
     inland -= lake * 4.2;
 
@@ -2464,12 +2631,12 @@ fn biome_weights(seed: u64, x: i32, z: i32, climate: ClimateSample) -> [f32; BIO
     let macro_x = x as f32 / MACROCHUNK_SIZE as f32;
     let macro_z = z as f32 / MACROCHUNK_SIZE as f32;
     let cluster_scale = BIOME_CLUSTER_MACROS as f32;
-    let coarse_warp_x = (fbm2(seed ^ 0x5522AA11, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.2;
-    let coarse_warp_z = (fbm2(seed ^ 0x5522AA12, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.2;
+    let coarse_warp_x = (fbm2(seed ^ 0x5522AA11, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.8;
+    let coarse_warp_z = (fbm2(seed ^ 0x5522AA12, macro_x * 0.16, macro_z * 0.16, 4) - 0.5) * 2.8;
     let fine_warp_x =
-        (fbm2(seed ^ 0x2211_8899, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.7;
+        (fbm2(seed ^ 0x2211_8899, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.95;
     let fine_warp_z =
-        (fbm2(seed ^ 0x2211_889A, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.7;
+        (fbm2(seed ^ 0x2211_889A, x as f32 * 0.0021, z as f32 * 0.0021, 2) - 0.5) * 0.95;
     let warped_x = macro_x / cluster_scale + coarse_warp_x + fine_warp_x;
     let warped_z = macro_z / cluster_scale + coarse_warp_z + fine_warp_z;
 
@@ -3494,6 +3661,87 @@ mod tests {
             sampled_pairs
         );
     }
+    #[test]
+    fn vegetation_pass_chunk_stages_flora_candidates() {
+        let config = ProcGenConfig::for_size(64, 0x4F10_22AA).with_origin([0, 0, 0]);
+        let world = generate_world(config);
+
+        let mut flora_count = 0usize;
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 {
+                let Some(top) = surface_y(&world, x, z) else {
+                    continue;
+                };
+                let above = world.get(x, top + 1, z);
+                if matches!(above, GRASS | BUSH) {
+                    flora_count += 1;
+                }
+            }
+        }
+
+        assert!(
+            flora_count >= 6,
+            "expected flora staging parity to produce grass/bush candidates, found {flora_count}"
+        );
+    }
+
+    #[test]
+    fn no_tree_voxels_spawn_above_ocean_adjacent_unsupported_columns() {
+        let config = ProcGenConfig::for_size(64, 0x91A7_03EF).with_origin([0, 0, 0]);
+        let timings = ProcGenPassTimings::default();
+        let cache = build_procgen_field_cache(&config, 16, &timings);
+        let world = generate_world(config);
+        let sea = config.sea_level_local();
+
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 {
+                let Some(field) = cache.cell_local(x, z) else {
+                    continue;
+                };
+                let ocean = field.weights[biome_index(BiomeType::Ocean)].max(field.ocean_prior);
+                let river = field.weights[biome_index(BiomeType::River)].max(field.river_prior);
+                let lake = field.weights[biome_index(BiomeType::Lake)];
+                let unsupported_ocean_edge = ocean > 0.34
+                    && field.surface_height <= sea + 2
+                    && (river > 0.24 || lake > 0.24 || ocean > 0.58);
+                if !unsupported_ocean_edge {
+                    continue;
+                }
+
+                for y in field.surface_height + 1..world.dims[1] as i32 {
+                    let mat = world.get(x, y, z);
+                    assert!(
+                        !matches!(mat, WOOD | LEAVES),
+                        "found unsupported tree voxel {mat} at ({x},{y},{z}) above ocean-adjacent unsupported column"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_surface_height_range_exceeds_boring_baseline() {
+        let config = ProcGenConfig::for_size(64, 0x6A2C_B17E).with_origin([0, 0, 0]);
+        let mut min_h = i32::MAX;
+        let mut max_h = i32::MIN;
+
+        for z in (0..320).step_by(2) {
+            for x in (0..320).step_by(2) {
+                let wx = x - 128;
+                let wz = z - 128;
+                let h = sampled_surface_height(&config, wx, wz, None);
+                min_h = min_h.min(h);
+                max_h = max_h.max(h);
+            }
+        }
+
+        let span = max_h - min_h;
+        assert!(
+            span >= 15,
+            "terrain relief regressed below baseline: span={span}, range={min_h}..{max_h}"
+        );
+    }
+
     #[test]
     fn trees_continue_across_lateral_chunk_boundaries() {
         let seed = 0xA51CEu64;
