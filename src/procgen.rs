@@ -423,6 +423,28 @@ fn classify_vertical_biome_stratum(
     VerticalBiomeStratum::Lowland
 }
 
+fn classify_vertical_biome_stratum_world(
+    config: &ProcGenConfig,
+    col: &ColumnGenData,
+    surface_world_y: i32,
+) -> VerticalBiomeStratum {
+    let sea = config.sea_level_world();
+    if surface_world_y <= sea + 1 && (col.river || col.climate.moisture > 0.60 || col.coastal) {
+        return VerticalBiomeStratum::WetlandValley;
+    }
+    if surface_world_y >= sea + 22 || col.slope >= 6 || col.climate.temperature < 0.32 {
+        return VerticalBiomeStratum::Alpine;
+    }
+    if surface_world_y >= sea + 10
+        && col.climate.moisture < 0.38
+        && col.climate.continentality > 0.55
+        && col.slope <= 4
+    {
+        return VerticalBiomeStratum::DryPlateau;
+    }
+    VerticalBiomeStratum::Lowland
+}
+
 fn sample_landmark(
     seed: u64,
     wx: i32,
@@ -1965,19 +1987,22 @@ fn vegetation_pass_chunk(
             let wz = config.world_origin[2] + lz;
             let climate = sample_climate(config.seed, wx, wz);
             let weights = biome_weights(config.seed, wx, wz, climate);
-            let surface_height = sampled_surface_height(config, wx, wz, Some(weights));
+            let local_surface = sampled_surface_height(config, wx, wz, Some(weights));
+            // `local_surface` is chunk-local Y. Convert once to world-space and use that
+            // consistently for all tree anchoring/roll decisions.
+            let ground_world_y = config.world_origin[1] + local_surface;
             let slope = slope_at_world(config, wx, wz);
             let ocean = weights[biome_index(BiomeType::Ocean)];
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
-            let coastal = shore_w > 0.18 && surface_height <= config.sea_level_local() + 4;
-            let stratum = classify_vertical_biome_stratum(
+            let coastal = shore_w > 0.18 && ground_world_y <= config.sea_level_world() + 4;
+            let stratum = classify_vertical_biome_stratum_world(
                 config,
                 &ColumnGenData {
                     wx,
                     wz,
                     weights,
                     climate,
-                    surface_height,
+                    surface_height: ground_world_y,
                     slope,
                     coastal,
                     river: false,
@@ -1985,7 +2010,7 @@ fn vegetation_pass_chunk(
                     stratum: VerticalBiomeStratum::Lowland,
                     landmark: sample_landmark(config.seed, wx, wz, climate, slope),
                 },
-                surface_height,
+                ground_world_y,
             );
             let landmark = sample_landmark(config.seed, wx, wz, climate, slope);
 
@@ -2017,12 +2042,16 @@ fn vegetation_pass_chunk(
                 tree_p *= 0.5;
             }
 
-            let roll = hash01(config.seed ^ 0x1111_7777, wx, surface_height, wz);
+            let roll = hash01(config.seed ^ 0x1111_7777, wx, ground_world_y, wz);
             if roll >= tree_p {
                 continue;
             }
 
-            let base_world_y = surface_height + 1;
+            if !has_tree_support_and_headroom(world, config, wx, wz, ground_world_y) {
+                continue;
+            }
+
+            let base_world_y = ground_world_y + 1;
             stage_tree_intents(
                 &mut intents,
                 config.seed,
@@ -2036,6 +2065,36 @@ fn vegetation_pass_chunk(
     }
 
     apply_vegetation_intents(world, config, &intents);
+}
+
+fn has_tree_support_and_headroom(
+    world: &World,
+    config: &ProcGenConfig,
+    wx: i32,
+    wz: i32,
+    ground_world_y: i32,
+) -> bool {
+    // Convert world-space anchor back to local coordinates to read generated chunk voxels.
+    let lx = wx - config.world_origin[0];
+    let lz = wz - config.world_origin[2];
+    let local_ground_y = ground_world_y - config.world_origin[1];
+
+    if lx < 0
+        || lz < 0
+        || local_ground_y < 0
+        || lx >= world.dims[0] as i32
+        || lz >= world.dims[2] as i32
+        || local_ground_y + 1 >= world.dims[1] as i32
+    {
+        return false;
+    }
+
+    let support = world.get(lx, local_ground_y, lz);
+    if support != TURF && support != DIRT && support != SAND {
+        return false;
+    }
+
+    can_place_tree(world, lx, local_ground_y + 1, lz)
 }
 
 fn apply_vegetation_intents(
