@@ -37,6 +37,7 @@ const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
+const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
@@ -240,6 +241,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last_player_chunk: Option<ChunkCoord> = None;
     let mut cached_sim_region: HashSet<ChunkCoord> =
         chunk_cube(ChunkCoord { x: 0, y: 0, z: 0 }, SIMULATION_RADIUS_CHUNKS);
+    let mut last_desired_look_dir: Option<Vec3> = None;
+    let mut desired_recompute_reason = String::from("init");
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
         ChunkCoord { x: 0, y: 0, z: 0 },
         Vec3::ZERO,
@@ -659,6 +662,12 @@ pub async fn run() -> anyhow::Result<()> {
                         let desired_t0 = Instant::now();
                         let player_chunk_changed = last_player_chunk != Some(player_chunk);
                         let stream_tuning_changed = cached_stream_tuning != stream_tuning;
+                        let look_dir = ctrl.look_dir().normalize_or_zero();
+                        let view_angle_changed = last_desired_look_dir
+                            .map(|prev| prev.dot(look_dir) < (1.0 - DESIRED_VIEW_RECOMPUTE_DOT_DELTA))
+                            .unwrap_or(false);
+                        let recompute_desired =
+                            player_chunk_changed || stream_tuning_changed || view_angle_changed;
                         let player_velocity_chunks = {
                             let dv = Vec3::new(
                                 (player_world_voxel.x - last_player_world_voxel.x) as f32,
@@ -668,11 +677,23 @@ pub async fn run() -> anyhow::Result<()> {
                             dv / crate::types::CHUNK_SIZE_VOXELS as f32
                         };
                         let visible_history = streaming.last_visible_frames();
-                        if player_chunk_changed || stream_tuning_changed {
+                        if recompute_desired {
+                            let mut reasons = Vec::with_capacity(3);
+                            if player_chunk_changed {
+                                reasons.push("chunk");
+                            }
+                            if stream_tuning_changed {
+                                reasons.push("tuning");
+                            }
+                            if view_angle_changed {
+                                reasons.push("view");
+                            }
+                            desired_recompute_reason = reasons.join("|");
+
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
                                 player_velocity_chunks,
-                                ctrl.look_dir(),
+                                look_dir,
                                 stream_tuning.near_radius_xz,
                                 stream_tuning.mid_radius_xz,
                                 Some(stream_tuning.far_radius_xz),
@@ -680,9 +701,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 &visible_history,
                                 frame_counter,
                             );
-                            cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
+                            if player_chunk_changed {
+                                cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
+                            }
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = stream_tuning.clone();
+                            last_desired_look_dir = Some(look_dir);
+                        } else {
+                            desired_recompute_reason.clear();
+                            desired_recompute_reason.push_str("none");
                         }
                         last_player_world_voxel = player_world_voxel;
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
@@ -796,6 +823,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 streaming.pending_evict_count()
                             ));
                         }
+                        if recompute_desired {
+                            let reason = desired_recompute_reason.clone();
+                            ui.log_once_per_second("desired_recompute", now_secs, || {
+                                format!(
+                                    "desired_recompute reason={} player=({}, {}, {})",
+                                    reason, player_chunk.x, player_chunk.y, player_chunk.z
+                                )
+                            });
+                        }
                         if generated_ready.len() >= apply_budget_items {
                             ui.log_once_per_second("apply_budget", now_secs, || {
                                 format!("apply budget hit: remaining queue={}", generated_ready.len())
@@ -808,7 +844,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) desired_recompute={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
@@ -818,6 +854,7 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
+                            desired_recompute_reason,
                             stream_tuning.near_radius_xz,
                             stream_tuning.mid_radius_xz,
                             stream_tuning.far_radius_xz,
