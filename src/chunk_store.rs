@@ -677,8 +677,18 @@ mod tests {
         store.insert_chunk(center, legacy_chunk_with_fill(1));
 
         assert!(store.is_chunk_loaded(center));
-        assert!(store.is_voxel_chunk_loaded(VoxelCoord { x: 15, y: 1, z: 15 }));
-        assert!(!store.is_voxel_chunk_loaded(VoxelCoord { x: 16, y: 1, z: 15 }));
+        let edge = CHUNK_SIZE_VOXELS - 1;
+        let outside = CHUNK_SIZE_VOXELS;
+        assert!(store.is_voxel_chunk_loaded(VoxelCoord {
+            x: edge,
+            y: 1,
+            z: edge,
+        }));
+        assert!(!store.is_voxel_chunk_loaded(VoxelCoord {
+            x: outside,
+            y: 1,
+            z: edge,
+        }));
     }
 
     #[test]
