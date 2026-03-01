@@ -54,6 +54,7 @@ struct StreamingTuning {
     near_radius_xz: i32,
     mid_radius_xz: i32,
     far_radius_xz: i32,
+    ultra_radius_xz: i32,
     vertical_radius: i32,
     lod_hysteresis: i32,
     base_apply_budget_items: usize,
@@ -63,6 +64,7 @@ struct StreamingTuning {
     lod_budget_near: usize,
     lod_budget_mid: usize,
     lod_budget_far: usize,
+    lod_budget_ultra: usize,
 }
 
 impl Default for StreamingTuning {
@@ -71,6 +73,7 @@ impl Default for StreamingTuning {
             near_radius_xz: 6,
             mid_radius_xz: 12,
             far_radius_xz: 16,
+            ultra_radius_xz: 24,
             vertical_radius: 4,
             lod_hysteresis: 1,
             base_apply_budget_items: 8,
@@ -80,6 +83,7 @@ impl Default for StreamingTuning {
             lod_budget_near: 8,
             lod_budget_mid: 6,
             lod_budget_far: 10,
+            lod_budget_ultra: 6,
         }
     }
 }
@@ -89,6 +93,7 @@ impl StreamingTuning {
         self.near_radius_xz = self.near_radius_xz.max(0);
         self.mid_radius_xz = self.mid_radius_xz.max(self.near_radius_xz);
         self.far_radius_xz = self.far_radius_xz.max(self.mid_radius_xz);
+        self.ultra_radius_xz = self.ultra_radius_xz.max(self.far_radius_xz);
         self.vertical_radius = self.vertical_radius.max(0);
         self.lod_hysteresis = self.lod_hysteresis.max(0);
         self.base_apply_budget_items = self.base_apply_budget_items.max(1);
@@ -102,6 +107,7 @@ impl StreamingTuning {
         self.lod_budget_near = self.lod_budget_near.max(1);
         self.lod_budget_mid = self.lod_budget_mid.max(1);
         self.lod_budget_far = self.lod_budget_far.max(1);
+        self.lod_budget_ultra = self.lod_budget_ultra.max(1);
         self
     }
 }
@@ -725,12 +731,14 @@ pub async fn run() -> anyhow::Result<()> {
                                 near: stream_tuning.near_radius_xz,
                                 mid: stream_tuning.mid_radius_xz,
                                 far: stream_tuning.far_radius_xz,
+                                ultra: stream_tuning.ultra_radius_xz,
                                 hysteresis: stream_tuning.lod_hysteresis,
                             },
                             LodMeshingBudgets {
                                 near: stream_tuning.lod_budget_near,
                                 mid: stream_tuning.lod_budget_mid,
                                 far: stream_tuning.lod_budget_far,
+                                ultra: stream_tuning.lod_budget_ultra,
                             },
                         );
                         ui.set_mesh_timing(mesh_stats.max_ms);
@@ -756,13 +764,16 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
                         ui.profiler.far_radius = stream_tuning.far_radius_xz;
+                        ui.profiler.ultra_radius = stream_tuning.ultra_radius_xz;
                         ui.profiler.lod_hysteresis = stream_tuning.lod_hysteresis;
                         ui.profiler.lod_budget_near = stream_tuning.lod_budget_near;
                         ui.profiler.lod_budget_mid = stream_tuning.lod_budget_mid;
                         ui.profiler.lod_budget_far = stream_tuning.lod_budget_far;
+                        ui.profiler.lod_budget_ultra = stream_tuning.lod_budget_ultra;
                         ui.profiler.mesh_near_count = mesh_stats.near_mesh_count;
                         ui.profiler.mesh_mid_count = mesh_stats.mid_mesh_count;
                         ui.profiler.mesh_far_count = mesh_stats.far_mesh_count;
+                        ui.profiler.mesh_ultra_count = mesh_stats.ultra_mesh_count;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
 

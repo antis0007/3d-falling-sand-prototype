@@ -32,13 +32,16 @@ pub struct ProfilerStats {
     pub near_radius: i32,
     pub mid_radius: i32,
     pub far_radius: i32,
+    pub ultra_radius: i32,
     pub lod_hysteresis: i32,
     pub lod_budget_near: usize,
     pub lod_budget_mid: usize,
     pub lod_budget_far: usize,
+    pub lod_budget_ultra: usize,
     pub mesh_near_count: usize,
     pub mesh_mid_count: usize,
     pub mesh_far_count: usize,
+    pub mesh_ultra_count: usize,
     pub sim_ms: f32,
     pub sim_chunk_steps: usize,
     pub render_submit_ms: f32,
@@ -408,20 +411,23 @@ pub fn draw(
                     ui_state.profiler.mesh_stale_drop_count,
                 ));
                 ui.monospace(format!(
-                    "lod radii n/m/f: {}/{}/{} | hysteresis: {}",
+                    "lod radii n/m/f/u: {}/{}/{}/{} | hysteresis: {}",
                     ui_state.profiler.near_radius,
                     ui_state.profiler.mid_radius,
                     ui_state.profiler.far_radius,
+                    ui_state.profiler.ultra_radius,
                     ui_state.profiler.lod_hysteresis,
                 ));
                 ui.monospace(format!(
-                    "lod budgets n/m/f: {}/{}/{} | rebuilt n/m/f: {}/{}/{}",
+                    "lod budgets n/m/f/u: {}/{}/{}/{} | rebuilt n/m/f/u: {}/{}/{}/{}",
                     ui_state.profiler.lod_budget_near,
                     ui_state.profiler.lod_budget_mid,
                     ui_state.profiler.lod_budget_far,
+                    ui_state.profiler.lod_budget_ultra,
                     ui_state.profiler.mesh_near_count,
                     ui_state.profiler.mesh_mid_count,
                     ui_state.profiler.mesh_far_count,
+                    ui_state.profiler.mesh_ultra_count,
                 ));
                 ui.monospace(format!(
                     "mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
