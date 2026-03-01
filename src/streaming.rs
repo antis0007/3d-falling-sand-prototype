@@ -45,8 +45,8 @@ struct ChunkLifecycle {
 pub struct ChunkStreaming {
     pub seed: u64,
     pub resident: HashSet<ChunkCoord>,
-    pub scheduled: HashSet<ChunkCoord>,
-    pub generating: HashSet<ChunkCoord>,
+    pub scheduled_generate: HashSet<ChunkCoord>,
+    pub dispatched_generate: HashSet<ChunkCoord>,
     pending_generate: VecDeque<ChunkCoord>,
     pending_evict: VecDeque<ChunkCoord>,
     evict_not_desired_since: HashMap<ChunkCoord, u64>,
@@ -65,8 +65,8 @@ impl ChunkStreaming {
         Self {
             seed,
             resident: HashSet::new(),
-            scheduled: HashSet::new(),
-            generating: HashSet::new(),
+            scheduled_generate: HashSet::new(),
+            dispatched_generate: HashSet::new(),
             pending_generate: VecDeque::new(),
             pending_evict: VecDeque::new(),
             evict_not_desired_since: HashMap::new(),
@@ -91,7 +91,9 @@ impl ChunkStreaming {
     pub fn residency_of(&self, coord: ChunkCoord) -> Residency {
         if self.resident.contains(&coord) {
             Residency::Resident
-        } else if self.generating.contains(&coord) {
+        } else if self.scheduled_generate.contains(&coord)
+            || self.dispatched_generate.contains(&coord)
+        {
             Residency::Generating
         } else {
             Residency::Unloaded
@@ -248,8 +250,8 @@ impl ChunkStreaming {
             let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
             lifecycle.last_visible_frame = frame_index;
             if self.resident.contains(&coord)
-                || self.generating.contains(&coord)
-                || self.scheduled.contains(&coord)
+                || self.dispatched_generate.contains(&coord)
+                || self.scheduled_generate.contains(&coord)
             {
                 continue;
             }
@@ -260,7 +262,7 @@ impl ChunkStreaming {
             if queued_this_frame >= self.max_generate_schedule_per_update {
                 continue;
             }
-            self.scheduled.insert(coord);
+            self.scheduled_generate.insert(coord);
             self.pending_generate.push_back(coord);
             self.work_items.push(WorkItem::Generate(coord));
             queued_this_frame += 1;
@@ -271,8 +273,8 @@ impl ChunkStreaming {
             .iter()
             .filter(|coord| {
                 !self.resident.contains(coord)
-                    && !self.generating.contains(coord)
-                    && !self.scheduled.contains(coord)
+                    && !self.dispatched_generate.contains(coord)
+                    && !self.scheduled_generate.contains(coord)
             })
             .count();
 
@@ -284,7 +286,7 @@ impl ChunkStreaming {
             .rev()
             .take(self.max_evict_schedule_per_update)
         {
-            if resident_keep.contains(&coord) || self.generating.contains(&coord) {
+            if resident_keep.contains(&coord) || self.dispatched_generate.contains(&coord) {
                 self.evict_not_desired_since.remove(&coord);
                 continue;
             }
@@ -320,19 +322,35 @@ impl ChunkStreaming {
         let mut out = Vec::with_capacity(take);
         for _ in 0..take {
             if let Some(coord) = self.pending_generate.pop_front() {
+                self.mark_dispatch_succeeded(coord);
                 out.push(coord);
             }
         }
         out
     }
 
-    pub fn next_generation_job(&mut self) -> Option<ChunkCoord> {
-        self.pending_generate.pop_front()
+    pub fn next_generation_job(&self) -> Option<ChunkCoord> {
+        self.pending_generate.front().copied()
     }
 
-    pub fn mark_dispatched(&mut self, coord: ChunkCoord) {
-        if self.scheduled.remove(&coord) {
-            self.generating.insert(coord);
+    pub fn mark_dispatch_succeeded(&mut self, coord: ChunkCoord) {
+        if let Some(pos) = self
+            .pending_generate
+            .iter()
+            .position(|queued| *queued == coord)
+        {
+            self.pending_generate.remove(pos);
+        }
+        self.scheduled_generate.remove(&coord);
+        self.dispatched_generate.insert(coord);
+    }
+
+    pub fn mark_dispatch_failed_or_deferred(&mut self, coord: ChunkCoord) {
+        if !self.scheduled_generate.contains(&coord) {
+            self.scheduled_generate.insert(coord);
+        }
+        if !self.pending_generate.contains(&coord) {
+            self.pending_generate.push_back(coord);
         }
     }
 
@@ -357,8 +375,8 @@ impl ChunkStreaming {
     }
 
     pub fn mark_generated(&mut self, coord: ChunkCoord, frame_index: u64) {
-        self.generating.remove(&coord);
-        self.scheduled.remove(&coord);
+        self.dispatched_generate.remove(&coord);
+        self.scheduled_generate.remove(&coord);
         self.resident.insert(coord);
         self.chunk_lifecycle
             .entry(coord)
@@ -367,18 +385,21 @@ impl ChunkStreaming {
     }
 
     pub fn mark_generation_dropped(&mut self, coord: ChunkCoord) {
-        self.generating.remove(&coord);
-        self.scheduled.remove(&coord);
+        self.dispatched_generate.remove(&coord);
+        self.scheduled_generate.remove(&coord);
+        self.pending_generate.retain(|queued| *queued != coord);
     }
 
     pub fn mark_canceled(&mut self, coord: ChunkCoord) {
-        self.generating.remove(&coord);
-        self.scheduled.remove(&coord);
+        self.dispatched_generate.remove(&coord);
+        self.scheduled_generate.remove(&coord);
+        self.pending_generate.retain(|queued| *queued != coord);
     }
 
     pub fn mark_evicted(&mut self, coord: ChunkCoord, frame_index: u64) {
-        self.generating.remove(&coord);
-        self.scheduled.remove(&coord);
+        self.dispatched_generate.remove(&coord);
+        self.scheduled_generate.remove(&coord);
+        self.pending_generate.retain(|queued| *queued != coord);
         self.resident.remove(&coord);
         self.evict_not_desired_since.remove(&coord);
         self.queued_evict_set.remove(&coord);
@@ -394,8 +415,8 @@ impl ChunkStreaming {
 
     pub fn clear(&mut self) {
         self.resident.clear();
-        self.scheduled.clear();
-        self.generating.clear();
+        self.scheduled_generate.clear();
+        self.dispatched_generate.clear();
         self.pending_generate.clear();
         self.pending_evict.clear();
         self.evict_not_desired_since.clear();
@@ -475,7 +496,8 @@ mod tests {
         let stats = streaming.update(&desired_sorted, &resident_keep, near_1, 100);
 
         assert_eq!(stats.queued_generate, 1);
-        assert!(streaming.scheduled.contains(&far));
+        assert!(streaming.scheduled_generate.contains(&far));
         assert_eq!(streaming.drain_generate_requests(8), vec![far]);
+        assert!(streaming.dispatched_generate.contains(&far));
     }
 }
