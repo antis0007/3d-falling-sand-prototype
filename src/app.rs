@@ -17,9 +17,11 @@ use crate::ui::{
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::Path;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, ElementState, Event, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -74,7 +76,63 @@ const SPAWN_SEARCH_RADIUS: i32 = 48;
 const SPAWN_HEADROOM: i32 = 3;
 const SPAWN_CLEARANCE: f32 = 3.4;
 const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
+const SPAWN_CEILING_PROBE_HEIGHT: i32 = 20;
+const SPAWN_MAX_SLOPE_DELTA: i32 = 3;
+const SPAWN_RETRY_HEIGHT_ABOVE_SURFACE: i32 = 6;
+const WORLD_SEED_SAVE_PATH: &str = ".world_seed";
 const MAX_CACHED_MODIFIED: usize = 2048;
+
+#[derive(Clone, Copy, Debug)]
+enum SeedSource {
+    Cli,
+    Env,
+    SaveState,
+    Generated,
+}
+
+impl SeedSource {
+    fn label(self) -> &'static str {
+        match self {
+            SeedSource::Cli => "cli",
+            SeedSource::Env => "env",
+            SeedSource::SaveState => "save-state",
+            SeedSource::Generated => "generated",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SeedSelection {
+    seed: u64,
+    source: SeedSource,
+}
+
+#[derive(Clone, Debug)]
+enum SpawnPendingReason {
+    Searching,
+    MissingNeighborhood,
+    BlockedCapsule,
+    NoValidColumn,
+    UsingFallbackBand,
+}
+
+impl SpawnPendingReason {
+    fn label(&self) -> &'static str {
+        match self {
+            SpawnPendingReason::Searching => "searching",
+            SpawnPendingReason::MissingNeighborhood => "missing neighborhood",
+            SpawnPendingReason::BlockedCapsule => "blocked capsule",
+            SpawnPendingReason::NoValidColumn => "no valid column",
+            SpawnPendingReason::UsingFallbackBand => "fallback above loaded surface",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpawnCandidate {
+    voxel: VoxelCoord,
+    surface_y: i32,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ModifiedChunkCacheMetrics {
@@ -479,6 +537,87 @@ impl BackgroundGenerator {
     }
 }
 
+fn resolve_world_seed() -> SeedSelection {
+    if let Some(seed) = seed_from_cli() {
+        let _ = persist_seed(seed);
+        return SeedSelection {
+            seed,
+            source: SeedSource::Cli,
+        };
+    }
+
+    if let Ok(value) = std::env::var("FALLING_SAND_WORLD_SEED") {
+        if let Ok(seed) = value.trim().parse::<u64>() {
+            let _ = persist_seed(seed);
+            return SeedSelection {
+                seed,
+                source: SeedSource::Env,
+            };
+        }
+    }
+
+    if let Some(seed) = seed_from_save_state() {
+        return SeedSelection {
+            seed,
+            source: SeedSource::SaveState,
+        };
+    }
+
+    let seed = generate_startup_seed();
+    let _ = persist_seed(seed);
+    SeedSelection {
+        seed,
+        source: SeedSource::Generated,
+    }
+}
+
+fn seed_from_cli() -> Option<u64> {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--seed=") {
+            if let Ok(seed) = value.trim().parse::<u64>() {
+                return Some(seed);
+            }
+        }
+        if let Some(value) = arg.strip_prefix("--world-seed=") {
+            if let Ok(seed) = value.trim().parse::<u64>() {
+                return Some(seed);
+            }
+        }
+        if (arg == "--seed" || arg == "--world-seed") && i + 1 < args.len() {
+            if let Ok(seed) = args[i + 1].trim().parse::<u64>() {
+                return Some(seed);
+            }
+        }
+    }
+    None
+}
+
+fn seed_from_save_state() -> Option<u64> {
+    fs::read_to_string(Path::new(WORLD_SEED_SAVE_PATH))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+}
+
+fn persist_seed(seed: u64) -> std::io::Result<()> {
+    fs::write(Path::new(WORLD_SEED_SAVE_PATH), seed.to_string())
+}
+
+fn generate_startup_seed() -> u64 {
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let mixed = now_ns ^ pid.rotate_left(17) ^ 0xA5A5_5A5A_D3C1_BEEF;
+    let mut h = mixed ^ (mixed >> 33);
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    h.max(1)
+}
+
 #[derive(Default)]
 struct EditRuntimeState {
     last_edit_at: Option<Instant>,
@@ -511,8 +650,14 @@ pub async fn run() -> anyhow::Result<()> {
         egui_wgpu::Renderer::new(&renderer.device, renderer.config.format, None, 1);
 
     let mut store = ChunkStore::new();
-    let mut streaming = ChunkStreaming::new(1337);
-    let chunk_generator = BackgroundGenerator::new(streaming.seed);
+    let seed_selection = resolve_world_seed();
+    println!(
+        "[world] using seed {} (source: {})",
+        seed_selection.seed,
+        seed_selection.source.label()
+    );
+    let mut streaming = ChunkStreaming::new(seed_selection.seed);
+    let mut chunk_generator = BackgroundGenerator::new(streaming.seed);
     let mut generated_ready: VecDeque<GenResult> = VecDeque::new();
     let mut stream_tuning = StreamingTuning::default().normalized();
     let mut cached_stream_tuning = stream_tuning.clone();
@@ -583,6 +728,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut gen_worker_inflight = 0usize;
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
+    let mut spawn_pending_reason = SpawnPendingReason::Searching;
+    let mut spawn_fallback_cursor: Option<VoxelCoord> = None;
 
     let _ = set_cursor(window, false);
 
@@ -788,21 +935,49 @@ pub async fn run() -> anyhow::Result<()> {
                         let gameplay_blocked = cursor_should_unlock;
 
                         if spawn_pending {
-                            if let Some(spawn_world) =
-                                find_safe_spawn_in_loaded_chunks(&store, streaming.seed)
-                            {
-                                ctrl.position = world_spawn_to_local_pos(spawn_world, origin_voxel);
-                                let neighborhood_loaded = collision_neighborhood_loaded(
-                                    &store,
-                                    ctrl.position,
-                                    origin_voxel,
-                                    COLLISION_SAFETY_RADIUS_VOXELS,
-                                );
-                                spawn_pending = !neighborhood_loaded;
-                                if !spawn_pending {
-                                    last_player_chunk = None;
-                                    cached_desired = DesiredChunks::default();
-                                    cached_sim_region.clear();
+                            if let Some(candidate) = find_safe_spawn_in_loaded_chunks(
+                                &store,
+                                streaming.seed,
+                                spawn_fallback_cursor,
+                            ) {
+                                let candidate_local =
+                                    world_spawn_to_local_pos(candidate.voxel, origin_voxel);
+                                if is_spawn_collision_free(&store, candidate_local, origin_voxel) {
+                                    ctrl.position = candidate_local;
+                                    let neighborhood_loaded = collision_neighborhood_loaded(
+                                        &store,
+                                        ctrl.position,
+                                        origin_voxel,
+                                        COLLISION_SAFETY_RADIUS_VOXELS,
+                                    );
+                                    spawn_pending = !neighborhood_loaded;
+                                    spawn_pending_reason = if spawn_pending {
+                                        SpawnPendingReason::MissingNeighborhood
+                                    } else {
+                                        SpawnPendingReason::Searching
+                                    };
+                                    if !spawn_pending {
+                                        spawn_fallback_cursor = None;
+                                        last_player_chunk = None;
+                                        cached_desired = DesiredChunks::default();
+                                        cached_sim_region.clear();
+                                    }
+                                } else {
+                                    spawn_pending_reason = SpawnPendingReason::BlockedCapsule;
+                                }
+                            } else {
+                                spawn_pending_reason = SpawnPendingReason::NoValidColumn;
+                                spawn_fallback_cursor = highest_loaded_surface(&store).map(|surface| VoxelCoord {
+                                    x: 0,
+                                    y: surface + SPAWN_RETRY_HEIGHT_ABOVE_SURFACE,
+                                    z: 0,
+                                });
+                                if let Some(cursor) = spawn_fallback_cursor {
+                                    let cursor_local = world_spawn_to_local_pos(cursor, origin_voxel);
+                                    if is_spawn_collision_free(&store, cursor_local, origin_voxel) {
+                                        ctrl.position = cursor_local;
+                                        spawn_pending_reason = SpawnPendingReason::UsingFallbackBand;
+                                    }
                                 }
                             }
                         }
@@ -1690,8 +1865,16 @@ pub async fn run() -> anyhow::Result<()> {
                                 step_once = true;
                             }
                             if actions.new_world || actions.new_procedural {
+                                let next_seed = if actions.new_procedural {
+                                    let generated = generate_startup_seed();
+                                    let _ = persist_seed(generated);
+                                    generated
+                                } else {
+                                    streaming.seed
+                                };
                                 store.clear();
-                                streaming.clear();
+                                streaming.reset_with_seed(next_seed);
+                                chunk_generator = BackgroundGenerator::new(next_seed);
                                 last_player_chunk = None;
                                 cached_desired = DesiredChunks::default();
                                 cached_sim_region.clear();
@@ -1703,6 +1886,17 @@ pub async fn run() -> anyhow::Result<()> {
                                 renderer.set_origin_voxel(origin_voxel);
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
+                                spawn_pending_reason = SpawnPendingReason::Searching;
+                                spawn_fallback_cursor = None;
+                                println!(
+                                    "[world] {} world seed {}",
+                                    if actions.new_procedural {
+                                        "regenerated procedural"
+                                    } else {
+                                        "preserved"
+                                    },
+                                    next_seed
+                                );
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
@@ -1795,6 +1989,16 @@ pub async fn run() -> anyhow::Result<()> {
                             None
                         };
 
+                        let spawn_debug = if spawn_pending {
+                            format!(
+                                "seed={} spawn pending: {}",
+                                streaming.seed,
+                                spawn_pending_reason.label()
+                            )
+                        } else {
+                            format!("seed={}", streaming.seed)
+                        };
+
                         draw_fps_overlays(
                             &egui_ctx,
                             ui.paused_menu,
@@ -1811,7 +2015,7 @@ pub async fn run() -> anyhow::Result<()> {
                             None,
                             start.elapsed().as_secs_f32(),
                             !gameplay_blocked && !egui_c,
-                            None,
+                            Some(&spawn_debug),
                             chunk_overlay_entries.as_deref(),
                         );
 
@@ -1959,9 +2163,13 @@ fn world_spawn_to_local_pos(spawn_world: VoxelCoord, origin: VoxelCoord) -> Vec3
     )
 }
 
-fn find_safe_spawn_in_loaded_chunks(store: &ChunkStore, seed: u64) -> Option<VoxelCoord> {
+fn find_safe_spawn_in_loaded_chunks(
+    store: &ChunkStore,
+    seed: u64,
+    fallback_cursor: Option<VoxelCoord>,
+) -> Option<SpawnCandidate> {
     let center = VoxelCoord { x: 0, y: 0, z: 0 };
-    let mut candidate: Option<VoxelCoord> = None;
+    let mut best_candidate: Option<SpawnCandidate> = None;
 
     for r in 0..=SPAWN_SEARCH_RADIUS {
         for dz in -r..=r {
@@ -1976,22 +2184,40 @@ fn find_safe_spawn_in_loaded_chunks(store: &ChunkStore, seed: u64) -> Option<Vox
                     continue;
                 }
                 if let Some(y) = valid_loaded_spawn_y(store, x, z) {
-                    return Some(VoxelCoord { x, y, z });
+                    let candidate = SpawnCandidate {
+                        voxel: VoxelCoord { x, y, z },
+                        surface_y: y,
+                    };
+                    if best_candidate
+                        .map(|best| candidate.surface_y > best.surface_y)
+                        .unwrap_or(true)
+                    {
+                        best_candidate = Some(candidate);
+                    }
                 }
             }
         }
     }
 
-    if store.is_chunk_loaded(ChunkCoord { x: 0, y: 0, z: 0 }) {
-        let sea_level = (18).min(CHUNK_SIZE as i32 - 10).max(10);
-        candidate = Some(VoxelCoord {
-            x: center.x,
-            y: sea_level + SPAWN_FALLBACK_EXTRA_HEIGHT,
-            z: center.z,
+    if best_candidate.is_some() {
+        return best_candidate;
+    }
+
+    if let Some(cursor) = fallback_cursor {
+        return Some(SpawnCandidate {
+            voxel: cursor,
+            surface_y: cursor.y,
         });
     }
 
-    candidate
+    highest_loaded_surface(store).map(|surface| SpawnCandidate {
+        voxel: VoxelCoord {
+            x: center.x,
+            y: surface + SPAWN_FALLBACK_EXTRA_HEIGHT,
+            z: center.z,
+        },
+        surface_y: surface,
+    })
 }
 
 fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
@@ -2003,7 +2229,12 @@ fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
             continue;
         }
         let base_id = store.get_voxel(base);
-        if base_id == EMPTY || base_id == 5 {
+        if !is_walkable_surface_material(base_id) {
+            continue;
+        }
+
+        let above = VoxelCoord { x, y: y + 1, z };
+        if !store.is_voxel_chunk_loaded(above) || store.get_voxel(above) != EMPTY {
             continue;
         }
 
@@ -2019,33 +2250,145 @@ fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
             continue;
         }
 
-        let mut near_water = false;
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                let sample = VoxelCoord {
-                    x: x + dx,
-                    y: y + 1,
-                    z: z + dz,
-                };
-                if !store.is_voxel_chunk_loaded(sample) {
-                    continue;
-                }
-                if store.get_voxel(sample) == 5 {
-                    near_water = true;
-                    break;
-                }
+        let mut blocked_above = false;
+        for dy in 1..=SPAWN_CEILING_PROBE_HEIGHT {
+            let probe = VoxelCoord { x, y: y + dy, z };
+            if !store.is_voxel_chunk_loaded(probe) {
+                break;
             }
-            if near_water {
+            if store.get_voxel(probe) != EMPTY {
+                blocked_above = true;
                 break;
             }
         }
-        if near_water {
+        if blocked_above {
+            continue;
+        }
+
+        if !is_topmost_walkable_in_loaded_column(store, x, y, z) {
+            continue;
+        }
+
+        if !has_safe_neighbors(store, x, y, z) {
             continue;
         }
 
         return Some(y);
     }
     None
+}
+
+fn is_topmost_walkable_in_loaded_column(store: &ChunkStore, x: i32, y: i32, z: i32) -> bool {
+    let max_y = CHUNK_SIZE as i32 * 3;
+    for probe_y in (y + 1)..=max_y {
+        let probe = VoxelCoord { x, y: probe_y, z };
+        if !store.is_voxel_chunk_loaded(probe) {
+            return true;
+        }
+        if is_walkable_surface_material(store.get_voxel(probe)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_safe_neighbors(store: &ChunkStore, x: i32, y: i32, z: i32) -> bool {
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let nx = x + dx;
+            let nz = z + dz;
+            let Some(neighbor_top_y) = highest_loaded_solid_y(store, nx, nz) else {
+                return false;
+            };
+            if (neighbor_top_y - y).abs() > SPAWN_MAX_SLOPE_DELTA {
+                return false;
+            }
+            let support = VoxelCoord {
+                x: nx,
+                y: neighbor_top_y,
+                z: nz,
+            };
+            let stand = VoxelCoord {
+                x: nx,
+                y: neighbor_top_y + 1,
+                z: nz,
+            };
+            if !store.is_voxel_chunk_loaded(support) || !store.is_voxel_chunk_loaded(stand) {
+                return false;
+            }
+            let support_id = store.get_voxel(support);
+            if !is_walkable_surface_material(support_id) {
+                return false;
+            }
+            if store.get_voxel(stand) != EMPTY {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_walkable_surface_material(id: u16) -> bool {
+    id != EMPTY && !matches!(id, 3 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 14 | 15)
+}
+
+fn highest_loaded_surface(store: &ChunkStore) -> Option<i32> {
+    let mut best = None;
+    for r in 0..=SPAWN_SEARCH_RADIUS {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if r > 0 && dx.abs() < r && dz.abs() < r {
+                    continue;
+                }
+                if let Some(y) = highest_loaded_solid_y(store, dx, dz) {
+                    best = Some(best.map(|b: i32| b.max(y)).unwrap_or(y));
+                }
+            }
+        }
+    }
+    best
+}
+
+fn highest_loaded_solid_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
+    let min_y = -64;
+    let max_y = CHUNK_SIZE as i32 * 3;
+    for y in (min_y..=max_y).rev() {
+        let voxel = VoxelCoord { x, y, z };
+        if !store.is_voxel_chunk_loaded(voxel) {
+            continue;
+        }
+        if store.get_voxel(voxel) != EMPTY {
+            return Some(y);
+        }
+    }
+    None
+}
+
+fn is_spawn_collision_free(
+    store: &ChunkStore,
+    player_local_pos: Vec3,
+    origin_voxel: VoxelCoord,
+) -> bool {
+    let player_world_pos = player_local_pos
+        + Vec3::new(
+            origin_voxel.x as f32,
+            origin_voxel.y as f32,
+            origin_voxel.z as f32,
+        );
+    let (min, max) = FpsController::collision_sample_bounds_world(player_world_pos);
+
+    for z in min.z..=max.z {
+        for y in min.y..=max.y {
+            for x in min.x..=max.x {
+                let v = VoxelCoord { x, y, z };
+                if !store.is_voxel_chunk_loaded(v) || store.get_voxel(v) != EMPTY {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 fn spawn_bias(seed: u64, x: i32, z: i32) -> f32 {
