@@ -10,7 +10,7 @@ use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     UiState, HOTBAR_SLOTS,
 };
-use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape};
+use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::Vec3;
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -37,12 +37,17 @@ const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
+const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
 const COLLISION_FREEZE_MAX_DURATION: Duration = Duration::from_millis(1500);
 const COLLISION_FREEZE_BACKOFF_DURATION: Duration = Duration::from_millis(900);
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
+const SPAWN_SEARCH_RADIUS: i32 = 48;
+const SPAWN_HEADROOM: i32 = 3;
+const SPAWN_CLEARANCE: f32 = 3.4;
+const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
 
 #[derive(Clone)]
 struct GenJob {
@@ -240,6 +245,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last_player_chunk: Option<ChunkCoord> = None;
     let mut cached_sim_region: HashSet<ChunkCoord> =
         chunk_cube(ChunkCoord { x: 0, y: 0, z: 0 }, SIMULATION_RADIUS_CHUNKS);
+    let mut last_desired_look_dir: Option<Vec3> = None;
+    let mut desired_recompute_reason = String::from("init");
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
         ChunkCoord { x: 0, y: 0, z: 0 },
         Vec3::ZERO,
@@ -262,6 +269,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut previous_collision_freeze_active = false;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
+    let mut spawn_pending = true;
 
     let _ = set_cursor(window, false);
 
@@ -320,12 +328,22 @@ pub async fn run() -> anyhow::Result<()> {
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
                             let egui_has_keyboard_focus = egui_ctx.wants_keyboard_input();
-                            let toggle_pause_key = matches!(key, KeyCode::Escape | KeyCode::KeyP);
-                            let toggle_pause_pressed = event.state == ElementState::Pressed
-                                && (!event.repeat || key == KeyCode::Escape);
+                            let toggle_pause_key = key == KeyCode::Escape;
+                            let toggle_pause_pressed =
+                                event.state == ElementState::Pressed && !event.repeat;
                             if toggle_pause_key && toggle_pause_pressed && !egui_has_keyboard_focus {
                                 ui.paused_menu = !ui.paused_menu;
                                 apply_cursor_mode(window, &ui, &mut cursor_is_unlocked);
+                            }
+
+                            let toggle_sim_key = key == KeyCode::KeyP;
+                            let toggle_sim_pressed =
+                                event.state == ElementState::Pressed && !event.repeat;
+                            if toggle_sim_key && toggle_sim_pressed && !egui_has_keyboard_focus {
+                                sim_running = !sim_running;
+                                if !sim_running {
+                                    step_once = false;
+                                }
                             }
 
                             if event.state == ElementState::Pressed {
@@ -456,6 +474,29 @@ pub async fn run() -> anyhow::Result<()> {
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
 
+                        if spawn_pending {
+                            if let Some(spawn_world) =
+                                find_safe_spawn_in_loaded_chunks(&store, streaming.seed)
+                            {
+                                ctrl.position = world_spawn_to_local_pos(spawn_world, origin_voxel);
+                                let neighborhood_loaded = collision_neighborhood_loaded(
+                                    &store,
+                                    ctrl.position,
+                                    origin_voxel,
+                                    COLLISION_SAFETY_RADIUS_VOXELS,
+                                );
+                                spawn_pending = !neighborhood_loaded;
+                                if !spawn_pending {
+                                    collision_freeze_started_at = None;
+                                    collision_freeze_backoff_until = None;
+                                    previous_collision_freeze_active = false;
+                                    last_player_chunk = None;
+                                    cached_desired = DesiredChunks::default();
+                                    cached_sim_region.clear();
+                                }
+                            }
+                        }
+
                         if cursor_should_unlock != cursor_is_unlocked {
                             let _ = set_cursor(window, cursor_should_unlock);
                             cursor_is_unlocked = cursor_should_unlock;
@@ -514,7 +555,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let should_consider_freeze = FREEZE_UNTIL_COLLISION_RESIDENT
                             && !collision_neighborhood_loaded
-                            && !gameplay_blocked
+                            && !(gameplay_blocked || spawn_pending)
                             && !egui_c;
                         let within_backoff = collision_freeze_backoff_until
                             .is_some_and(|until| now_instant < until);
@@ -617,7 +658,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         collision_used_unloaded_chunks = false;
-                        let look_active = !gameplay_blocked && !egui_c;
+                        let look_active = !(gameplay_blocked || spawn_pending) && !egui_c;
                         let mut ctrl_input = input.clone();
                         if collision_freeze_active {
                             ctrl_input.pressed.remove(&KeyCode::KeyW);
@@ -659,6 +700,12 @@ pub async fn run() -> anyhow::Result<()> {
                         let desired_t0 = Instant::now();
                         let player_chunk_changed = last_player_chunk != Some(player_chunk);
                         let stream_tuning_changed = cached_stream_tuning != stream_tuning;
+                        let look_dir = ctrl.look_dir().normalize_or_zero();
+                        let view_angle_changed = last_desired_look_dir
+                            .map(|prev| prev.dot(look_dir) < (1.0 - DESIRED_VIEW_RECOMPUTE_DOT_DELTA))
+                            .unwrap_or(false);
+                        let recompute_desired =
+                            player_chunk_changed || stream_tuning_changed || view_angle_changed;
                         let player_velocity_chunks = {
                             let dv = Vec3::new(
                                 (player_world_voxel.x - last_player_world_voxel.x) as f32,
@@ -668,11 +715,23 @@ pub async fn run() -> anyhow::Result<()> {
                             dv / crate::types::CHUNK_SIZE_VOXELS as f32
                         };
                         let visible_history = streaming.last_visible_frames();
-                        if player_chunk_changed || stream_tuning_changed {
+                        if recompute_desired {
+                            let mut reasons = Vec::with_capacity(3);
+                            if player_chunk_changed {
+                                reasons.push("chunk");
+                            }
+                            if stream_tuning_changed {
+                                reasons.push("tuning");
+                            }
+                            if view_angle_changed {
+                                reasons.push("view");
+                            }
+                            desired_recompute_reason = reasons.join("|");
+
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
                                 player_velocity_chunks,
-                                ctrl.look_dir(),
+                                look_dir,
                                 stream_tuning.near_radius_xz,
                                 stream_tuning.mid_radius_xz,
                                 Some(stream_tuning.far_radius_xz),
@@ -680,9 +739,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 &visible_history,
                                 frame_counter,
                             );
-                            cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
+                            if player_chunk_changed {
+                                cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
+                            }
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = stream_tuning.clone();
+                            last_desired_look_dir = Some(look_dir);
+                        } else {
+                            desired_recompute_reason.clear();
+                            desired_recompute_reason.push_str("none");
                         }
                         last_player_world_voxel = player_world_voxel;
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
@@ -796,6 +861,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 streaming.pending_evict_count()
                             ));
                         }
+                        if recompute_desired {
+                            let reason = desired_recompute_reason.clone();
+                            ui.log_once_per_second("desired_recompute", now_secs, || {
+                                format!(
+                                    "desired_recompute reason={} player=({}, {}, {})",
+                                    reason, player_chunk.x, player_chunk.y, player_chunk.z
+                                )
+                            });
+                        }
                         if generated_ready.len() >= apply_budget_items {
                             ui.log_once_per_second("apply_budget", now_secs, || {
                                 format!("apply budget hit: remaining queue={}", generated_ready.len())
@@ -808,7 +882,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) desired_recompute={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
@@ -818,6 +892,7 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
+                            desired_recompute_reason,
                             stream_tuning.near_radius_xz,
                             stream_tuning.mid_radius_xz,
                             stream_tuning.far_radius_xz,
@@ -967,6 +1042,13 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_sim_region.clear();
                                 generated_ready.clear();
                                 total_generated_chunks = 0;
+                                origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                ctrl.position = Vec3::new(8.0, 6.0, 8.0);
+                                spawn_pending = true;
+                                collision_freeze_active = false;
+                                collision_freeze_started_at = None;
+                                collision_freeze_backoff_until = None;
+                                previous_collision_freeze_active = false;
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
@@ -1169,6 +1251,115 @@ fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {
         y: local_pos.y.floor() as i32 + origin.y,
         z: local_pos.z.floor() as i32 + origin.z,
     }
+}
+
+fn world_spawn_to_local_pos(spawn_world: VoxelCoord, origin: VoxelCoord) -> Vec3 {
+    Vec3::new(
+        spawn_world.x as f32 + 0.5 - origin.x as f32,
+        spawn_world.y as f32 + SPAWN_CLEARANCE - origin.y as f32,
+        spawn_world.z as f32 + 0.5 - origin.z as f32,
+    )
+}
+
+fn find_safe_spawn_in_loaded_chunks(store: &ChunkStore, seed: u64) -> Option<VoxelCoord> {
+    let center = VoxelCoord { x: 0, y: 0, z: 0 };
+    let mut candidate: Option<VoxelCoord> = None;
+
+    for r in 0..=SPAWN_SEARCH_RADIUS {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if r > 0 && dx.abs() < r && dz.abs() < r {
+                    continue;
+                }
+                let x = center.x + dx;
+                let z = center.z + dz;
+                let bias = spawn_bias(seed, x, z);
+                if bias < 0.08 {
+                    continue;
+                }
+                if let Some(y) = valid_loaded_spawn_y(store, x, z) {
+                    return Some(VoxelCoord { x, y, z });
+                }
+            }
+        }
+    }
+
+    if store.is_chunk_loaded(ChunkCoord { x: 0, y: 0, z: 0 }) {
+        let sea_level = (18).min(CHUNK_SIZE as i32 - 10).max(10);
+        candidate = Some(VoxelCoord {
+            x: center.x,
+            y: sea_level + SPAWN_FALLBACK_EXTRA_HEIGHT,
+            z: center.z,
+        });
+    }
+
+    candidate
+}
+
+fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
+    let min_y = -64;
+    let max_y = CHUNK_SIZE as i32 * 3;
+    for y in (min_y..=max_y).rev() {
+        let base = VoxelCoord { x, y, z };
+        if !store.is_voxel_chunk_loaded(base) {
+            continue;
+        }
+        let base_id = store.get_voxel(base);
+        if base_id == EMPTY || base_id == 5 {
+            continue;
+        }
+
+        let mut has_headroom = true;
+        for dy in 1..=SPAWN_HEADROOM {
+            let head = VoxelCoord { x, y: y + dy, z };
+            if !store.is_voxel_chunk_loaded(head) || store.get_voxel(head) != EMPTY {
+                has_headroom = false;
+                break;
+            }
+        }
+        if !has_headroom {
+            continue;
+        }
+
+        let mut near_water = false;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let sample = VoxelCoord {
+                    x: x + dx,
+                    y: y + 1,
+                    z: z + dz,
+                };
+                if !store.is_voxel_chunk_loaded(sample) {
+                    continue;
+                }
+                if store.get_voxel(sample) == 5 {
+                    near_water = true;
+                    break;
+                }
+            }
+            if near_water {
+                break;
+            }
+        }
+        if near_water {
+            continue;
+        }
+
+        return Some(y);
+    }
+    None
+}
+
+fn spawn_bias(seed: u64, x: i32, z: i32) -> f32 {
+    let mut h = seed ^ 0xABCD_0001;
+    h ^= (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= (z as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    ((h >> 40) as f32) / ((1u64 << 24) as f32)
 }
 
 fn within_collision_safety_radius(
