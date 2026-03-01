@@ -447,9 +447,9 @@ pub async fn run() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut cursor_is_unlocked = false;
 
-    let mut origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+    let mut floating_origin_state = FloatingOriginState::new();
+    let mut origin_voxel = floating_origin_state.origin_translation;
     let floating_origin_config = FloatingOriginConfig::default();
-    let floating_origin_state = FloatingOriginState::new();
     let mut cached_modified_chunks: std::collections::HashMap<
         ChunkCoord,
         crate::chunk_store::Chunk,
@@ -744,21 +744,22 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Origin shifting to keep float precision stable
-                        let shift =
-                            floating_origin_state.recenter_shift_for(ctrl.position, floating_origin_config);
-                        if shift != (VoxelCoord { x: 0, y: 0, z: 0 }) {
-                            origin_voxel.x += shift.x;
-                            origin_voxel.y += shift.y;
-                            origin_voxel.z += shift.z;
-                            ctrl.position -= Vec3::new(shift.x as f32, shift.y as f32, shift.z as f32);
+                        let now_instant = Instant::now();
 
+                        // Origin shifting to keep float precision stable.
+                        let origin_update = floating_origin_state.update(
+                            ctrl.position,
+                            now_instant,
+                            floating_origin_config,
+                        );
+                        origin_voxel = origin_update.origin_translation;
+                        ctrl.position = origin_update.player_local_position;
+                        if origin_update.recentered {
                             // Avoid global remesh storms on recenter.
                             renderer.clear_mesh_cache();
                         }
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
-                        let now_instant = Instant::now();
                         let player_local_for_collision = ctrl.position;
                         let player_world_for_collision = local_to_world_voxel(player_local_for_collision, origin_voxel);
                         let (player_chunk_for_collision, _) = voxel_to_chunk(player_world_for_collision);
@@ -1390,7 +1391,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 generated_ready.clear();
                                 cached_modified_chunks.clear();
                                 total_generated_chunks = 0;
-                                origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                floating_origin_state.reset();
+                                origin_voxel = floating_origin_state.origin_translation;
                                 renderer.set_origin_voxel(origin_voxel);
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
