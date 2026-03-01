@@ -3,9 +3,9 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "procgen-profile")]
 use std::time::{Duration, Instant};
 
-use crate::chunk_store::ChunkStore;
+use crate::chunk_store::{Chunk, ChunkStore, NeighborDirtyPolicy};
 use crate::types::ChunkCoord;
-use crate::world::{Chunk, MaterialId, World, CHUNK_SIZE, EMPTY};
+use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
@@ -78,12 +78,16 @@ fn generate_chunk_from_config(config: ProcGenConfig) -> Chunk {
     world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
 
-    world.chunks.into_iter().next().unwrap_or_else(Chunk::new)
+    let legacy = world
+        .chunks
+        .into_iter()
+        .next()
+        .unwrap_or_else(crate::world::Chunk::new);
+    legacy.into()
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
-    store.insert_chunk(c, chunk);
-    store.mark_dirty(c);
+    store.insert_chunk_with_policy(c, chunk, true, NeighborDirtyPolicy::GeneratedConditional);
 }
 
 #[derive(Default)]
