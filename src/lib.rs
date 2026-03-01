@@ -3,6 +3,7 @@ pub mod world;
 pub mod chunk_store;
 pub mod edits;
 pub mod floating_origin;
+pub mod gpu_compute;
 pub mod meshing;
 pub mod renderer;
 pub mod sim;
