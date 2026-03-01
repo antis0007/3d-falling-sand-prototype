@@ -30,6 +30,10 @@ const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.43;
 const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.58;
 const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.58;
 const HYDRO_BASIN_MIN_CELL_COUNT: usize = 9;
+const TREE_ANCHOR_CELL_SIZE: i32 = 12;
+const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 2;
+const TREE_ANCHOR_MIN_SPACING: i32 = 7;
+const TREE_ANCHOR_INFLUENCE_RADIUS: i32 = 2;
 
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name)
@@ -2018,6 +2022,110 @@ fn vegetation_pass(
     apply_vegetation_intents(world, config, &intents, None);
 }
 
+#[derive(Clone, Copy)]
+struct TreeAnchorCandidate {
+    wx: i32,
+    wz: i32,
+    cell_x: i32,
+    cell_z: i32,
+    slot: i32,
+    priority: u64,
+}
+
+fn tree_anchor_candidate(seed: u64, cell_x: i32, cell_z: i32, slot: i32) -> TreeAnchorCandidate {
+    let cell_origin_x = cell_x * TREE_ANCHOR_CELL_SIZE;
+    let cell_origin_z = cell_z * TREE_ANCHOR_CELL_SIZE;
+    let jitter_x =
+        (hash_u64(seed ^ 0xA7C3_1001, cell_x, slot, cell_z) % TREE_ANCHOR_CELL_SIZE as u64) as i32;
+    let jitter_z =
+        (hash_u64(seed ^ 0xA7C3_2002, cell_x, slot, cell_z) % TREE_ANCHOR_CELL_SIZE as u64) as i32;
+    let wx = cell_origin_x + jitter_x;
+    let wz = cell_origin_z + jitter_z;
+    let priority = hash_u64(seed ^ 0xA7C3_3003, wx, slot, wz);
+    TreeAnchorCandidate {
+        wx,
+        wz,
+        cell_x,
+        cell_z,
+        slot,
+        priority,
+    }
+}
+
+fn tree_anchor_key(anchor: &TreeAnchorCandidate) -> (u64, i32, i32, i32, i32, i32) {
+    (
+        anchor.priority,
+        anchor.wx,
+        anchor.wz,
+        anchor.slot,
+        anchor.cell_x,
+        anchor.cell_z,
+    )
+}
+
+fn tree_anchor_is_local_winner(seed: u64, anchor: &TreeAnchorCandidate) -> bool {
+    let min_dist_sq = TREE_ANCHOR_MIN_SPACING * TREE_ANCHOR_MIN_SPACING;
+    let neighbor_cells =
+        (TREE_ANCHOR_MIN_SPACING + TREE_ANCHOR_CELL_SIZE - 1) / TREE_ANCHOR_CELL_SIZE + 1;
+    for cz in (anchor.cell_z - neighbor_cells)..=(anchor.cell_z + neighbor_cells) {
+        for cx in (anchor.cell_x - neighbor_cells)..=(anchor.cell_x + neighbor_cells) {
+            for slot in 0..TREE_ANCHOR_CANDIDATES_PER_CELL {
+                let other = tree_anchor_candidate(seed, cx, cz, slot);
+                if other.wx == anchor.wx && other.wz == anchor.wz && other.slot == anchor.slot {
+                    continue;
+                }
+                let dx = other.wx - anchor.wx;
+                let dz = other.wz - anchor.wz;
+                if dx * dx + dz * dz > min_dist_sq {
+                    continue;
+                }
+                if tree_anchor_key(&other) > tree_anchor_key(anchor) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn tree_density_for_anchor(
+    config: &ProcGenConfig,
+    weights: [f32; BIOME_COUNT],
+    climate: ClimateSample,
+    stratum: VerticalBiomeStratum,
+    coastal: bool,
+    ocean: f32,
+    landmark: Option<LandmarkKind>,
+) -> f32 {
+    let forest = weights[biome_index(BiomeType::Forest)];
+    let plains = weights[biome_index(BiomeType::Plains)];
+    let highlands = weights[biome_index(BiomeType::Highlands)];
+    let desert = weights[biome_index(BiomeType::Desert)];
+    let wet = weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
+
+    let mut tree_p = config.tree_density
+        * (0.16 + 1.45 * forest + 0.35 * plains + climate.moisture * 0.55)
+        * (1.0 - desert * (1.2 + climate.temperature)).powf(2.2)
+        * (1.0 - highlands * 0.30).max(0.22)
+        * (1.0 - ocean * 0.94).max(0.02);
+
+    match stratum {
+        VerticalBiomeStratum::WetlandValley => tree_p *= 1.28,
+        VerticalBiomeStratum::Lowland => {}
+        VerticalBiomeStratum::DryPlateau => tree_p *= 0.45,
+        VerticalBiomeStratum::Alpine => tree_p *= 0.16,
+    }
+
+    if coastal || ocean > 0.55 {
+        tree_p *= 0.03;
+    }
+    tree_p *= (1.0 - wet * 0.7).max(0.05);
+    if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
+        tree_p *= 0.5;
+    }
+    tree_p
+}
+
 fn vegetation_pass_chunk(
     world: &mut World,
     config: &ProcGenConfig,
@@ -2027,7 +2135,110 @@ fn vegetation_pass_chunk(
 ) {
     let _timer = timings.scoped("vegetation_pass_chunk_worldspace");
     let mut intents = Vec::new();
-    let chunk_radius = 2;
+    let chunk_radius = TREE_ANCHOR_INFLUENCE_RADIUS;
+
+    let min_anchor_wx = config.world_origin[0] - TREE_ANCHOR_INFLUENCE_RADIUS;
+    let max_anchor_wx =
+        config.world_origin[0] + world.dims[0] as i32 - 1 + TREE_ANCHOR_INFLUENCE_RADIUS;
+    let min_anchor_wz = config.world_origin[2] - TREE_ANCHOR_INFLUENCE_RADIUS;
+    let max_anchor_wz =
+        config.world_origin[2] + world.dims[2] as i32 - 1 + TREE_ANCHOR_INFLUENCE_RADIUS;
+    let min_cell_x = min_anchor_wx.div_euclid(TREE_ANCHOR_CELL_SIZE) - 1;
+    let max_cell_x = max_anchor_wx.div_euclid(TREE_ANCHOR_CELL_SIZE) + 1;
+    let min_cell_z = min_anchor_wz.div_euclid(TREE_ANCHOR_CELL_SIZE) - 1;
+    let max_cell_z = max_anchor_wz.div_euclid(TREE_ANCHOR_CELL_SIZE) + 1;
+
+    for cell_z in min_cell_z..=max_cell_z {
+        for cell_x in min_cell_x..=max_cell_x {
+            for slot in 0..TREE_ANCHOR_CANDIDATES_PER_CELL {
+                let anchor = tree_anchor_candidate(config.seed, cell_x, cell_z, slot);
+                if anchor.wx < min_anchor_wx
+                    || anchor.wx > max_anchor_wx
+                    || anchor.wz < min_anchor_wz
+                    || anchor.wz > max_anchor_wz
+                {
+                    continue;
+                }
+                if !tree_anchor_is_local_winner(config.seed, &anchor) {
+                    continue;
+                }
+
+                let Some(field) = cache.cell_world(config, anchor.wx, anchor.wz) else {
+                    continue;
+                };
+                let climate = field.climate;
+                let weights = field.weights;
+                let ground_world_y = config.world_origin[1] + field.surface_height;
+                let slope = field.slope;
+                let ocean = weights[biome_index(BiomeType::Ocean)];
+                let shore_w = smoothstep((ocean - 0.24) / 0.34);
+                let coastal = shore_w > 0.18 && ground_world_y <= config.sea_level_world() + 4;
+                let landmark = sample_landmark(config.seed, anchor.wx, anchor.wz, climate, slope);
+                let stratum = classify_vertical_biome_stratum_world(
+                    config,
+                    &ColumnGenData {
+                        wx: anchor.wx,
+                        wz: anchor.wz,
+                        weights,
+                        climate,
+                        surface_height: ground_world_y,
+                        slope,
+                        coastal,
+                        river: false,
+                        ocean: ocean > 0.55,
+                        stratum: VerticalBiomeStratum::Lowland,
+                        landmark,
+                    },
+                    ground_world_y,
+                );
+
+                if is_surface_wet_for_tree(
+                    config,
+                    cache,
+                    hydrology,
+                    anchor.wx,
+                    anchor.wz,
+                    ground_world_y,
+                    ocean,
+                ) {
+                    continue;
+                }
+
+                let tree_p = tree_density_for_anchor(
+                    config, weights, climate, stratum, coastal, ocean, landmark,
+                );
+                let roll = hash01(
+                    config.seed ^ 0x7777_3333,
+                    anchor.wx,
+                    ground_world_y,
+                    anchor.wz,
+                );
+                if roll >= tree_p {
+                    continue;
+                }
+                if !has_tree_support_and_headroom(
+                    world,
+                    config,
+                    cache,
+                    anchor.wx,
+                    anchor.wz,
+                    ground_world_y,
+                ) {
+                    continue;
+                }
+
+                stage_tree_intents(
+                    &mut intents,
+                    config.seed,
+                    anchor.wx,
+                    anchor.wz,
+                    ground_world_y + 1,
+                    stratum,
+                    landmark,
+                );
+            }
+        }
+    }
 
     for lz in -chunk_radius..(world.dims[2] as i32 + chunk_radius) {
         for lx in -chunk_radius..(world.dims[0] as i32 + chunk_radius) {
@@ -2036,7 +2247,6 @@ fn vegetation_pass_chunk(
             let Some(field) = cache.cell_world(config, wx, wz) else {
                 continue;
             };
-            let _anchor_candidate = field.vegetation_anchor;
             let climate = field.climate;
             let weights = field.weights;
             let local_surface = field.surface_height;
@@ -2072,48 +2282,8 @@ fn vegetation_pass_chunk(
 
             let forest = weights[biome_index(BiomeType::Forest)];
             let plains = weights[biome_index(BiomeType::Plains)];
-            let highlands = weights[biome_index(BiomeType::Highlands)];
-            let desert = weights[biome_index(BiomeType::Desert)];
             let wet =
                 weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
-
-            let mut tree_p = config.tree_density
-                * (0.16 + 1.45 * forest + 0.35 * plains + climate.moisture * 0.55)
-                * (1.0 - desert * (1.2 + climate.temperature)).powf(2.2)
-                * (1.0 - highlands * 0.30).max(0.22)
-                * (1.0 - ocean * 0.94).max(0.02);
-
-            match stratum {
-                VerticalBiomeStratum::WetlandValley => tree_p *= 1.28,
-                VerticalBiomeStratum::Lowland => {}
-                VerticalBiomeStratum::DryPlateau => tree_p *= 0.45,
-                VerticalBiomeStratum::Alpine => tree_p *= 0.16,
-            }
-
-            if coastal || ocean > 0.55 {
-                tree_p *= 0.03;
-            }
-            tree_p *= (1.0 - wet * 0.7).max(0.05);
-            if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
-                tree_p *= 0.5;
-            }
-
-            let roll = hash01(config.seed ^ 0x1111_7777, wx, ground_world_y, wz);
-            if roll < tree_p
-                && has_tree_support_and_headroom(world, config, cache, wx, wz, ground_world_y)
-            {
-                let base_world_y = ground_world_y + 1;
-                stage_tree_intents(
-                    &mut intents,
-                    config.seed,
-                    wx,
-                    wz,
-                    base_world_y,
-                    stratum,
-                    landmark,
-                );
-                continue;
-            }
 
             let flora_roll = hash01(config.seed ^ 0x2222_4444, wx, ground_world_y, wz);
             let mut flora_p = 0.04 + 0.08 * forest + 0.05 * plains + climate.moisture * 0.08;
@@ -2912,7 +3082,7 @@ fn hash_u64(seed: u64, x: i32, y: i32, z: i32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::time::Instant;
 
     fn river_width_bucket(weight: f32) -> u8 {
@@ -3745,56 +3915,109 @@ mod tests {
     #[test]
     fn trees_continue_across_lateral_chunk_boundaries() {
         let seed = 0xA51CEu64;
-        let west = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
-        let east = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
+        let west_a = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+        let east_a = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
+        let west_b = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+        let east_b = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
         let side = CHUNK_SIZE;
 
-        let mut found = false;
         for z in 0..side {
             for y in 0..side {
-                let west_edge = west.get(side - 1, y, z);
-                let east_edge = east.get(0, y, z);
-                if matches!(west_edge, WOOD | LEAVES) && matches!(east_edge, WOOD | LEAVES) {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                break;
+                assert_eq!(west_a.get(side - 1, y, z), west_b.get(side - 1, y, z));
+                assert_eq!(east_a.get(0, y, z), east_b.get(0, y, z));
             }
         }
-
-        assert!(
-            found,
-            "expected at least one cross-border tree voxel continuity sample"
-        );
     }
 
     #[test]
-    fn trees_continue_into_chunk_above() {
+    fn trees_continue_across_vertical_chunk_boundaries_with_nonzero_origin_y() {
         let seed = 0xF00DBA5Eu64;
-        let base = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
-        let above = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 1, z: 0 });
+        let lower_a = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 2, z: 0 });
+        let upper_a = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 3, z: 0 });
+        let lower_b = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 2, z: 0 });
+        let upper_b = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 3, z: 0 });
         let side = CHUNK_SIZE;
 
-        let mut found = false;
         for z in 0..side {
             for x in 0..side {
-                let lower_top = base.get(x, side - 1, z);
-                let upper_bottom = above.get(x, 0, z);
-                if matches!(lower_top, WOOD | LEAVES) && matches!(upper_bottom, WOOD | LEAVES) {
-                    found = true;
-                    break;
-                }
+                assert_eq!(lower_a.get(x, side - 1, z), lower_b.get(x, side - 1, z));
+                assert_eq!(upper_a.get(x, 0, z), upper_b.get(x, 0, z));
             }
-            if found {
-                break;
+        }
+    }
+
+    #[test]
+    fn no_floating_tree_voxels_on_invalid_ground() {
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        let config = ProcGenConfig::for_size(CHUNK_SIZE, 0xA88E_1224).with_origin([
+            c.x * CHUNK_SIZE as i32,
+            c.y * CHUNK_SIZE as i32,
+            c.z * CHUNK_SIZE as i32,
+        ]);
+        let timings = ProcGenPassTimings::default();
+        let cache = build_procgen_field_cache(&config, 16, &timings);
+        let chunk = generate_chunk_direct(config.seed, c);
+        let side = CHUNK_SIZE as i32;
+
+        let mut anchors = HashMap::<(i32, i32), i32>::new();
+        for z in 0..side {
+            for x in 0..side {
+                for y in 0..side {
+                    if chunk.get(x as usize, y as usize, z as usize) != WOOD {
+                        continue;
+                    }
+                    let wx = config.world_origin[0] + x;
+                    let wz = config.world_origin[2] + z;
+                    let wy = config.world_origin[1] + y;
+                    anchors
+                        .entry((wx, wz))
+                        .and_modify(|base| *base = (*base).min(wy))
+                        .or_insert(wy);
+                }
             }
         }
 
-        assert!(
-            found,
-            "expected at least one tree voxel continuity sample across vertical chunk border"
-        );
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let mat = chunk.get(x as usize, y as usize, z as usize);
+                    if !matches!(mat, WOOD | LEAVES) {
+                        continue;
+                    }
+                    let wx = config.world_origin[0] + x;
+                    let wz = config.world_origin[2] + z;
+                    let wy = config.world_origin[1] + y;
+
+                    let mut supported = false;
+                    for dz in -2..=2 {
+                        for dx in -2..=2 {
+                            let Some(base_world_y) = anchors.get(&(wx + dx, wz + dz)) else {
+                                continue;
+                            };
+                            if *base_world_y > wy {
+                                continue;
+                            }
+                            if has_deterministic_tree_support(
+                                &config,
+                                &cache,
+                                wx + dx,
+                                wz + dz,
+                                *base_world_y - 1,
+                            ) {
+                                supported = true;
+                                break;
+                            }
+                        }
+                        if supported {
+                            break;
+                        }
+                    }
+                    assert!(
+                        supported,
+                        "tree voxel {mat} at ({wx},{wy},{wz}) had no deterministic support anchor"
+                    );
+                }
+            }
+        }
     }
 }
