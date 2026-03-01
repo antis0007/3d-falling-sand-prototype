@@ -59,6 +59,8 @@ impl Vertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     vp: [[f32; 4]; 4],
+    origin_offset: [f32; 3],
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -90,8 +92,8 @@ pub struct ChunkMesh {
     ib: wgpu::Buffer,
     indirect: wgpu::Buffer,
     index_count: u32,
-    aabb_min: Vec3,
-    aabb_max: Vec3,
+    world_aabb_min: Vec3,
+    world_aabb_max: Vec3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -154,6 +156,7 @@ pub struct Renderer {
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
+    origin_voxel: VoxelCoord,
 
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
@@ -265,7 +268,6 @@ pub(crate) struct MeshJob {
     pub(crate) coord: ChunkCoord,
     pub(crate) lod: ChunkLod,
     pub(crate) version: u64,
-    pub(crate) origin_voxel: VoxelCoord,
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
     pub(crate) greedy: bool,
@@ -319,13 +321,8 @@ impl BackgroundMeshQueue {
 
                     let snapshot =
                         rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
-                    let (verts, inds, aabb_min, aabb_max) = mesh_chunk_snapshot(
-                        job.coord,
-                        job.origin_voxel,
-                        &snapshot,
-                        job.lod,
-                        job.greedy,
-                    );
+                    let (verts, inds, aabb_min, aabb_max) =
+                        mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
@@ -429,6 +426,8 @@ impl Renderer {
             label: Some("cam"),
             contents: bytemuck::bytes_of(&CameraUniform {
                 vp: Mat4::IDENTITY.to_cols_array_2d(),
+                origin_offset: [0.0, 0.0, 0.0],
+                _pad: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -520,6 +519,7 @@ impl Renderer {
             lod_selection: HashMap::new(),
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
+            origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
             day: true,
             mesh_backend,
             settings: RendererSettings::default(),
@@ -542,6 +542,10 @@ impl Renderer {
         self.settings = settings;
     }
 
+    pub fn set_origin_voxel(&mut self, new_origin: VoxelCoord) {
+        self.origin_voxel = new_origin;
+    }
+
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
         let vp = camera.view_proj();
         let mut stats = CullStats::default();
@@ -556,17 +560,16 @@ impl Renderer {
                 stats.lod_filtered += 1;
                 continue;
             }
-            if self.settings.frustum_culling && !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
+            let (aabb_min, aabb_max) = world_aabb_to_render_space(
+                mesh.world_aabb_min,
+                mesh.world_aabb_max,
+                self.origin_voxel,
+            );
+            if self.settings.frustum_culling && !aabb_in_view(vp, aabb_min, aabb_max) {
                 stats.frustum_culled += 1;
                 continue;
             }
-            if !passes_screen_space_cull(
-                camera,
-                lod,
-                mesh.aabb_min,
-                mesh.aabb_max,
-                self.size.height,
-            ) {
+            if !passes_screen_space_cull(camera, lod, aabb_min, aabb_max, self.size.height) {
                 stats.screen_culled += 1;
                 continue;
             }
@@ -582,7 +585,6 @@ impl Renderer {
     pub fn rebuild_dirty_store_chunks(
         &mut self,
         store: &mut ChunkStore,
-        origin_voxel: VoxelCoord,
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
         mesh_budget: usize,
@@ -648,7 +650,6 @@ impl Renderer {
                     coord,
                     lod,
                     version,
-                    origin_voxel,
                     queued_at: Instant::now(),
                     snapshot: snapshot.clone(),
                     greedy: self.settings.greedy_meshing,
@@ -886,8 +887,8 @@ impl Renderer {
                             },
                         ),
                         index_count: result.inds.len() as u32,
-                        aabb_min: result.aabb_min,
-                        aabb_max: result.aabb_max,
+                        world_aabb_min: result.aabb_min,
+                        world_aabb_max: result.aabb_max,
                     },
                 );
             }
@@ -956,7 +957,9 @@ impl Renderer {
             {
                 continue;
             }
-            if aabb_in_view(vp, m.aabb_min, m.aabb_max) {
+            let (aabb_min, aabb_max) =
+                world_aabb_to_render_space(m.world_aabb_min, m.world_aabb_max, self.origin_voxel);
+            if aabb_in_view(vp, aabb_min, aabb_max) {
                 chunks += 1;
                 inds += m.index_count as u64;
             }
@@ -972,6 +975,12 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&CameraUniform {
                 vp: vp.to_cols_array_2d(),
+                origin_offset: [
+                    self.origin_voxel.x as f32 * VOXEL_SIZE,
+                    self.origin_voxel.y as f32 * VOXEL_SIZE,
+                    self.origin_voxel.z as f32 * VOXEL_SIZE,
+                ],
+                _pad: 0.0,
             }),
         );
 
@@ -988,16 +997,15 @@ impl Renderer {
             {
                 continue;
             }
-            if self.settings.frustum_culling && !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
+            let (aabb_min, aabb_max) = world_aabb_to_render_space(
+                mesh.world_aabb_min,
+                mesh.world_aabb_max,
+                self.origin_voxel,
+            );
+            if self.settings.frustum_culling && !aabb_in_view(vp, aabb_min, aabb_max) {
                 continue;
             }
-            if !passes_screen_space_cull(
-                camera,
-                lod,
-                mesh.aabb_min,
-                mesh.aabb_max,
-                self.size.height,
-            ) {
+            if !passes_screen_space_cull(camera, lod, aabb_min, aabb_max, self.size.height) {
                 continue;
             }
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
@@ -1174,7 +1182,6 @@ fn synthesize_missing_neighbor_borders(
 
 fn mesh_chunk_snapshot(
     _coord: ChunkCoord,
-    origin_voxel: VoxelCoord,
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
     greedy: bool,
@@ -1183,26 +1190,25 @@ fn mesh_chunk_snapshot(
     match lod {
         ChunkLod::Near => {
             if greedy {
-                mesh_chunk_voxel_faces_greedy(snapshot, chunk_world_min, origin_voxel)
+                mesh_chunk_voxel_faces_greedy(snapshot, chunk_world_min)
             } else {
-                mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 1)
+                mesh_chunk_voxel_faces(snapshot, chunk_world_min, 1)
             }
         }
-        ChunkLod::Mid => mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 2),
-        ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, origin_voxel, 4),
-        ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, origin_voxel, 8),
+        ChunkLod::Mid => mesh_chunk_voxel_faces(snapshot, chunk_world_min, 2),
+        ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, 4),
+        ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, 8),
     }
 }
 
 fn mesh_chunk_voxel_faces(
     snapshot: &ChunkSnapshot,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     step: i32,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let min = voxel_to_world(chunk_world_min);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
 
     let mut lz = 0;
@@ -1229,7 +1235,6 @@ fn mesh_chunk_voxel_faces(
                     ly,
                     lz,
                     world_voxel,
-                    origin_voxel,
                     id,
                     color,
                     &mut verts,
@@ -1249,11 +1254,10 @@ fn mesh_chunk_voxel_faces(
 fn mesh_chunk_voxel_faces_greedy(
     snapshot: &ChunkSnapshot,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let min = voxel_to_world(chunk_world_min);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
 
@@ -1280,7 +1284,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + y,
                         z: chunk_world_min.z + z,
                     },
-                    origin_voxel,
                     (x - start) as f32,
                     1.0,
                     1.0,
@@ -1316,7 +1319,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + y,
                         z: chunk_world_min.z + z,
                     },
-                    origin_voxel,
                     (x - start) as f32,
                     1.0,
                     1.0,
@@ -1352,7 +1354,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + y,
                         z: chunk_world_min.z + start,
                     },
-                    origin_voxel,
                     1.0,
                     1.0,
                     (z - start) as f32,
@@ -1388,7 +1389,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + y,
                         z: chunk_world_min.z + start,
                     },
-                    origin_voxel,
                     1.0,
                     1.0,
                     (z - start) as f32,
@@ -1424,7 +1424,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + start,
                         z: chunk_world_min.z + z,
                     },
-                    origin_voxel,
                     1.0,
                     (y - start) as f32,
                     1.0,
@@ -1460,7 +1459,6 @@ fn mesh_chunk_voxel_faces_greedy(
                         y: chunk_world_min.y + start,
                         z: chunk_world_min.z + z,
                     },
-                    origin_voxel,
                     1.0,
                     (y - start) as f32,
                     1.0,
@@ -1479,12 +1477,11 @@ fn mesh_chunk_voxel_faces_greedy(
 fn mesh_chunk_coarse_solid(
     snapshot: &ChunkSnapshot,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     step: i32,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let min = voxel_to_world(chunk_world_min);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
 
@@ -1521,7 +1518,6 @@ fn mesh_chunk_coarse_solid(
                             y: chunk_world_min.y + y,
                             z: chunk_world_min.z + z,
                         },
-                        origin_voxel,
                         step as f32,
                         step as f32,
                         step as f32,
@@ -1543,12 +1539,11 @@ fn mesh_chunk_coarse_solid(
 fn mesh_chunk_heightfield_proxy(
     snapshot: &ChunkSnapshot,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     tile: i32,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let min = voxel_to_world(chunk_world_min);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
     let tiles = (side / tile) as usize;
@@ -1598,7 +1593,6 @@ fn mesh_chunk_heightfield_proxy(
                     y: chunk_world_min.y,
                     z: chunk_world_min.z + tz * tile,
                 },
-                origin_voxel,
                 tile as f32,
                 top as f32,
                 tile as f32,
@@ -1657,7 +1651,6 @@ fn dominant_material_in_cell(
 
 fn add_box_faces(
     world_voxel_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     sx: f32,
     sy: f32,
     sz: f32,
@@ -1713,9 +1706,9 @@ fn add_box_faces(
         ),
     ];
     let origin = [
-        (world_voxel_min.x - origin_voxel.x) as f32 * VOXEL_SIZE,
-        (world_voxel_min.y - origin_voxel.y) as f32 * VOXEL_SIZE,
-        (world_voxel_min.z - origin_voxel.z) as f32 * VOXEL_SIZE,
+        world_voxel_min.x as f32 * VOXEL_SIZE,
+        world_voxel_min.y as f32 * VOXEL_SIZE,
+        world_voxel_min.z as f32 * VOXEL_SIZE,
     ];
 
     for (i, (quad, shade)) in dirs.iter().enumerate() {
@@ -1789,6 +1782,15 @@ fn fallback_lod_near_threshold(
     }
 }
 
+fn world_aabb_to_render_space(
+    world_aabb_min: Vec3,
+    world_aabb_max: Vec3,
+    origin_voxel: VoxelCoord,
+) -> (Vec3, Vec3) {
+    let origin = voxel_to_world(origin_voxel);
+    (world_aabb_min - origin, world_aabb_max - origin)
+}
+
 fn passes_screen_space_cull(
     camera: &Camera,
     lod: ChunkLod,
@@ -1819,7 +1821,6 @@ fn add_snapshot_voxel_faces(
     local_y: i32,
     local_z: i32,
     world_voxel: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
@@ -1871,9 +1872,9 @@ fn add_snapshot_voxel_faces(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (world_voxel.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                    (world_voxel.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                    (world_voxel.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
                 ],
                 color: shaded,
             });
@@ -1905,12 +1906,8 @@ fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
     ]
 }
 
-fn relative_voxel_to_world(voxel: VoxelCoord, origin_voxel: VoxelCoord) -> Vec3 {
-    Vec3::new(
-        (voxel.x - origin_voxel.x) as f32,
-        (voxel.y - origin_voxel.y) as f32,
-        (voxel.z - origin_voxel.z) as f32,
-    ) * VOXEL_SIZE
+fn voxel_to_world(voxel: VoxelCoord) -> Vec3 {
+    Vec3::new(voxel.x as f32, voxel.y as f32, voxel.z as f32) * VOXEL_SIZE
 }
 
 fn create_depth_texture(
