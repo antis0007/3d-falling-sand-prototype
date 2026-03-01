@@ -28,7 +28,10 @@ const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
 const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
-const MESH_UPLOAD_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
+const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
+const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
+const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
+const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 
 const GENERATOR_THREADS: usize = 3;
@@ -128,6 +131,26 @@ fn scaled_budget(base: usize, max: usize, backlog: usize, threshold: usize) -> u
     }
     let pressure = ((backlog - threshold) / threshold.max(1)).min(8);
     (base + base * pressure).min(max)
+}
+
+fn adaptive_mesh_upload_budget(last_frame_ms: f32, queue_pressure: usize) -> usize {
+    let frame_headroom =
+        ((FRAME_TIME_TARGET_MS - last_frame_ms) / FRAME_TIME_TARGET_MS).clamp(-1.0, 1.0);
+    let headroom_scale = (1.0 + frame_headroom * 0.5).clamp(0.6, 1.5);
+
+    let pressure = if queue_pressure <= MESH_BACKPRESSURE_START {
+        0.0
+    } else {
+        ((queue_pressure - MESH_BACKPRESSURE_START) as f32
+            / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+            .clamp(0.0, 1.0)
+    };
+    let pressure_scale = 1.0 + pressure * 2.0;
+
+    ((MESH_UPLOAD_BYTES_BASE_PER_FRAME as f32 * headroom_scale * pressure_scale) as usize).clamp(
+        MESH_UPLOAD_BYTES_MIN_PER_FRAME,
+        MESH_UPLOAD_BYTES_MAX_PER_FRAME,
+    )
 }
 
 struct BackgroundGenerator {
@@ -963,13 +986,17 @@ pub async fn run() -> anyhow::Result<()> {
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
 
                         renderer.day = ui.day;
+                        let mesh_upload_budget = adaptive_mesh_upload_budget(
+                            ui.profiler.frame_ms,
+                            prior_mesh_backlog,
+                        );
                         let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
                             origin_voxel,
                             player_chunk,
                             &cached_desired.generation_scores,
                             REMESH_JOB_BUDGET_PER_FRAME,
-                            MESH_UPLOAD_BYTES_PER_FRAME,
+                            mesh_upload_budget,
                             LodRadii {
                                 near: stream_tuning.near_radius_xz,
                                 mid: stream_tuning.mid_radius_xz,
@@ -1004,6 +1031,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
+                        ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
                         ui.profiler.far_radius = stream_tuning.far_radius_xz;
