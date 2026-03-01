@@ -23,6 +23,12 @@ pub struct ProfilerStats {
     pub mesh_ms: f32,
     pub mesh_count: usize,
     pub dirty_backlog: usize,
+    pub mesh_queue_depth: usize,
+    pub mesh_completed_depth: usize,
+    pub mesh_upload_count: usize,
+    pub mesh_upload_bytes: usize,
+    pub mesh_upload_latency_ms: f32,
+    pub mesh_stale_drop_count: usize,
     pub sim_ms: f32,
     pub sim_chunk_steps: usize,
     pub render_submit_ms: f32,
@@ -384,6 +390,18 @@ pub fn draw(
                     ui_state.profiler.mesh_ms,
                     ui_state.profiler.mesh_count,
                     ui_state.profiler.dirty_backlog
+                ));
+                ui.monospace(format!(
+                    "mesh queue/completed: {}/{} | stale drops: {}",
+                    ui_state.profiler.mesh_queue_depth,
+                    ui_state.profiler.mesh_completed_depth,
+                    ui_state.profiler.mesh_stale_drop_count,
+                ));
+                ui.monospace(format!(
+                    "mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
+                    ui_state.profiler.mesh_upload_count,
+                    ui_state.profiler.mesh_upload_bytes,
+                    ui_state.profiler.mesh_upload_latency_ms,
                 ));
                 ui.monospace(format!(
                     "sim: {:.2} ms | chunk_steps: {}",
