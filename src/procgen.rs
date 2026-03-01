@@ -240,11 +240,45 @@ struct ColumnGenData {
     wx: i32,
     wz: i32,
     weights: [f32; BIOME_COUNT],
+    climate: ClimateSample,
     surface_height: i32,
     slope: i32,
     coastal: bool,
     river: bool,
     ocean: bool,
+    stratum: VerticalBiomeStratum,
+    landmark: Option<LandmarkKind>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClimateSample {
+    temperature: f32,
+    moisture: f32,
+    continentality: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerticalBiomeStratum {
+    WetlandValley,
+    Lowland,
+    DryPlateau,
+    Alpine,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandmarkKind {
+    BoulderField,
+    Ravine,
+    Oasis,
+    DeadwoodGrove,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VegetationIntent {
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    material: MaterialId,
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +351,97 @@ struct HydrologyContext {
     cells: Vec<HydrologyContextCell>,
 }
 
+fn sample_climate(seed: u64, wx: i32, wz: i32) -> ClimateSample {
+    let temperature = (fbm2(
+        seed ^ 0x6C11_A001,
+        wx as f32 * 0.0018,
+        wz as f32 * 0.0018,
+        4,
+    ) * 0.75
+        + fbm2(
+            seed ^ 0x6C11_A002,
+            wx as f32 * 0.0060,
+            wz as f32 * 0.0060,
+            2,
+        ) * 0.25)
+        .clamp(0.0, 1.0);
+    let moisture = (fbm2(
+        seed ^ 0x6C11_B001,
+        wx as f32 * 0.0020,
+        wz as f32 * 0.0020,
+        4,
+    ) * 0.7
+        + fbm2(
+            seed ^ 0x6C11_B002,
+            wx as f32 * 0.0080,
+            wz as f32 * 0.0080,
+            2,
+        ) * 0.3)
+        .clamp(0.0, 1.0);
+    let continentality = fbm2(
+        seed ^ 0x6C11_C001,
+        wx as f32 * 0.0016,
+        wz as f32 * 0.0016,
+        4,
+    )
+    .clamp(0.0, 1.0);
+    ClimateSample {
+        temperature,
+        moisture,
+        continentality,
+    }
+}
+
+fn classify_vertical_biome_stratum(
+    config: &ProcGenConfig,
+    col: &ColumnGenData,
+    surface_height: i32,
+) -> VerticalBiomeStratum {
+    let sea = config.sea_level_local();
+    if surface_height <= sea + 1 && (col.river || col.climate.moisture > 0.60 || col.coastal) {
+        return VerticalBiomeStratum::WetlandValley;
+    }
+    if surface_height >= sea + 22 || col.slope >= 6 || col.climate.temperature < 0.32 {
+        return VerticalBiomeStratum::Alpine;
+    }
+    if surface_height >= sea + 10
+        && col.climate.moisture < 0.38
+        && col.climate.continentality > 0.55
+        && col.slope <= 4
+    {
+        return VerticalBiomeStratum::DryPlateau;
+    }
+    VerticalBiomeStratum::Lowland
+}
+
+fn sample_landmark(
+    seed: u64,
+    wx: i32,
+    wz: i32,
+    climate: ClimateSample,
+    slope: i32,
+) -> Option<LandmarkKind> {
+    let coarse = fbm2(
+        seed ^ 0xDEAD_B001,
+        wx as f32 * 0.0008,
+        wz as f32 * 0.0008,
+        3,
+    );
+    let mask = hash01(seed ^ 0xDEAD_B002, wx.div_euclid(12), 0, wz.div_euclid(12));
+    if coarse > 0.86 && slope >= 5 && mask < 0.42 {
+        return Some(LandmarkKind::Ravine);
+    }
+    if coarse > 0.82 && slope <= 3 && mask < 0.26 {
+        return Some(LandmarkKind::BoulderField);
+    }
+    if climate.moisture < 0.30 && climate.temperature > 0.66 && coarse < 0.15 && mask < 0.30 {
+        return Some(LandmarkKind::Oasis);
+    }
+    if climate.moisture < 0.44 && climate.temperature < 0.48 && coarse > 0.72 && mask < 0.22 {
+        return Some(LandmarkKind::DeadwoodGrove);
+    }
+    None
+}
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
         let sea_level = 18.min(size as i32 - 10).max(10);
@@ -428,12 +553,12 @@ pub fn biome_hint_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType 
 }
 
 pub fn base_biome_at_world(config: &ProcGenConfig, x: i32, z: i32) -> BiomeType {
-    let weights = biome_weights(config.seed, x, z);
+    let weights = biome_weights(config.seed, x, z, sample_climate(config.seed, x, z));
     dominant_base_biome(weights)
 }
 
 pub fn hydro_feature_at_world(config: &ProcGenConfig, x: i32, z: i32) -> HydroFeature {
-    let weights = biome_weights(config.seed, x, z);
+    let weights = biome_weights(config.seed, x, z, sample_climate(config.seed, x, z));
     let ocean = weights[biome_index(BiomeType::Ocean)];
     if ocean > 0.62 {
         return HydroFeature::OceanShelf;
@@ -467,11 +592,14 @@ fn build_column_cache(
             wx: 0,
             wz: 0,
             weights: [0.0; BIOME_COUNT],
+            climate: ClimateSample::default(),
             surface_height: 0,
             slope: 0,
             coastal: false,
             river: false,
             ocean: false,
+            stratum: VerticalBiomeStratum::Lowland,
+            landmark: None,
         };
         config.dims[0] * config.dims[2]
     ];
@@ -480,18 +608,22 @@ fn build_column_cache(
             let wx = config.world_origin[0] + x;
             let wz = config.world_origin[2] + z;
             let idx = x as usize + z as usize * config.dims[0];
-            let weights = biome_weights(config.seed, wx, wz);
+            let climate = sample_climate(config.seed, wx, wz);
+            let weights = biome_weights(config.seed, wx, wz, climate);
             let surface_height = sampled_surface_height(config, wx, wz, Some(weights));
             heights[idx] = surface_height;
             columns[idx] = ColumnGenData {
                 wx,
                 wz,
                 weights,
+                climate,
                 surface_height,
                 slope: 0,
                 coastal: false,
                 river: false,
                 ocean: false,
+                stratum: VerticalBiomeStratum::Lowland,
+                landmark: None,
             };
         }
     }
@@ -511,6 +643,8 @@ fn build_column_cache(
             col.coastal = shore_w > 0.18 && near_sea_band;
             col.river = river > 0.48;
             col.ocean = ocean > 0.55;
+            col.stratum = classify_vertical_biome_stratum(config, col, col.surface_height);
+            col.landmark = sample_landmark(config.seed, col.wx, col.wz, col.climate, col.slope);
         }
     }
     (heights, columns)
@@ -576,9 +710,9 @@ fn build_hydrology_cache_impl(
                     None
                 };
             let local_col = local_idx.map(|idx| columns[idx]);
-            let local_weights = local_col
-                .map(|col| col.weights)
-                .unwrap_or_else(|| biome_weights(config.seed, wx, wz));
+            let local_weights = local_col.map(|col| col.weights).unwrap_or_else(|| {
+                biome_weights(config.seed, wx, wz, sample_climate(config.seed, wx, wz))
+            });
             let surface_height = local_col
                 .map(|col| col.surface_height)
                 .unwrap_or_else(|| sampled_surface_height(config, wx, wz, Some(local_weights)));
@@ -1014,6 +1148,8 @@ fn surface_layering_pass(
             let coastal = smoothstep((hydrology.ocean_weight[idx] - 0.35) / 0.45);
             let river_bank = smoothstep((hydrology.river_weight[idx] - 0.30) / 0.55);
             let slope = col.slope as f32;
+            let climate = col.climate;
+            let aridity = (climate.temperature * (1.0 - climate.moisture)).clamp(0.0, 1.0);
             let blend_mask = fbm2(
                 config.seed ^ 0x1133_77AA,
                 wx as f32 * 0.010,
@@ -1028,13 +1164,19 @@ fn surface_layering_pass(
             );
             let anti_stripe = (blend_mask - 0.5) * 0.26 + (depth_mod - 0.5) * 0.12;
 
-            let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert_surface) - 0.9 * highlands)
+            let dirt_depth = (3.0 + 2.2 * plains + 1.4 * (1.0 - desert_surface) - 0.9 * highlands
+                + climate.moisture * 1.6
+                - aridity * 0.9)
                 + anti_stripe * 5.0;
             let dirt_depth = dirt_depth.round().clamp(2.0, 8.0) as i32;
-            let sand_depth =
-                (1.0 + 3.5 * desert_surface + 3.0 * coastal + 2.0 * river_bank + anti_stripe * 4.0)
-                    .round()
-                    .clamp(1.0, 10.0) as i32;
+            let sand_depth = (1.0
+                + 3.5 * desert_surface
+                + 3.0 * coastal
+                + 2.0 * river_bank
+                + aridity * 2.0
+                + anti_stripe * 4.0)
+                .round()
+                .clamp(1.0, 10.0) as i32;
             let sediment_context =
                 coastal > 0.38 || river_bank > 0.42 || (desert_surface > 0.55 && slope < 4.0);
             let deep_stone_context =
@@ -1051,13 +1193,38 @@ fn surface_layering_pass(
                     .clamp(0.0, 1.0);
                 let rock_bias =
                     (highlands * 0.75 + slope * 0.12 - anti_stripe * 0.5).clamp(0.0, 1.0);
-                let top_cover = if rock_bias > 0.65 && top_y > config.sea_level_local() + 4 {
+                let mut top_cover = if rock_bias > 0.65 && top_y > config.sea_level_local() + 4 {
                     STONE
                 } else if sand_bias > 0.52 && sediment_context {
                     SAND
                 } else {
                     TURF
                 };
+                match col.stratum {
+                    VerticalBiomeStratum::WetlandValley => {
+                        if top_cover == STONE {
+                            top_cover = DIRT;
+                        }
+                    }
+                    VerticalBiomeStratum::Lowland => {}
+                    VerticalBiomeStratum::DryPlateau => {
+                        if top_cover == TURF {
+                            top_cover = if aridity > 0.58 { SAND } else { DIRT };
+                        }
+                    }
+                    VerticalBiomeStratum::Alpine => {
+                        top_cover = if slope > 3.0 { STONE } else { DIRT };
+                    }
+                }
+                if matches!(
+                    col.landmark,
+                    Some(LandmarkKind::BoulderField | LandmarkKind::Ravine)
+                ) {
+                    top_cover = STONE;
+                }
+                if matches!(col.landmark, Some(LandmarkKind::Oasis)) {
+                    top_cover = TURF;
+                }
                 let cover_depth = if top_cover == SAND {
                     sand_depth.min(3)
                 } else {
@@ -1660,8 +1827,9 @@ fn vegetation_pass(
 ) {
     let _timer = timings.scoped("vegetation_pass");
     let sea_level = config.sea_level_local();
-    for lz in 2..world.dims[2] as i32 - 2 {
-        for lx in 2..world.dims[0] as i32 - 2 {
+    let mut intents = Vec::new();
+    for lz in 0..world.dims[2] as i32 {
+        for lx in 0..world.dims[0] as i32 {
             let Some(top_y) = surface_y(world, lx, lz) else {
                 continue;
             };
@@ -1675,9 +1843,13 @@ fn vegetation_pass(
 
             let col = &columns[lx as usize + lz as usize * world.dims[0]];
             let idx = lx as usize + lz as usize * world.dims[0];
-            if hydrology_wet_candidate(hydrology, col.surface_height, sea_level, idx) {
+            if hydrology_wet_candidate(hydrology, col.surface_height, sea_level, idx)
+                && col.stratum != VerticalBiomeStratum::WetlandValley
+            {
                 continue;
             }
+
+            let climate = col.climate;
             let wx = col.wx;
             let wz = col.wz;
             let weights = col.weights;
@@ -1690,34 +1862,74 @@ fn vegetation_pass(
             let ocean = weights[biome_index(BiomeType::Ocean)];
 
             let mut tree_p = config.tree_density
-                * (0.20 + 1.65 * forest + 0.40 * plains)
-                * (1.0 - desert).powf(2.5)
-                * (1.0 - highlands * 0.45).max(0.35)
-                * (1.0 - ocean * 0.92).max(0.02);
-            if col.coastal || col.ocean || ground == SAND {
+                * (0.16 + 1.45 * forest + 0.35 * plains + climate.moisture * 0.55)
+                * (1.0 - desert * (1.2 + climate.temperature)).powf(2.2)
+                * (1.0 - highlands * 0.30).max(0.22)
+                * (1.0 - ocean * 0.94).max(0.02);
+
+            match col.stratum {
+                VerticalBiomeStratum::WetlandValley => tree_p *= 1.28,
+                VerticalBiomeStratum::Lowland => {}
+                VerticalBiomeStratum::DryPlateau => tree_p *= 0.45,
+                VerticalBiomeStratum::Alpine => tree_p *= 0.16,
+            }
+
+            if col.coastal
+                || col.ocean
+                || (ground == SAND && col.landmark != Some(LandmarkKind::Oasis))
+            {
                 tree_p *= 0.03;
             }
             if near_water(world, lx, top_y, lz) {
-                tree_p *= (1.0 - wet * 0.8).max(0.04);
+                tree_p *= (1.0 - wet * 0.7).max(0.05);
+            }
+            if matches!(col.landmark, Some(LandmarkKind::DeadwoodGrove)) {
+                tree_p *= 0.5;
             }
 
-            let roll = hash01(config.seed ^ 0x11117777, wx, top_y, wz);
-            if roll < tree_p && can_place_tree(world, lx, top_y + 1, lz) {
-                place_tree(world, config.seed, wx, lx, top_y + 1, lz);
-                continue;
+            let roll = hash01(config.seed ^ 0x1111_7777, wx, top_y, wz);
+            if roll < tree_p {
+                let base_world_y = config.world_origin[1] + top_y + 1;
+                if can_place_tree(world, lx, top_y + 1, lz) {
+                    stage_tree_intents(
+                        &mut intents,
+                        config.seed,
+                        wx,
+                        wz,
+                        base_world_y,
+                        col.stratum,
+                        col.landmark,
+                    );
+                    continue;
+                }
             }
 
-            let flora_roll = hash01(config.seed ^ 0x22224444, wx, top_y, wz);
-            if (forest > 0.4 || plains > 0.5) && ground != SAND && flora_roll < 0.09 {
-                let _ = world.set_raw_no_side_effects(
-                    lx,
-                    top_y + 1,
-                    lz,
-                    if flora_roll < 0.026 { BUSH } else { GRASS },
-                );
+            let flora_roll = hash01(config.seed ^ 0x2222_4444, wx, top_y, wz);
+            let mut flora_p = 0.04 + 0.08 * forest + 0.05 * plains + climate.moisture * 0.08;
+            flora_p *= match col.stratum {
+                VerticalBiomeStratum::WetlandValley => 1.4,
+                VerticalBiomeStratum::Lowland => 1.0,
+                VerticalBiomeStratum::DryPlateau => 0.6,
+                VerticalBiomeStratum::Alpine => 0.4,
+            };
+            if matches!(
+                col.landmark,
+                Some(LandmarkKind::BoulderField | LandmarkKind::Ravine)
+            ) {
+                flora_p *= 0.35;
+            }
+            if flora_roll < flora_p {
+                let flora_material = vegetation_ground_cover(col, flora_roll, ground);
+                intents.push(VegetationIntent {
+                    wx,
+                    wy: config.world_origin[1] + top_y + 1,
+                    wz,
+                    material: flora_material,
+                });
             }
         }
     }
+    apply_vegetation_intents(world, config, &intents);
 }
 
 fn vegetation_pass_chunk(
@@ -1728,6 +1940,105 @@ fn vegetation_pass_chunk(
     timings: &ProcGenPassTimings,
 ) {
     vegetation_pass(world, config, columns, hydrology, timings);
+}
+
+fn apply_vegetation_intents(
+    world: &mut World,
+    config: &ProcGenConfig,
+    intents: &[VegetationIntent],
+) {
+    for intent in intents {
+        let lx = intent.wx - config.world_origin[0];
+        let ly = intent.wy - config.world_origin[1];
+        let lz = intent.wz - config.world_origin[2];
+        if lx < 0
+            || ly < 0
+            || lz < 0
+            || lx >= world.dims[0] as i32
+            || ly >= world.dims[1] as i32
+            || lz >= world.dims[2] as i32
+        {
+            continue;
+        }
+        if world.get(lx, ly, lz) == EMPTY {
+            let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
+        }
+    }
+}
+
+fn vegetation_ground_cover(col: &ColumnGenData, flora_roll: f32, ground: MaterialId) -> MaterialId {
+    if matches!(col.landmark, Some(LandmarkKind::DeadwoodGrove)) {
+        return BUSH;
+    }
+    if matches!(col.stratum, VerticalBiomeStratum::Alpine) {
+        return if flora_roll < 0.03 { BUSH } else { GRASS };
+    }
+    if matches!(col.stratum, VerticalBiomeStratum::WetlandValley) && ground != SAND {
+        return if flora_roll < 0.04 { BUSH } else { GRASS };
+    }
+    if ground == SAND {
+        return if flora_roll < 0.018 { BUSH } else { GRASS };
+    }
+    if flora_roll < 0.026 {
+        BUSH
+    } else {
+        GRASS
+    }
+}
+
+fn stage_tree_intents(
+    intents: &mut Vec<VegetationIntent>,
+    seed: u64,
+    wx: i32,
+    wz: i32,
+    base_world_y: i32,
+    stratum: VerticalBiomeStratum,
+    landmark: Option<LandmarkKind>,
+) {
+    let mut trunk_h = 4 + (hash01(seed ^ 0x7133_5599, wx, base_world_y, wz) * 4.0) as i32;
+    if matches!(stratum, VerticalBiomeStratum::Alpine) {
+        trunk_h = trunk_h.saturating_sub(2).max(2);
+    }
+    if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
+        trunk_h = trunk_h.saturating_sub(1).max(2);
+    }
+
+    for ty in 0..trunk_h {
+        intents.push(VegetationIntent {
+            wx,
+            wy: base_world_y + ty,
+            wz,
+            material: WOOD,
+        });
+    }
+
+    if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
+        return;
+    }
+
+    let radius = if matches!(stratum, VerticalBiomeStratum::Alpine) {
+        1
+    } else {
+        2
+    };
+    let top = base_world_y + trunk_h;
+    for dz in -radius..=radius {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let dist = dx * dx + dz * dz + (dy * dy * 2 / 3);
+                let cap = if radius == 1 { 2 } else { 6 };
+                if dist > cap {
+                    continue;
+                }
+                intents.push(VegetationIntent {
+                    wx: wx + dx,
+                    wy: top + dy,
+                    wz: wz + dz,
+                    material: LEAVES,
+                });
+            }
+        }
+    }
 }
 
 pub fn find_safe_spawn(world: &World, seed: u64) -> [f32; 3] {
@@ -1789,12 +2100,13 @@ fn sampled_surface_height(
         for dx in -1..=1 {
             let sx = x + dx;
             let sz = z + dz;
-            let w = biome_weights(config.seed, sx, sz);
+            let w = biome_weights(config.seed, sx, sz, sample_climate(config.seed, sx, sz));
             sum += terrain_height(config, sx, sz, w) as f32;
             n += 1.0;
         }
     }
-    let w0 = cached_weights.unwrap_or_else(|| biome_weights(config.seed, x, z));
+    let w0 = cached_weights
+        .unwrap_or_else(|| biome_weights(config.seed, x, z, sample_climate(config.seed, x, z)));
     let raw = terrain_height(config, x, z, w0) as f32;
     let world_surface = (raw * 0.6 + (sum / n) * 0.4)
         .round()
@@ -1886,7 +2198,7 @@ fn river_meander_signal(seed: u64, x: i32, z: i32) -> f32 {
     (1.0 - ((path - 0.5).abs() * 3.4)).clamp(0.0, 1.0)
 }
 
-fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; BIOME_COUNT] {
+fn biome_weights(seed: u64, x: i32, z: i32, climate: ClimateSample) -> [f32; BIOME_COUNT] {
     let mut weights = [0.0; BIOME_COUNT];
     let macro_x = x as f32 / MACROCHUNK_SIZE as f32;
     let macro_z = z as f32 / MACROCHUNK_SIZE as f32;
@@ -1931,19 +2243,36 @@ fn biome_weights(seed: u64, x: i32, z: i32) -> [f32; BIOME_COUNT] {
     let warp = fbm2(seed ^ 0xF009_1201, x as f32 * 0.0024, z as f32 * 0.0024, 3) - 0.5;
     let river = river_meander_signal(seed, x, z);
     let continental = fbm2(seed ^ 0xAD991100, x as f32 * 0.0016, z as f32 * 0.0016, 4);
-    let desert_continental_scale = smoothstep((continental - 0.64) / 0.20);
+    let desert_continental_scale = smoothstep((continental - 0.64) / 0.20)
+        * smoothstep((climate.temperature - 0.45) / 0.35)
+        * smoothstep((0.56 - climate.moisture) / 0.42);
     weights[biome_index(BiomeType::Desert)] *= desert_continental_scale;
-    weights[biome_index(BiomeType::River)] =
-        (weights[biome_index(BiomeType::River)] * 0.45 + river * 0.75 + warp * 0.1).max(0.0);
+
+    let hydro_boost = smoothstep((climate.moisture - 0.46) / 0.35);
+    weights[biome_index(BiomeType::River)] = (weights[biome_index(BiomeType::River)] * 0.40
+        + river * 0.82
+        + hydro_boost * 0.22
+        + warp * 0.1)
+        .max(0.0);
     weights[biome_index(BiomeType::Lake)] =
-        (weights[biome_index(BiomeType::Lake)] + warp * 0.08).max(0.0);
-    weights[biome_index(BiomeType::Ocean)] =
-        (weights[biome_index(BiomeType::Ocean)] + (continental - 0.68).max(0.0) * 1.1).max(0.0);
+        (weights[biome_index(BiomeType::Lake)] + warp * 0.08 + hydro_boost * 0.16).max(0.0);
+    weights[biome_index(BiomeType::Ocean)] = (weights[biome_index(BiomeType::Ocean)]
+        + (continental - 0.68).max(0.0) * 1.1
+        + (climate.continentality - 0.70).max(0.0) * 0.75)
+        .max(0.0);
     let relief = fbm2(seed ^ 0xCC99_1010, x as f32 * 0.0025, z as f32 * 0.0025, 3);
-    weights[biome_index(BiomeType::Highlands)] =
-        (weights[biome_index(BiomeType::Highlands)] + (relief - 0.56).max(0.0) * 1.25).max(0.0);
-    weights[biome_index(BiomeType::Plains)] =
-        (weights[biome_index(BiomeType::Plains)] + (0.60 - relief).max(0.0) * 0.9).max(0.0);
+    weights[biome_index(BiomeType::Highlands)] = (weights[biome_index(BiomeType::Highlands)]
+        + (relief - 0.56).max(0.0) * 1.25
+        + (0.42 - climate.temperature).max(0.0) * 0.35)
+        .max(0.0);
+    weights[biome_index(BiomeType::Forest)] = (weights[biome_index(BiomeType::Forest)]
+        + hydro_boost * 0.55
+        + (0.60 - climate.continentality).max(0.0) * 0.25)
+        .max(0.0);
+    weights[biome_index(BiomeType::Plains)] = (weights[biome_index(BiomeType::Plains)]
+        + (0.60 - relief).max(0.0) * 0.9
+        + (0.64 - climate.moisture).max(0.0) * 0.2)
+        .max(0.0);
 
     normalize(weights)
 }
@@ -2002,40 +2331,6 @@ fn hydrology_wet_candidate(
     (hydrology.ocean_weight[idx] > 0.05 && surface_height <= sea_level)
         || hydrology.lake_level[idx].is_some_and(|level| surface_height <= level)
         || hydrology.river_level[idx].is_some_and(|level| surface_height <= level + 1)
-}
-
-fn place_tree(world: &mut World, seed: u64, world_x: i32, x: i32, y: i32, z: i32) {
-    let trunk_h = 4 + (hash01(seed ^ 0x71335599, world_x, y, z) * 4.0) as i32;
-    for ty in 0..trunk_h {
-        let _ = world.set_raw_no_side_effects(x, y + ty, z, WOOD);
-    }
-
-    let top = y + trunk_h;
-    for dz in -2..=2 {
-        for dy in -2..=2 {
-            for dx in -2..=2 {
-                let dist = dx * dx + dz * dz + (dy * dy * 2 / 3);
-                if dist > 6 {
-                    continue;
-                }
-                let px = x + dx;
-                let py = top + dy;
-                let pz = z + dz;
-                if px <= 1
-                    || pz <= 1
-                    || py <= 1
-                    || px >= world.dims[0] as i32 - 2
-                    || pz >= world.dims[2] as i32 - 2
-                    || py >= world.dims[1] as i32 - 2
-                {
-                    continue;
-                }
-                if world.get(px, py, pz) == EMPTY {
-                    let _ = world.set_raw_no_side_effects(px, py, pz, LEAVES);
-                }
-            }
-        }
-    }
 }
 
 fn surface_y(world: &World, x: i32, z: i32) -> Option<i32> {
