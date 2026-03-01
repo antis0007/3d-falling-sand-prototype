@@ -147,6 +147,7 @@ pub struct Renderer {
     pending_dirty: VecDeque<ChunkCoord>,
     pending_dirty_set: HashSet<ChunkCoord>,
     mesh_versions: HashMap<(ChunkCoord, ChunkLod), u64>,
+    meshed_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
 
     mesh_queue: BackgroundMeshQueue,
@@ -468,6 +469,7 @@ impl Renderer {
             pending_dirty: VecDeque::new(),
             pending_dirty_set: HashSet::new(),
             mesh_versions: HashMap::new(),
+            meshed_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
@@ -635,6 +637,17 @@ impl Renderer {
                 continue;
             }
 
+            if self
+                .meshed_versions
+                .get(&result.coord)
+                .copied()
+                .unwrap_or(0)
+                != result.version
+            {
+                store.mark_chunk_meshed(result.coord);
+                self.meshed_versions.insert(result.coord, result.version);
+            }
+
             let bytes = result.verts.len() * std::mem::size_of::<Vertex>()
                 + result.inds.len() * std::mem::size_of::<u32>();
             if bytes_uploaded + bytes > upload_byte_budget {
@@ -733,6 +746,7 @@ impl Renderer {
         self.pending_dirty_set.clear();
         self.completed_meshes.clear();
         self.mesh_versions.clear();
+        self.meshed_versions.clear();
         self.lod_selection.clear();
     }
     pub fn mesh_draw_stats(&self, vp: glam::Mat4) -> (usize, u64) {
