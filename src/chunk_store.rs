@@ -7,6 +7,41 @@ use crate::world::EMPTY;
 const CHUNK_VOLUME: usize =
     CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize;
 
+fn chunk_neighbors_6(coord: ChunkCoord) -> [ChunkCoord; 6] {
+    [
+        ChunkCoord {
+            x: coord.x - 1,
+            y: coord.y,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x + 1,
+            y: coord.y,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y - 1,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y + 1,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z - 1,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z + 1,
+        },
+    ]
+}
+
 #[derive(Clone)]
 pub struct Chunk {
     voxels: Box<[MaterialId]>,
@@ -146,11 +181,16 @@ impl ChunkStore {
         }
         self.chunks.insert(coord, dst);
         self.dirty_chunks.insert(coord);
+        self.mark_existing_neighbors_dirty(coord);
     }
 
     pub fn remove_chunk(&mut self, coord: ChunkCoord) {
-        self.chunks.remove(&coord);
-        self.dirty_chunks.remove(&coord);
+        if self.chunk_exists(coord) {
+            self.mark_existing_neighbors_dirty(coord);
+            self.chunks.remove(&coord);
+            self.dirty_chunks.remove(&coord);
+            self.mark_existing_neighbors_dirty(coord);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -184,5 +224,59 @@ impl ChunkStore {
         if self.chunk_exists(coord) {
             self.dirty_chunks.insert(coord);
         }
+    }
+
+    fn mark_existing_neighbors_dirty(&mut self, coord: ChunkCoord) {
+        for neighbor_coord in chunk_neighbors_6(coord) {
+            self.mark_neighbor_dirty(neighbor_coord);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_chunk_with_fill(fill: MaterialId) -> LegacyChunk {
+        let mut chunk = LegacyChunk::new();
+        for z in 0..CHUNK_SIZE_VOXELS as usize {
+            for y in 0..CHUNK_SIZE_VOXELS as usize {
+                for x in 0..CHUNK_SIZE_VOXELS as usize {
+                    chunk.set(x, y, z, fill);
+                }
+            }
+        }
+        chunk
+    }
+
+    #[test]
+    fn insert_chunk_marks_existing_neighbors_dirty() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+
+        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.take_dirty_chunks();
+
+        store.insert_chunk(center, legacy_chunk_with_fill(2));
+
+        assert!(store.is_dirty(center));
+        assert!(store.is_dirty(east));
+    }
+
+    #[test]
+    fn remove_chunk_marks_existing_neighbors_dirty() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+
+        store.insert_chunk(center, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, legacy_chunk_with_fill(2));
+        store.take_dirty_chunks();
+
+        store.remove_chunk(center);
+
+        assert!(!store.chunk_exists(center));
+        assert!(store.is_dirty(east));
     }
 }
