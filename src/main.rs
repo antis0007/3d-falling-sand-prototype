@@ -10,13 +10,9 @@ mod renderer;
 mod sim;
 mod sim_world;
 mod streaming;
-mod streaming_manager;
 mod types;
 mod ui;
 mod world;
-mod world_bounds;
-mod world_manager;
-mod world_stream;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

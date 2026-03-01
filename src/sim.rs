@@ -1,7 +1,5 @@
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 
-const MACROCHUNK_SIZE_VOXELS: i32 = 64;
-
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
 const WATER: MaterialId = 5;
@@ -501,60 +499,6 @@ pub fn step_selected_chunks(world: &mut World, rng: &mut XorShift32, chunk_indic
     }
 }
 
-/// Prioritize chunks in a flat 3x3 macrochunk area centered on the player's current macro layer.
-///
-/// High-priority receives every chunk whose macrochunk satisfies `dx <= 1 && dz <= 1 && dy == 0`.
-/// This guarantees simulation of at least 9 macrochunks when that full neighborhood is in-bounds,
-/// and gracefully clamps near world edges where fewer macrochunks exist.
-///
-/// Low-priority is intentionally disabled for now. Returning an empty list makes this policy
-/// explicit and prevents misleading throttle logic at call sites.
-pub fn prioritize_chunks_for_player(
-    world: &World,
-    player_pos: glam::Vec3,
-) -> (Vec<usize>, Vec<usize>) {
-    let macro_coord = macrochunk_from_world(
-        player_pos.x.floor() as i32,
-        player_pos.y.floor() as i32,
-        player_pos.z.floor() as i32,
-    );
-    let mut high = Vec::new();
-    let low = Vec::new();
-    for cz in 0..world.chunks_dims[2] {
-        for cy in 0..world.chunks_dims[1] {
-            for cx in 0..world.chunks_dims[0] {
-                let idx = world.chunk_index(cx, cy, cz);
-                let chunk_macro = macrochunk_from_chunk_coord(cx as i32, cy as i32, cz as i32);
-                let dx = (chunk_macro[0] - macro_coord[0]).abs();
-                let dy = (chunk_macro[1] - macro_coord[1]).abs();
-                let dz = (chunk_macro[2] - macro_coord[2]).abs();
-                if dx <= 1 && dy == 0 && dz <= 1 {
-                    high.push(idx);
-                }
-            }
-        }
-    }
-    high.sort_unstable();
-    (high, low)
-}
-
-pub fn macrochunk_from_world(x: i32, y: i32, z: i32) -> [i32; 3] {
-    [
-        floor_div(x, MACROCHUNK_SIZE_VOXELS),
-        floor_div(y, MACROCHUNK_SIZE_VOXELS),
-        floor_div(z, MACROCHUNK_SIZE_VOXELS),
-    ]
-}
-
-pub fn macrochunk_from_chunk_coord(cx: i32, cy: i32, cz: i32) -> [i32; 3] {
-    let chunk_voxel_size = CHUNK_SIZE as i32;
-    macrochunk_from_world(
-        cx * chunk_voxel_size,
-        cy * chunk_voxel_size,
-        cz * chunk_voxel_size,
-    )
-}
-
 fn chunk_index_to_coord(world: &World, cidx: usize) -> [usize; 3] {
     let w = world.chunks_dims[0];
     let h = world.chunks_dims[1];
@@ -563,15 +507,6 @@ fn chunk_index_to_coord(world: &World, cidx: usize) -> [usize; 3] {
     let cy = rem / w;
     let cx = rem % w;
     [cx, cy, cz]
-}
-
-fn floor_div(a: i32, b: i32) -> i32 {
-    let mut q = a / b;
-    let r = a % b;
-    if r != 0 && ((r > 0) != (b > 0)) {
-        q -= 1;
-    }
-    q
 }
 
 fn try_move(world: &mut World, from: [i32; 3], to: [i32; 3], id: MaterialId) -> bool {

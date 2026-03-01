@@ -35,45 +35,17 @@ fn hash3(seed: u64, x: i32, y: i32, z: i32) -> u64 {
 }
 
 pub fn generate_chunk(seed: u64, c: ChunkCoord) -> Chunk {
-    let mut chunk = Chunk::new();
-    let base_x = c.x * CHUNK_SIZE as i32;
-    let base_y = c.y * CHUNK_SIZE as i32;
-    let base_z = c.z * CHUNK_SIZE as i32;
-
-    for lz in 0..CHUNK_SIZE {
-        for lx in 0..CHUNK_SIZE {
-            let wx = base_x + lx as i32;
-            let wz = base_z + lz as i32;
-
-            let terrain_hash = hash3(seed ^ 0xA02BDBF7BB3C0A7, wx, 0, wz);
-            let terrain_offset = ((terrain_hash & 31) as i32) - 10;
-            let surface_y = terrain_offset;
-
-            for ly in 0..CHUNK_SIZE {
-                let wy = base_y + ly as i32;
-                let cave_hash = hash3(seed ^ 0x51A2C41D9A7B3E11, wx, wy, wz);
-                let cave_open = (cave_hash & 0xFF) < 28;
-
-                let material = if wy > surface_y {
-                    EMPTY
-                } else if cave_open && wy < surface_y - 2 {
-                    EMPTY
-                } else if wy == surface_y {
-                    TURF
-                } else if wy > surface_y - 3 {
-                    DIRT
-                } else {
-                    STONE
-                };
-
-                if material != EMPTY {
-                    chunk.set(lx, ly, lz, material);
-                }
-            }
-        }
-    }
-
-    chunk
+    let chunk_origin = [
+        c.x * CHUNK_SIZE as i32,
+        c.y * CHUNK_SIZE as i32,
+        c.z * CHUNK_SIZE as i32,
+    ];
+    let config = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin(chunk_origin);
+    generate_world(config)
+        .chunks
+        .into_iter()
+        .next()
+        .unwrap_or_else(Chunk::new)
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
@@ -196,7 +168,7 @@ enum VerticalStratum {
 }
 
 #[derive(Clone, Copy)]
-pub struct ProcGenControl<'a> {
+struct ProcGenControl<'a> {
     pub epoch: u64,
     pub should_cancel: &'a dyn Fn(u64) -> bool,
 }
@@ -326,7 +298,7 @@ impl ProcGenConfig {
     }
 }
 
-pub fn generate_world(config: ProcGenConfig) -> World {
+fn generate_world(config: ProcGenConfig) -> World {
     let never_cancel = |_epoch: u64| false;
     generate_world_with_control(
         config,
@@ -342,7 +314,7 @@ pub fn generate_world(config: ProcGenConfig) -> World {
     })
 }
 
-pub fn generate_world_with_control(
+fn generate_world_with_control(
     config: ProcGenConfig,
     control: ProcGenControl<'_>,
 ) -> Option<World> {

@@ -1,22 +1,14 @@
 use crate::chunk_store::ChunkStore;
 use crate::meshing::mesh_chunk as mesh_store_chunk;
-use crate::sim::{material, Phase};
 use crate::types::{ChunkCoord, VoxelCoord};
-use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
 pub const VOXEL_SIZE: f32 = 0.5;
-const TURF_ID: MaterialId = 17;
-const BUSH_ID: MaterialId = 18;
-const GRASS_ID: MaterialId = 19;
 
 #[derive(Clone, Copy)]
 pub enum UnknownNeighborOcclusionPolicy {
@@ -80,10 +72,6 @@ pub struct ChunkMesh {
     aabb_max: Vec3,
 }
 
-struct StreamMeshEntry {
-    active_version: u64,
-    active_meshes: Vec<ChunkMesh>,
-}
 
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
@@ -96,14 +84,7 @@ pub struct Renderer {
     cam_bg: wgpu::BindGroup,
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
-    meshes: HashMap<usize, ChunkMesh>,
     store_meshes: HashMap<ChunkCoord, ChunkMesh>,
-    streamed_meshes: HashMap<[i32; 3], StreamMeshEntry>,
-    stream_mesh_versions: HashMap<[i32; 3], u64>,
-    dirty_scan_cursor: usize,
-    mesh_frame: u64,
-    dirty_since_frame: HashMap<usize, u64>,
-    unknown_neighbor_policy: UnknownNeighborOcclusionPolicy,
     pub day: bool,
 }
 
@@ -219,14 +200,7 @@ impl Renderer {
             cam_bg,
             depth_texture,
             depth_view,
-            meshes: HashMap::new(),
             store_meshes: HashMap::new(),
-            streamed_meshes: HashMap::new(),
-            stream_mesh_versions: HashMap::new(),
-            dirty_scan_cursor: 0,
-            mesh_frame: 0,
-            dirty_since_frame: HashMap::new(),
-            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Conservative,
             day: true,
         })
     }
@@ -237,95 +211,6 @@ impl Renderer {
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
         (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
-    }
-
-    pub fn rebuild_dirty_chunks_with_budget(
-        &mut self,
-        world: &mut World,
-        budget: usize,
-        world_origin: [i32; 3],
-    ) {
-        self.rebuild_dirty_chunks_with_budget_and_sampler(world, budget, world_origin, |_| None);
-    }
-
-    pub fn rebuild_dirty_chunks_with_budget_and_sampler<F>(
-        &mut self,
-        world: &mut World,
-        budget: usize,
-        world_origin: [i32; 3],
-        mut sample_global: F,
-    ) where
-        F: FnMut([i32; 3]) -> Option<MaterialId>,
-    {
-        let budget = budget.max(1);
-        self.mesh_frame = self.mesh_frame.saturating_add(1);
-        for (index, chunk) in world.chunks.iter().enumerate() {
-            if chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version {
-                self.dirty_since_frame
-                    .entry(index)
-                    .or_insert(self.mesh_frame);
-            }
-        }
-
-        let dirty_chunks =
-            select_dirty_chunks_fair(world.chunks.len(), budget, self.dirty_scan_cursor, |idx| {
-                let chunk = &world.chunks[idx];
-                chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version
-            });
-        self.dirty_scan_cursor = dirty_chunks.next_cursor;
-
-        for i in dirty_chunks.indices {
-            let (verts, inds, aabb_min, aabb_max) =
-                mesh_chunk(world, i, world_origin, |local, global| {
-                    if local_in_bounds(world, local) {
-                        return world.get(local[0], local[1], local[2]);
-                    }
-                    match sample_global(global) {
-                        Some(id) => id,
-                        None => unknown_neighbor_material(self.unknown_neighbor_policy),
-                    }
-                });
-            if inds.is_empty() {
-                self.meshes.remove(&i);
-                world.chunks[i].dirty_mesh = false;
-                world.chunks[i].meshed_version = world.chunks[i].voxel_version;
-                continue;
-            }
-            let vb = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("chunk vb"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ib = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("chunk ib"),
-                    contents: bytemuck::cast_slice(&inds),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            self.meshes.insert(
-                i,
-                ChunkMesh {
-                    vb,
-                    ib,
-                    index_count: inds.len() as u32,
-                    aabb_min,
-                    aabb_max,
-                },
-            );
-            world.chunks[i].dirty_mesh = false;
-            world.chunks[i].meshed_version = world.chunks[i].voxel_version;
-            self.dirty_since_frame.remove(&i);
-        }
-        self.dirty_since_frame.retain(|idx, _| {
-            world
-                .chunks
-                .get(*idx)
-                .map(|chunk| chunk.dirty_mesh || chunk.voxel_version != chunk.meshed_version)
-                .unwrap_or(false)
-        });
     }
 
     pub fn rebuild_dirty_store_chunks(
@@ -372,113 +257,8 @@ impl Renderer {
         }
     }
 
-    pub fn rebuild_dirty_chunks(&mut self, world: &mut World) {
-        self.rebuild_dirty_chunks_with_budget(world, usize::MAX, [0, 0, 0]);
-    }
-
-    pub fn request_stream_mesh_version(&mut self, coord: [i32; 3]) -> u64 {
-        let next = self
-            .stream_mesh_versions
-            .get(&coord)
-            .map(|version| version.saturating_add(1))
-            .unwrap_or(0);
-        self.stream_mesh_versions.insert(coord, next);
-        next
-    }
-
-    pub fn upsert_stream_mesh<F>(
-        &mut self,
-        coord: [i32; 3],
-        version: u64,
-        world: &World,
-        world_origin: [i32; 3],
-        mut sample_global: F,
-    ) where
-        F: FnMut([i32; 3]) -> Option<MaterialId>,
-    {
-        let mut meshes = Vec::with_capacity(world.chunks.len());
-        for idx in 0..world.chunks.len() {
-            if world.chunks[idx].iter_raw().iter().all(|&v| v == EMPTY) {
-                continue;
-            }
-            let (verts, inds, aabb_min, aabb_max) =
-                mesh_chunk(world, idx, world_origin, |local, global| {
-                    if local_in_bounds(world, local) {
-                        return world.get(local[0], local[1], local[2]);
-                    }
-                    match sample_global(global) {
-                        Some(id) => id,
-                        None => unknown_neighbor_material(self.unknown_neighbor_policy),
-                    }
-                });
-            if inds.is_empty() {
-                continue;
-            }
-            let vb = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("stream chunk vb"),
-                    contents: bytemuck::cast_slice(&verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ib = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("stream chunk ib"),
-                    contents: bytemuck::cast_slice(&inds),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
-            meshes.push(ChunkMesh {
-                vb,
-                ib,
-                index_count: inds.len() as u32,
-                aabb_min,
-                aabb_max,
-            });
-        }
-        let expected = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0);
-        if version != expected {
-            return;
-        }
-        let entry = self
-            .streamed_meshes
-            .entry(coord)
-            .or_insert(StreamMeshEntry {
-                active_version: 0,
-                active_meshes: Vec::new(),
-            });
-        entry.active_meshes = meshes;
-        entry.active_version = version;
-    }
-
-    pub fn prune_stream_meshes(&mut self, keep: &std::collections::HashSet<[i32; 3]>) {
-        self.streamed_meshes.retain(|coord, _| keep.contains(coord));
-        self.stream_mesh_versions
-            .retain(|coord, _| keep.contains(coord));
-    }
-
-    pub fn has_stream_mesh(&self, coord: [i32; 3]) -> bool {
-        self.streamed_meshes
-            .get(&coord)
-            .map(|entry| !entry.active_meshes.is_empty())
-            .unwrap_or(false)
-    }
-
-    pub fn stream_mesh_is_transitioning(&self, coord: [i32; 3]) -> bool {
-        let desired = self.stream_mesh_versions.get(&coord).copied().unwrap_or(0);
-        self.streamed_meshes
-            .get(&coord)
-            .map(|entry| desired > entry.active_version)
-            .unwrap_or(false)
-    }
-
     pub fn clear_mesh_cache(&mut self) {
-        self.meshes.clear();
         self.store_meshes.clear();
-        self.streamed_meshes.clear();
-        self.stream_mesh_versions.clear();
-        self.dirty_since_frame.clear();
-        self.dirty_scan_cursor = 0;
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
@@ -492,14 +272,6 @@ impl Renderer {
         );
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
-        for mesh in self.meshes.values() {
-            if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
-                continue;
-            }
-            pass.set_vertex_buffer(0, mesh.vb.slice(..));
-            pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-        }
         for mesh in self.store_meshes.values() {
             if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
@@ -508,56 +280,9 @@ impl Renderer {
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
-        for entry in self.streamed_meshes.values() {
-            for mesh in &entry.active_meshes {
-                if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
-                    continue;
-                }
-                pass.set_vertex_buffer(0, mesh.vb.slice(..));
-                pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
     }
 }
 
-struct DirtySelection {
-    indices: Vec<usize>,
-    next_cursor: usize,
-}
-
-fn select_dirty_chunks_fair<F>(
-    chunk_count: usize,
-    budget: usize,
-    cursor: usize,
-    mut is_dirty: F,
-) -> DirtySelection
-where
-    F: FnMut(usize) -> bool,
-{
-    if chunk_count == 0 {
-        return DirtySelection {
-            indices: Vec::new(),
-            next_cursor: 0,
-        };
-    }
-    let mut indices = Vec::new();
-    let mut scanned = 0usize;
-    let mut index = cursor % chunk_count;
-
-    while scanned < chunk_count && indices.len() < budget {
-        if is_dirty(index) {
-            indices.push(index);
-        }
-        index = (index + 1) % chunk_count;
-        scanned += 1;
-    }
-
-    DirtySelection {
-        indices,
-        next_cursor: index,
-    }
-}
 
 fn create_depth_texture(
     device: &wgpu::Device,
@@ -602,7 +327,6 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
                 1 => -clip.x + clip.w,
                 2 => clip.y + clip.w,
                 3 => -clip.y + clip.w,
-                // perspective_rh_gl uses OpenGL clip space where -w <= z <= w.
                 4 => clip.z + clip.w,
                 _ => -clip.z + clip.w,
             };
@@ -615,321 +339,6 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
         }
     }
     true
-}
-
-fn unknown_neighbor_material(policy: UnknownNeighborOcclusionPolicy) -> MaterialId {
-    match policy {
-        // Conservative: treat unknown neighbors as solid to avoid seams/cracks.
-        UnknownNeighborOcclusionPolicy::Conservative => TURF_ID,
-        // Aggressive: treat unknown neighbors as empty to expose surfaces early.
-        UnknownNeighborOcclusionPolicy::Aggressive => EMPTY,
-    }
-}
-
-fn local_in_bounds(world: &World, local: [i32; 3]) -> bool {
-    local[0] >= 0
-        && local[1] >= 0
-        && local[2] >= 0
-        && (local[0] as usize) < world.dims[0]
-        && (local[1] as usize) < world.dims[1]
-        && (local[2] as usize) < world.dims[2]
-}
-
-fn mesh_chunk<F>(
-    world: &World,
-    idx: usize,
-    world_origin: [i32; 3],
-    mut sample_voxel: F,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3)
-where
-    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
-{
-    let cdx = world.chunks_dims[0];
-    let cdy = world.chunks_dims[1];
-    let cx = idx % cdx;
-    let cy = (idx / cdx) % cdy;
-    let cz = idx / (cdx * cdy);
-    let mut verts = Vec::new();
-    let mut inds = Vec::new();
-    let chunk = &world.chunks[idx];
-    if chunk.iter_raw().iter().all(|&v| v == EMPTY) {
-        let min = Vec3::new(
-            (world_origin[0] + (cx as i32 * CHUNK_SIZE as i32)) as f32,
-            (world_origin[1] + (cy as i32 * CHUNK_SIZE as i32)) as f32,
-            (world_origin[2] + (cz as i32 * CHUNK_SIZE as i32)) as f32,
-        ) * VOXEL_SIZE;
-        let max = min + Vec3::splat(CHUNK_SIZE as f32 * VOXEL_SIZE);
-        return (verts, inds, min, max);
-    }
-
-    let ox = cx as i32 * CHUNK_SIZE as i32;
-    let oy = cy as i32 * CHUNK_SIZE as i32;
-    let oz = cz as i32 * CHUNK_SIZE as i32;
-    for lz in 0..CHUNK_SIZE as i32 {
-        for ly in 0..CHUNK_SIZE as i32 {
-            for lx in 0..CHUNK_SIZE as i32 {
-                let local = [ox + lx, oy + ly, oz + lz];
-                let world_p = [
-                    world_origin[0] + local[0],
-                    world_origin[1] + local[1],
-                    world_origin[2] + local[2],
-                ];
-                let id = chunk.get(lx as usize, ly as usize, lz as usize);
-                if id == EMPTY {
-                    continue;
-                }
-                if matches!(id, BUSH_ID | GRASS_ID) {
-                    add_crossed_billboard(
-                        [local[0], local[1], local[2]],
-                        world_p,
-                        &mut sample_voxel,
-                        id,
-                        &mut verts,
-                        &mut inds,
-                    );
-                    continue;
-                }
-                let color = material(id).color;
-                add_voxel_faces(
-                    [local[0], local[1], local[2]],
-                    world_p,
-                    &mut sample_voxel,
-                    id,
-                    color,
-                    &mut verts,
-                    &mut inds,
-                );
-            }
-        }
-    }
-
-    let min = Vec3::new(
-        (world_origin[0] + ox) as f32,
-        (world_origin[1] + oy) as f32,
-        (world_origin[2] + oz) as f32,
-    ) * VOXEL_SIZE;
-    let max = Vec3::new(
-        (world_origin[0] + ox + CHUNK_SIZE as i32) as f32,
-        (world_origin[1] + oy + CHUNK_SIZE as i32) as f32,
-        (world_origin[2] + oz + CHUNK_SIZE as i32) as f32,
-    ) * VOXEL_SIZE;
-    (verts, inds, min, max)
-}
-
-fn add_voxel_faces<F>(
-    local_p: [i32; 3],
-    world_p: [i32; 3],
-    sample_voxel: &mut F,
-    id: MaterialId,
-    color: [u8; 4],
-    verts: &mut Vec<Vertex>,
-    inds: &mut Vec<u32>,
-) where
-    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
-{
-    let dirs = [
-        (
-            [1, 0, 0],
-            [[1., 0., 0.], [1., 1., 0.], [1., 1., 1.], [1., 0., 1.]],
-            0.88,
-        ),
-        (
-            [-1, 0, 0],
-            [[0., 0., 1.], [0., 1., 1.], [0., 1., 0.], [0., 0., 0.]],
-            0.73,
-        ),
-        (
-            [0, 1, 0],
-            [[0., 1., 1.], [1., 1., 1.], [1., 1., 0.], [0., 1., 0.]],
-            1.0,
-        ),
-        (
-            [0, -1, 0],
-            [[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]],
-            0.58,
-        ),
-        (
-            [0, 0, 1],
-            [[1., 0., 1.], [1., 1., 1.], [0., 1., 1.], [0., 0., 1.]],
-            0.8,
-        ),
-        (
-            [0, 0, -1],
-            [[0., 0., 0.], [0., 1., 0.], [1., 1., 0.], [1., 0., 0.]],
-            0.66,
-        ),
-    ];
-    for (d, quad, shade) in dirs {
-        let local_neighbor = [local_p[0] + d[0], local_p[1] + d[1], local_p[2] + d[2]];
-        let world_neighbor = [world_p[0] + d[0], world_p[1] + d[1], world_p[2] + d[2]];
-        if is_face_occluded(id, sample_voxel(local_neighbor, world_neighbor)) {
-            continue;
-        }
-        let b = verts.len() as u32;
-        let face_color = turf_face_color(id, d, color);
-        let shaded = shade_color(face_color, shade);
-        for v in quad {
-            verts.push(Vertex {
-                pos: [
-                    (world_p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (world_p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (world_p[2] as f32 + v[2]) * VOXEL_SIZE,
-                ],
-                color: shaded,
-            });
-        }
-        inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-    }
-}
-
-fn is_face_occluded(self_id: MaterialId, neighbor_id: MaterialId) -> bool {
-    if neighbor_id == EMPTY {
-        return false;
-    }
-
-    if neighbor_id == self_id {
-        return true;
-    }
-
-    if matches!(neighbor_id, GRASS_ID | BUSH_ID) {
-        return false;
-    }
-
-    let neighbor = material(neighbor_id);
-    if neighbor.color[3] < 255 {
-        return false;
-    }
-
-    matches!(neighbor.phase, Phase::Solid | Phase::Powder)
-}
-
-fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] {
-    if id != TURF_ID {
-        return fallback;
-    }
-    if dir == [0, 1, 0] {
-        return [92, 171, 78, 255];
-    }
-    if dir == [0, -1, 0] {
-        return [121, 88, 56, 255];
-    }
-    [116, 103, 61, 255]
-}
-
-fn add_crossed_billboard<F>(
-    local_p: [i32; 3],
-    world_p: [i32; 3],
-    sample_voxel: &mut F,
-    id: MaterialId,
-    verts: &mut Vec<Vertex>,
-    inds: &mut Vec<u32>,
-) where
-    F: FnMut([i32; 3], [i32; 3]) -> MaterialId,
-{
-    let above = sample_voxel(
-        [local_p[0], local_p[1] + 1, local_p[2]],
-        [world_p[0], world_p[1] + 1, world_p[2]],
-    );
-    if above != EMPTY {
-        return;
-    }
-    let base_color = material(id).color;
-    let texture_tint = plant_texture_tint(id);
-    let color = [
-        ((base_color[0] as u16 + texture_tint[0] as u16) / 2) as u8,
-        ((base_color[1] as u16 + texture_tint[1] as u16) / 2) as u8,
-        ((base_color[2] as u16 + texture_tint[2] as u16) / 2) as u8,
-        base_color[3],
-    ];
-
-    let quads = [
-        [
-            [0.15, 0.0, 0.15],
-            [0.15, 1.0, 0.15],
-            [0.85, 1.0, 0.85],
-            [0.85, 0.0, 0.85],
-        ],
-        [
-            [0.15, 0.0, 0.85],
-            [0.15, 1.0, 0.85],
-            [0.85, 1.0, 0.15],
-            [0.85, 0.0, 0.15],
-        ],
-    ];
-
-    for quad in quads {
-        let b = verts.len() as u32;
-        for v in quad {
-            verts.push(Vertex {
-                pos: [
-                    (world_p[0] as f32 + v[0]) * VOXEL_SIZE,
-                    (world_p[1] as f32 + v[1]) * VOXEL_SIZE,
-                    (world_p[2] as f32 + v[2]) * VOXEL_SIZE,
-                ],
-                color,
-            });
-        }
-        inds.extend_from_slice(&[
-            b,
-            b + 1,
-            b + 2,
-            b,
-            b + 2,
-            b + 3,
-            b,
-            b + 2,
-            b + 1,
-            b,
-            b + 3,
-            b + 2,
-        ]);
-    }
-}
-
-fn plant_texture_tint(id: MaterialId) -> [u8; 4] {
-    static TINTS: OnceLock<([u8; 4], [u8; 4])> = OnceLock::new();
-    let (grass, bush) = *TINTS.get_or_init(|| {
-        let grass =
-            load_tint_from_file(Path::new("assets/materials/grass.txt"), [90, 180, 80, 220]);
-        let bush = load_tint_from_file(Path::new("assets/materials/bush.txt"), [70, 150, 65, 220]);
-        (grass, bush)
-    });
-    if id == GRASS_ID {
-        grass
-    } else {
-        bush
-    }
-}
-
-fn load_tint_from_file(path: &Path, fallback: [u8; 4]) -> [u8; 4] {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return fallback;
-    };
-    let line = raw
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'));
-    let Some(line) = line else {
-        return fallback;
-    };
-    let mut vals = line
-        .split(',')
-        .map(str::trim)
-        .filter_map(|v| v.parse::<u8>().ok());
-    let (Some(r), Some(g), Some(b), Some(a)) = (vals.next(), vals.next(), vals.next(), vals.next())
-    else {
-        return fallback;
-    };
-    [r, g, b, a]
-}
-
-fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
-    [
-        ((color[0] as f32 * shade).min(255.0)) as u8,
-        ((color[1] as f32 * shade).min(255.0)) as u8,
-        ((color[2] as f32 * shade).min(255.0)) as u8,
-        color[3],
-    ]
 }
 
 #[cfg(test)]
