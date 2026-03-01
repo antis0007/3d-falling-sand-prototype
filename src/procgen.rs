@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+
+#[cfg(feature = "procgen-profile")]
 use std::time::{Duration, Instant};
 
 use crate::chunk_store::ChunkStore;
@@ -56,38 +58,63 @@ pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk
 
 #[derive(Default)]
 struct ProcGenPassTimings {
+    #[cfg(feature = "procgen-profile")]
     rows: std::sync::Mutex<Vec<(&'static str, Duration)>>,
 }
 
+#[cfg(feature = "procgen-profile")]
 struct ScopedPassTimer<'a> {
     owner: &'a ProcGenPassTimings,
     name: &'static str,
     start: Instant,
 }
 
+#[cfg(not(feature = "procgen-profile"))]
+struct ScopedPassTimer<'a>(std::marker::PhantomData<&'a ProcGenPassTimings>);
+
 impl ProcGenPassTimings {
     fn scoped(&self, name: &'static str) -> ScopedPassTimer<'_> {
-        ScopedPassTimer {
-            owner: self,
-            name,
-            start: Instant::now(),
+        #[cfg(feature = "procgen-profile")]
+        {
+            ScopedPassTimer {
+                owner: self,
+                name,
+                start: Instant::now(),
+            }
+        }
+
+        #[cfg(not(feature = "procgen-profile"))]
+        {
+            let _ = self;
+            let _ = name;
+            ScopedPassTimer(std::marker::PhantomData)
         }
     }
 
     fn log_total(&self, origin: [i32; 3]) {
-        let rows = self.rows.lock().expect("procgen timing lock");
-        let total: Duration = rows.iter().map(|(_, d)| *d).sum();
-        log::info!(
-            "procgen {:?} total {:.2}ms",
-            origin,
-            total.as_secs_f64() * 1000.0
-        );
-        for (name, d) in rows.iter() {
-            log::info!("procgen pass {}: {:.2}ms", name, d.as_secs_f64() * 1000.0);
+        #[cfg(feature = "procgen-profile")]
+        {
+            let rows = self.rows.lock().expect("procgen timing lock");
+            let total: Duration = rows.iter().map(|(_, d)| *d).sum();
+            log::info!(
+                "procgen {:?} total {:.2}ms",
+                origin,
+                total.as_secs_f64() * 1000.0
+            );
+            for (name, d) in rows.iter() {
+                log::info!("procgen pass {}: {:.2}ms", name, d.as_secs_f64() * 1000.0);
+            }
+        }
+
+        #[cfg(not(feature = "procgen-profile"))]
+        {
+            let _ = self;
+            let _ = origin;
         }
     }
 }
 
+#[cfg(feature = "procgen-profile")]
 impl Drop for ScopedPassTimer<'_> {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed();

@@ -3,6 +3,9 @@ name = "falling_sand_3d"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+procgen-profile = []
+
 [dependencies]
 anyhow = "1"
 bincode = "1.3"
