@@ -11,8 +11,8 @@ use crate::sim_world::{step_region_profiled, Rng};
 use crate::streaming::{is_urgent_chunk, ChunkStreaming, DesiredChunks, VisibilityContext};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
-    assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
-    UiState, HOTBAR_SLOTS,
+    assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material,
+    ChunkDebugOverlayEntry, ToolKind, UiState, HOTBAR_SLOTS,
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::{Mat4, Vec3, Vec4};
@@ -152,11 +152,14 @@ impl ModifiedChunkCache {
 #[derive(Clone)]
 struct GenJob {
     coord: ChunkCoord,
+    requested_at: Instant,
 }
 
 struct GenResult {
     coord: ChunkCoord,
     chunk: crate::chunk_store::Chunk,
+    requested_at: Instant,
+    generated_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,6 +449,8 @@ impl BackgroundGenerator {
                         .send(GenResult {
                             coord: job.coord,
                             chunk,
+                            requested_at: job.requested_at,
+                            generated_at: Instant::now(),
                         })
                         .is_err()
                     {
@@ -459,7 +464,10 @@ impl BackgroundGenerator {
     }
 
     fn try_request(&self, coord: ChunkCoord) -> bool {
-        match self.tx.try_send(GenJob { coord }) {
+        match self.tx.try_send(GenJob {
+            coord,
+            requested_at: Instant::now(),
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => false,
             Err(TrySendError::Disconnected(_)) => false,
@@ -1118,6 +1126,10 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             frame_counter,
                         );
+                        streaming.reprioritize_generate_queue(
+                            player_chunk,
+                            &cached_desired.generation_scores,
+                        );
 
                         let gen_inflight_before_dispatch = streaming.dispatched_generate.len();
                         if gen_dispatch_paused {
@@ -1260,6 +1272,32 @@ pub async fn run() -> anyhow::Result<()> {
                                     starvation_reason
                                 )
                             });
+                        }
+
+                        if generated_ready.len() > 1 {
+                            let mut prioritized: Vec<_> = generated_ready.drain(..).collect();
+                            prioritized.sort_by(|a, b| {
+                                let urgent_a = is_urgent_chunk(player_chunk, a.coord);
+                                let urgent_b = is_urgent_chunk(player_chunk, b.coord);
+                                urgent_b
+                                    .cmp(&urgent_a)
+                                    .then_with(|| {
+                                        cached_desired
+                                            .generation_scores
+                                            .get(&b.coord)
+                                            .copied()
+                                            .unwrap_or(0.0)
+                                            .total_cmp(
+                                                &cached_desired
+                                                    .generation_scores
+                                                    .get(&a.coord)
+                                                    .copied()
+                                                    .unwrap_or(0.0),
+                                            )
+                                    })
+                                    .then_with(|| a.generated_at.cmp(&b.generated_at))
+                            });
+                            generated_ready.extend(prioritized);
                         }
 
                         let apply_budget_items = scaled_budget(
@@ -1670,6 +1708,41 @@ pub async fn run() -> anyhow::Result<()> {
                             })
                             .collect();
 
+                        let chunk_overlay_entries = if ui.show_chunk_overlay {
+                            let mut entries = Vec::new();
+                            let overlay_radius = 3;
+                            for dz in -overlay_radius..=overlay_radius {
+                                for dy in -1..=1 {
+                                    for dx in -overlay_radius..=overlay_radius {
+                                        let coord = ChunkCoord {
+                                            x: player_chunk.x + dx,
+                                            y: player_chunk.y + dy,
+                                            z: player_chunk.z + dz,
+                                        };
+                                        let color = if store.is_dirty(coord) {
+                                            [90, 170, 255, 180]
+                                        } else if streaming.dispatched_generate.contains(&coord) {
+                                            [255, 150, 60, 180]
+                                        } else if streaming.scheduled_generate.contains(&coord) {
+                                            [255, 230, 80, 180]
+                                        } else if streaming.resident.contains(&coord) {
+                                            [80, 235, 120, 180]
+                                        } else {
+                                            [130, 130, 130, 110]
+                                        };
+                                        let world_min = crate::types::chunk_to_world_min(coord);
+                                        entries.push(ChunkDebugOverlayEntry {
+                                            chunk_min: [world_min.x, world_min.y, world_min.z],
+                                            color,
+                                        });
+                                    }
+                                }
+                            }
+                            Some(entries)
+                        } else {
+                            None
+                        };
+
                         draw_fps_overlays(
                             &egui_ctx,
                             ui.paused_menu,
@@ -1687,6 +1760,7 @@ pub async fn run() -> anyhow::Result<()> {
                             start.elapsed().as_secs_f32(),
                             !gameplay_blocked && !egui_c,
                             None,
+                            chunk_overlay_entries.as_deref(),
                         );
 
                         // Render

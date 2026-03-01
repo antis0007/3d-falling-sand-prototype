@@ -83,6 +83,35 @@ pub struct ChunkStreaming {
 }
 
 impl ChunkStreaming {
+    pub fn reprioritize_generate_queue(
+        &mut self,
+        player_chunk: ChunkCoord,
+        generation_scores: &HashMap<ChunkCoord, f32>,
+    ) {
+        if self.pending_generate.len() <= 1 {
+            return;
+        }
+
+        let mut coords: Vec<_> = self.pending_generate.drain(..).collect();
+        coords.sort_by(|a, b| {
+            let urgent_a = is_urgent_chunk(player_chunk, *a);
+            let urgent_b = is_urgent_chunk(player_chunk, *b);
+            urgent_b
+                .cmp(&urgent_a)
+                .then_with(|| {
+                    generation_scores
+                        .get(b)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .total_cmp(&generation_scores.get(a).copied().unwrap_or(0.0))
+                })
+                .then_with(|| {
+                    Self::sort_key(player_chunk, *a).cmp(&Self::sort_key(player_chunk, *b))
+                })
+        });
+        self.pending_generate.extend(coords);
+    }
+
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
@@ -743,5 +772,28 @@ mod tests {
         let c = ChunkCoord { x: 3, y: 0, z: 0 };
         streaming.scheduled_generate.insert(c);
         assert_eq!(streaming.residency_of(c), Residency::Scheduled);
+    }
+
+    #[test]
+    fn reprioritize_queue_promotes_urgent_and_high_score_chunks() {
+        let mut streaming = ChunkStreaming::new(1);
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let far = ChunkCoord { x: 8, y: 0, z: 0 };
+        let near = ChunkCoord { x: 2, y: 0, z: 0 };
+        let urgent = ChunkCoord { x: 1, y: 0, z: 1 };
+        streaming.pending_generate.push_back(far);
+        streaming.pending_generate.push_back(near);
+        streaming.pending_generate.push_back(urgent);
+
+        let mut scores = HashMap::new();
+        scores.insert(far, 0.8);
+        scores.insert(near, 0.2);
+        scores.insert(urgent, 0.1);
+
+        streaming.reprioritize_generate_queue(player, &scores);
+
+        assert_eq!(streaming.pending_generate.pop_front(), Some(urgent));
+        assert_eq!(streaming.pending_generate.pop_front(), Some(far));
+        assert_eq!(streaming.pending_generate.pop_front(), Some(near));
     }
 }

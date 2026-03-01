@@ -1949,11 +1949,91 @@ fn vegetation_pass(
 fn vegetation_pass_chunk(
     world: &mut World,
     config: &ProcGenConfig,
-    columns: &[ColumnGenData],
-    hydrology: &HydrologyData,
+    _columns: &[ColumnGenData],
+    _hydrology: &HydrologyData,
     timings: &ProcGenPassTimings,
 ) {
-    vegetation_pass(world, config, columns, hydrology, timings);
+    let _timer = timings.scoped("vegetation_pass_chunk_worldspace");
+    let mut intents = Vec::new();
+    let chunk_radius = 2;
+
+    for lz in -chunk_radius..(world.dims[2] as i32 + chunk_radius) {
+        for lx in -chunk_radius..(world.dims[0] as i32 + chunk_radius) {
+            let wx = config.world_origin[0] + lx;
+            let wz = config.world_origin[2] + lz;
+            let climate = sample_climate(config.seed, wx, wz);
+            let weights = biome_weights(config.seed, wx, wz, climate);
+            let surface_height = sampled_surface_height(config, wx, wz, Some(weights));
+            let slope = slope_at_world(config, wx, wz);
+            let ocean = weights[biome_index(BiomeType::Ocean)];
+            let shore_w = smoothstep((ocean - 0.24) / 0.34);
+            let coastal = shore_w > 0.18 && surface_height <= config.sea_level_local() + 4;
+            let stratum = classify_vertical_biome_stratum(
+                config,
+                &ColumnGenData {
+                    wx,
+                    wz,
+                    weights,
+                    climate,
+                    surface_height,
+                    slope,
+                    coastal,
+                    river: false,
+                    ocean: ocean > 0.55,
+                    stratum: VerticalBiomeStratum::Lowland,
+                    landmark: sample_landmark(config.seed, wx, wz, climate, slope),
+                },
+                surface_height,
+            );
+            let landmark = sample_landmark(config.seed, wx, wz, climate, slope);
+
+            let forest = weights[biome_index(BiomeType::Forest)];
+            let plains = weights[biome_index(BiomeType::Plains)];
+            let highlands = weights[biome_index(BiomeType::Highlands)];
+            let desert = weights[biome_index(BiomeType::Desert)];
+            let wet =
+                weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
+
+            let mut tree_p = config.tree_density
+                * (0.16 + 1.45 * forest + 0.35 * plains + climate.moisture * 0.55)
+                * (1.0 - desert * (1.2 + climate.temperature)).powf(2.2)
+                * (1.0 - highlands * 0.30).max(0.22)
+                * (1.0 - ocean * 0.94).max(0.02);
+
+            match stratum {
+                VerticalBiomeStratum::WetlandValley => tree_p *= 1.28,
+                VerticalBiomeStratum::Lowland => {}
+                VerticalBiomeStratum::DryPlateau => tree_p *= 0.45,
+                VerticalBiomeStratum::Alpine => tree_p *= 0.16,
+            }
+
+            if coastal || ocean > 0.55 {
+                tree_p *= 0.03;
+            }
+            tree_p *= (1.0 - wet * 0.7).max(0.05);
+            if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
+                tree_p *= 0.5;
+            }
+
+            let roll = hash01(config.seed ^ 0x1111_7777, wx, surface_height, wz);
+            if roll >= tree_p {
+                continue;
+            }
+
+            let base_world_y = surface_height + 1;
+            stage_tree_intents(
+                &mut intents,
+                config.seed,
+                wx,
+                wz,
+                base_world_y,
+                stratum,
+                landmark,
+            );
+        }
+    }
+
+    apply_vegetation_intents(world, config, &intents);
 }
 
 fn apply_vegetation_intents(
@@ -3118,6 +3198,61 @@ mod tests {
             ratio * 100.0,
             alternating_pairs,
             sampled_pairs
+        );
+    }
+    #[test]
+    fn trees_continue_across_lateral_chunk_boundaries() {
+        let seed = 0xA51CEu64;
+        let west = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+        let east = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
+        let side = CHUNK_SIZE;
+
+        let mut found = false;
+        for z in 0..side {
+            for y in 0..side {
+                let west_edge = west.get(side - 1, y, z);
+                let east_edge = east.get(0, y, z);
+                if matches!(west_edge, WOOD | LEAVES) && matches!(east_edge, WOOD | LEAVES) {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        assert!(
+            found,
+            "expected at least one cross-border tree voxel continuity sample"
+        );
+    }
+
+    #[test]
+    fn trees_continue_into_chunk_above() {
+        let seed = 0xF00DBA5Eu64;
+        let base = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+        let above = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 1, z: 0 });
+        let side = CHUNK_SIZE;
+
+        let mut found = false;
+        for z in 0..side {
+            for x in 0..side {
+                let lower_top = base.get(x, side - 1, z);
+                let upper_bottom = above.get(x, 0, z);
+                if matches!(lower_top, WOOD | LEAVES) && matches!(upper_bottom, WOOD | LEAVES) {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        assert!(
+            found,
+            "expected at least one tree voxel continuity sample across vertical chunk border"
         );
     }
 }

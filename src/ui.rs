@@ -1,11 +1,19 @@
 use crate::sim::{material, MATERIALS};
-use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, MaterialId};
+use crate::world::{
+    AreaFootprintShape, BrushMode, BrushSettings, BrushShape, MaterialId, CHUNK_SIZE,
+};
 use glam::{Mat4, Vec2, Vec3};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 pub const HOTBAR_SLOTS: usize = 10;
 pub const HOTBAR_DISPLAY_ORDER: [usize; HOTBAR_SLOTS] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkDebugOverlayEntry {
+    pub chunk_min: [i32; 3],
+    pub color: [u8; 4],
+}
 
 #[derive(Clone, Default)]
 pub struct ProfilerStats {
@@ -139,6 +147,7 @@ pub struct UiState {
     pub renderer_frustum_culling: bool,
     pub renderer_greedy_meshing: bool,
     pub renderer_conservative_neighbors: bool,
+    pub show_chunk_overlay: bool,
 
     log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
@@ -260,6 +269,7 @@ impl Default for UiState {
             renderer_frustum_culling: true,
             renderer_greedy_meshing: true,
             renderer_conservative_neighbors: false,
+            show_chunk_overlay: false,
 
             log_last_seconds: HashMap::new(),
             drag_source: None,
@@ -568,6 +578,8 @@ pub fn draw(
                 ));
                 ui.separator();
                 ui.heading("Renderer Debug");
+                ui.checkbox(&mut ui_state.show_chunk_overlay, "Chunk state overlay");
+                ui.monospace("overlay key: resident=green scheduled=yellow generating=orange dirty=blue unloaded=gray");
                 ui.checkbox(&mut ui_state.renderer_frustum_culling, "Frustum culling");
                 ui.checkbox(
                     &mut ui_state.renderer_greedy_meshing,
@@ -1033,6 +1045,7 @@ pub fn draw_fps_overlays(
     now_s: f32,
     using_tool: bool,
     modifier_hint: Option<&str>,
+    chunk_overlay: Option<&[ChunkDebugOverlayEntry]>,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
@@ -1090,6 +1103,26 @@ pub fn draw_fps_overlays(
             voxel_size,
             outline_color,
         );
+    }
+
+    if let Some(entries) = chunk_overlay {
+        let chunk_world_size = CHUNK_SIZE as f32 * voxel_size;
+        for entry in entries {
+            draw_chunk_outline(
+                &painter,
+                vp,
+                viewport,
+                ctx.pixels_per_point(),
+                entry.chunk_min,
+                chunk_world_size,
+                egui::Color32::from_rgba_unmultiplied(
+                    entry.color[0],
+                    entry.color[1],
+                    entry.color[2],
+                    entry.color[3],
+                ),
+            );
+        }
     }
 
     draw_brush_radial_hint(
@@ -1214,6 +1247,57 @@ fn draw_block_outline(
         .map(|c| project(vp, viewport, pixels_per_point, c))
         .collect();
     let stroke = egui::Stroke::new(2.0, color);
+    for (a, b) in edges {
+        if let (Some(pa), Some(pb)) = (projected[a], projected[b]) {
+            painter.line_segment([pa, pb], stroke);
+        }
+    }
+}
+
+fn draw_chunk_outline(
+    painter: &egui::Painter,
+    vp: Mat4,
+    viewport: [u32; 2],
+    pixels_per_point: f32,
+    chunk_min: [i32; 3],
+    chunk_world_size: f32,
+    color: egui::Color32,
+) {
+    let b = Vec3::new(
+        chunk_min[0] as f32,
+        chunk_min[1] as f32,
+        chunk_min[2] as f32,
+    );
+    let s = chunk_world_size;
+    let corners = [
+        b,
+        b + Vec3::new(s, 0.0, 0.0),
+        b + Vec3::new(s, s, 0.0),
+        b + Vec3::new(0.0, s, 0.0),
+        b + Vec3::new(0.0, 0.0, s),
+        b + Vec3::new(s, 0.0, s),
+        b + Vec3::new(s, s, s),
+        b + Vec3::new(0.0, s, s),
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let projected: Vec<Option<egui::Pos2>> = corners
+        .into_iter()
+        .map(|c| project(vp, viewport, pixels_per_point, c))
+        .collect();
+    let stroke = egui::Stroke::new(1.0, color);
     for (a, b) in edges {
         if let (Some(pa), Some(pb)) = (projected[a], projected[b]) {
             painter.line_segment([pa, pb], stroke);
