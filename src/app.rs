@@ -16,7 +16,7 @@ use crate::ui::{
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::Vec3;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,6 +68,80 @@ const SPAWN_SEARCH_RADIUS: i32 = 48;
 const SPAWN_HEADROOM: i32 = 3;
 const SPAWN_CLEARANCE: f32 = 3.4;
 const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
+const MAX_CACHED_MODIFIED: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModifiedChunkCacheMetrics {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+struct ModifiedChunkCache {
+    max_entries: usize,
+    entries: HashMap<ChunkCoord, crate::chunk_store::Chunk>,
+    recency: VecDeque<ChunkCoord>,
+    metrics: ModifiedChunkCacheMetrics,
+}
+
+impl ModifiedChunkCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            metrics: ModifiedChunkCacheMetrics::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+    }
+
+    fn insert(&mut self, coord: ChunkCoord, chunk: crate::chunk_store::Chunk) {
+        self.entries.insert(coord, chunk);
+        self.touch(coord);
+        self.enforce_limit();
+    }
+
+    fn take(&mut self, coord: ChunkCoord) -> Option<crate::chunk_store::Chunk> {
+        let chunk = self.entries.remove(&coord);
+        if chunk.is_some() {
+            self.metrics.hits += 1;
+            self.remove_from_recency(coord);
+        } else {
+            self.metrics.misses += 1;
+        }
+        chunk
+    }
+
+    fn metrics(&self) -> ModifiedChunkCacheMetrics {
+        self.metrics
+    }
+
+    fn touch(&mut self, coord: ChunkCoord) {
+        self.remove_from_recency(coord);
+        self.recency.push_back(coord);
+    }
+
+    fn remove_from_recency(&mut self, coord: ChunkCoord) {
+        if let Some(index) = self.recency.iter().position(|queued| *queued == coord) {
+            self.recency.remove(index);
+        }
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.metrics.evictions += 1;
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct GenJob {
@@ -430,10 +504,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut floating_origin_state = FloatingOriginState::new();
     let mut origin_voxel = floating_origin_state.origin_translation;
     let floating_origin_config = FloatingOriginConfig::default();
-    let mut cached_modified_chunks: std::collections::HashMap<
-        ChunkCoord,
-        crate::chunk_store::Chunk,
-    > = std::collections::HashMap::new();
+    let mut cached_modified_chunks = ModifiedChunkCache::new(MAX_CACHED_MODIFIED);
+    let mut cached_modified_last_metrics = ModifiedChunkCacheMetrics::default();
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
@@ -450,7 +522,7 @@ pub async fn run() -> anyhow::Result<()> {
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
-        &std::collections::HashMap::new(),
+        &HashMap::new(),
         0,
     );
     let mut stream_debug = String::new();
@@ -766,7 +838,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 {
                                     continue;
                                 }
-                                if chunk_generator.try_request(coord) {
+                                if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                    apply_generated_chunk(&mut store, coord, chunk);
+                                    streaming.mark_generated(coord, frame_counter);
+                                    forced_local_requests += 1;
+                                } else if chunk_generator.try_request(coord) {
                                     streaming.generating.insert(coord);
                                     forced_local_requests += 1;
                                 }
@@ -987,14 +1063,16 @@ pub async fn run() -> anyhow::Result<()> {
                                 dispatch_far.push(coord);
                             }
                         }
-
                         if !gen_dispatch_paused {
                             for coord in dispatch_urgent {
                                 if streaming.scheduled.insert(coord) {
                                     streaming.mark_canceled(coord);
                                     streaming.scheduled.insert(coord);
                                 }
-                                if chunk_generator.try_request(coord) {
+                                if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                    apply_generated_chunk(&mut store, coord, chunk);
+                                    streaming.mark_generated(coord, frame_counter);
+                                } else if chunk_generator.try_request(coord) {
                                     streaming.mark_dispatched(coord);
                                     gen_request_count += 1;
                                 }
@@ -1017,7 +1095,11 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut near_sent = 0usize;
                         while near_sent < near_budget {
                             let Some(coord) = streaming.next_generation_job() else { break; };
-                            if chunk_generator.try_request(coord) {
+                            if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                apply_generated_chunk(&mut store, coord, chunk);
+                                streaming.mark_generated(coord, frame_counter);
+                                near_sent += 1;
+                            } else if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 near_sent += 1;
@@ -1029,7 +1111,11 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
                         while far_budget > 0 {
                             let Some(coord) = streaming.next_generation_job() else { break; };
-                            if chunk_generator.try_request(coord) {
+                            if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                apply_generated_chunk(&mut store, coord, chunk);
+                                streaming.mark_generated(coord, frame_counter);
+                                far_budget -= 1;
+                            } else if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 far_budget -= 1;
@@ -1123,6 +1209,26 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let streaming_ms = streaming_t0.elapsed().as_secs_f32() * 1000.0;
                         let now_secs = start.elapsed().as_secs_f32();
+                        let cache_metrics = cached_modified_chunks.metrics();
+                        let cache_hit_delta = cache_metrics.hits.saturating_sub(cached_modified_last_metrics.hits);
+                        let cache_miss_delta = cache_metrics.misses.saturating_sub(cached_modified_last_metrics.misses);
+                        let cache_evict_delta = cache_metrics
+                            .evictions
+                            .saturating_sub(cached_modified_last_metrics.evictions);
+                        if cache_hit_delta > 0 || cache_miss_delta > 0 || cache_evict_delta > 0 {
+                            ui.log_once_per_second("modified_cache", now_secs, || {
+                                format!(
+                                    "modified_cache hit={} miss={} evict={} totals[h={}, m={}, e={}]",
+                                    cache_hit_delta,
+                                    cache_miss_delta,
+                                    cache_evict_delta,
+                                    cache_metrics.hits,
+                                    cache_metrics.misses,
+                                    cache_metrics.evictions,
+                                )
+                            });
+                            cached_modified_last_metrics = cache_metrics;
+                        }
                         if player_chunk_changed {
                             ui.log_once_per_second("chunk_change", now_secs, || format!(
                                 "chunk_change player=({}, {}, {}) desired={} newly_desired={} requested={} applied={} evicted={} pending_apply={} pending_evict={}",
