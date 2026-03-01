@@ -97,6 +97,7 @@ pub enum ChunkLod {
     Near,
     Mid,
     Far,
+    Ultra,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +105,7 @@ pub struct LodRadii {
     pub near: i32,
     pub mid: i32,
     pub far: i32,
+    pub ultra: i32,
     pub hysteresis: i32,
 }
 
@@ -112,6 +114,7 @@ impl LodRadii {
         self.near = self.near.max(0);
         self.mid = self.mid.max(self.near);
         self.far = self.far.max(self.mid);
+        self.ultra = self.ultra.max(self.far);
         self.hysteresis = self.hysteresis.max(0);
         self
     }
@@ -122,6 +125,7 @@ pub struct LodMeshingBudgets {
     pub near: usize,
     pub mid: usize,
     pub far: usize,
+    pub ultra: usize,
 }
 
 pub struct Renderer {
@@ -167,6 +171,7 @@ pub struct MeshRebuildStats {
     pub near_mesh_count: usize,
     pub mid_mesh_count: usize,
     pub far_mesh_count: usize,
+    pub ultra_mesh_count: usize,
 }
 
 #[derive(Clone)]
@@ -499,7 +504,12 @@ impl Renderer {
             if self.pending_dirty_set.insert(coord) {
                 self.pending_dirty.push_back(coord);
             }
-            for lod in [ChunkLod::Near, ChunkLod::Mid, ChunkLod::Far] {
+            for lod in [
+                ChunkLod::Near,
+                ChunkLod::Mid,
+                ChunkLod::Far,
+                ChunkLod::Ultra,
+            ] {
                 let version = self.mesh_versions.entry((coord, lod)).or_insert(0);
                 *version = version.saturating_add(1);
             }
@@ -509,6 +519,7 @@ impl Renderer {
         let mut near_jobs = Vec::new();
         let mut mid_jobs = Vec::new();
         let mut far_jobs = Vec::new();
+        let mut ultra_jobs = Vec::new();
         while let Some(coord) = self.pending_dirty.pop_front() {
             let t0 = Instant::now();
             let snapshot = build_chunk_snapshot(store, coord);
@@ -531,6 +542,7 @@ impl Renderer {
             push_job(ChunkLod::Near, &mut near_jobs);
             push_job(ChunkLod::Mid, &mut mid_jobs);
             push_job(ChunkLod::Far, &mut far_jobs);
+            push_job(ChunkLod::Ultra, &mut ultra_jobs);
             self.pending_dirty_set.remove(&coord);
         }
 
@@ -562,6 +574,7 @@ impl Renderer {
                                 ChunkLod::Near => stats.near_mesh_count += 1,
                                 ChunkLod::Mid => stats.mid_mesh_count += 1,
                                 ChunkLod::Far => stats.far_mesh_count += 1,
+                                ChunkLod::Ultra => stats.ultra_mesh_count += 1,
                             }
                         }
                         Err(TrySendError::Full(job)) => {
@@ -574,13 +587,20 @@ impl Renderer {
             };
 
         submit_from(&mut near_jobs, lod_budgets.near, &mut stats);
-        submit_from(&mut far_jobs, lod_budgets.far, &mut stats);
         submit_from(&mut mid_jobs, lod_budgets.mid, &mut stats);
+        submit_from(&mut far_jobs, lod_budgets.far, &mut stats);
+        submit_from(&mut ultra_jobs, lod_budgets.ultra, &mut stats);
         submit_from(&mut far_jobs, mesh_budget, &mut stats);
+        submit_from(&mut ultra_jobs, mesh_budget, &mut stats);
         submit_from(&mut near_jobs, mesh_budget, &mut stats);
         submit_from(&mut mid_jobs, mesh_budget, &mut stats);
 
-        for job in near_jobs.into_iter().chain(mid_jobs).chain(far_jobs) {
+        for job in near_jobs
+            .into_iter()
+            .chain(mid_jobs)
+            .chain(far_jobs)
+            .chain(ultra_jobs)
+        {
             if self.pending_dirty_set.insert(job.coord) {
                 self.pending_dirty.push_back(job.coord);
             }
@@ -684,7 +704,7 @@ impl Renderer {
 
         let mut drop_keys = Vec::new();
         for &(coord, _) in self.store_meshes.keys() {
-            if chunk_chebyshev_dist(player_chunk, coord) > lod_radii.far {
+            if chunk_chebyshev_dist(player_chunk, coord) > lod_radii.ultra {
                 drop_keys.push(coord);
             }
         }
@@ -692,6 +712,7 @@ impl Renderer {
             self.store_meshes.remove(&(coord, ChunkLod::Near));
             self.store_meshes.remove(&(coord, ChunkLod::Mid));
             self.store_meshes.remove(&(coord, ChunkLod::Far));
+            self.store_meshes.remove(&(coord, ChunkLod::Ultra));
             self.lod_selection.remove(&coord);
         }
 
@@ -762,6 +783,15 @@ impl Renderer {
             if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
             }
+            if !passes_screen_space_cull(
+                camera,
+                lod,
+                mesh.aabb_min,
+                mesh.aabb_max,
+                self.size.height,
+            ) {
+                continue;
+            }
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed_indirect(&mesh.indirect, 0);
@@ -784,30 +814,34 @@ fn build_chunk_snapshot(store: &ChunkStore, coord: ChunkCoord) -> ChunkSnapshot 
 }
 
 fn mesh_chunk_snapshot(
-    coord: ChunkCoord,
+    _coord: ChunkCoord,
     origin_voxel: VoxelCoord,
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+    let chunk_world_min = snapshot.world_min;
+    match lod {
+        ChunkLod::Near => mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 1),
+        ChunkLod::Mid => mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 2),
+        ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, origin_voxel, 4),
+        ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, origin_voxel, 8),
+    }
+}
+
+fn mesh_chunk_voxel_faces(
+    snapshot: &ChunkSnapshot,
+    chunk_world_min: VoxelCoord,
+    origin_voxel: VoxelCoord,
+    step: i32,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let chunk_world_min = chunk_to_world_min(coord);
     let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
 
-    let (step, top_only) = match lod {
-        ChunkLod::Near => (1, false),
-        ChunkLod::Mid => (2, false),
-        ChunkLod::Far => (4, true),
-    };
-
     let mut lz = 0;
     while lz < CHUNK_SIZE_VOXELS {
-        let mut ly = if top_only {
-            CHUNK_SIZE_VOXELS - step
-        } else {
-            0
-        };
+        let mut ly = 0;
         while ly < CHUNK_SIZE_VOXELS {
             let mut lx = 0;
             while lx < CHUNK_SIZE_VOXELS {
@@ -823,32 +857,18 @@ fn mesh_chunk_snapshot(
                 }
 
                 let color = material(id).color;
-                if top_only {
-                    add_snapshot_voxel_top(
-                        snapshot,
-                        lx,
-                        ly,
-                        lz,
-                        world_voxel,
-                        origin_voxel,
-                        color,
-                        &mut verts,
-                        &mut inds,
-                    );
-                } else {
-                    add_snapshot_voxel_faces(
-                        snapshot,
-                        lx,
-                        ly,
-                        lz,
-                        world_voxel,
-                        origin_voxel,
-                        id,
-                        color,
-                        &mut verts,
-                        &mut inds,
-                    );
-                }
+                add_snapshot_voxel_faces(
+                    snapshot,
+                    lx,
+                    ly,
+                    lz,
+                    world_voxel,
+                    origin_voxel,
+                    id,
+                    color,
+                    &mut verts,
+                    &mut inds,
+                );
 
                 lx += step;
             }
@@ -860,34 +880,266 @@ fn mesh_chunk_snapshot(
     (verts, inds, min, max)
 }
 
-fn add_snapshot_voxel_top(
+fn mesh_chunk_coarse_solid(
     snapshot: &ChunkSnapshot,
-    local_x: i32,
-    local_y: i32,
-    local_z: i32,
-    world_voxel: VoxelCoord,
+    chunk_world_min: VoxelCoord,
     origin_voxel: VoxelCoord,
+    step: i32,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+    let mut verts = Vec::new();
+    let mut inds = Vec::new();
+    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+    let side = CHUNK_SIZE_VOXELS;
+
+    let is_solid =
+        |x: i32, y: i32, z: i32| dominant_material_in_cell(snapshot, x, y, z, step).is_some();
+
+    let mut z = 0;
+    while z < side {
+        let mut y = 0;
+        while y < side {
+            let mut x = 0;
+            while x < side {
+                let Some(id) = dominant_material_in_cell(snapshot, x, y, z, step) else {
+                    x += step;
+                    continue;
+                };
+                let color = material(id).color;
+                let mut exposed = [false; 6];
+                let n = [
+                    (x + step, y, z),
+                    (x - step, y, z),
+                    (x, y + step, z),
+                    (x, y - step, z),
+                    (x, y, z + step),
+                    (x, y, z - step),
+                ];
+                for (i, &(nx, ny, nz)) in n.iter().enumerate() {
+                    exposed[i] = !is_solid(nx, ny, nz);
+                }
+                if exposed.iter().any(|e| *e) {
+                    add_box_faces(
+                        VoxelCoord {
+                            x: chunk_world_min.x + x,
+                            y: chunk_world_min.y + y,
+                            z: chunk_world_min.z + z,
+                        },
+                        origin_voxel,
+                        step as f32,
+                        step as f32,
+                        step as f32,
+                        color,
+                        &exposed,
+                        &mut verts,
+                        &mut inds,
+                    );
+                }
+                x += step;
+            }
+            y += step;
+        }
+        z += step;
+    }
+    (verts, inds, min, max)
+}
+
+fn mesh_chunk_heightfield_proxy(
+    snapshot: &ChunkSnapshot,
+    chunk_world_min: VoxelCoord,
+    origin_voxel: VoxelCoord,
+    tile: i32,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+    let mut verts = Vec::new();
+    let mut inds = Vec::new();
+    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+    let side = CHUNK_SIZE_VOXELS;
+    let tiles = (side / tile) as usize;
+    let mut heights = vec![None; tiles * tiles];
+
+    for tz in 0..tiles as i32 {
+        for tx in 0..tiles as i32 {
+            heights[(tz as usize) * tiles + tx as usize] =
+                tile_peak(snapshot, tx * tile, tz * tile, tile);
+        }
+    }
+
+    for tz in 0..tiles as i32 {
+        for tx in 0..tiles as i32 {
+            let Some((height, id)) = heights[(tz as usize) * tiles + tx as usize] else {
+                continue;
+            };
+            let color = material(id).color;
+            let top = height + 1;
+            let neighbors = [
+                tx + 1 < tiles as i32
+                    && heights[(tz as usize) * tiles + (tx + 1) as usize]
+                        .is_some_and(|(h, _)| h >= height),
+                tx > 0
+                    && heights[(tz as usize) * tiles + (tx - 1) as usize]
+                        .is_some_and(|(h, _)| h >= height),
+                false,
+                true,
+                tz + 1 < tiles as i32
+                    && heights[((tz + 1) as usize) * tiles + tx as usize]
+                        .is_some_and(|(h, _)| h >= height),
+                tz > 0
+                    && heights[((tz - 1) as usize) * tiles + tx as usize]
+                        .is_some_and(|(h, _)| h >= height),
+            ];
+            let exposed = [
+                !neighbors[0],
+                !neighbors[1],
+                true,
+                false,
+                !neighbors[4],
+                !neighbors[5],
+            ];
+            add_box_faces(
+                VoxelCoord {
+                    x: chunk_world_min.x + tx * tile,
+                    y: chunk_world_min.y,
+                    z: chunk_world_min.z + tz * tile,
+                },
+                origin_voxel,
+                tile as f32,
+                top as f32,
+                tile as f32,
+                color,
+                &exposed,
+                &mut verts,
+                &mut inds,
+            );
+        }
+    }
+    (verts, inds, min, max)
+}
+
+fn tile_peak(
+    snapshot: &ChunkSnapshot,
+    base_x: i32,
+    base_z: i32,
+    tile: i32,
+) -> Option<(i32, MaterialId)> {
+    for y in (0..CHUNK_SIZE_VOXELS).rev() {
+        for z in base_z..(base_z + tile).min(CHUNK_SIZE_VOXELS) {
+            for x in base_x..(base_x + tile).min(CHUNK_SIZE_VOXELS) {
+                let id = snapshot.get_local(x, y, z);
+                if id != EMPTY {
+                    return Some((y, id));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn dominant_material_in_cell(
+    snapshot: &ChunkSnapshot,
+    base_x: i32,
+    base_y: i32,
+    base_z: i32,
+    step: i32,
+) -> Option<MaterialId> {
+    if base_x < 0 || base_y < 0 || base_z < 0 {
+        return None;
+    }
+    let mut counts = HashMap::<MaterialId, u16>::new();
+    for z in base_z..(base_z + step).min(CHUNK_SIZE_VOXELS) {
+        for y in base_y..(base_y + step).min(CHUNK_SIZE_VOXELS) {
+            for x in base_x..(base_x + step).min(CHUNK_SIZE_VOXELS) {
+                let id = snapshot.get_local(x, y, z);
+                if id != EMPTY {
+                    *counts.entry(id).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(id, _)| id)
+}
+
+fn add_box_faces(
+    world_voxel_min: VoxelCoord,
+    origin_voxel: VoxelCoord,
+    sx: f32,
+    sy: f32,
+    sz: f32,
     color: [u8; 4],
+    exposed: &[bool; 6],
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
 ) {
-    if snapshot.get_local(local_x, local_y + 1, local_z) != EMPTY {
-        return;
-    }
-    let b = verts.len() as u32;
-    let shaded = shade_color(color, 0.9);
-    let quad = [[0., 1., 1.], [1., 1., 1.], [1., 1., 0.], [0., 1., 0.]];
-    for v in quad {
-        verts.push(Vertex {
-            pos: [
-                (world_voxel.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                (world_voxel.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                (world_voxel.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+    let dirs = [
+        (
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, sy, 0.0],
+                [1.0, sy, sz],
+                [1.0, 0.0, sz],
             ],
-            color: shaded,
-        });
+            0.88,
+        ),
+        (
+            [
+                [0.0, 0.0, sz],
+                [0.0, sy, sz],
+                [0.0, sy, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            0.73,
+        ),
+        (
+            [[0.0, sy, sz], [sx, sy, sz], [sx, sy, 0.0], [0.0, sy, 0.0]],
+            1.0,
+        ),
+        (
+            [
+                [0.0, 0.0, 0.0],
+                [sx, 0.0, 0.0],
+                [sx, 0.0, sz],
+                [0.0, 0.0, sz],
+            ],
+            0.58,
+        ),
+        (
+            [[sx, 0.0, sz], [sx, sy, sz], [0.0, sy, sz], [0.0, 0.0, sz]],
+            0.8,
+        ),
+        (
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, sy, 0.0],
+                [sx, sy, 0.0],
+                [sx, 0.0, 0.0],
+            ],
+            0.66,
+        ),
+    ];
+    let origin = [
+        (world_voxel_min.x - origin_voxel.x) as f32 * VOXEL_SIZE,
+        (world_voxel_min.y - origin_voxel.y) as f32 * VOXEL_SIZE,
+        (world_voxel_min.z - origin_voxel.z) as f32 * VOXEL_SIZE,
+    ];
+
+    for (i, (quad, shade)) in dirs.iter().enumerate() {
+        if !exposed[i] {
+            continue;
+        }
+        let b = verts.len() as u32;
+        let shaded = shade_color(color, *shade);
+        for v in quad {
+            verts.push(Vertex {
+                pos: [
+                    origin[0] + v[0] * VOXEL_SIZE,
+                    origin[1] + v[1] * VOXEL_SIZE,
+                    origin[2] + v[2] * VOXEL_SIZE,
+                ],
+                color: shaded,
+            });
+        }
+        inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
-    inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
 }
 
 fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
@@ -905,14 +1157,40 @@ fn select_lod(
 ) -> ChunkLod {
     let d = chunk_chebyshev_dist(coord, player_chunk);
     let h = radii.hysteresis;
-    match prev.unwrap_or(ChunkLod::Far) {
+    match prev.unwrap_or(ChunkLod::Ultra) {
         ChunkLod::Near if d <= radii.near + h => ChunkLod::Near,
         ChunkLod::Mid if d >= radii.near.saturating_sub(h) && d <= radii.mid + h => ChunkLod::Mid,
-        ChunkLod::Far if d >= radii.mid.saturating_sub(h) => ChunkLod::Far,
-        _ if d <= radii.near => ChunkLod::Near,
-        _ if d <= radii.mid => ChunkLod::Mid,
-        _ => ChunkLod::Far,
+        ChunkLod::Far if d >= radii.mid.saturating_sub(h) && d <= radii.far + h => ChunkLod::Far,
+        ChunkLod::Ultra if d >= radii.far.saturating_sub(h) => ChunkLod::Ultra,
+        _ if d <= radii.near.saturating_sub(h) => ChunkLod::Near,
+        _ if d <= radii.mid.saturating_sub(h) => ChunkLod::Mid,
+        _ if d <= radii.far.saturating_sub(h) => ChunkLod::Far,
+        _ => ChunkLod::Ultra,
     }
+}
+
+fn passes_screen_space_cull(
+    camera: &Camera,
+    lod: ChunkLod,
+    aabb_min: Vec3,
+    aabb_max: Vec3,
+    screen_h: u32,
+) -> bool {
+    let min_pixels = match lod {
+        ChunkLod::Near => 0.0,
+        ChunkLod::Mid => 0.5,
+        ChunkLod::Far => 1.0,
+        ChunkLod::Ultra => 2.0,
+    };
+    if min_pixels <= 0.0 {
+        return true;
+    }
+    let center = (aabb_min + aabb_max) * 0.5;
+    let radius = (aabb_max - center).length();
+    let distance = (center - camera.pos).length().max(0.01);
+    let focal = screen_h as f32 / (2.0 * (60f32.to_radians() * 0.5).tan());
+    let pixel_radius = (radius / distance) * focal;
+    pixel_radius * 2.0 >= min_pixels
 }
 
 fn add_snapshot_voxel_faces(
@@ -1097,5 +1375,39 @@ mod tests {
         let beyond_far_min = Vec3::new(-1.0, -1.0, -1300.0);
         let beyond_far_max = Vec3::new(1.0, 1.0, -1250.0);
         assert!(!aabb_in_view(vp, beyond_far_min, beyond_far_max));
+    }
+    #[test]
+    fn lod_selection_uses_ultra_tier_with_hysteresis() {
+        let radii = LodRadii {
+            near: 4,
+            mid: 8,
+            far: 12,
+            ultra: 20,
+            hysteresis: 2,
+        };
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+
+        let near = select_lod(
+            ChunkCoord { x: 3, y: 0, z: 0 },
+            player,
+            radii,
+            Some(ChunkLod::Near),
+        );
+        let far = select_lod(
+            ChunkCoord { x: 11, y: 0, z: 0 },
+            player,
+            radii,
+            Some(ChunkLod::Far),
+        );
+        let ultra = select_lod(
+            ChunkCoord { x: 21, y: 0, z: 0 },
+            player,
+            radii,
+            Some(ChunkLod::Ultra),
+        );
+
+        assert_eq!(near, ChunkLod::Near);
+        assert_eq!(far, ChunkLod::Far);
+        assert_eq!(ultra, ChunkLod::Ultra);
     }
 }
