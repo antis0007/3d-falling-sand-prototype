@@ -39,6 +39,11 @@ pub struct ProfilerStats {
     pub lod_budget_mid: usize,
     pub lod_budget_far: usize,
     pub lod_budget_ultra: usize,
+    pub auto_tune_active: bool,
+    pub auto_tune_level: f32,
+    pub auto_tune_latency_pressure: f32,
+    pub auto_tune_queue_pressure: f32,
+    pub auto_tune_dirty_pressure: f32,
     pub mesh_near_count: usize,
     pub mesh_mid_count: usize,
     pub mesh_far_count: usize,
@@ -430,6 +435,18 @@ pub fn draw(
                     ui_state.profiler.mesh_mid_count,
                     ui_state.profiler.mesh_far_count,
                     ui_state.profiler.mesh_ultra_count,
+                ));
+                ui.monospace(format!(
+                    "auto tune: {} | level {:.2} | pressure latency/queue/dirty: {:.2}/{:.2}/{:.2}",
+                    if ui_state.profiler.auto_tune_active {
+                        "active"
+                    } else {
+                        "idle"
+                    },
+                    ui_state.profiler.auto_tune_level,
+                    ui_state.profiler.auto_tune_latency_pressure,
+                    ui_state.profiler.auto_tune_queue_pressure,
+                    ui_state.profiler.auto_tune_dirty_pressure,
                 ));
                 ui.monospace(format!(
                     "mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
