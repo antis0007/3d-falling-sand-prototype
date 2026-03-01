@@ -347,7 +347,7 @@ pub fn draw(
     egui::TopBottomPanel::bottom("toolbar")
         .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 22)))
         .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui_state.drag_target_slot = None;
                 for &i in &HOTBAR_DISPLAY_ORDER {
                     let id = selected_material(ui_state, i);
@@ -376,7 +376,10 @@ pub fn draw(
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(&ui_state.biome_hint).strong());
                     ui.label("Biome under player");
-                    ui.label(&ui_state.stream_debug);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&ui_state.stream_debug).monospace())
+                            .truncate(true),
+                    );
                 });
             });
         });
