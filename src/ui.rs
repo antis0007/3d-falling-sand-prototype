@@ -52,6 +52,10 @@ pub struct ProfilerStats {
     pub sim_chunk_steps: usize,
     pub render_submit_ms: f32,
     pub egui_ms: f32,
+    pub missing_in_radius: usize,
+    pub culled_chunks: usize,
+    pub frustum_culled_chunks: usize,
+    pub gpu_upload_bytes_frame: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +121,9 @@ pub struct UiState {
     pub disable_preview_outlines: bool, // reduces CPU in egui overlay if needed
     pub preview_max_blocks: usize,      // clamps overlay work
     pub profiler: ProfilerStats,
+    pub renderer_frustum_culling: bool,
+    pub renderer_greedy_meshing: bool,
+    pub renderer_conservative_neighbors: bool,
 
     log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
@@ -225,6 +232,9 @@ impl Default for UiState {
             disable_preview_outlines: false,
             preview_max_blocks: 1024,
             profiler: ProfilerStats::default(),
+            renderer_frustum_culling: true,
+            renderer_greedy_meshing: true,
+            renderer_conservative_neighbors: false,
 
             log_last_seconds: HashMap::new(),
             drag_source: None,
@@ -466,6 +476,27 @@ pub fn draw(
                     "chunks_drawn: {} | total_indices: {}",
                     ui_state.chunks_drawn, ui_state.total_indices
                 ));
+                ui.monospace(format!(
+                    "missing in radius: {} | culled: {} (frustum {})",
+                    ui_state.profiler.missing_in_radius,
+                    ui_state.profiler.culled_chunks,
+                    ui_state.profiler.frustum_culled_chunks,
+                ));
+                ui.monospace(format!(
+                    "gpu upload bytes/frame: {}",
+                    ui_state.profiler.gpu_upload_bytes_frame,
+                ));
+                ui.separator();
+                ui.heading("Renderer Debug");
+                ui.checkbox(&mut ui_state.renderer_frustum_culling, "Frustum culling");
+                ui.checkbox(
+                    &mut ui_state.renderer_greedy_meshing,
+                    "Greedy meshing (near LOD)",
+                );
+                ui.checkbox(
+                    &mut ui_state.renderer_conservative_neighbors,
+                    "Unknown neighbors occlude (conservative)",
+                );
                 ui.monospace(format!(
                     "meshing last/max: {:.2}/{:.2}",
                     ui_state.mesh_ms_last, ui_state.mesh_ms_max
