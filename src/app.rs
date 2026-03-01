@@ -1015,7 +1015,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
                             stream_tuning.max_generate_drain_items,
-                            streaming.pending_generate_count() + generated_ready.len(),
+                            streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
                         let generate_drain_budget = gen_throttle_state
@@ -1084,10 +1084,9 @@ pub async fn run() -> anyhow::Result<()> {
                             };
                             ui.log_once_per_second("gen_starvation", now_secs, || {
                                 format!(
-                                    "gen starvation inflight={} pending_generate={} apply_queue={} recv_ms={:.3} reason={}",
+                                    "gen starvation inflight={} pending_generate={} recv_ms={:.3} reason={}",
                                     gen_inflight,
                                     streaming.pending_generate_count(),
-                                    generated_ready.len(),
                                     gen_recv_ms,
                                     starvation_reason
                                 )
@@ -1160,6 +1159,14 @@ pub async fn run() -> anyhow::Result<()> {
                         if generated_ready.len() >= apply_budget_items {
                             ui.log_once_per_second("apply_budget", now_secs, || {
                                 format!("apply budget hit: remaining queue={}", generated_ready.len())
+                            });
+                            ui.log_once_per_second("apply_pipeline_health", now_secs, || {
+                                format!(
+                                    "apply pipeline backlog queue={} apply_budget_items={} gen_pending={}",
+                                    generated_ready.len(),
+                                    apply_budget_items,
+                                    streaming.pending_generate_count()
+                                )
                             });
                         }
                         if streaming.pending_evict_count() > streaming.max_evict_schedule_per_update {
