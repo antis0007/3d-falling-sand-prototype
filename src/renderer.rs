@@ -18,6 +18,7 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
 pub const VOXEL_SIZE: f32 = 0.5;
+const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 
 #[derive(Clone, Copy)]
 pub enum UnknownNeighborOcclusionPolicy {
@@ -353,13 +354,22 @@ impl Renderer {
         let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter) {
             #[cfg(feature = "gpu-compute")]
             {
+                log::info!(
+                    "mesh backend selected: gpu-compute (adapter supports compute pipelines)"
+                );
                 MeshPipelineBackend::Gpu
             }
             #[cfg(not(feature = "gpu-compute"))]
             {
+                log::warn!(
+                    "mesh backend selected: cpu (adapter supports GPU compute but `gpu-compute` feature is disabled at compile time)"
+                );
                 MeshPipelineBackend::Cpu
             }
         } else {
+            log::warn!(
+                "mesh backend selected: cpu (adapter/runtime does not satisfy gpu-compute requirements)"
+            );
             MeshPipelineBackend::Cpu
         };
         let caps = surface.get_capabilities(&adapter);
@@ -514,13 +524,20 @@ impl Renderer {
                 *version = version.saturating_add(1);
             }
         }
+        self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
         let mut stats = MeshRebuildStats::default();
         let mut near_jobs = Vec::new();
         let mut mid_jobs = Vec::new();
         let mut far_jobs = Vec::new();
         let mut ultra_jobs = Vec::new();
-        while let Some(coord) = self.pending_dirty.pop_front() {
+        let chunk_snapshot_budget = mesh_budget.max(1);
+        let mut snapshot_coords = self.pop_priority_dirty_chunks(
+            chunk_snapshot_budget,
+            player_chunk,
+            chunk_priority_scores,
+        );
+        while let Some(coord) = snapshot_coords.pop() {
             let t0 = Instant::now();
             let snapshot = build_chunk_snapshot(store, coord);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -543,7 +560,6 @@ impl Renderer {
             push_job(ChunkLod::Mid, &mut mid_jobs);
             push_job(ChunkLod::Far, &mut far_jobs);
             push_job(ChunkLod::Ultra, &mut ultra_jobs);
-            self.pending_dirty_set.remove(&coord);
         }
 
         let job_priority = |coord: ChunkCoord| {
@@ -555,6 +571,18 @@ impl Renderer {
         far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+
+        let far_pressure = self.pending_dirty.len() + self.mesh_queue.inflight;
+        let far_scale = if far_pressure > 4096 {
+            4
+        } else if far_pressure > 1024 {
+            2
+        } else {
+            1
+        };
+        let far_budget = (lod_budgets.far / far_scale).max(usize::from(!far_jobs.is_empty()));
+        let ultra_budget = (lod_budgets.ultra / far_scale)
+            .max(usize::from(!ultra_jobs.is_empty() && far_scale == 1));
 
         let mut submitted = 0usize;
         let mut submit_from =
@@ -588,12 +616,16 @@ impl Renderer {
 
         submit_from(&mut near_jobs, lod_budgets.near, &mut stats);
         submit_from(&mut mid_jobs, lod_budgets.mid, &mut stats);
-        submit_from(&mut far_jobs, lod_budgets.far, &mut stats);
-        submit_from(&mut ultra_jobs, lod_budgets.ultra, &mut stats);
-        submit_from(&mut far_jobs, mesh_budget, &mut stats);
-        submit_from(&mut ultra_jobs, mesh_budget, &mut stats);
+        submit_from(&mut far_jobs, far_budget, &mut stats);
+        submit_from(&mut ultra_jobs, ultra_budget, &mut stats);
         submit_from(&mut near_jobs, mesh_budget, &mut stats);
         submit_from(&mut mid_jobs, mesh_budget, &mut stats);
+        submit_from(&mut far_jobs, mesh_budget / far_scale.max(1), &mut stats);
+        submit_from(
+            &mut ultra_jobs,
+            mesh_budget / (far_scale.saturating_mul(2)).max(1),
+            &mut stats,
+        );
 
         for job in near_jobs
             .into_iter()
@@ -605,6 +637,7 @@ impl Renderer {
                 self.pending_dirty.push_back(job.coord);
             }
         }
+        self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
         while let Ok(result) = self.mesh_queue.try_recv() {
             self.completed_meshes.push(result);
@@ -799,11 +832,74 @@ impl Renderer {
     }
 }
 
+impl Renderer {
+    fn pop_priority_dirty_chunks(
+        &mut self,
+        count: usize,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) -> Vec<ChunkCoord> {
+        let mut pooled = Vec::with_capacity(self.pending_dirty.len());
+        pooled.extend(self.pending_dirty.drain(..));
+        pooled.sort_by(|a, b| {
+            dirty_coord_priority(*a, player_chunk, chunk_priority_scores).total_cmp(
+                &dirty_coord_priority(*b, player_chunk, chunk_priority_scores),
+            )
+        });
+
+        let keep_count = pooled.len().saturating_sub(count.min(pooled.len()));
+        let snapshots = pooled.split_off(keep_count);
+        for coord in &snapshots {
+            self.pending_dirty_set.remove(&coord);
+        }
+        for coord in pooled {
+            self.pending_dirty.push_back(coord);
+        }
+        snapshots
+    }
+
+    fn enforce_dirty_queue_bound(
+        &mut self,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) {
+        if self.pending_dirty.len() <= MAX_PENDING_DIRTY_CHUNKS {
+            return;
+        }
+        let mut coords = Vec::with_capacity(self.pending_dirty.len());
+        coords.extend(self.pending_dirty.drain(..));
+        coords.sort_by(|a, b| {
+            dirty_coord_priority(*a, player_chunk, chunk_priority_scores).total_cmp(
+                &dirty_coord_priority(*b, player_chunk, chunk_priority_scores),
+            )
+        });
+
+        let keep_from = coords.len().saturating_sub(MAX_PENDING_DIRTY_CHUNKS);
+        for dropped in coords.iter().take(keep_from) {
+            self.pending_dirty_set.remove(dropped);
+        }
+        for coord in coords.into_iter().skip(keep_from) {
+            self.pending_dirty.push_back(coord);
+        }
+    }
+}
+
+fn dirty_coord_priority(
+    coord: ChunkCoord,
+    player_chunk: ChunkCoord,
+    chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+) -> f32 {
+    chunk_priority_scores
+        .get(&coord)
+        .copied()
+        .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
+}
+
 fn build_chunk_snapshot(store: &ChunkStore, coord: ChunkCoord) -> ChunkSnapshot {
     let chunk_world_min = chunk_to_world_min(coord);
     let center_voxels = store
         .get_chunk(coord)
-        .map(|chunk| Arc::<[MaterialId]>::from(chunk.iter_raw().to_vec()))
+        .map(|chunk| Arc::<[MaterialId]>::from(chunk.iter_raw()))
         .unwrap_or_else(|| Arc::from(vec![EMPTY; (CHUNK_SIZE_VOXELS.pow(3)) as usize]));
 
     ChunkSnapshot {
@@ -1375,6 +1471,46 @@ mod tests {
         let beyond_far_min = Vec3::new(-1.0, -1.0, -1300.0);
         let beyond_far_max = Vec3::new(1.0, 1.0, -1250.0);
         assert!(!aabb_in_view(vp, beyond_far_min, beyond_far_max));
+    }
+
+    #[test]
+    fn dirty_priority_prefers_near_chunks() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near = ChunkCoord { x: 1, y: 0, z: 0 };
+        let far = ChunkCoord { x: 40, y: 0, z: 0 };
+        let scores = HashMap::new();
+
+        assert!(
+            dirty_coord_priority(near, player, &scores)
+                > dirty_coord_priority(far, player, &scores)
+        );
+    }
+
+    #[test]
+    fn dirty_backlog_sort_perf_guard() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut backlog = Vec::with_capacity(20_000);
+        for i in 0..20_000 {
+            backlog.push(ChunkCoord {
+                x: i % 200,
+                y: (i / 200) % 10,
+                z: i / 2000,
+            });
+        }
+        let scores = HashMap::new();
+
+        let started = Instant::now();
+        backlog.sort_by(|a, b| {
+            dirty_coord_priority(*a, player, &scores)
+                .total_cmp(&dirty_coord_priority(*b, player, &scores))
+        });
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 750,
+            "backlog prioritization regressed: {:?}",
+            elapsed
+        );
     }
     #[test]
     fn lod_selection_uses_ultra_tier_with_hysteresis() {
