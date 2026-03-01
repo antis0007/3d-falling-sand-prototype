@@ -202,6 +202,8 @@ fn blend_i32(max: i32, min: i32, t: f32) -> i32 {
 fn blend_usize(max: usize, min: usize, t: f32) -> usize {
     let min = min.min(max);
     ((max as f32) - ((max - min) as f32 * t.clamp(0.0, 1.0))).round() as usize
+}
+
 fn adaptive_mesh_upload_budget(last_frame_ms: f32, queue_pressure: usize) -> usize {
     let frame_headroom =
         ((FRAME_TIME_TARGET_MS - last_frame_ms) / FRAME_TIME_TARGET_MS).clamp(-1.0, 1.0);
