@@ -782,26 +782,20 @@ pub async fn run() -> anyhow::Result<()> {
                                 origin_voxel,
                                 COLLISION_SAFETY_RADIUS_VOXELS,
                             );
-                            let mut forced_local_requests = 0usize;
+                            let mut queued_collision_priority = 0usize;
                             for coord in missing_coords
                                 .into_iter()
                                 .take(COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET)
                             {
-                                if streaming.resident.contains(&coord)
-                                    || streaming.generating.contains(&coord)
-                                {
-                                    continue;
-                                }
-                                if chunk_generator.try_request(coord) {
-                                    streaming.generating.insert(coord);
-                                    forced_local_requests += 1;
+                                if streaming.enqueue_collision_priority(coord) {
+                                    queued_collision_priority += 1;
                                 }
                             }
-                            if forced_local_requests > 0 {
+                            if queued_collision_priority > 0 {
                                 ui.log_once_per_second("collision_force_local", start.elapsed().as_secs_f32(), || {
                                     format!(
-                                        "collision_force_local requested={} player_chunk=({}, {}, {})",
-                                        forced_local_requests,
+                                        "collision_force_local queued_priority={} player_chunk=({}, {}, {})",
+                                        queued_collision_priority,
                                         player_chunk_for_collision.x,
                                         player_chunk_for_collision.y,
                                         player_chunk_for_collision.z,
@@ -975,42 +969,6 @@ pub async fn run() -> anyhow::Result<()> {
                         gen_throttle_state.update(prior_meshing_queue_depth, prior_dirty_backlog);
 
                         let mut gen_request_count = 0usize;
-                        let mut urgent_missing = 0usize;
-                        let urgent_vertical = 1;
-                        let urgent_radius = 1;
-                        let mut dispatch_urgent = Vec::new();
-                        let mut dispatch_near = Vec::new();
-                        let mut dispatch_far = Vec::new();
-
-                        for &coord in &generation_priority {
-                            if streaming.resident.contains(&coord)
-                                || streaming.generating.contains(&coord)
-                                || streaming.scheduled.contains(&coord)
-                            {
-                                continue;
-                            }
-                            if chebyshev_from_player(player_chunk, coord) <= urgent_radius
-                                && (coord.y - player_chunk.y).abs() <= urgent_vertical
-                            {
-                                urgent_missing += 1;
-                                dispatch_urgent.push(coord);
-                            } else if cached_desired.near.contains(&coord) {
-                                dispatch_near.push(coord);
-                            } else {
-                                dispatch_far.push(coord);
-                            }
-                        }
-
-                        for coord in dispatch_urgent {
-                            if streaming.scheduled.insert(coord) {
-                                streaming.mark_canceled(coord);
-                                streaming.scheduled.insert(coord);
-                            }
-                            if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
-                                gen_request_count += 1;
-                            }
-                        }
 
                         let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
@@ -1025,24 +983,26 @@ pub async fn run() -> anyhow::Result<()> {
                         let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
                         let mut near_sent = 0usize;
                         while near_sent < near_budget {
-                            let Some(coord) = streaming.next_generation_job() else { break; };
+                            let Some((coord, priority)) = streaming.next_generation_job_with_priority() else { break; };
                             if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 near_sent += 1;
                             } else {
+                                streaming.requeue_generation_job_front(coord, priority);
                                 break;
                             }
                         }
 
                         let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
                         while far_budget > 0 {
-                            let Some(coord) = streaming.next_generation_job() else { break; };
+                            let Some((coord, priority)) = streaming.next_generation_job_with_priority() else { break; };
                             if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 far_budget -= 1;
                             } else {
+                                streaming.requeue_generation_job_front(coord, priority);
                                 break;
                             }
                         }

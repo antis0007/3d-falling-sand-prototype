@@ -48,9 +48,11 @@ pub struct ChunkStreaming {
     pub scheduled: HashSet<ChunkCoord>,
     pub generating: HashSet<ChunkCoord>,
     pending_generate: VecDeque<ChunkCoord>,
+    collision_priority: VecDeque<ChunkCoord>,
     pending_evict: VecDeque<ChunkCoord>,
     evict_not_desired_since: HashMap<ChunkCoord, u64>,
     queued_evict_set: HashSet<ChunkCoord>,
+    collision_priority_set: HashSet<ChunkCoord>,
     chunk_lifecycle: HashMap<ChunkCoord, ChunkLifecycle>,
     pub max_generate_schedule_per_update: usize,
     pub max_evict_schedule_per_update: usize,
@@ -68,9 +70,11 @@ impl ChunkStreaming {
             scheduled: HashSet::new(),
             generating: HashSet::new(),
             pending_generate: VecDeque::new(),
+            collision_priority: VecDeque::new(),
             pending_evict: VecDeque::new(),
             evict_not_desired_since: HashMap::new(),
             queued_evict_set: HashSet::new(),
+            collision_priority_set: HashSet::new(),
             chunk_lifecycle: HashMap::new(),
             max_generate_schedule_per_update: 36,
             max_evict_schedule_per_update: 24,
@@ -327,11 +331,56 @@ impl ChunkStreaming {
     }
 
     pub fn next_generation_job(&mut self) -> Option<ChunkCoord> {
-        self.pending_generate.pop_front()
+        self.next_generation_job_with_priority()
+            .map(|(coord, _)| coord)
+    }
+
+    pub fn next_generation_job_with_priority(&mut self) -> Option<(ChunkCoord, bool)> {
+        if let Some(coord) = self.collision_priority.pop_front() {
+            self.collision_priority_set.remove(&coord);
+            return Some((coord, true));
+        }
+        self.pending_generate
+            .pop_front()
+            .map(|coord| (coord, false))
+    }
+
+    pub fn requeue_generation_job_front(&mut self, coord: ChunkCoord, priority: bool) {
+        if !self.scheduled.contains(&coord) {
+            return;
+        }
+        if priority {
+            if self.collision_priority_set.insert(coord) {
+                self.collision_priority.push_front(coord);
+            }
+            return;
+        }
+        self.pending_generate.push_front(coord);
+    }
+
+    pub fn enqueue_collision_priority(&mut self, coord: ChunkCoord) -> bool {
+        if self.resident.contains(&coord)
+            || self.generating.contains(&coord)
+            || self.scheduled.contains(&coord)
+        {
+            return false;
+        }
+        if !self.collision_priority_set.insert(coord) {
+            return false;
+        }
+        self.scheduled.insert(coord);
+        self.collision_priority.push_back(coord);
+        self.work_items.push(WorkItem::Generate(coord));
+        true
+    }
+
+    pub fn collision_priority_count(&self) -> usize {
+        self.collision_priority.len()
     }
 
     pub fn mark_dispatched(&mut self, coord: ChunkCoord) {
         if self.scheduled.remove(&coord) {
+            self.collision_priority_set.remove(&coord);
             self.generating.insert(coord);
         }
     }
@@ -397,9 +446,11 @@ impl ChunkStreaming {
         self.scheduled.clear();
         self.generating.clear();
         self.pending_generate.clear();
+        self.collision_priority.clear();
         self.pending_evict.clear();
         self.evict_not_desired_since.clear();
         self.queued_evict_set.clear();
+        self.collision_priority_set.clear();
         self.chunk_lifecycle.clear();
         self.work_items.clear();
     }
@@ -477,5 +528,46 @@ mod tests {
         assert_eq!(stats.queued_generate, 1);
         assert!(streaming.scheduled.contains(&far));
         assert_eq!(streaming.drain_generate_requests(8), vec![far]);
+    }
+
+    #[test]
+    fn collision_priority_jobs_dispatch_before_normal_jobs() {
+        let mut streaming = ChunkStreaming::new(1);
+        let normal = ChunkCoord { x: 4, y: 0, z: 0 };
+        let priority = ChunkCoord { x: 0, y: 0, z: 0 };
+
+        streaming.scheduled.insert(normal);
+        streaming.pending_generate.push_back(normal);
+        assert!(streaming.enqueue_collision_priority(priority));
+
+        assert_eq!(
+            streaming.next_generation_job_with_priority(),
+            Some((priority, true))
+        );
+        assert_eq!(
+            streaming.next_generation_job_with_priority(),
+            Some((normal, false))
+        );
+    }
+
+    #[test]
+    fn generation_jobs_can_be_requeued_when_dispatch_fails() {
+        let mut streaming = ChunkStreaming::new(1);
+        let coord = ChunkCoord { x: 2, y: 0, z: 0 };
+
+        streaming.scheduled.insert(coord);
+        streaming.requeue_generation_job_front(coord, false);
+
+        let (popped, was_priority) = streaming
+            .next_generation_job_with_priority()
+            .expect("queued job");
+        assert_eq!(popped, coord);
+        assert!(!was_priority);
+
+        streaming.requeue_generation_job_front(popped, was_priority);
+        assert_eq!(
+            streaming.next_generation_job_with_priority(),
+            Some((coord, false))
+        );
     }
 }
