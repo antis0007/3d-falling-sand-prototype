@@ -1,4 +1,5 @@
 use crate::chunk_store::ChunkStore;
+use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
 use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
@@ -29,7 +30,6 @@ const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
-const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
 const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
 const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
@@ -42,9 +42,9 @@ const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
 const DESIRED_NEAR_PER_FRAME_CAP: usize = 224;
-const DESIRED_MID_PER_FRAME_CAP: usize = 288;
-const DESIRED_FAR_PER_FRAME_CAP: usize = 384;
-const DESIRED_MAX_TOTAL_BUDGET: usize = 2200;
+const DESIRED_MID_PER_FRAME_CAP: usize = 320;
+const DESIRED_FAR_PER_FRAME_CAP: usize = 448;
+const DESIRED_MAX_TOTAL_BUDGET: usize = 2600;
 const DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV: i32 = 1;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
@@ -61,7 +61,7 @@ const AUTO_TUNE_RECOVER_PER_SEC: f32 = 0.6;
 const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
-const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
+const FREEZE_UNTIL_COLLISION_RESIDENT: bool = false;
 const COLLISION_FREEZE_MAX_DURATION: Duration = Duration::from_millis(1500);
 const COLLISION_FREEZE_BACKOFF_DURATION: Duration = Duration::from_millis(900);
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
@@ -448,6 +448,12 @@ pub async fn run() -> anyhow::Result<()> {
     let mut cursor_is_unlocked = false;
 
     let mut origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+    let floating_origin_config = FloatingOriginConfig::default();
+    let floating_origin_state = FloatingOriginState::new();
+    let mut cached_modified_chunks: std::collections::HashMap<
+        ChunkCoord,
+        crate::chunk_store::Chunk,
+    > = std::collections::HashMap::new();
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
@@ -739,20 +745,16 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         // Origin shifting to keep float precision stable
-                        let shift = origin_shift_for(ctrl.position);
-                        if shift != [0, 0, 0] {
-                            origin_voxel.x += shift[0];
-                            origin_voxel.y += shift[1];
-                            origin_voxel.z += shift[2];
-                            ctrl.position -=
-                                Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
+                        let shift =
+                            floating_origin_state.recenter_shift_for(ctrl.position, floating_origin_config);
+                        if shift != (VoxelCoord { x: 0, y: 0, z: 0 }) {
+                            origin_voxel.x += shift.x;
+                            origin_voxel.y += shift.y;
+                            origin_voxel.z += shift.z;
+                            ctrl.position -= Vec3::new(shift.x as f32, shift.y as f32, shift.z as f32);
 
-                            // Conservative: mark all loaded chunks dirty (so meshes rebase)
-                            let loaded: Vec<ChunkCoord> =
-                                store.iter_loaded_chunks().copied().collect();
-                            for coord in loaded {
-                                store.mark_dirty(coord);
-                            }
+                            // Avoid global remesh storms on recenter.
+                            renderer.clear_mesh_cache();
                         }
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
@@ -1047,6 +1049,10 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         if !gen_backpressure_state.paused_by_mesh_pressure {
                             for coord in streaming.drain_generate_requests(generate_drain_budget) {
+                                if let Some(chunk) = cached_modified_chunks.remove(&coord) {
+                                    generated_ready.push_back(GenResult { coord, chunk });
+                                    continue;
+                                }
                                 if chunk_generator.try_request(coord) {
                                     gen_request_count += 1;
                                 } else {
@@ -1130,7 +1136,11 @@ pub async fn run() -> anyhow::Result<()> {
                             let Some(coord) = one.pop() else {
                                 break;
                             };
-                            store.remove_chunk(coord);
+                            if let Some((chunk, was_modified)) = store.remove_chunk_with_data(coord) {
+                                if was_modified {
+                                    cached_modified_chunks.insert(coord, chunk);
+                                }
+                            }
                             streaming.mark_evicted(coord, frame_counter);
                             evict_count += 1;
                         }
@@ -1379,6 +1389,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_desired = DesiredChunks::default();
                                 cached_sim_region.clear();
                                 generated_ready.clear();
+                                cached_modified_chunks.clear();
                                 total_generated_chunks = 0;
                                 origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
@@ -1575,20 +1586,6 @@ pub async fn run() -> anyhow::Result<()> {
             _ => {}
         })
         .map_err(anyhow::Error::from)
-}
-
-fn origin_shift_for(pos: Vec3) -> [i32; 3] {
-    let mut shift = [0, 0, 0];
-    if pos.x.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[0] = pos.x.floor() as i32;
-    }
-    if pos.y.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[1] = pos.y.floor() as i32;
-    }
-    if pos.z.abs() > ORIGIN_SHIFT_THRESHOLD {
-        shift[2] = pos.z.floor() as i32;
-    }
-    shift
 }
 
 fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {

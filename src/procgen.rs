@@ -19,6 +19,15 @@ const LEAVES: MaterialId = 23;
 const BIOME_CLUSTER_MACROS: i32 = 3;
 const MACROCHUNK_SIZE: i32 = 64;
 const BIOME_COUNT: usize = 7;
+const DEFAULT_WORLD_MIN_Y: i32 = -256;
+const DEFAULT_WORLD_MAX_Y: i32 = 384;
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .unwrap_or(default)
+}
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -445,13 +454,18 @@ fn sample_landmark(
 impl ProcGenConfig {
     pub fn for_size(size: usize, seed: u64) -> Self {
         let sea_level = 18.min(size as i32 - 10).max(10);
+        let configured_min_y = env_i32("SAND_WORLD_MIN_Y", DEFAULT_WORLD_MIN_Y);
+        let configured_max_y = env_i32("SAND_WORLD_MAX_Y", DEFAULT_WORLD_MAX_Y);
+        let global_min_y = configured_min_y.min(configured_max_y - 1);
+        let global_max_y = configured_max_y.max(global_min_y + 1);
+
         Self {
             dims: [size, size, size],
             world_origin: [0, 0, 0],
             seed,
             sea_level,
-            global_min_y: -1024,
-            global_max_y: 1024,
+            global_min_y,
+            global_max_y,
             surface_band_center: 0,
             deep_cave_start: -64,
             sky_ceiling_start: 160,
