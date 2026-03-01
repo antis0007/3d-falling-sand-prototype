@@ -467,8 +467,8 @@ impl ChunkStreaming {
         out
     }
 
-    pub fn next_generation_job(&self) -> Option<ChunkCoord> {
-        self.pending_generate.front().copied()
+    pub fn next_generation_job(&mut self) -> Option<ChunkCoord> {
+        self.pending_generate.pop_front()
     }
 
     pub fn mark_dispatch_succeeded(&mut self, coord: ChunkCoord) {
