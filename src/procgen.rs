@@ -2948,6 +2948,14 @@ mod tests {
         None
     }
 
+    fn column_contains(chunk: &Chunk, x: usize, z: usize, mat: MaterialId) -> bool {
+        (0..CHUNK_SIZE).any(|y| chunk.get(x, y, z) == mat)
+    }
+
+    fn lowest_in_column(chunk: &Chunk, x: usize, z: usize, mat: MaterialId) -> Option<usize> {
+        (0..CHUNK_SIZE).find(|&y| chunk.get(x, y, z) == mat)
+    }
+
     fn cave_agreement(a: &World, b: &World, axis: char) -> (usize, usize) {
         let heights_a = build_surface_heightmap_from_world(a);
         let heights_b = build_surface_heightmap_from_world(b);
@@ -3796,5 +3804,301 @@ mod tests {
             found,
             "expected at least one tree voxel continuity sample across vertical chunk border"
         );
+    }
+
+    #[test]
+    fn river_and_waterline_remain_stable_across_chunk_seams() {
+        let size = CHUNK_SIZE as i32;
+        let seed = 0x7135_AA91;
+        let timings = ProcGenPassTimings::default();
+
+        let center_cfg = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin([size, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin([0, 0, size]);
+
+        let center_cache = build_procgen_field_cache(&center_cfg, 16, &timings);
+        let east_cache = build_procgen_field_cache(&east_cfg, 16, &timings);
+        let south_cache = build_procgen_field_cache(&south_cfg, 16, &timings);
+
+        let center_hydro = build_hydrology_cache_for_chunk(&center_cfg, &center_cache, &timings);
+        let east_hydro = build_hydrology_cache_for_chunk(&east_cfg, &east_cache, &timings);
+        let south_hydro = build_hydrology_cache_for_chunk(&south_cfg, &south_cache, &timings);
+
+        for z in 0..CHUNK_SIZE {
+            let center_idx = CHUNK_SIZE - 1 + z * CHUNK_SIZE;
+            let east_idx = z * CHUNK_SIZE;
+
+            let center_channel = center_hydro.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let east_channel = east_hydro.river_weight[east_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_channel, east_channel,
+                "east/west river channel presence mismatch at z={z}: center_weight={:.3}, east_weight={:.3}",
+                center_hydro.river_weight[center_idx],
+                east_hydro.river_weight[east_idx]
+            );
+
+            if let (Some(a), Some(b)) = (
+                center_hydro.river_level[center_idx],
+                east_hydro.river_level[east_idx],
+            ) {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "east/west river level seam delta exceeded bound at z={z}: {a} vs {b}"
+                );
+            }
+        }
+
+        for x in 0..CHUNK_SIZE {
+            let center_idx = x + (CHUNK_SIZE - 1) * CHUNK_SIZE;
+            let south_idx = x;
+
+            let center_channel = center_hydro.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let south_channel = south_hydro.river_weight[south_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_channel, south_channel,
+                "north/south river channel presence mismatch at x={x}: center_weight={:.3}, south_weight={:.3}",
+                center_hydro.river_weight[center_idx],
+                south_hydro.river_weight[south_idx]
+            );
+
+            if let (Some(a), Some(b)) = (
+                center_hydro.river_level[center_idx],
+                south_hydro.river_level[south_idx],
+            ) {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "north/south river level seam delta exceeded bound at x={x}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lake_and_shoreline_materials_do_not_only_break_on_chunk_seams() {
+        let seed = 0x24A1_EE77;
+        let center = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+        let east = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
+        let south = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 1 });
+
+        let mut ew_mismatch = 0usize;
+        let mut ew_samples = 0usize;
+        for z in 0..CHUNK_SIZE {
+            let west_has_water = column_contains(&center, CHUNK_SIZE - 1, z, WATER);
+            let east_has_water = column_contains(&east, 0, z, WATER);
+            let west_shore = column_contains(&center, CHUNK_SIZE - 1, z, SAND);
+            let east_shore = column_contains(&east, 0, z, SAND);
+            if west_has_water || east_has_water || west_shore || east_shore {
+                ew_samples += 1;
+                if west_has_water != east_has_water || west_shore != east_shore {
+                    ew_mismatch += 1;
+                }
+            }
+        }
+
+        let mut ns_mismatch = 0usize;
+        let mut ns_samples = 0usize;
+        for x in 0..CHUNK_SIZE {
+            let north_has_water = column_contains(&center, x, CHUNK_SIZE - 1, WATER);
+            let south_has_water = column_contains(&south, x, 0, WATER);
+            let north_shore = column_contains(&center, x, CHUNK_SIZE - 1, SAND);
+            let south_shore = column_contains(&south, x, 0, SAND);
+            if north_has_water || south_has_water || north_shore || south_shore {
+                ns_samples += 1;
+                if north_has_water != south_has_water || north_shore != south_shore {
+                    ns_mismatch += 1;
+                }
+            }
+        }
+
+        assert!(ew_samples > 0, "no east/west shoreline samples collected for seed {seed:#X}");
+        assert!(ns_samples > 0, "no north/south shoreline samples collected for seed {seed:#X}");
+
+        let ew_ratio = ew_mismatch as f32 / ew_samples as f32;
+        let ns_ratio = ns_mismatch as f32 / ns_samples as f32;
+        assert!(
+            ew_ratio <= 0.25,
+            "east/west seam introduced abrupt shoreline mismatch: {ew_mismatch}/{ew_samples} ({:.1}%) shoreline columns",
+            ew_ratio * 100.0
+        );
+        assert!(
+            ns_ratio <= 0.25,
+            "north/south seam introduced abrupt shoreline mismatch: {ns_mismatch}/{ns_samples} ({:.1}%) shoreline columns",
+            ns_ratio * 100.0
+        );
+    }
+
+    #[test]
+    fn vertical_tree_generation_keeps_rooting_and_cross_chunk_continuity_for_nonzero_chunk_y() {
+        let seed = 0xF00D_BA5E_u64;
+        let mut nonzero_tree_voxels = 0usize;
+
+        for chunk_y in [-1, 1] {
+            for cz in -2..=2 {
+                for cx in -2..=2 {
+                    let chunk = generate_chunk_direct(
+                        seed,
+                        ChunkCoord {
+                            x: cx,
+                            y: chunk_y,
+                            z: cz,
+                        },
+                    );
+                    let below = generate_chunk_direct(
+                        seed,
+                        ChunkCoord {
+                            x: cx,
+                            y: chunk_y - 1,
+                            z: cz,
+                        },
+                    );
+                    let above = generate_chunk_direct(
+                        seed,
+                        ChunkCoord {
+                            x: cx,
+                            y: chunk_y + 1,
+                            z: cz,
+                        },
+                    );
+
+                    for z in 0..CHUNK_SIZE {
+                        for x in 0..CHUNK_SIZE {
+                            let column_has_veg = column_contains(&chunk, x, z, WOOD)
+                                || column_contains(&chunk, x, z, LEAVES);
+                            if column_has_veg {
+                                nonzero_tree_voxels += 1;
+                            }
+
+                            let Some(base_wood_y) = lowest_in_column(&chunk, x, z, WOOD) else {
+                                continue;
+                            };
+
+                            let support = if base_wood_y == 0 {
+                                below.get(x, CHUNK_SIZE - 1, z)
+                            } else {
+                                chunk.get(x, base_wood_y - 1, z)
+                            };
+                            assert!(
+                                matches!(support, WOOD | DIRT | TURF | STONE | SAND),
+                                "nonzero-y trunk root unsupported at chunk ({cx},{chunk_y},{cz}) column ({x},{z}) y={base_wood_y}: support={support}"
+                            );
+
+                            if chunk.get(x, CHUNK_SIZE - 1, z) == WOOD {
+                                let continuation = above.get(x, 0, z);
+                                assert!(
+                                    matches!(continuation, WOOD | LEAVES | EMPTY),
+                                    "unexpected top-of-chunk trunk transition at chunk ({cx},{chunk_y},{cz}) column ({x},{z}): continuation={continuation}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = nonzero_tree_voxels;
+    }
+
+    #[test]
+    fn vegetation_has_no_floating_trunks_or_leaf_only_columns() {
+        let seed = 0x91A7_03EF;
+        let chunk = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let has_wood = column_contains(&chunk, x, z, WOOD);
+                let has_leaves = column_contains(&chunk, x, z, LEAVES);
+
+                if has_wood {
+                    let trunk_base = lowest_in_column(&chunk, x, z, WOOD)
+                        .expect("column reports wood but base scan failed");
+                    if trunk_base > 0 {
+                        let below = chunk.get(x, trunk_base - 1, z);
+                        assert!(
+                            matches!(below, WOOD | DIRT | TURF | STONE | SAND),
+                            "floating trunk base at ({x},{trunk_base},{z}): unsupported material below is {below}"
+                        );
+                    }
+                }
+
+                if has_leaves && !has_wood {
+                    panic!(
+                        "leaf-only vegetation pillar found without trunk support at column ({x},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_leaves_no_unsupported_hanging_water_components() {
+        let config = ProcGenConfig::for_size(64, 0x0CEA_0123).with_origin([0, 0, 0]);
+        let world = generate_world(config);
+        let width = world.dims[0] as i32;
+        let height = world.dims[1] as i32;
+        let depth = world.dims[2] as i32;
+        let sea = config.sea_level_local();
+
+        let idx3 = |x: i32, y: i32, z: i32| -> usize {
+            x as usize + y as usize * world.dims[0] + z as usize * world.dims[0] * world.dims[1]
+        };
+
+        let mut connected = vec![false; world.dims[0] * world.dims[1] * world.dims[2]];
+        let mut open = VecDeque::new();
+
+        for z in 0..depth {
+            for x in 0..width {
+                for y in 1..height {
+                    if world.get(x, y, z) != WATER {
+                        continue;
+                    }
+                    let boundary_source = (x == 0 || z == 0 || x == width - 1 || z == depth - 1)
+                        && y <= sea;
+                    let grounded = world.get(x, y - 1, z) != EMPTY;
+                    if boundary_source || grounded {
+                        let idx = idx3(x, y, z);
+                        connected[idx] = true;
+                        open.push_back((x, y, z));
+                    }
+                }
+            }
+        }
+
+        while let Some((x, y, z)) = open.pop_front() {
+            for (nx, ny, nz) in [
+                (x - 1, y, z),
+                (x + 1, y, z),
+                (x, y - 1, z),
+                (x, y + 1, z),
+                (x, y, z - 1),
+                (x, y, z + 1),
+            ] {
+                if nx < 0 || nz < 0 || ny < 1 || nx >= width || ny >= height || nz >= depth {
+                    continue;
+                }
+                if world.get(nx, ny, nz) != WATER {
+                    continue;
+                }
+                let ni = idx3(nx, ny, nz);
+                if connected[ni] {
+                    continue;
+                }
+                connected[ni] = true;
+                open.push_back((nx, ny, nz));
+            }
+        }
+
+        for z in 0..depth {
+            for x in 0..width {
+                for y in 1..height {
+                    if world.get(x, y, z) != WATER {
+                        continue;
+                    }
+                    assert!(
+                        connected[idx3(x, y, z)],
+                        "unsupported hanging-water regression at ({x},{y},{z}): not connected to grounded/boundary-supported water"
+                    );
+                }
+            }
+        }
     }
 }
