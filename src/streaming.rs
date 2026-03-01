@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use glam::Vec3;
+
 use crate::types::ChunkCoord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +30,15 @@ pub struct DesiredChunks {
     pub mid: Vec<ChunkCoord>,
     pub far: Vec<ChunkCoord>,
     pub generation_order: Vec<ChunkCoord>,
+    pub generation_scores: HashMap<ChunkCoord, f32>,
     pub resident_keep: HashSet<ChunkCoord>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChunkLifecycle {
+    last_visible_frame: u64,
+    last_generated_frame: u64,
+    last_evicted_frame: u64,
 }
 
 #[derive(Debug)]
@@ -40,9 +50,12 @@ pub struct ChunkStreaming {
     pending_evict: VecDeque<ChunkCoord>,
     evict_not_desired_since: HashMap<ChunkCoord, u64>,
     queued_evict_set: HashSet<ChunkCoord>,
+    chunk_lifecycle: HashMap<ChunkCoord, ChunkLifecycle>,
     pub max_generate_schedule_per_update: usize,
     pub max_evict_schedule_per_update: usize,
     pub eviction_linger_frames: u64,
+    pub boundary_eviction_linger_frames: u64,
+    pub regen_cooldown_frames: u64,
     work_items: Vec<WorkItem>,
 }
 
@@ -56,9 +69,12 @@ impl ChunkStreaming {
             pending_evict: VecDeque::new(),
             evict_not_desired_since: HashMap::new(),
             queued_evict_set: HashSet::new(),
+            chunk_lifecycle: HashMap::new(),
             max_generate_schedule_per_update: 24,
             max_evict_schedule_per_update: 24,
             eviction_linger_frames: 24,
+            boundary_eviction_linger_frames: 96,
+            regen_cooldown_frames: 24,
             work_items: Vec::new(),
         }
     }
@@ -80,12 +96,17 @@ impl ChunkStreaming {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn desired_set(
         player_chunk: ChunkCoord,
+        player_velocity: Vec3,
+        view_dir: Vec3,
         near_radius_xz: i32,
         mid_radius_xz: i32,
         far_radius_xz: Option<i32>,
         vertical_radius: i32,
+        last_visible_frame: &HashMap<ChunkCoord, u64>,
+        frame_index: u64,
     ) -> DesiredChunks {
         let near_radius = near_radius_xz.max(0);
         let mid_radius = mid_radius_xz.max(near_radius);
@@ -96,10 +117,72 @@ impl ChunkStreaming {
         let mid = Self::ring_sorted_region(player_chunk, mid_radius, ry, near_radius + 1);
         let far = Self::ring_sorted_region(player_chunk, far_radius, ry, mid_radius + 1);
 
-        let mut generation_order = Vec::with_capacity(near.len() + mid.len() + far.len());
-        generation_order.extend(near.iter().copied());
-        generation_order.extend(mid.iter().copied());
-        generation_order.extend(far.iter().copied());
+        let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len());
+        let view_dir = view_dir.normalize_or_zero();
+        let velocity_dir = player_velocity.normalize_or_zero();
+        for coord in near
+            .iter()
+            .copied()
+            .chain(mid.iter().copied())
+            .chain(far.iter().copied())
+        {
+            let dx = i64::from(coord.x - player_chunk.x);
+            let dy = i64::from(coord.y - player_chunk.y);
+            let dz = i64::from(coord.z - player_chunk.z);
+            let distance2 = dx * dx + dy * dy + dz * dz;
+            let to_chunk = Vec3::new(dx as f32, dy as f32, dz as f32).normalize_or_zero();
+            let view_alignment = view_dir.dot(to_chunk).max(0.0);
+            let velocity_alignment = velocity_dir.dot(to_chunk).max(0.0);
+            let recent_age = last_visible_frame
+                .get(&coord)
+                .map(|last| frame_index.saturating_sub(*last))
+                .unwrap_or(u64::MAX);
+            let recent_visibility = if recent_age == u64::MAX {
+                0.0
+            } else {
+                (1.0 - (recent_age as f32 / 120.0)).clamp(0.0, 1.0)
+            };
+            let cheb = (coord.x - player_chunk.x)
+                .abs()
+                .max((coord.y - player_chunk.y).abs())
+                .max((coord.z - player_chunk.z).abs());
+            let lod_need = if cheb <= near_radius {
+                1.0
+            } else if cheb <= mid_radius {
+                0.65
+            } else {
+                0.35
+            };
+            let score = (1.0 / (1.0 + distance2 as f32)) * 0.55
+                + (view_alignment * 0.75 + velocity_alignment * 0.25) * 0.25
+                + recent_visibility * 0.12
+                + lod_need * 0.08;
+            weighted.push((
+                coord,
+                score,
+                distance2,
+                view_alignment,
+                recent_visibility,
+                lod_need,
+            ));
+        }
+        weighted.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| b.3.total_cmp(&a.3))
+                .then_with(|| b.4.total_cmp(&a.4))
+                .then_with(|| b.5.total_cmp(&a.5))
+                .then_with(|| a.0.x.cmp(&b.0.x))
+                .then_with(|| a.0.y.cmp(&b.0.y))
+                .then_with(|| a.0.z.cmp(&b.0.z))
+        });
+
+        let mut generation_order = Vec::with_capacity(weighted.len());
+        let mut generation_scores = HashMap::with_capacity(weighted.len());
+        for (coord, score, ..) in weighted {
+            generation_order.push(coord);
+            generation_scores.insert(coord, score);
+        }
 
         let mut resident_keep = HashSet::with_capacity(near.len() + mid.len() + far.len());
         resident_keep.extend(near.iter().copied());
@@ -111,6 +194,7 @@ impl ChunkStreaming {
             mid,
             far,
             generation_order,
+            generation_scores,
             resident_keep,
         }
     }
@@ -161,7 +245,13 @@ impl ChunkStreaming {
             .iter()
             .take(self.max_generate_schedule_per_update)
         {
+            let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
+            lifecycle.last_visible_frame = frame_index;
             if self.resident.contains(&coord) || self.generating.contains(&coord) {
+                continue;
+            }
+            if frame_index.saturating_sub(lifecycle.last_evicted_frame) < self.regen_cooldown_frames
+            {
                 continue;
             }
             self.generating.insert(coord);
@@ -192,7 +282,16 @@ impl ChunkStreaming {
                 .evict_not_desired_since
                 .entry(coord)
                 .or_insert(frame_index);
-            if frame_index.saturating_sub(*since) < self.eviction_linger_frames {
+            let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
+            let linger = if frame_index.saturating_sub(lifecycle.last_visible_frame)
+                < self.boundary_eviction_linger_frames
+            {
+                self.boundary_eviction_linger_frames
+                    .max(self.eviction_linger_frames)
+            } else {
+                self.eviction_linger_frames
+            };
+            if frame_index.saturating_sub(*since) < linger {
                 continue;
             }
             if self.queued_evict_set.insert(coord) {
@@ -236,20 +335,28 @@ impl ChunkStreaming {
         self.pending_evict.len()
     }
 
-    pub fn mark_generated(&mut self, coord: ChunkCoord) {
+    pub fn mark_generated(&mut self, coord: ChunkCoord, frame_index: u64) {
         self.generating.remove(&coord);
         self.resident.insert(coord);
+        self.chunk_lifecycle
+            .entry(coord)
+            .or_default()
+            .last_generated_frame = frame_index;
     }
 
     pub fn mark_generation_dropped(&mut self, coord: ChunkCoord) {
         self.generating.remove(&coord);
     }
 
-    pub fn mark_evicted(&mut self, coord: ChunkCoord) {
+    pub fn mark_evicted(&mut self, coord: ChunkCoord, frame_index: u64) {
         self.generating.remove(&coord);
         self.resident.remove(&coord);
         self.evict_not_desired_since.remove(&coord);
         self.queued_evict_set.remove(&coord);
+        self.chunk_lifecycle
+            .entry(coord)
+            .or_default()
+            .last_evicted_frame = frame_index;
     }
 
     pub fn drain_work_items(&mut self) -> Vec<WorkItem> {
@@ -263,12 +370,26 @@ impl ChunkStreaming {
         self.pending_evict.clear();
         self.evict_not_desired_since.clear();
         self.queued_evict_set.clear();
+        self.chunk_lifecycle.clear();
         self.work_items.clear();
     }
 
     pub fn reset_with_seed(&mut self, seed: u64) {
         self.seed = seed;
         self.clear();
+    }
+
+    pub fn last_visible_frames(&self) -> HashMap<ChunkCoord, u64> {
+        self.chunk_lifecycle
+            .iter()
+            .filter_map(|(coord, life)| {
+                if life.last_visible_frame > 0 {
+                    Some((*coord, life.last_visible_frame))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 

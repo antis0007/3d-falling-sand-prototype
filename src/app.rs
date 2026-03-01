@@ -35,6 +35,8 @@ const GENERATOR_THREADS: usize = 3;
 const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
+const MESH_BACKPRESSURE_START: usize = 80;
+const MESH_BACKPRESSURE_HIGH: usize = 180;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
@@ -231,16 +233,22 @@ pub async fn run() -> anyhow::Result<()> {
         chunk_cube(ChunkCoord { x: 0, y: 0, z: 0 }, SIMULATION_RADIUS_CHUNKS);
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
         ChunkCoord { x: 0, y: 0, z: 0 },
+        Vec3::ZERO,
+        Vec3::Z,
         stream_tuning.near_radius_xz,
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
+        &std::collections::HashMap::new(),
+        0,
     );
     let mut stream_debug = String::new();
     let mut frame_counter: u64 = 0;
     let mut total_generated_chunks: u64 = 0;
     let mut collision_freeze_active = false;
     let mut collision_used_unloaded_chunks = false;
+    let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
+    let mut prior_mesh_backlog = 0usize;
 
     let _ = set_cursor(window, false);
 
@@ -521,18 +529,32 @@ pub async fn run() -> anyhow::Result<()> {
                         let desired_t0 = Instant::now();
                         let player_chunk_changed = last_player_chunk != Some(player_chunk);
                         let stream_tuning_changed = cached_stream_tuning != stream_tuning;
+                        let player_velocity_chunks = {
+                            let dv = Vec3::new(
+                                (player_world_voxel.x - last_player_world_voxel.x) as f32,
+                                (player_world_voxel.y - last_player_world_voxel.y) as f32,
+                                (player_world_voxel.z - last_player_world_voxel.z) as f32,
+                            );
+                            dv / crate::types::CHUNK_SIZE_VOXELS as f32
+                        };
+                        let visible_history = streaming.last_visible_frames();
                         if player_chunk_changed || stream_tuning_changed {
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
+                                player_velocity_chunks,
+                                ctrl.look_dir(),
                                 stream_tuning.near_radius_xz,
                                 stream_tuning.mid_radius_xz,
                                 Some(stream_tuning.far_radius_xz),
                                 stream_tuning.vertical_radius,
+                                &visible_history,
+                                frame_counter,
                             );
                             cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = stream_tuning.clone();
                         }
+                        last_player_world_voxel = player_world_voxel;
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
                         let streaming_t0 = Instant::now();
@@ -542,7 +564,28 @@ pub async fn run() -> anyhow::Result<()> {
                             streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        let stream_stats = streaming.update(&cached_desired.generation_order, &cached_desired.resident_keep, player_chunk, frame_counter);
+                        let backpressure = if prior_mesh_backlog <= MESH_BACKPRESSURE_START {
+                            0.0
+                        } else {
+                            ((prior_mesh_backlog - MESH_BACKPRESSURE_START) as f32
+                                / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+                                .clamp(0.0, 1.0)
+                        };
+                        let mut generation_priority = cached_desired.generation_order.clone();
+                        if backpressure > 0.0 {
+                            let far_radius_cutoff = (stream_tuning.mid_radius_xz as f32
+                                + (stream_tuning.far_radius_xz - stream_tuning.mid_radius_xz) as f32
+                                    * (1.0 - backpressure))
+                                .round() as i32;
+                            generation_priority.retain(|coord| {
+                                let cheb = (coord.x - player_chunk.x)
+                                    .abs()
+                                    .max((coord.y - player_chunk.y).abs())
+                                    .max((coord.z - player_chunk.z).abs());
+                                cheb <= far_radius_cutoff
+                            });
+                        }
+                        let stream_stats = streaming.update(&generation_priority, &cached_desired.resident_keep, player_chunk, frame_counter);
                         let mut gen_request_count = 0usize;
                         let generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
@@ -586,7 +629,7 @@ pub async fn run() -> anyhow::Result<()> {
                         {
                             let Some(done) = generated_ready.pop_front() else { break; };
                             apply_generated_chunk(&mut store, done.coord, done.chunk);
-                            streaming.mark_generated(done.coord);
+                            streaming.mark_generated(done.coord, frame_counter);
                             apply_count += 1;
                         }
                         let apply_ms = apply_t0.elapsed().as_secs_f32() * 1000.0;
@@ -601,7 +644,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 break;
                             };
                             store.remove_chunk(coord);
-                            streaming.mark_evicted(coord);
+                            streaming.mark_evicted(coord, frame_counter);
                             evict_count += 1;
                         }
                         let evict_ms = evict_t0.elapsed().as_secs_f32() * 1000.0;
@@ -719,6 +762,7 @@ pub async fn run() -> anyhow::Result<()> {
                             &mut store,
                             origin_voxel,
                             player_chunk,
+                            &cached_desired.generation_scores,
                             REMESH_JOB_BUDGET_PER_FRAME,
                             MESH_UPLOAD_BYTES_PER_FRAME,
                             LodRadii {
@@ -763,6 +807,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_near_count = mesh_stats.near_mesh_count;
                         ui.profiler.mesh_mid_count = mesh_stats.mid_mesh_count;
                         ui.profiler.mesh_far_count = mesh_stats.far_mesh_count;
+                        prior_mesh_backlog = mesh_stats.meshing_queue_depth + mesh_stats.meshing_completed_depth;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
 

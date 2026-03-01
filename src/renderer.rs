@@ -488,6 +488,7 @@ impl Renderer {
         store: &mut ChunkStore,
         origin_voxel: VoxelCoord,
         player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
         mesh_budget: usize,
         upload_byte_budget: usize,
         lod_radii: LodRadii,
@@ -533,10 +534,15 @@ impl Renderer {
             self.pending_dirty_set.remove(&coord);
         }
 
-        far_jobs
-            .sort_by_key(|job| std::cmp::Reverse(chunk_chebyshev_dist(player_chunk, job.coord)));
-        near_jobs.sort_by_key(|job| chunk_chebyshev_dist(player_chunk, job.coord));
-        mid_jobs.sort_by_key(|job| chunk_chebyshev_dist(player_chunk, job.coord));
+        let job_priority = |coord: ChunkCoord| {
+            chunk_priority_scores
+                .get(&coord)
+                .copied()
+                .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
+        };
+        far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+        near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+        mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
 
         let mut submitted = 0usize;
         let mut submit_from =
@@ -584,11 +590,14 @@ impl Renderer {
             self.completed_meshes.push(result);
         }
 
-        self.completed_meshes.sort_by_key(|result| {
-            let dx = i64::from(result.coord.x - player_chunk.x).abs();
-            let dy = i64::from(result.coord.y - player_chunk.y).abs();
-            let dz = i64::from(result.coord.z - player_chunk.z).abs();
-            dx + dy + dz
+        self.completed_meshes.sort_by(|a, b| {
+            job_priority(a.coord)
+                .total_cmp(&job_priority(b.coord))
+                .then_with(|| {
+                    let ad = chunk_chebyshev_dist(player_chunk, a.coord);
+                    let bd = chunk_chebyshev_dist(player_chunk, b.coord);
+                    bd.cmp(&ad)
+                })
         });
 
         let mut bytes_uploaded = 0usize;
