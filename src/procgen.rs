@@ -319,23 +319,6 @@ struct HydrologyData {
     ocean_weight: Vec<f32>,
     lake_level: Vec<Option<i32>>,
     river_level: Vec<Option<i32>>,
-    seam_hints: HashMap<SeamDirection, Vec<SeamHydrologyHint>>,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum SeamDirection {
-    North,
-    South,
-    West,
-    East,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SeamHydrologyHint {
-    flow_outlet: bool,
-    channel_level: Option<i32>,
-    river_width_hint: f32,
-    river_depth_hint: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -689,8 +672,8 @@ fn build_hydrology_cache_for_chunk(
     let width = config.dims[0];
     let depth = config.dims[2];
     let len = width * depth;
-    let pad_x = 1;
-    let pad_z = 1;
+    let pad_x = (width as i32).max(16);
+    let pad_z = (depth as i32).max(16);
     build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
 }
 
@@ -783,24 +766,6 @@ fn build_hydrology_cache_impl(
             flow_accum[down] += flow_accum[idx];
         }
     }
-
-    let mut seam_hints: HashMap<SeamDirection, Vec<SeamHydrologyHint>> = HashMap::new();
-    seam_hints.insert(
-        SeamDirection::North,
-        vec![SeamHydrologyHint::default(); width],
-    );
-    seam_hints.insert(
-        SeamDirection::South,
-        vec![SeamHydrologyHint::default(); width],
-    );
-    seam_hints.insert(
-        SeamDirection::West,
-        vec![SeamHydrologyHint::default(); depth],
-    );
-    seam_hints.insert(
-        SeamDirection::East,
-        vec![SeamHydrologyHint::default(); depth],
-    );
 
     let mut ocean_weight = vec![0.0; len];
     let mut river_weight = vec![0.0; len];
@@ -995,7 +960,6 @@ fn build_hydrology_cache_impl(
         ocean_weight,
         lake_level,
         river_level,
-        seam_hints,
     }
 }
 
@@ -1281,13 +1245,15 @@ fn surface_layering_pass(
                     block = STONE;
                 }
 
-                block =
-                    if d <= sand_depth && sand_bias > 0.35 && sediment_context && !deep_stone_context
-                    {
-                        SAND
-                    } else {
-                        block
-                    };
+                block = if d <= sand_depth
+                    && sand_bias > 0.35
+                    && sediment_context
+                    && !deep_stone_context
+                {
+                    SAND
+                } else {
+                    block
+                };
                 let _ = world.set_raw_no_side_effects(lx, y, lz, block);
             }
         }
@@ -1519,8 +1485,7 @@ fn hydrology_fill_pass(
             }
 
             if let Some(level) = hydrology.river_level[idx] {
-                let mut river_fill = smoothstep((river_w - 0.24) / 0.50);
-                river_fill = river_fill.max(seam_river_influence(hydrology, x, z, width, depth));
+                let river_fill = smoothstep((river_w - 0.24) / 0.50);
                 if river_fill <= 0.02 {
                     continue;
                 }
@@ -1549,51 +1514,6 @@ fn hydrology_fill_pass(
             }
         }
     }
-}
-
-fn seam_river_influence(
-    hydrology: &HydrologyData,
-    x: i32,
-    z: i32,
-    width: usize,
-    depth: usize,
-) -> f32 {
-    let mut influence: f32 = 0.0;
-    if z == 0 {
-        if let Some(row) = hydrology.seam_hints.get(&SeamDirection::North) {
-            let hint = row[x as usize];
-            if hint.flow_outlet {
-                let level_bias = hint.channel_level.unwrap_or(0) as f32 * 0.0;
-                influence = influence
-                    .max(((hint.river_width_hint + hint.river_depth_hint) * 0.08) + level_bias);
-            }
-        }
-    }
-    if z == depth as i32 - 1 {
-        if let Some(row) = hydrology.seam_hints.get(&SeamDirection::South) {
-            let hint = row[x as usize];
-            if hint.flow_outlet {
-                influence = influence.max((hint.river_width_hint + hint.river_depth_hint) * 0.08);
-            }
-        }
-    }
-    if x == 0 {
-        if let Some(row) = hydrology.seam_hints.get(&SeamDirection::West) {
-            let hint = row[z as usize];
-            if hint.flow_outlet {
-                influence = influence.max((hint.river_width_hint + hint.river_depth_hint) * 0.08);
-            }
-        }
-    }
-    if x == width as i32 - 1 {
-        if let Some(row) = hydrology.seam_hints.get(&SeamDirection::East) {
-            let hint = row[z as usize];
-            if hint.flow_outlet {
-                influence = influence.max((hint.river_width_hint + hint.river_depth_hint) * 0.08);
-            }
-        }
-    }
-    influence.clamp(0.0, 1.0)
 }
 
 fn apply_channel_edit(
