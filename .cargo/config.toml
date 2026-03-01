@@ -1,0 +1,7 @@
+[build]
+# Keep build artifacts in a shared workspace-level cache so dependencies
+# don't have to be recompiled from scratch on every task.
+target-dir = "/workspace/.cargo-target/3d-falling-sand-prototype"
+
+[term]
+verbose = false
