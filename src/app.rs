@@ -618,7 +618,7 @@ pub async fn run() -> anyhow::Result<()> {
                             cam.view_proj(),
                             [renderer.config.width, renderer.config.height],
                             &preview_local,
-                            [origin_voxel.x, origin_voxel.y, origin_voxel.z],
+                            [0, 0, 0],
                             &brush,
                             preview_mode,
                             ui.show_radial_menu,
@@ -890,8 +890,58 @@ fn preview_blocks(
         return preview_wand_blocks(store, raycast, tool, 256);
     }
     brush_center(*brush, raycast, mode)
-        .map(|c| vec![c])
+        .map(|center| preview_brush_volume(*brush, center))
         .unwrap_or_default()
+}
+
+fn preview_brush_volume(brush: BrushSettings, center: [i32; 3]) -> Vec<[i32; 3]> {
+    let radius = brush.radius.max(0);
+    let mut out = Vec::new();
+    for dz in -radius..=radius {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let include = match brush.shape {
+                    BrushShape::Cube => true,
+                    BrushShape::Sphere => dx * dx + dy * dy + dz * dz <= radius * radius,
+                    BrushShape::Torus => {
+                        let ring_radius = (radius as f32).max(1.0);
+                        let tube_radius = (radius as f32 * 0.5).max(1.0);
+                        let q = ((dx * dx + dz * dz) as f32).sqrt() - ring_radius;
+                        (q * q + (dy as f32) * (dy as f32)) <= tube_radius * tube_radius
+                    }
+                    BrushShape::Hemisphere => {
+                        dy >= 0 && (dx * dx + dy * dy + dz * dz) <= radius * radius
+                    }
+                    BrushShape::Bowl => {
+                        if dy > 0 {
+                            false
+                        } else {
+                            let r2 = dx * dx + dy * dy + dz * dz;
+                            let outer = r2 <= radius * radius;
+                            let inner_radius = (radius - 1).max(0);
+                            let inner = r2 < inner_radius * inner_radius;
+                            outer && !inner
+                        }
+                    }
+                    BrushShape::InvertedBowl => {
+                        if dy < 0 {
+                            false
+                        } else {
+                            let r2 = dx * dx + dy * dy + dz * dz;
+                            let outer = r2 <= radius * radius;
+                            let inner_radius = (radius - 1).max(0);
+                            let inner = r2 < inner_radius * inner_radius;
+                            outer && !inner
+                        }
+                    }
+                };
+                if include {
+                    out.push([center[0] + dx, center[1] + dy, center[2] + dz]);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn apply_mouse_edit(
