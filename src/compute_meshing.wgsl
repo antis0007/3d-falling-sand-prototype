@@ -56,7 +56,23 @@ fn in_bounds(p: vec3<i32>) -> bool {
 fn is_light_fluid(v: u32) -> bool {
     return v == WATER || v == ACID || v == SMOKE || v == STEAM || v == FIRE_GAS;
 }
+fn neighbor_dir(i: u32) -> vec3<i32> {
+    switch i {
+        case 0u: { return vec3<i32>( 1, 0, 0); }
+        case 1u: { return vec3<i32>(-1, 0, 0); }
+        case 2u: { return vec3<i32>( 0, 1, 0); }
+        case 3u: { return vec3<i32>( 0,-1, 0); }
+        case 4u: { return vec3<i32>( 0, 0, 1); }
+        default: { return vec3<i32>( 0, 0,-1); }
+    }
+}
 
+fn lateral_xoff(i: u32, parity: u32) -> i32 {
+    switch ((i + parity) & 1u) {
+        case 0u: { return -1; }
+        default: { return 1; }
+    }
+}
 fn apply_rule(id: u32, idx: u32, src_off: u32) -> u32 {
     if (id == EMPTY) {
         return EMPTY;
@@ -65,16 +81,8 @@ fn apply_rule(id: u32, idx: u32, src_off: u32) -> u32 {
     let p = unpack(idx);
 
     if (id == LAVA || id == WATER) {
-        let dirs = array<vec3<i32>, 6>(
-            vec3<i32>(1, 0, 0),
-            vec3<i32>(-1, 0, 0),
-            vec3<i32>(0, 1, 0),
-            vec3<i32>(0, -1, 0),
-            vec3<i32>(0, 0, 1),
-            vec3<i32>(0, 0, -1),
-        );
         for (var i = 0u; i < 6u; i = i + 1u) {
-            let np = vec3<i32>(p) + dirs[i];
+            let np = vec3<i32>(p) + neighbor_dir(i);
             if (!in_bounds(np)) {
                 continue;
             }
@@ -102,10 +110,8 @@ fn apply_rule(id: u32, idx: u32, src_off: u32) -> u32 {
 
         if (id == WATER || id == ACID || id == LAVA) {
             let parity = (idx ^ (idx >> 3u)) & 1u;
-            let lateral = array<i32, 2>(-1, 1);
             for (var i = 0u; i < 2u; i = i + 1u) {
-                let xoff = lateral[(i + parity) & 1u];
-                let nx = i32(p.x) + xoff;
+                let nx = i32(p.x) + lateral_xoff(i, parity);
                 if (nx < 0 || nx >= i32(CHUNK_SIDE)) {
                     continue;
                 }
@@ -194,17 +200,9 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let p = vec3<i32>(unpack(voxel_idx));
-    let dirs = array<vec3<i32>, 6>(
-        vec3<i32>(1, 0, 0),
-        vec3<i32>(-1, 0, 0),
-        vec3<i32>(0, 1, 0),
-        vec3<i32>(0, -1, 0),
-        vec3<i32>(0, 0, 1),
-        vec3<i32>(0, 0, -1),
-    );
     var faces: u32 = 0u;
     for (var d = 0u; d < 6u; d = d + 1u) {
-        if (voxel_at(src_off, p + dirs[d]) == EMPTY) {
+        if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) {
             faces = faces + 1u;
         }
     }
