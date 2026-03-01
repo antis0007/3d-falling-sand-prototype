@@ -19,6 +19,7 @@ use winit::dpi::PhysicalSize;
 
 pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
+const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
 
 #[derive(Clone, Copy)]
 pub enum UnknownNeighborOcclusionPolicy {
@@ -539,7 +540,16 @@ impl Renderer {
             player_chunk,
             chunk_priority_scores,
         );
+        let snapshot_frame_start = Instant::now();
+        let mut deferred_snapshot_coords = Vec::new();
         while let Some(coord) = snapshot_coords.pop() {
+            let elapsed_ms = snapshot_frame_start.elapsed().as_secs_f32() * 1000.0;
+            if elapsed_ms >= CHUNK_SNAPSHOT_BUILD_BUDGET_MS {
+                deferred_snapshot_coords.push(coord);
+                deferred_snapshot_coords.extend(snapshot_coords.into_iter().rev());
+                break;
+            }
+
             let t0 = Instant::now();
             let snapshot = build_chunk_snapshot(store, coord);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -547,6 +557,12 @@ impl Renderer {
             if ms > stats.max_ms {
                 stats.max_ms = ms;
             }
+
+            let prev = self.lod_selection.get(&coord).copied();
+            let primary_lod = select_lod(coord, player_chunk, lod_radii, prev);
+            let fallback_lod =
+                fallback_lod_near_threshold(coord, player_chunk, lod_radii, primary_lod);
+
             let push_job = |lod: ChunkLod, jobs: &mut Vec<MeshJob>| {
                 let version = *self.mesh_versions.get(&(coord, lod)).unwrap_or(&0);
                 jobs.push(MeshJob {
@@ -558,10 +574,28 @@ impl Renderer {
                     snapshot: snapshot.clone(),
                 });
             };
-            push_job(ChunkLod::Near, &mut near_jobs);
-            push_job(ChunkLod::Mid, &mut mid_jobs);
-            push_job(ChunkLod::Far, &mut far_jobs);
-            push_job(ChunkLod::Ultra, &mut ultra_jobs);
+
+            match primary_lod {
+                ChunkLod::Near => push_job(ChunkLod::Near, &mut near_jobs),
+                ChunkLod::Mid => push_job(ChunkLod::Mid, &mut mid_jobs),
+                ChunkLod::Far => push_job(ChunkLod::Far, &mut far_jobs),
+                ChunkLod::Ultra => push_job(ChunkLod::Ultra, &mut ultra_jobs),
+            }
+
+            if let Some(lod) = fallback_lod {
+                match lod {
+                    ChunkLod::Near => push_job(ChunkLod::Near, &mut near_jobs),
+                    ChunkLod::Mid => push_job(ChunkLod::Mid, &mut mid_jobs),
+                    ChunkLod::Far => push_job(ChunkLod::Far, &mut far_jobs),
+                    ChunkLod::Ultra => push_job(ChunkLod::Ultra, &mut ultra_jobs),
+                }
+            }
+        }
+
+        for coord in deferred_snapshot_coords {
+            if self.pending_dirty_set.insert(coord) {
+                self.pending_dirty.push_back(coord);
+            }
         }
 
         let job_priority = |coord: ChunkCoord| {
@@ -1276,6 +1310,30 @@ fn select_lod(
         _ if d <= radii.mid.saturating_sub(h) => ChunkLod::Mid,
         _ if d <= radii.far.saturating_sub(h) => ChunkLod::Far,
         _ => ChunkLod::Ultra,
+    }
+}
+
+fn fallback_lod_near_threshold(
+    coord: ChunkCoord,
+    player_chunk: ChunkCoord,
+    radii: LodRadii,
+    primary: ChunkLod,
+) -> Option<ChunkLod> {
+    let d = chunk_chebyshev_dist(coord, player_chunk);
+    let h = radii.hysteresis.max(1);
+
+    let near_edge = (d - radii.near).abs() <= h;
+    let mid_edge = (d - radii.mid).abs() <= h;
+    let far_edge = (d - radii.far).abs() <= h;
+
+    match primary {
+        ChunkLod::Near if near_edge => Some(ChunkLod::Mid),
+        ChunkLod::Mid if near_edge => Some(ChunkLod::Near),
+        ChunkLod::Mid if mid_edge => Some(ChunkLod::Far),
+        ChunkLod::Far if mid_edge => Some(ChunkLod::Mid),
+        ChunkLod::Far if far_edge => Some(ChunkLod::Ultra),
+        ChunkLod::Ultra if far_edge => Some(ChunkLod::Far),
+        _ => None,
     }
 }
 
