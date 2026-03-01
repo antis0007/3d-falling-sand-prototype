@@ -37,6 +37,12 @@ const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
+const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
+const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
+const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
+const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
+const AUTO_TUNE_RAMP_UP_PER_SEC: f32 = 3.5;
+const AUTO_TUNE_RECOVER_PER_SEC: f32 = 0.6;
 const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
@@ -130,6 +136,71 @@ fn scaled_budget(base: usize, max: usize, backlog: usize, threshold: usize) -> u
     (base + base * pressure).min(max)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AutoTuneState {
+    degrade_level: f32,
+    latency_pressure: f32,
+    queue_pressure: f32,
+    dirty_pressure: f32,
+}
+
+impl Default for AutoTuneState {
+    fn default() -> Self {
+        Self {
+            degrade_level: 0.0,
+            latency_pressure: 0.0,
+            queue_pressure: 0.0,
+            dirty_pressure: 0.0,
+        }
+    }
+}
+
+impl AutoTuneState {
+    fn update(
+        &mut self,
+        dt_seconds: f32,
+        dirty_backlog: usize,
+        meshing_queue_depth: usize,
+        upload_latency_ms: f32,
+    ) {
+        self.latency_pressure = ((upload_latency_ms - AUTO_TUNE_UPLOAD_LATENCY_START_MS)
+            / (AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS - AUTO_TUNE_UPLOAD_LATENCY_START_MS))
+            .clamp(0.0, 1.0);
+        self.queue_pressure = ((meshing_queue_depth as f32 - MESH_BACKPRESSURE_START as f32)
+            / (MESH_BACKPRESSURE_HIGH as f32 - MESH_BACKPRESSURE_START as f32))
+            .clamp(0.0, 1.0);
+        self.dirty_pressure = ((dirty_backlog as f32 - DIRTY_BACKLOG_PRESSURE_START as f32)
+            / (DIRTY_BACKLOG_PRESSURE_HIGH as f32 - DIRTY_BACKLOG_PRESSURE_START as f32))
+            .clamp(0.0, 1.0);
+
+        let target = self
+            .latency_pressure
+            .max(self.queue_pressure * 0.8)
+            .max(self.dirty_pressure * 0.65);
+        if target > self.degrade_level {
+            self.degrade_level =
+                (self.degrade_level + AUTO_TUNE_RAMP_UP_PER_SEC * dt_seconds).min(target);
+        } else {
+            self.degrade_level =
+                (self.degrade_level - AUTO_TUNE_RECOVER_PER_SEC * dt_seconds).max(target);
+        }
+    }
+
+    fn is_active(self) -> bool {
+        self.degrade_level > 0.01
+    }
+}
+
+fn blend_i32(max: i32, min: i32, t: f32) -> i32 {
+    let min = min.min(max);
+    ((max as f32) - ((max - min) as f32 * t.clamp(0.0, 1.0))).round() as i32
+}
+
+fn blend_usize(max: usize, min: usize, t: f32) -> usize {
+    let min = min.min(max);
+    ((max as f32) - ((max - min) as f32 * t.clamp(0.0, 1.0))).round() as usize
+}
+
 struct BackgroundGenerator {
     tx: SyncSender<GenJob>,
     rx: Receiver<GenResult>,
@@ -221,6 +292,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut generated_ready: VecDeque<GenResult> = VecDeque::new();
     let mut stream_tuning = StreamingTuning::default().normalized();
     let mut cached_stream_tuning = stream_tuning.clone();
+    let mut auto_tune = AutoTuneState::default();
     let mut rng = Rng::new(0x1234_5678);
     let mut sim_acc = 0.0f32;
 
@@ -269,6 +341,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut previous_collision_freeze_active = false;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
+    let mut prior_dirty_backlog = 0usize;
+    let mut prior_meshing_queue_depth = 0usize;
+    let mut prior_upload_latency_ms = 0.0f32;
     let mut spawn_pending = true;
 
     let _ = set_cursor(window, false);
@@ -698,8 +773,42 @@ pub async fn run() -> anyhow::Result<()> {
 
                         // Cache desired/sim_region to avoid rebuilding allocations every frame
                         let desired_t0 = Instant::now();
+                        auto_tune.update(
+                            dt,
+                            prior_dirty_backlog,
+                            prior_meshing_queue_depth,
+                            prior_upload_latency_ms,
+                        );
+                        let effective_far_radius = blend_i32(
+                            stream_tuning.far_radius_xz,
+                            stream_tuning.mid_radius_xz,
+                            auto_tune.degrade_level,
+                        );
+                        let effective_ultra_radius = blend_i32(
+                            stream_tuning.ultra_radius_xz,
+                            effective_far_radius,
+                            auto_tune.degrade_level,
+                        );
+                        let effective_far_budget = blend_usize(
+                            stream_tuning.lod_budget_far,
+                            1,
+                            auto_tune.degrade_level,
+                        )
+                        .max(1);
+                        let effective_ultra_budget = blend_usize(
+                            stream_tuning.lod_budget_ultra,
+                            1,
+                            auto_tune.degrade_level,
+                        )
+                        .max(1);
+                        let mut effective_stream_tuning = stream_tuning.clone();
+                        effective_stream_tuning.far_radius_xz = effective_far_radius;
+                        effective_stream_tuning.ultra_radius_xz = effective_ultra_radius;
+                        effective_stream_tuning.lod_budget_far = effective_far_budget;
+                        effective_stream_tuning.lod_budget_ultra = effective_ultra_budget;
+
                         let player_chunk_changed = last_player_chunk != Some(player_chunk);
-                        let stream_tuning_changed = cached_stream_tuning != stream_tuning;
+                        let stream_tuning_changed = cached_stream_tuning != effective_stream_tuning;
                         let look_dir = ctrl.look_dir().normalize_or_zero();
                         let view_angle_changed = last_desired_look_dir
                             .map(|prev| prev.dot(look_dir) < (1.0 - DESIRED_VIEW_RECOMPUTE_DOT_DELTA))
@@ -732,10 +841,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 player_chunk,
                                 player_velocity_chunks,
                                 look_dir,
-                                stream_tuning.near_radius_xz,
-                                stream_tuning.mid_radius_xz,
-                                Some(stream_tuning.far_radius_xz),
-                                stream_tuning.vertical_radius,
+                                effective_stream_tuning.near_radius_xz,
+                                effective_stream_tuning.mid_radius_xz,
+                                Some(effective_stream_tuning.far_radius_xz),
+                                effective_stream_tuning.vertical_radius,
                                 &visible_history,
                                 frame_counter,
                             );
@@ -743,7 +852,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
                             }
                             last_player_chunk = Some(player_chunk);
-                            cached_stream_tuning = stream_tuning.clone();
+                            cached_stream_tuning = effective_stream_tuning.clone();
                             last_desired_look_dir = Some(look_dir);
                         } else {
                             desired_recompute_reason.clear();
@@ -768,8 +877,8 @@ pub async fn run() -> anyhow::Result<()> {
                         };
                         let mut generation_priority = cached_desired.generation_order.clone();
                         if backpressure > 0.0 {
-                            let far_radius_cutoff = (stream_tuning.mid_radius_xz as f32
-                                + (stream_tuning.far_radius_xz - stream_tuning.mid_radius_xz) as f32
+                            let far_radius_cutoff = (effective_stream_tuning.mid_radius_xz as f32
+                                + (effective_stream_tuning.far_radius_xz - effective_stream_tuning.mid_radius_xz) as f32
                                     * (1.0 - backpressure))
                                 .round() as i32;
                             generation_priority.retain(|coord| {
@@ -971,17 +1080,17 @@ pub async fn run() -> anyhow::Result<()> {
                             REMESH_JOB_BUDGET_PER_FRAME,
                             MESH_UPLOAD_BYTES_PER_FRAME,
                             LodRadii {
-                                near: stream_tuning.near_radius_xz,
-                                mid: stream_tuning.mid_radius_xz,
-                                far: stream_tuning.far_radius_xz,
-                                ultra: stream_tuning.ultra_radius_xz,
-                                hysteresis: stream_tuning.lod_hysteresis,
+                                near: effective_stream_tuning.near_radius_xz,
+                                mid: effective_stream_tuning.mid_radius_xz,
+                                far: effective_stream_tuning.far_radius_xz,
+                                ultra: effective_stream_tuning.ultra_radius_xz,
+                                hysteresis: effective_stream_tuning.lod_hysteresis,
                             },
                             LodMeshingBudgets {
-                                near: stream_tuning.lod_budget_near,
-                                mid: stream_tuning.lod_budget_mid,
-                                far: stream_tuning.lod_budget_far,
-                                ultra: stream_tuning.lod_budget_ultra,
+                                near: effective_stream_tuning.lod_budget_near,
+                                mid: effective_stream_tuning.lod_budget_mid,
+                                far: effective_stream_tuning.lod_budget_far,
+                                ultra: effective_stream_tuning.lod_budget_ultra,
                             },
                         );
                         ui.set_mesh_timing(mesh_stats.max_ms);
@@ -1004,19 +1113,27 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
-                        ui.profiler.near_radius = stream_tuning.near_radius_xz;
-                        ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
-                        ui.profiler.far_radius = stream_tuning.far_radius_xz;
-                        ui.profiler.ultra_radius = stream_tuning.ultra_radius_xz;
-                        ui.profiler.lod_hysteresis = stream_tuning.lod_hysteresis;
-                        ui.profiler.lod_budget_near = stream_tuning.lod_budget_near;
-                        ui.profiler.lod_budget_mid = stream_tuning.lod_budget_mid;
-                        ui.profiler.lod_budget_far = stream_tuning.lod_budget_far;
-                        ui.profiler.lod_budget_ultra = stream_tuning.lod_budget_ultra;
+                        ui.profiler.near_radius = effective_stream_tuning.near_radius_xz;
+                        ui.profiler.mid_radius = effective_stream_tuning.mid_radius_xz;
+                        ui.profiler.far_radius = effective_stream_tuning.far_radius_xz;
+                        ui.profiler.ultra_radius = effective_stream_tuning.ultra_radius_xz;
+                        ui.profiler.lod_hysteresis = effective_stream_tuning.lod_hysteresis;
+                        ui.profiler.lod_budget_near = effective_stream_tuning.lod_budget_near;
+                        ui.profiler.lod_budget_mid = effective_stream_tuning.lod_budget_mid;
+                        ui.profiler.lod_budget_far = effective_stream_tuning.lod_budget_far;
+                        ui.profiler.lod_budget_ultra = effective_stream_tuning.lod_budget_ultra;
+                        ui.profiler.auto_tune_active = auto_tune.is_active();
+                        ui.profiler.auto_tune_level = auto_tune.degrade_level;
+                        ui.profiler.auto_tune_latency_pressure = auto_tune.latency_pressure;
+                        ui.profiler.auto_tune_queue_pressure = auto_tune.queue_pressure;
+                        ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_near_count = mesh_stats.near_mesh_count;
                         ui.profiler.mesh_mid_count = mesh_stats.mid_mesh_count;
                         ui.profiler.mesh_far_count = mesh_stats.far_mesh_count;
                         prior_mesh_backlog = mesh_stats.meshing_queue_depth + mesh_stats.meshing_completed_depth;
+                        prior_dirty_backlog = ui.profiler.dirty_backlog;
+                        prior_meshing_queue_depth = mesh_stats.meshing_queue_depth;
+                        prior_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_ultra_count = mesh_stats.ultra_mesh_count;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
