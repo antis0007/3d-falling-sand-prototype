@@ -788,12 +788,14 @@ pub async fn run() -> anyhow::Result<()> {
                                 .take(COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET)
                             {
                                 if streaming.resident.contains(&coord)
-                                    || streaming.generating.contains(&coord)
+                                    || streaming.dispatched_generate.contains(&coord)
+                                    || streaming.scheduled_generate.contains(&coord)
                                 {
                                     continue;
                                 }
                                 if chunk_generator.try_request(coord) {
-                                    streaming.generating.insert(coord);
+                                    streaming.scheduled_generate.insert(coord);
+                                    streaming.mark_dispatch_succeeded(coord);
                                     forced_local_requests += 1;
                                 }
                             }
@@ -984,8 +986,8 @@ pub async fn run() -> anyhow::Result<()> {
 
                         for &coord in &generation_priority {
                             if streaming.resident.contains(&coord)
-                                || streaming.generating.contains(&coord)
-                                || streaming.scheduled.contains(&coord)
+                                || streaming.dispatched_generate.contains(&coord)
+                                || streaming.scheduled_generate.contains(&coord)
                             {
                                 continue;
                             }
@@ -1002,13 +1004,15 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         for coord in dispatch_urgent {
-                            if streaming.scheduled.insert(coord) {
+                            if streaming.scheduled_generate.insert(coord) {
                                 streaming.mark_canceled(coord);
-                                streaming.scheduled.insert(coord);
+                                streaming.scheduled_generate.insert(coord);
                             }
                             if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
+                                streaming.mark_dispatch_succeeded(coord);
                                 gen_request_count += 1;
+                            } else {
+                                streaming.mark_dispatch_failed_or_deferred(coord);
                             }
                         }
 
@@ -1027,10 +1031,11 @@ pub async fn run() -> anyhow::Result<()> {
                         while near_sent < near_budget {
                             let Some(coord) = streaming.next_generation_job() else { break; };
                             if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
+                                streaming.mark_dispatch_succeeded(coord);
                                 gen_request_count += 1;
                                 near_sent += 1;
                             } else {
+                                streaming.mark_dispatch_failed_or_deferred(coord);
                                 break;
                             }
                         }
@@ -1039,10 +1044,11 @@ pub async fn run() -> anyhow::Result<()> {
                         while far_budget > 0 {
                             let Some(coord) = streaming.next_generation_job() else { break; };
                             if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
+                                streaming.mark_dispatch_succeeded(coord);
                                 gen_request_count += 1;
                                 far_budget -= 1;
                             } else {
+                                streaming.mark_dispatch_failed_or_deferred(coord);
                                 break;
                             }
                         }
@@ -1070,7 +1076,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         total_generated_chunks = total_generated_chunks
                             .saturating_add(gen_completed_count as u64);
-                        let gen_inflight = streaming.generating.len();
+                        let gen_inflight = streaming.dispatched_generate.len();
                         if gen_inflight >= 96 && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
                             let starvation_reason = if gen_throttle_state.pressure > 1.0 {
@@ -1298,7 +1304,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.desired_ms = desired_ms;
                         ui.profiler.streaming_ms = streaming_ms;
                         ui.profiler.gen_request_count = gen_request_count;
-                        ui.profiler.gen_inflight_count = streaming.generating.len();
+                        ui.profiler.gen_inflight_count = streaming.dispatched_generate.len();
                         ui.profiler.gen_completed_count = gen_completed_count;
                         ui.profiler.gen_completed_total = total_generated_chunks;
                         ui.profiler.apply_ms = apply_ms;
@@ -1409,7 +1415,11 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.missing_in_radius = cached_desired
                             .generation_order
                             .iter()
-                            .filter(|coord| !streaming.resident.contains(coord) && !streaming.generating.contains(coord))
+                            .filter(|coord| {
+                                !streaming.resident.contains(coord)
+                                    && !streaming.dispatched_generate.contains(coord)
+                                    && !streaming.scheduled_generate.contains(coord)
+                            })
                             .count();
 
                         let preview_local: Vec<[i32; 3]> = preview_block_list
