@@ -1281,11 +1281,13 @@ fn surface_layering_pass(
                     block = STONE;
                 }
 
-                if d <= sand_depth && sand_bias > 0.35 && sediment_context && !deep_stone_context {
-                    SAND
-                } else {
-                    block
-                };
+                block =
+                    if d <= sand_depth && sand_bias > 0.35 && sediment_context && !deep_stone_context
+                    {
+                        SAND
+                    } else {
+                        block
+                    };
                 let _ = world.set_raw_no_side_effects(lx, y, lz, block);
             }
         }
