@@ -132,7 +132,7 @@ fn add_voxel_faces(
             y: world_voxel.y + d[1],
             z: world_voxel.z + d[2],
         };
-        if is_face_occluded(id, store.get_voxel(neighbor).unwrap_or(EMPTY)) {
+        if is_face_occluded(id, store.get_voxel(neighbor)) {
             continue;
         }
 
@@ -166,7 +166,7 @@ fn add_crossed_billboard(
         y: world_voxel.y + 1,
         z: world_voxel.z,
     });
-    if above.unwrap_or(EMPTY) != EMPTY {
+    if above != EMPTY {
         return;
     }
 

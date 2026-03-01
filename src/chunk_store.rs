@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{voxel_to_chunk, ChunkCoord, MaterialId, VoxelCoord, CHUNK_SIZE_VOXELS};
+use crate::world::Chunk as LegacyChunk;
 use crate::world::EMPTY;
 
 const CHUNK_VOLUME: usize =
@@ -33,6 +34,10 @@ impl Chunk {
     pub fn set(&mut self, x: usize, y: usize, z: usize, id: MaterialId) {
         let idx = Self::index(x, y, z);
         self.voxels[idx] = id;
+    }
+
+    pub fn iter_raw(&self) -> &[MaterialId] {
+        &self.voxels
     }
 }
 
@@ -104,6 +109,29 @@ impl ChunkStore {
 
     pub fn get_chunk(&self, coord: ChunkCoord) -> Option<&Chunk> {
         self.chunks.get(&coord)
+    }
+
+    pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: LegacyChunk) {
+        let mut dst = Chunk::new_empty();
+        for z in 0..CHUNK_SIZE_VOXELS as usize {
+            for y in 0..CHUNK_SIZE_VOXELS as usize {
+                for x in 0..CHUNK_SIZE_VOXELS as usize {
+                    dst.set(x, y, z, chunk.get(x, y, z));
+                }
+            }
+        }
+        self.chunks.insert(coord, dst);
+        self.dirty_chunks.insert(coord);
+    }
+
+    pub fn remove_chunk(&mut self, coord: ChunkCoord) {
+        self.chunks.remove(&coord);
+        self.dirty_chunks.remove(&coord);
+    }
+
+    pub fn clear(&mut self) {
+        self.chunks.clear();
+        self.dirty_chunks.clear();
     }
 
     pub fn mark_dirty(&mut self, coord: ChunkCoord) {
