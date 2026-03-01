@@ -38,10 +38,19 @@ const GENERATOR_THREADS: usize = 3;
 const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
 const EVICT_BUDGET_MS: f32 = 1.0;
+const DESIRED_NEAR_PER_FRAME_CAP: usize = 224;
+const DESIRED_MID_PER_FRAME_CAP: usize = 288;
+const DESIRED_FAR_PER_FRAME_CAP: usize = 384;
+const DESIRED_MAX_TOTAL_BUDGET: usize = 2200;
+const DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV: i32 = 1;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
+const GEN_PAUSE_QUEUE_HIGH: usize = 1800;
+const GEN_PAUSE_QUEUE_LOW: usize = 980;
+const GEN_PAUSE_DIRTY_HIGH: usize = 1700;
+const GEN_PAUSE_DIRTY_LOW: usize = 900;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
 const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
 const AUTO_TUNE_RAMP_UP_PER_SEC: f32 = 3.5;
@@ -192,6 +201,108 @@ impl AutoTuneState {
     fn is_active(self) -> bool {
         self.degrade_level > 0.01
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GenBackpressureState {
+    paused_by_mesh_pressure: bool,
+}
+
+impl GenBackpressureState {
+    fn update(&mut self, meshing_queue_depth: usize, dirty_backlog: usize) {
+        if self.paused_by_mesh_pressure {
+            if meshing_queue_depth <= GEN_PAUSE_QUEUE_LOW && dirty_backlog <= GEN_PAUSE_DIRTY_LOW {
+                self.paused_by_mesh_pressure = false;
+            }
+        } else if meshing_queue_depth >= GEN_PAUSE_QUEUE_HIGH
+            || dirty_backlog >= GEN_PAUSE_DIRTY_HIGH
+        {
+            self.paused_by_mesh_pressure = true;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DesiredCapStats {
+    near_kept: usize,
+    near_dropped: usize,
+    mid_kept: usize,
+    mid_dropped: usize,
+    far_kept: usize,
+    far_dropped: usize,
+    uncapped_kept: usize,
+    budget_dropped: usize,
+}
+
+fn chebyshev_from_player(player_chunk: ChunkCoord, coord: ChunkCoord) -> i32 {
+    (coord.x - player_chunk.x)
+        .abs()
+        .max((coord.y - player_chunk.y).abs())
+        .max((coord.z - player_chunk.z).abs())
+}
+
+fn cap_desired_generation_order(
+    desired: &DesiredChunks,
+    player_chunk: ChunkCoord,
+    max_total_budget: usize,
+) -> (Vec<ChunkCoord>, DesiredCapStats) {
+    let near_set: HashSet<_> = desired.near.iter().copied().collect();
+    let mid_set: HashSet<_> = desired.mid.iter().copied().collect();
+    let far_set: HashSet<_> = desired.far.iter().copied().collect();
+    let mut near_left = DESIRED_NEAR_PER_FRAME_CAP;
+    let mut mid_left = DESIRED_MID_PER_FRAME_CAP;
+    let mut far_left = DESIRED_FAR_PER_FRAME_CAP;
+
+    let mut capped = Vec::with_capacity(desired.generation_order.len().min(max_total_budget));
+    let mut stats = DesiredCapStats::default();
+
+    for &coord in &desired.generation_order {
+        let cheb = chebyshev_from_player(player_chunk, coord);
+        let uncapped_immediate = cheb <= DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV;
+        let keep = if uncapped_immediate {
+            stats.uncapped_kept += 1;
+            true
+        } else if near_set.contains(&coord) {
+            if near_left > 0 {
+                near_left -= 1;
+                stats.near_kept += 1;
+                true
+            } else {
+                stats.near_dropped += 1;
+                false
+            }
+        } else if mid_set.contains(&coord) {
+            if mid_left > 0 {
+                mid_left -= 1;
+                stats.mid_kept += 1;
+                true
+            } else {
+                stats.mid_dropped += 1;
+                false
+            }
+        } else if far_set.contains(&coord) {
+            if far_left > 0 {
+                far_left -= 1;
+                stats.far_kept += 1;
+                true
+            } else {
+                stats.far_dropped += 1;
+                false
+            }
+        } else {
+            false
+        };
+
+        if keep {
+            if capped.len() >= max_total_budget {
+                stats.budget_dropped += 1;
+                continue;
+            }
+            capped.push(coord);
+        }
+    }
+
+    (capped, stats)
 }
 
 fn blend_i32(max: i32, min: i32, t: f32) -> i32 {
@@ -367,6 +478,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut prior_dirty_backlog = 0usize;
     let mut prior_meshing_queue_depth = 0usize;
     let mut prior_upload_latency_ms = 0.0f32;
+    let mut gen_backpressure_state = GenBackpressureState::default();
+    let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
 
     let _ = set_cursor(window, false);
@@ -898,21 +1011,30 @@ pub async fn run() -> anyhow::Result<()> {
                                 / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
                                 .clamp(0.0, 1.0)
                         };
-                        let mut generation_priority = cached_desired.generation_order.clone();
+                        let (mut generation_priority, desired_cap_stats) = cap_desired_generation_order(
+                            &cached_desired,
+                            player_chunk,
+                            DESIRED_MAX_TOTAL_BUDGET,
+                        );
+                        last_desired_cap_stats = desired_cap_stats;
                         if backpressure > 0.0 {
                             let far_radius_cutoff = (effective_stream_tuning.mid_radius_xz as f32
-                                + (effective_stream_tuning.far_radius_xz - effective_stream_tuning.mid_radius_xz) as f32
+                                + (effective_stream_tuning.far_radius_xz
+                                    - effective_stream_tuning.mid_radius_xz) as f32
                                     * (1.0 - backpressure))
                                 .round() as i32;
                             generation_priority.retain(|coord| {
-                                let cheb = (coord.x - player_chunk.x)
-                                    .abs()
-                                    .max((coord.y - player_chunk.y).abs())
-                                    .max((coord.z - player_chunk.z).abs());
-                                cheb <= far_radius_cutoff
+                                chebyshev_from_player(player_chunk, *coord) <= far_radius_cutoff
                             });
                         }
-                        let stream_stats = streaming.update(&generation_priority, &cached_desired.resident_keep, player_chunk, frame_counter);
+                        let stream_stats = streaming.update(
+                            &generation_priority,
+                            &cached_desired.resident_keep,
+                            player_chunk,
+                            frame_counter,
+                        );
+                        gen_backpressure_state
+                            .update(prior_meshing_queue_depth, prior_dirty_backlog);
                         let mut gen_request_count = 0usize;
                         let generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
@@ -920,28 +1042,63 @@ pub async fn run() -> anyhow::Result<()> {
                             streaming.pending_generate_count() + generated_ready.len(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        for coord in streaming.drain_generate_requests(generate_drain_budget) {
-                            if chunk_generator.try_request(coord) {
-                                gen_request_count += 1;
-                            } else {
-                                streaming.mark_generation_dropped(coord);
+                        if !gen_backpressure_state.paused_by_mesh_pressure {
+                            for coord in streaming.drain_generate_requests(generate_drain_budget) {
+                                if chunk_generator.try_request(coord) {
+                                    gen_request_count += 1;
+                                } else {
+                                    streaming.mark_generation_dropped(coord);
+                                }
                             }
                         }
 
+                        let gen_recv_t0 = Instant::now();
                         let mut gen_completed_count = 0usize;
+                        let mut gen_recv_empty = false;
+                        let mut gen_recv_disconnected = false;
                         loop {
                             match chunk_generator.try_recv() {
                                 Ok(res) => {
                                     generated_ready.push_back(res);
                                     gen_completed_count += 1;
                                 }
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => break,
+                                Err(TryRecvError::Empty) => {
+                                    gen_recv_empty = true;
+                                    break;
+                                }
+                                Err(TryRecvError::Disconnected) => {
+                                    gen_recv_disconnected = true;
+                                    break;
+                                }
                             }
                         }
+                        let gen_recv_ms = gen_recv_t0.elapsed().as_secs_f32() * 1000.0;
 
                         total_generated_chunks = total_generated_chunks
                             .saturating_add(gen_completed_count as u64);
+                        let gen_inflight = streaming.generating.len();
+                        if gen_inflight >= 96 && gen_completed_count == 0 {
+                            let now_secs = start.elapsed().as_secs_f32();
+                            let starvation_reason = if gen_backpressure_state.paused_by_mesh_pressure {
+                                "paused_by_mesh_pressure"
+                            } else if gen_recv_disconnected {
+                                "generator_channel_disconnected"
+                            } else if gen_recv_empty {
+                                "workers_not_finished_or_result_queue_empty"
+                            } else {
+                                "main_thread_drain_not_progressing"
+                            };
+                            ui.log_once_per_second("gen_starvation", now_secs, || {
+                                format!(
+                                    "gen starvation inflight={} pending_generate={} apply_queue={} recv_ms={:.3} reason={}",
+                                    gen_inflight,
+                                    streaming.pending_generate_count(),
+                                    generated_ready.len(),
+                                    gen_recv_ms,
+                                    starvation_reason
+                                )
+                            });
+                        }
 
                         let apply_budget_items = scaled_budget(
                             stream_tuning.base_apply_budget_items,
@@ -1014,17 +1171,22 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) desired_recompute={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
                             cached_desired.far.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
+                            gen_backpressure_state.paused_by_mesh_pressure,
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
                             desired_recompute_reason,
+                            last_desired_cap_stats.near_dropped,
+                            last_desired_cap_stats.mid_dropped,
+                            last_desired_cap_stats.far_dropped,
+                            last_desired_cap_stats.budget_dropped,
                             stream_tuning.near_radius_xz,
                             stream_tuning.mid_radius_xz,
                             stream_tuning.far_radius_xz,
@@ -1155,6 +1317,9 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.auto_tune_queue_pressure = auto_tune.queue_pressure;
                         ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
+                        ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
+                        ui.profiler.gen_paused_by_mesh_pressure = gen_backpressure_state.paused_by_mesh_pressure;
+                        ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
                         ui.profiler.far_radius = stream_tuning.far_radius_xz;
@@ -2098,4 +2263,36 @@ fn preview_wand_blocks(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn desired_caps_preserve_immediate_neighbors() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let immediate = ChunkCoord { x: 1, y: 0, z: 0 };
+        let mut near = vec![immediate];
+        near.extend((0..600).map(|i| ChunkCoord {
+            x: 2 + i,
+            y: 0,
+            z: 0,
+        }));
+
+        let desired = DesiredChunks {
+            near: near.clone(),
+            mid: Vec::new(),
+            far: Vec::new(),
+            generation_order: near,
+            generation_scores: HashMap::new(),
+            resident_keep: HashSet::new(),
+        };
+
+        let (capped, stats) = cap_desired_generation_order(&desired, player, 64);
+        assert!(capped.contains(&immediate));
+        assert_eq!(capped.len(), 64);
+        assert!(stats.budget_dropped > 0);
+    }
 }
