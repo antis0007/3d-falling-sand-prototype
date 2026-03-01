@@ -448,6 +448,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut cursor_is_unlocked = false;
 
     let mut origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+    renderer.set_origin_voxel(origin_voxel);
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
@@ -746,13 +747,7 @@ pub async fn run() -> anyhow::Result<()> {
                             origin_voxel.z += shift[2];
                             ctrl.position -=
                                 Vec3::new(shift[0] as f32, shift[1] as f32, shift[2] as f32);
-
-                            // Conservative: mark all loaded chunks dirty (so meshes rebase)
-                            let loaded: Vec<ChunkCoord> =
-                                store.iter_loaded_chunks().copied().collect();
-                            for coord in loaded {
-                                store.mark_dirty(coord);
-                            }
+                            renderer.set_origin_voxel(origin_voxel);
                         }
 
                         // === Player movement/collision: query the actual ChunkStore (not dummy world) ===
@@ -1281,7 +1276,6 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
-                            origin_voxel,
                             player_chunk,
                             &cached_desired.generation_scores,
                             REMESH_JOB_BUDGET_PER_FRAME,
@@ -1381,6 +1375,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 generated_ready.clear();
                                 total_generated_chunks = 0;
                                 origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                renderer.set_origin_voxel(origin_voxel);
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
                                 collision_freeze_active = false;
