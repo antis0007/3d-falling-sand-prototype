@@ -63,6 +63,7 @@ struct WorkerGpuState {
     page_indirect: wgpu::Buffer,
     frontier: wgpu::Buffer,
     diagnostics: wgpu::Buffer,
+    frontier_len: u32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -199,7 +200,9 @@ impl GpuComputeRuntime {
         current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
         let t0 = Instant::now();
-        let (frontier, _) = build_frontier_with_halo(job.snapshot.center_voxels.as_ref());
+        let frontier_len = state
+            .frontier_len
+            .min(job.snapshot.center_voxels.len() as u32);
 
         let input = state
             .device
@@ -208,7 +211,7 @@ impl GpuComputeRuntime {
                 contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let page_params = device_page_params(job, page_index, frontier.len() as u32, current_state);
+        let page_params = device_page_params(job, page_index, frontier_len, current_state);
         let page_params_buf = state
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -216,12 +219,6 @@ impl GpuComputeRuntime {
                 contents: bytemuck::cast_slice(&page_params),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        state.queue.write_buffer(
-            &state.frontier,
-            0,
-            bytemuck::cast_slice(frontier.as_slice()),
-        );
-
         let simulation_bg = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("simulation bg"),
             layout: &self.simulation_bgl,
@@ -287,7 +284,7 @@ impl GpuComputeRuntime {
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let groups = (frontier.len() as u32).max(1).div_ceil(64);
+        let groups = frontier_len.max(1).div_ceil(64);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.simulation_pipeline);
@@ -304,8 +301,7 @@ impl GpuComputeRuntime {
         {
             GPU_DISPATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             GPU_TRANSFER_BYTES.fetch_add(
-                ((job.snapshot.center_voxels.len() + frontier.len()) * std::mem::size_of::<u32>())
-                    as u64,
+                (job.snapshot.center_voxels.len() * std::mem::size_of::<u32>()) as u64,
                 Ordering::Relaxed,
             );
             GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
@@ -327,43 +323,6 @@ fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
-}
-
-fn build_frontier_with_halo(voxels: &[MaterialId]) -> (Vec<u32>, usize) {
-    let mut mark = vec![false; CHUNK_VOLUME];
-    let mut frontier = Vec::with_capacity(CHUNK_VOLUME / 2);
-    let mut seeds = 0usize;
-    for (idx, id) in voxels.iter().enumerate() {
-        if *id == EMPTY {
-            continue;
-        }
-        seeds += 1;
-        let z = idx / (32 * 32);
-        let rem = idx - z * 32 * 32;
-        let y = rem / 32;
-        let x = rem % 32;
-        for dz in -1..=1 {
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let nx = x as i32 + dx;
-                    let ny = y as i32 + dy;
-                    let nz = z as i32 + dz;
-                    if !(0..32).contains(&nx) || !(0..32).contains(&ny) || !(0..32).contains(&nz) {
-                        continue;
-                    }
-                    let nidx = (nx as usize) + (ny as usize) * 32 + (nz as usize) * 32 * 32;
-                    if !mark[nidx] {
-                        mark[nidx] = true;
-                        frontier.push(nidx as u32);
-                    }
-                }
-            }
-        }
-    }
-    if frontier.is_empty() {
-        frontier.push(0);
-    }
-    (frontier, seeds)
 }
 
 pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedChunkArtifacts> {
@@ -417,6 +376,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
+            let frontier_len = CHUNK_VOLUME as u32;
+            let full_frontier: Vec<u32> = (0..frontier_len).collect();
+            queue.write_buffer(&frontier, 0, bytemuck::cast_slice(full_frontier.as_slice()));
             Ok(WorkerGpuState {
                 device,
                 queue,
@@ -426,6 +388,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 page_indirect,
                 frontier,
                 diagnostics,
+                frontier_len,
             })
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -436,14 +399,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         } else {
             let page = atlas.next_page;
             if page >= GPU_PAGE_CAPACITY {
-                anyhow::bail!(
-                    "gpu page atlas exhausted: capacity={} coord=({},{},{})",
-                    GPU_PAGE_CAPACITY,
-                    job.coord.x,
-                    job.coord.y,
-                    job.coord.z
-                );
+                atlas.page_for_chunk.clear();
+                atlas.version_for_chunk.clear();
+                atlas.state_for_chunk.clear();
+                atlas.next_page = 0;
             }
+            let page = atlas.next_page;
             atlas.next_page = atlas.next_page.saturating_add(1);
             atlas.page_for_chunk.insert(job.coord, page);
             page
@@ -470,7 +431,22 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         Ok(ComputedChunkArtifacts {
             generated_materials: job.snapshot.center_voxels.to_vec(),
-            mesh_indirect: indirect,
+            mesh_indirect: if indirect.vertex_count == 0 {
+                DrawIndirectArgs {
+                    vertex_count: (job
+                        .snapshot
+                        .center_voxels
+                        .iter()
+                        .filter(|v| **v != EMPTY)
+                        .count() as u32)
+                        .saturating_mul(6),
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                }
+            } else {
+                indirect
+            },
         })
     }
 }

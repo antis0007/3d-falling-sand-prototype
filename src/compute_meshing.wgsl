@@ -31,7 +31,7 @@ struct DrawIndirectArgs {
 @group(0) @binding(2) var<storage, read> active_frontier: array<u32>;
 @group(0) @binding(3) var<storage, read> page_params: array<PageParams>;
 @group(0) @binding(4) var<storage, read_write> page_indirect: array<DrawIndirectArgs>;
-@group(0) @binding(5) var<storage, read_write> diagnostics: array<u32>;
+@group(0) @binding(5) var<storage, read_write> diagnostics: array<atomic<u32>>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
     return page * (CHUNK_VOLUME * 2u) + state * CHUNK_VOLUME;
@@ -175,7 +175,7 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         page_indirect[params.page_index].instance_count = 1u;
         page_indirect[params.page_index].first_vertex = 0u;
         page_indirect[params.page_index].first_instance = 0u;
-        diagnostics[0u] = 0u;
+        atomicStore(&diagnostics[0u], 0u);
     }
 
     if (i >= params.frontier_len) {
