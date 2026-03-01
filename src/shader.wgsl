@@ -1,5 +1,7 @@
 struct Camera {
   vp: mat4x4<f32>,
+  origin_offset: vec3<f32>,
+  _pad: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -16,7 +18,8 @@ struct VsOut {
 @vertex
 fn vs_main(i: VsIn) -> VsOut {
   var o: VsOut;
-  o.pos = camera.vp * vec4<f32>(i.pos, 1.0);
+  let render_pos = i.pos - camera.origin_offset;
+  o.pos = camera.vp * vec4<f32>(render_pos, 1.0);
   o.color = i.color;
   return o;
 }

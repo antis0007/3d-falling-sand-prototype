@@ -1291,7 +1291,6 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
-                            origin_voxel,
                             player_chunk,
                             &cached_desired.generation_scores,
                             REMESH_JOB_BUDGET_PER_FRAME,
@@ -1392,6 +1391,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_modified_chunks.clear();
                                 total_generated_chunks = 0;
                                 origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                renderer.set_origin_voxel(origin_voxel);
                                 ctrl.position = Vec3::new(8.0, 6.0, 8.0);
                                 spawn_pending = true;
                                 collision_freeze_active = false;
