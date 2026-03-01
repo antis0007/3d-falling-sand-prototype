@@ -83,7 +83,7 @@ pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &m
             let target_id = snapshot
                 .get(&destination)
                 .copied()
-                .or_else(|| store.get_voxel(destination))
+                .or_else(|| Some(store.get_voxel(destination)))
                 .unwrap_or(EMPTY);
             if target_id == mat_id {
                 continue;
