@@ -4,7 +4,7 @@ use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
 use crate::renderer::{Camera, Renderer, VOXEL_SIZE};
 use crate::sim_world::{step_region_profiled, Rng};
-use crate::streaming::ChunkStreaming;
+use crate::streaming::{ChunkStreaming, DesiredChunks};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
@@ -26,17 +26,13 @@ const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
-const SIM_RADIUS_CHUNKS: i32 = 2;
-const RENDER_RADIUS_CHUNKS: i32 = 4;
 const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
 const REMESH_BUDGET_PER_FRAME: usize = 24;
 
 const GENERATOR_THREADS: usize = 3;
 const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
-const APPLY_BUDGET_ITEMS: usize = 6;
 const EVICT_BUDGET_MS: f32 = 1.0;
-const EVICT_BUDGET_ITEMS: usize = 8;
 
 #[derive(Clone)]
 struct GenJob {
@@ -46,6 +42,61 @@ struct GenJob {
 struct GenResult {
     coord: ChunkCoord,
     chunk: crate::world::Chunk,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamingTuning {
+    guaranteed_radius_xz: i32,
+    render_radius_xz: i32,
+    prefetch_radius_xz: i32,
+    prefetch_enabled: bool,
+    vertical_radius: i32,
+    base_apply_budget_items: usize,
+    max_apply_budget_items: usize,
+    base_generate_drain_items: usize,
+    max_generate_drain_items: usize,
+}
+
+impl Default for StreamingTuning {
+    fn default() -> Self {
+        Self {
+            guaranteed_radius_xz: 3,
+            render_radius_xz: 6,
+            prefetch_radius_xz: 9,
+            prefetch_enabled: true,
+            vertical_radius: 2,
+            base_apply_budget_items: 8,
+            max_apply_budget_items: 48,
+            base_generate_drain_items: 24,
+            max_generate_drain_items: 96,
+        }
+    }
+}
+
+impl StreamingTuning {
+    fn normalized(mut self) -> Self {
+        self.guaranteed_radius_xz = self.guaranteed_radius_xz.max(0);
+        self.render_radius_xz = self.render_radius_xz.max(self.guaranteed_radius_xz);
+        self.prefetch_radius_xz = self.prefetch_radius_xz.max(self.render_radius_xz);
+        self.vertical_radius = self.vertical_radius.max(0);
+        self.base_apply_budget_items = self.base_apply_budget_items.max(1);
+        self.max_apply_budget_items = self
+            .max_apply_budget_items
+            .max(self.base_apply_budget_items);
+        self.base_generate_drain_items = self.base_generate_drain_items.max(1);
+        self.max_generate_drain_items = self
+            .max_generate_drain_items
+            .max(self.base_generate_drain_items);
+        self
+    }
+}
+
+fn scaled_budget(base: usize, max: usize, backlog: usize, threshold: usize) -> usize {
+    if backlog <= threshold {
+        return base;
+    }
+    let pressure = ((backlog - threshold) / threshold.max(1)).min(8);
+    (base + base * pressure).min(max)
 }
 
 struct BackgroundGenerator {
@@ -137,6 +188,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut streaming = ChunkStreaming::new(1337);
     let chunk_generator = BackgroundGenerator::new(streaming.seed);
     let mut generated_ready: VecDeque<GenResult> = VecDeque::new();
+    let mut stream_tuning = StreamingTuning::default().normalized();
+    let mut cached_stream_tuning = stream_tuning.clone();
     let mut rng = Rng::new(0x1234_5678);
     let mut sim_acc = 0.0f32;
 
@@ -160,7 +213,17 @@ pub async fn run() -> anyhow::Result<()> {
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
     let mut last_player_chunk: Option<ChunkCoord> = None;
     let mut cached_sim_region: HashSet<ChunkCoord> = HashSet::new();
-    let mut cached_desired: Vec<ChunkCoord> = Vec::new();
+    let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
+        ChunkCoord { x: 0, y: 0, z: 0 },
+        stream_tuning.guaranteed_radius_xz,
+        stream_tuning.render_radius_xz,
+        if stream_tuning.prefetch_enabled {
+            Some(stream_tuning.prefetch_radius_xz)
+        } else {
+            None
+        },
+        stream_tuning.vertical_radius,
+    );
     let mut stream_debug = String::new();
     let mut frame_counter: u64 = 0;
 
@@ -255,9 +318,57 @@ pub async fn run() -> anyhow::Result<()> {
                                             BrushShape::Sphere
                                         }
                                     }
+                                    KeyCode::F1 => {
+                                        stream_tuning.base_generate_drain_items = stream_tuning.base_generate_drain_items.saturating_sub(4);
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F2 => {
+                                        stream_tuning.base_generate_drain_items += 4;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F3 => {
+                                        stream_tuning.base_apply_budget_items = stream_tuning.base_apply_budget_items.saturating_sub(2);
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F4 => {
+                                        stream_tuning.base_apply_budget_items += 2;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F5 => {
+                                        stream_tuning.prefetch_radius_xz += 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
                                     KeyCode::BracketLeft => ui.adjust_sim_speed(-1),
                                     KeyCode::BracketRight => ui.adjust_sim_speed(1),
                                     KeyCode::Backslash => ui.set_sim_speed(1.0),
+                                    KeyCode::F6 => {
+                                        stream_tuning.guaranteed_radius_xz -= 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F7 => {
+                                        stream_tuning.guaranteed_radius_xz += 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F8 => {
+                                        stream_tuning.render_radius_xz -= 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F9 => {
+                                        stream_tuning.render_radius_xz += 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F10 => {
+                                        stream_tuning.vertical_radius -= 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F11 => {
+                                        stream_tuning.vertical_radius += 1;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
+                                    KeyCode::F12 => {
+                                        stream_tuning.prefetch_enabled = !stream_tuning.prefetch_enabled;
+                                        stream_tuning = stream_tuning.clone().normalized();
+                                    }
                                     _ if hotbar_slot.is_some() => {
                                         assign_or_select_hotbar(
                                             &mut ui,
@@ -379,22 +490,41 @@ pub async fn run() -> anyhow::Result<()> {
                         // Cache desired/sim_region to avoid rebuilding allocations every frame
                         let desired_t0 = Instant::now();
                         let player_chunk_changed = last_player_chunk != Some(player_chunk);
-                        if player_chunk_changed {
+                        let stream_tuning_changed = cached_stream_tuning != stream_tuning;
+                        if player_chunk_changed || stream_tuning_changed {
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
-                                SIM_RADIUS_CHUNKS,
-                                RENDER_RADIUS_CHUNKS,
-                                1,
+                                stream_tuning.guaranteed_radius_xz,
+                                stream_tuning.render_radius_xz,
+                                if stream_tuning.prefetch_enabled {
+                                    Some(stream_tuning.prefetch_radius_xz)
+                                } else {
+                                    None
+                                },
+                                stream_tuning.vertical_radius,
                             );
-                            cached_sim_region = chunk_cube(player_chunk, SIM_RADIUS_CHUNKS);
+                            cached_sim_region = chunk_cube(player_chunk, stream_tuning.guaranteed_radius_xz);
                             last_player_chunk = Some(player_chunk);
+                            cached_stream_tuning = stream_tuning.clone();
                         }
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
                         let streaming_t0 = Instant::now();
-                        let stream_stats = streaming.update(&cached_desired, player_chunk, frame_counter);
+                        streaming.max_generate_schedule_per_update = scaled_budget(
+                            stream_tuning.base_generate_drain_items,
+                            stream_tuning.max_generate_drain_items,
+                            streaming.pending_generate_count(),
+                            stream_tuning.base_generate_drain_items,
+                        );
+                        let stream_stats = streaming.update(&cached_desired.generation_order, &cached_desired.resident_keep, player_chunk, frame_counter);
                         let mut gen_request_count = 0usize;
-                        for coord in streaming.drain_generate_requests(streaming.max_generate_schedule_per_update) {
+                        let generate_drain_budget = scaled_budget(
+                            stream_tuning.base_generate_drain_items,
+                            stream_tuning.max_generate_drain_items,
+                            streaming.pending_generate_count() + generated_ready.len(),
+                            stream_tuning.base_generate_drain_items,
+                        );
+                        for coord in streaming.drain_generate_requests(generate_drain_budget) {
                             if chunk_generator.try_request(coord) {
                                 gen_request_count += 1;
                             } else {
@@ -414,9 +544,15 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
+                        let apply_budget_items = scaled_budget(
+                            stream_tuning.base_apply_budget_items,
+                            stream_tuning.max_apply_budget_items,
+                            generated_ready.len(),
+                            stream_tuning.base_apply_budget_items,
+                        );
                         let apply_t0 = Instant::now();
                         let mut apply_count = 0usize;
-                        while apply_count < APPLY_BUDGET_ITEMS
+                        while apply_count < apply_budget_items
                             && apply_t0.elapsed() < Duration::from_secs_f32(APPLY_BUDGET_MS / 1000.0)
                         {
                             let Some(done) = generated_ready.pop_front() else { break; };
@@ -428,7 +564,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let evict_t0 = Instant::now();
                         let mut evict_count = 0usize;
-                        while evict_count < EVICT_BUDGET_ITEMS
+                        while evict_count < streaming.max_evict_schedule_per_update
                             && evict_t0.elapsed() < Duration::from_secs_f32(EVICT_BUDGET_MS / 1000.0)
                         {
                             let mut one = streaming.drain_evict_requests(1);
@@ -449,7 +585,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 player_chunk.x,
                                 player_chunk.y,
                                 player_chunk.z,
-                                cached_desired.len(),
+                                cached_desired.generation_order.len(),
                                 stream_stats.newly_desired,
                                 gen_request_count,
                                 apply_count,
@@ -458,26 +594,34 @@ pub async fn run() -> anyhow::Result<()> {
                                 streaming.pending_evict_count()
                             ));
                         }
-                        if generated_ready.len() >= APPLY_BUDGET_ITEMS {
+                        if generated_ready.len() >= apply_budget_items {
                             ui.log_once_per_second("apply_budget", now_secs, || {
                                 format!("apply budget hit: remaining queue={}", generated_ready.len())
                             });
                         }
-                        if streaming.pending_evict_count() > EVICT_BUDGET_ITEMS {
+                        if streaming.pending_evict_count() > streaming.max_evict_schedule_per_update {
                             ui.log_once_per_second("evict_budget", now_secs, || {
                                 format!("evict budget hit: remaining queue={}", streaming.pending_evict_count())
                             });
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} desired={} gen_pending={} apply_queue={} player_chunk=({}, {}, {})",
+                            "Stream: resident={} guaranteed={} render={} prefetch={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) radii[g/r/p/v]={}/{}/{}/{} budgets[gen/app]={}/{} keys[F1/F2 gen, F3/F4 apply, F5 prefetch+, F6/F7 g, F8/F9 r, F10/F11 v, F12 prefetch]",
                             streaming.resident.len(),
-                            cached_desired.len(),
+                            cached_desired.guaranteed.len(),
+                            cached_desired.render.len(),
+                            cached_desired.prefetch.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
                             player_chunk.x,
                             player_chunk.y,
-                            player_chunk.z
+                            player_chunk.z,
+                            stream_tuning.guaranteed_radius_xz,
+                            stream_tuning.render_radius_xz,
+                            if stream_tuning.prefetch_enabled { stream_tuning.prefetch_radius_xz } else { 0 },
+                            stream_tuning.vertical_radius,
+                            generate_drain_budget,
+                            apply_budget_items,
                         );
                         ui.stream_debug = stream_debug.clone();
 
@@ -573,7 +717,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 store.clear();
                                 streaming.clear();
                                 last_player_chunk = None;
-                                cached_desired.clear();
+                                cached_desired = DesiredChunks::default();
                                 cached_sim_region.clear();
                                 generated_ready.clear();
                             }

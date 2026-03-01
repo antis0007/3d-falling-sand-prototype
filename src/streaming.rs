@@ -22,6 +22,15 @@ pub struct StreamingUpdateStats {
     pub queued_evict: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DesiredChunks {
+    pub guaranteed: Vec<ChunkCoord>,
+    pub render: Vec<ChunkCoord>,
+    pub prefetch: Vec<ChunkCoord>,
+    pub generation_order: Vec<ChunkCoord>,
+    pub resident_keep: HashSet<ChunkCoord>,
+}
+
 #[derive(Debug)]
 pub struct ChunkStreaming {
     pub seed: u64,
@@ -73,37 +82,84 @@ impl ChunkStreaming {
 
     pub fn desired_set(
         player_chunk: ChunkCoord,
-        sim_radius_xz: i32,
+        guaranteed_radius_xz: i32,
         render_radius_xz: i32,
+        prefetch_radius_xz: Option<i32>,
         vertical_radius: i32,
-    ) -> Vec<ChunkCoord> {
-        let mut desired = Vec::new();
-        let radius_xz = sim_radius_xz.max(render_radius_xz).max(0);
+    ) -> DesiredChunks {
+        let guaranteed_radius = guaranteed_radius_xz.max(0);
+        let render_radius = render_radius_xz.max(guaranteed_radius);
+        let prefetch_radius = prefetch_radius_xz
+            .unwrap_or(render_radius)
+            .max(render_radius);
         let ry = vertical_radius.max(0);
 
-        for dz in -radius_xz..=radius_xz {
-            for dy in -ry..=ry {
-                for dx in -radius_xz..=radius_xz {
-                    desired.push(ChunkCoord {
-                        x: player_chunk.x + dx,
-                        y: player_chunk.y + dy,
-                        z: player_chunk.z + dz,
-                    });
+        let guaranteed = Self::ring_sorted_region(player_chunk, guaranteed_radius, ry, 0);
+        let render =
+            Self::ring_sorted_region(player_chunk, render_radius, ry, guaranteed_radius + 1);
+        let prefetch =
+            Self::ring_sorted_region(player_chunk, prefetch_radius, ry, render_radius + 1);
+
+        let mut generation_order =
+            Vec::with_capacity(guaranteed.len() + render.len() + prefetch.len());
+        generation_order.extend(guaranteed.iter().copied());
+        generation_order.extend(render.iter().copied());
+        generation_order.extend(prefetch.iter().copied());
+
+        let mut resident_keep = HashSet::with_capacity(guaranteed.len() + render.len());
+        resident_keep.extend(guaranteed.iter().copied());
+        resident_keep.extend(render.iter().copied());
+
+        DesiredChunks {
+            guaranteed,
+            render,
+            prefetch,
+            generation_order,
+            resident_keep,
+        }
+    }
+
+    fn ring_sorted_region(
+        player_chunk: ChunkCoord,
+        radius_xz: i32,
+        vertical_radius: i32,
+        start_ring: i32,
+    ) -> Vec<ChunkCoord> {
+        let radius = radius_xz.max(0);
+        let start = start_ring.max(0).min(radius + 1);
+        let mut out = Vec::new();
+
+        for ring in start..=radius {
+            let mut ring_coords = Vec::new();
+            for dz in -ring..=ring {
+                for dx in -ring..=ring {
+                    if dx.abs().max(dz.abs()) != ring {
+                        continue;
+                    }
+                    for dy in -vertical_radius..=vertical_radius {
+                        ring_coords.push(ChunkCoord {
+                            x: player_chunk.x + dx,
+                            y: player_chunk.y + dy,
+                            z: player_chunk.z + dz,
+                        });
+                    }
                 }
             }
+            ring_coords.sort_by_key(|&coord| Self::sort_key(player_chunk, coord));
+            out.extend(ring_coords);
         }
-        desired.sort_by_key(|&coord| Self::sort_key(player_chunk, coord));
-        desired
+
+        out
     }
 
     pub fn update(
         &mut self,
         desired_sorted: &[ChunkCoord],
+        resident_keep: &HashSet<ChunkCoord>,
         player_chunk: ChunkCoord,
         frame_index: u64,
     ) -> StreamingUpdateStats {
         let mut stats = StreamingUpdateStats::default();
-        let desired_lookup: HashSet<ChunkCoord> = desired_sorted.iter().copied().collect();
 
         for &coord in desired_sorted
             .iter()
@@ -118,7 +174,7 @@ impl ChunkStreaming {
             stats.queued_generate += 1;
         }
 
-        stats.newly_desired = desired_lookup
+        stats.newly_desired = desired_sorted
             .iter()
             .filter(|coord| !self.resident.contains(coord) && !self.generating.contains(coord))
             .count();
@@ -131,7 +187,7 @@ impl ChunkStreaming {
             .rev()
             .take(self.max_evict_schedule_per_update)
         {
-            if desired_lookup.contains(&coord) || self.generating.contains(&coord) {
+            if resident_keep.contains(&coord) || self.generating.contains(&coord) {
                 self.evict_not_desired_since.remove(&coord);
                 continue;
             }
