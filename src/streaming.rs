@@ -6,6 +6,12 @@ use crate::types::ChunkCoord;
 
 pub const URGENT_CHUNK_CHEBYSHEV_RADIUS: i32 = 1;
 pub const URGENT_CHUNK_VERTICAL_RADIUS: i32 = 1;
+const MID_RING_UPWARD_BIAS_BUDGET: i32 = 4;
+const FAR_RING_UPWARD_BIAS_BUDGET: i32 = 8;
+const DEPTH_PENALTY_START_DELTA_Y: i32 = 3;
+const DEPTH_PENALTY_PER_CHUNK: f32 = 0.035;
+const ABOVE_PLAYER_RING_BOOST: f32 = 0.08;
+const HORIZONTAL_NEIGHBOR_SCHEDULE_FLOOR: usize = 4;
 
 pub fn is_urgent_chunk(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
     let chebyshev = (coord.x - player_chunk.x)
@@ -172,9 +178,21 @@ impl ChunkStreaming {
         let far_radius = far_radius_xz.unwrap_or(mid_radius).max(mid_radius);
         let ry = vertical_radius.max(0);
 
-        let near = Self::ring_sorted_region(player_chunk, near_radius, ry, 0);
-        let mid = Self::ring_sorted_region(player_chunk, mid_radius, ry, near_radius + 1);
-        let far = Self::ring_sorted_region(player_chunk, far_radius, ry, mid_radius + 1);
+        let near = Self::ring_sorted_region(player_chunk, near_radius, ry, 0, 0);
+        let mid = Self::ring_sorted_region(
+            player_chunk,
+            mid_radius,
+            ry,
+            near_radius + 1,
+            MID_RING_UPWARD_BIAS_BUDGET,
+        );
+        let far = Self::ring_sorted_region(
+            player_chunk,
+            far_radius,
+            ry,
+            mid_radius + 1,
+            FAR_RING_UPWARD_BIAS_BUDGET,
+        );
 
         let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len());
         let view_dir = view_dir.normalize_or_zero();
@@ -256,6 +274,7 @@ impl ChunkStreaming {
                 .abs()
                 .max((coord.y - player_chunk.y).abs())
                 .max((coord.z - player_chunk.z).abs());
+            let dy_i32 = coord.y - player_chunk.y;
             let lod_need = if cheb <= near_radius {
                 1.0
             } else if cheb <= mid_radius {
@@ -263,11 +282,24 @@ impl ChunkStreaming {
             } else {
                 0.35
             };
+            let depth_penalty = if dy_i32 < -DEPTH_PENALTY_START_DELTA_Y {
+                (-dy_i32 - DEPTH_PENALTY_START_DELTA_Y) as f32 * DEPTH_PENALTY_PER_CHUNK
+            } else {
+                0.0
+            };
+            let is_near_or_mid = cheb <= mid_radius;
+            let above_player_boost = if dy_i32 >= 0 && is_near_or_mid {
+                ABOVE_PLAYER_RING_BOOST * (0.7 + 0.3 * cone_weight)
+            } else {
+                0.0
+            };
             let score = (1.0 / (1.0 + distance2 as f32)) * 0.55
                 + (cone_weight * 0.72 + velocity_alignment * 0.28) * 0.25
                 + frustum_weight * 0.08
                 + recent_visibility * 0.12
-                + lod_need * 0.08;
+                + lod_need * 0.08
+                + above_player_boost
+                - depth_penalty;
             weighted.push((
                 coord,
                 score,
@@ -337,9 +369,12 @@ impl ChunkStreaming {
         radius_xz: i32,
         vertical_radius: i32,
         start_ring: i32,
+        upward_bias_budget: i32,
     ) -> Vec<ChunkCoord> {
         let radius = radius_xz.max(0);
         let start = start_ring.max(0).min(radius + 1);
+        let min_dy = -vertical_radius;
+        let max_dy = vertical_radius + upward_bias_budget.max(0);
         let mut out = Vec::new();
 
         for ring in start..=radius {
@@ -349,7 +384,7 @@ impl ChunkStreaming {
                     if dx.abs().max(dz.abs()) != ring {
                         continue;
                     }
-                    for dy in -vertical_radius..=vertical_radius {
+                    for dy in min_dy..=max_dy {
                         ring_coords.push(ChunkCoord {
                             x: player_chunk.x + dx,
                             y: player_chunk.y + dy,
@@ -390,30 +425,59 @@ impl ChunkStreaming {
             self.evict_not_desired_since.remove(&coord);
         }
 
-        for &coord in desired_sorted {
-            let lifecycle = self.chunk_lifecycle.entry(coord).or_default();
+        let try_schedule = |streaming: &mut Self, coord: ChunkCoord| -> bool {
+            let lifecycle = streaming.chunk_lifecycle.entry(coord).or_default();
             lifecycle.last_visible_frame = frame_index;
-            if self.resident.contains(&coord)
-                || self.dispatched_generate.contains(&coord)
-                || self.scheduled_generate.contains(&coord)
+
+            if streaming.resident.contains(&coord)
+                || streaming.dispatched_generate.contains(&coord)
+                || streaming.scheduled_generate.contains(&coord)
             {
-                continue;
+                return false;
             }
+
             if !is_urgent_chunk(player_chunk, coord)
                 && lifecycle.last_evicted_frame > 0
                 && frame_index.saturating_sub(lifecycle.last_evicted_frame)
-                    < self.regen_cooldown_frames
+                    < streaming.regen_cooldown_frames
             {
-                continue;
+                return false;
             }
+
+            streaming.scheduled_generate.insert(coord);
+            streaming.pending_generate.push_back(coord);
+            streaming.work_items.push(WorkItem::Generate(coord));
+            true
+        };
+
+        let horizontal_neighbors: Vec<_> = desired_sorted
+            .iter()
+            .copied()
+            .filter(|coord| Self::is_immediate_horizontal_neighbor(player_chunk, *coord))
+            .collect();
+
+        let reserved_neighbor_budget = HORIZONTAL_NEIGHBOR_SCHEDULE_FLOOR
+            .min(horizontal_neighbors.len())
+            .min(self.max_generate_schedule_per_update);
+
+        for coord in horizontal_neighbors {
+            if queued_this_frame >= reserved_neighbor_budget {
+                break;
+            }
+            if try_schedule(self, coord) {
+                queued_this_frame += 1;
+                stats.queued_generate += 1;
+            }
+        }
+
+        for &coord in desired_sorted {
             if queued_this_frame >= self.max_generate_schedule_per_update {
-                continue;
+                break;
             }
-            self.scheduled_generate.insert(coord);
-            self.pending_generate.push_back(coord);
-            self.work_items.push(WorkItem::Generate(coord));
-            queued_this_frame += 1;
-            stats.queued_generate += 1;
+            if try_schedule(self, coord) {
+                queued_this_frame += 1;
+                stats.queued_generate += 1;
+            }
         }
 
         let mut resident_sorted: Vec<ChunkCoord> = self.resident.iter().copied().collect();
@@ -588,6 +652,12 @@ impl ChunkStreaming {
 }
 
 impl ChunkStreaming {
+    fn is_immediate_horizontal_neighbor(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
+        let dx = (coord.x - player_chunk.x).abs();
+        let dz = (coord.z - player_chunk.z).abs();
+        dx.max(dz) == 1 && coord.y == player_chunk.y
+    }
+
     fn cancel_queued_evict(&mut self, coord: ChunkCoord) {
         if !self.queued_evict_set.remove(&coord) {
             return;
@@ -633,7 +703,9 @@ impl Default for StreamingState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    use glam::Vec3;
 
     use crate::types::ChunkCoord;
 
@@ -795,5 +867,101 @@ mod tests {
         assert_eq!(streaming.pending_generate.pop_front(), Some(urgent));
         assert_eq!(streaming.pending_generate.pop_front(), Some(far));
         assert_eq!(streaming.pending_generate.pop_front(), Some(near));
+    }
+
+    #[test]
+    fn desired_set_keeps_surface_adjacent_chunks_when_player_is_low() {
+        let player = ChunkCoord { x: 0, y: -10, z: 0 };
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            None,
+            1,
+            3,
+            Some(5),
+            3,
+            32,
+            32,
+            &HashMap::new(),
+            0,
+        );
+
+        let near_surface = ChunkCoord { x: 0, y: 0, z: 4 };
+        let deep_below = ChunkCoord { x: 0, y: -13, z: 4 };
+
+        assert!(desired.generation_scores.contains_key(&near_surface));
+        assert!(desired.generation_scores.contains_key(&deep_below));
+        assert!(desired.generation_scores[&near_surface] > desired.generation_scores[&deep_below]);
+
+        let near_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == near_surface)
+            .unwrap();
+        let deep_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == deep_below)
+            .unwrap();
+        assert!(near_idx < deep_idx);
+    }
+
+    #[test]
+    fn deep_below_chunks_do_not_displace_near_above_chunks_with_finite_budget() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 1;
+
+        let player = ChunkCoord { x: 0, y: -6, z: 0 };
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::new(0.0, 1.0, 0.0),
+            None,
+            1,
+            3,
+            Some(5),
+            3,
+            32,
+            32,
+            &HashMap::new(),
+            0,
+        );
+
+        let near_above = ChunkCoord { x: 1, y: 0, z: 4 };
+        let deep_below = ChunkCoord { x: 1, y: -9, z: 4 };
+        assert!(desired.generation_scores[&near_above] > desired.generation_scores[&deep_below]);
+
+        let desired_pair = if desired.generation_scores[&near_above] >= desired.generation_scores[&deep_below] {
+            vec![near_above, deep_below]
+        } else {
+            vec![deep_below, near_above]
+        };
+        let keep_pair: HashSet<_> = desired_pair.iter().copied().collect();
+        let stats = streaming.update(&desired_pair, &keep_pair, player, 1);
+
+        assert_eq!(stats.queued_generate, 1);
+        assert!(streaming.scheduled_generate.contains(&near_above));
+        assert!(!streaming.scheduled_generate.contains(&deep_below));
+    }
+
+    #[test]
+    fn immediate_horizontal_neighbors_are_scheduled_with_budget_floor() {
+        let mut streaming = ChunkStreaming::new(1);
+        streaming.max_generate_schedule_per_update = 2;
+
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let neighbor_a = ChunkCoord { x: 1, y: 0, z: 0 };
+        let neighbor_b = ChunkCoord { x: 0, y: 0, z: 1 };
+        let high_y = ChunkCoord { x: 0, y: 4, z: 0 };
+
+        let desired = vec![high_y, neighbor_a, neighbor_b];
+        let keep: HashSet<_> = desired.iter().copied().collect();
+        let stats = streaming.update(&desired, &keep, player, 1);
+
+        assert_eq!(stats.queued_generate, 2);
+        assert!(streaming.scheduled_generate.contains(&neighbor_a));
+        assert!(streaming.scheduled_generate.contains(&neighbor_b));
+        assert!(!streaming.scheduled_generate.contains(&high_y));
     }
 }
