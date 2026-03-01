@@ -2,7 +2,10 @@ use crate::chunk_store::ChunkStore;
 use crate::input::{FpsController, InputState};
 use crate::player::camera_world_pos_from_blocks;
 use crate::procgen::{apply_generated_chunk, generate_chunk};
-use crate::renderer::{Camera, LodMeshingBudgets, LodRadii, Renderer, VOXEL_SIZE};
+use crate::renderer::{
+    Camera, LodMeshingBudgets, LodRadii, Renderer, RendererSettings,
+    UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
+};
 use crate::sim_world::{step_region_profiled, Rng};
 use crate::streaming::{ChunkStreaming, DesiredChunks};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
@@ -1014,7 +1017,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) desired_recompute={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} player_chunk=({}, {}, {}) desired_recompute={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] origin=({}, {}, {}) player_world=({}, {}, {})",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
@@ -1038,6 +1041,12 @@ pub async fn run() -> anyhow::Result<()> {
                             collision_freeze_active,
                             collision_used_unloaded_chunks,
                             COLLISION_SAFETY_RADIUS_VOXELS,
+                            origin_voxel.x,
+                            origin_voxel.y,
+                            origin_voxel.z,
+                            player_world_voxel.x,
+                            player_world_voxel.y,
+                            player_world_voxel.z,
                         );
                         ui.stream_debug = stream_debug.clone();
 
@@ -1095,6 +1104,15 @@ pub async fn run() -> anyhow::Result<()> {
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
 
                         renderer.day = ui.day;
+                        renderer.set_settings(RendererSettings {
+                            frustum_culling: ui.renderer_frustum_culling,
+                            greedy_meshing: ui.renderer_greedy_meshing,
+                            unknown_neighbor_policy: if ui.renderer_conservative_neighbors {
+                                UnknownNeighborOcclusionPolicy::Conservative
+                            } else {
+                                UnknownNeighborOcclusionPolicy::Aggressive
+                            },
+                        });
                         let mesh_upload_budget = adaptive_mesh_upload_budget(
                             ui.profiler.frame_ms,
                             prior_mesh_backlog,
@@ -1139,6 +1157,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_count = mesh_stats.upload_count;
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
+                        ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
                         ui.profiler.near_radius = effective_stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = effective_stream_tuning.mid_radius_xz;
@@ -1226,6 +1245,14 @@ pub async fn run() -> anyhow::Result<()> {
                         let vp = cam.view_proj();
                         let (chunks_drawn, total_indices) = renderer.mesh_draw_stats(vp);
                         ui.set_draw_stats(chunks_drawn, total_indices);
+                        let cull_stats = renderer.cull_stats(&cam);
+                        ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
+                        ui.profiler.frustum_culled_chunks = cull_stats.frustum_culled;
+                        ui.profiler.missing_in_radius = cached_desired
+                            .generation_order
+                            .iter()
+                            .filter(|coord| !streaming.resident.contains(coord) && !streaming.generating.contains(coord))
+                            .count();
 
                         let preview_local: Vec<[i32; 3]> = preview_block_list
                             .iter()

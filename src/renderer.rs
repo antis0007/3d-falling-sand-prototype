@@ -21,7 +21,7 @@ pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum UnknownNeighborOcclusionPolicy {
     Conservative,
     Aggressive,
@@ -157,6 +157,32 @@ pub struct Renderer {
 
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
+    settings: RendererSettings,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RendererSettings {
+    pub frustum_culling: bool,
+    pub greedy_meshing: bool,
+    pub unknown_neighbor_policy: UnknownNeighborOcclusionPolicy,
+}
+
+impl Default for RendererSettings {
+    fn default() -> Self {
+        Self {
+            frustum_culling: true,
+            greedy_meshing: true,
+            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Aggressive,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct CullStats {
+    pub drawn: usize,
+    pub frustum_culled: usize,
+    pub lod_filtered: usize,
+    pub screen_culled: usize,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -241,6 +267,7 @@ pub(crate) struct MeshJob {
     pub(crate) origin_voxel: VoxelCoord,
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
+    pub(crate) greedy: bool,
 }
 
 struct MeshResult {
@@ -291,8 +318,13 @@ impl BackgroundMeshQueue {
 
                     let snapshot =
                         rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
-                    let (verts, inds, aabb_min, aabb_max) =
-                        mesh_chunk_snapshot(job.coord, job.origin_voxel, &snapshot, job.lod);
+                    let (verts, inds, aabb_min, aabb_max) = mesh_chunk_snapshot(
+                        job.coord,
+                        job.origin_voxel,
+                        &snapshot,
+                        job.lod,
+                        job.greedy,
+                    );
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
@@ -489,6 +521,7 @@ impl Renderer {
             completed_meshes: Vec::new(),
             day: true,
             mesh_backend,
+            settings: RendererSettings::default(),
         })
     }
 
@@ -498,6 +531,47 @@ impl Renderer {
         self.config.height = size.height.max(1);
         self.surface.configure(&self.device, &self.config);
         (self.depth_texture, self.depth_view) = create_depth_texture(&self.device, &self.config);
+    }
+
+    pub fn settings(&self) -> RendererSettings {
+        self.settings
+    }
+
+    pub fn set_settings(&mut self, settings: RendererSettings) {
+        self.settings = settings;
+    }
+
+    pub fn cull_stats(&self, camera: &Camera) -> CullStats {
+        let vp = camera.view_proj();
+        let mut stats = CullStats::default();
+        for (&(coord, lod), mesh) in &self.store_meshes {
+            if self
+                .lod_selection
+                .get(&coord)
+                .copied()
+                .unwrap_or(ChunkLod::Near)
+                != lod
+            {
+                stats.lod_filtered += 1;
+                continue;
+            }
+            if self.settings.frustum_culling && !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
+                stats.frustum_culled += 1;
+                continue;
+            }
+            if !passes_screen_space_cull(
+                camera,
+                lod,
+                mesh.aabb_min,
+                mesh.aabb_max,
+                self.size.height,
+            ) {
+                stats.screen_culled += 1;
+                continue;
+            }
+            stats.drawn += 1;
+        }
+        stats
     }
 
     /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
@@ -554,7 +628,8 @@ impl Renderer {
             }
 
             let t0 = Instant::now();
-            let snapshot = build_chunk_snapshot(store, coord);
+            let snapshot =
+                build_chunk_snapshot(store, coord, self.settings.unknown_neighbor_policy);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
             stats.total_ms += ms;
             if ms > stats.max_ms {
@@ -575,6 +650,7 @@ impl Renderer {
                     origin_voxel,
                     queued_at: Instant::now(),
                     snapshot: snapshot.clone(),
+                    greedy: self.settings.greedy_meshing,
                 });
             };
 
@@ -898,7 +974,7 @@ impl Renderer {
             {
                 continue;
             }
-            if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
+            if self.settings.frustum_culling && !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
             }
             if !passes_screen_space_cull(
@@ -980,17 +1056,105 @@ fn dirty_coord_priority(
         .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
 }
 
-fn build_chunk_snapshot(store: &ChunkStore, coord: ChunkCoord) -> ChunkSnapshot {
+fn build_chunk_snapshot(
+    store: &ChunkStore,
+    coord: ChunkCoord,
+    policy: UnknownNeighborOcclusionPolicy,
+) -> ChunkSnapshot {
     let chunk_world_min = chunk_to_world_min(coord);
     let center_voxels = store
         .get_chunk(coord)
         .map(|chunk| Arc::<[MaterialId]>::from(chunk.iter_raw()))
         .unwrap_or_else(|| Arc::from(vec![EMPTY; (CHUNK_SIZE_VOXELS.pow(3)) as usize]));
 
+    let mut strips = store.chunk_border_strips(coord);
+    if matches!(policy, UnknownNeighborOcclusionPolicy::Conservative) {
+        synthesize_missing_neighbor_borders(store, coord, &mut strips);
+    }
+
     ChunkSnapshot {
         world_min: chunk_world_min,
         center_voxels,
-        border_strips: Arc::new(store.chunk_border_strips(coord)),
+        border_strips: Arc::new(strips),
+    }
+}
+
+fn synthesize_missing_neighbor_borders(
+    store: &ChunkStore,
+    coord: ChunkCoord,
+    strips: &mut ChunkBorderStrips,
+) {
+    let Some(center) = store.get_chunk(coord) else {
+        return;
+    };
+    let side = CHUNK_SIZE_VOXELS as usize;
+    let idx = |u: usize, v: usize| u * side + v;
+
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x - 1,
+        y: coord.y,
+        z: coord.z,
+    }) {
+        for y in 0..side {
+            for z in 0..side {
+                strips.neg_x[idx(y, z)] = center.get(0, y, z);
+            }
+        }
+    }
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x + 1,
+        y: coord.y,
+        z: coord.z,
+    }) {
+        for y in 0..side {
+            for z in 0..side {
+                strips.pos_x[idx(y, z)] = center.get(side - 1, y, z);
+            }
+        }
+    }
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x,
+        y: coord.y - 1,
+        z: coord.z,
+    }) {
+        for x in 0..side {
+            for z in 0..side {
+                strips.neg_y[idx(x, z)] = center.get(x, 0, z);
+            }
+        }
+    }
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x,
+        y: coord.y + 1,
+        z: coord.z,
+    }) {
+        for x in 0..side {
+            for z in 0..side {
+                strips.pos_y[idx(x, z)] = center.get(x, side - 1, z);
+            }
+        }
+    }
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x,
+        y: coord.y,
+        z: coord.z - 1,
+    }) {
+        for x in 0..side {
+            for y in 0..side {
+                strips.neg_z[idx(x, y)] = center.get(x, y, 0);
+            }
+        }
+    }
+    if !store.is_chunk_loaded(ChunkCoord {
+        x: coord.x,
+        y: coord.y,
+        z: coord.z + 1,
+    }) {
+        for x in 0..side {
+            for y in 0..side {
+                strips.pos_z[idx(x, y)] = center.get(x, y, side - 1);
+            }
+        }
     }
 }
 
@@ -999,10 +1163,17 @@ fn mesh_chunk_snapshot(
     origin_voxel: VoxelCoord,
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
+    greedy: bool,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let chunk_world_min = snapshot.world_min;
     match lod {
-        ChunkLod::Near => mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 1),
+        ChunkLod::Near => {
+            if greedy {
+                mesh_chunk_voxel_faces_greedy(snapshot, chunk_world_min, origin_voxel)
+            } else {
+                mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 1)
+            }
+        }
         ChunkLod::Mid => mesh_chunk_voxel_faces(snapshot, chunk_world_min, origin_voxel, 2),
         ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, origin_voxel, 4),
         ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, origin_voxel, 8),
@@ -1056,6 +1227,236 @@ fn mesh_chunk_voxel_faces(
             ly += step;
         }
         lz += step;
+    }
+
+    (verts, inds, min, max)
+}
+
+fn mesh_chunk_voxel_faces_greedy(
+    snapshot: &ChunkSnapshot,
+    chunk_world_min: VoxelCoord,
+    origin_voxel: VoxelCoord,
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+    let mut verts = Vec::new();
+    let mut inds = Vec::new();
+    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+    let side = CHUNK_SIZE_VOXELS;
+
+    for y in 0..side {
+        for z in 0..side {
+            let mut x = 0;
+            while x < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x + 1, y, z)) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x + 1, y, z)) {
+                        break;
+                    }
+                    x += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + start,
+                        y: chunk_world_min.y + y,
+                        z: chunk_world_min.z + z,
+                    },
+                    origin_voxel,
+                    (x - start) as f32,
+                    1.0,
+                    1.0,
+                    material(id).color,
+                    &[true, false, false, false, false, false],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
+    }
+
+    for y in 0..side {
+        for z in 0..side {
+            let mut x = 0;
+            while x < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x - 1, y, z)) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x - 1, y, z)) {
+                        break;
+                    }
+                    x += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + start,
+                        y: chunk_world_min.y + y,
+                        z: chunk_world_min.z + z,
+                    },
+                    origin_voxel,
+                    (x - start) as f32,
+                    1.0,
+                    1.0,
+                    material(id).color,
+                    &[false, true, false, false, false, false],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
+    }
+
+    for x in 0..side {
+        for y in 0..side {
+            let mut z = 0;
+            while z < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y, z + 1)) {
+                    z += 1;
+                    continue;
+                }
+                let start = z;
+                while z < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x, y, z + 1)) {
+                        break;
+                    }
+                    z += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + x,
+                        y: chunk_world_min.y + y,
+                        z: chunk_world_min.z + start,
+                    },
+                    origin_voxel,
+                    1.0,
+                    1.0,
+                    (z - start) as f32,
+                    material(id).color,
+                    &[false, false, false, false, true, false],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
+    }
+
+    for x in 0..side {
+        for y in 0..side {
+            let mut z = 0;
+            while z < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y, z - 1)) {
+                    z += 1;
+                    continue;
+                }
+                let start = z;
+                while z < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x, y, z - 1)) {
+                        break;
+                    }
+                    z += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + x,
+                        y: chunk_world_min.y + y,
+                        z: chunk_world_min.z + start,
+                    },
+                    origin_voxel,
+                    1.0,
+                    1.0,
+                    (z - start) as f32,
+                    material(id).color,
+                    &[false, false, false, false, false, true],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
+    }
+
+    for x in 0..side {
+        for z in 0..side {
+            let mut y = 0;
+            while y < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y + 1, z)) {
+                    y += 1;
+                    continue;
+                }
+                let start = y;
+                while y < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x, y + 1, z)) {
+                        break;
+                    }
+                    y += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + x,
+                        y: chunk_world_min.y + start,
+                        z: chunk_world_min.z + z,
+                    },
+                    origin_voxel,
+                    1.0,
+                    (y - start) as f32,
+                    1.0,
+                    material(id).color,
+                    &[false, false, true, false, false, false],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
+    }
+
+    for x in 0..side {
+        for z in 0..side {
+            let mut y = 0;
+            while y < side {
+                let id = snapshot.get_local(x, y, z);
+                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y - 1, z)) {
+                    y += 1;
+                    continue;
+                }
+                let start = y;
+                while y < side {
+                    let cur = snapshot.get_local(x, y, z);
+                    if cur != id || is_face_occluded(cur, snapshot.get_local(x, y - 1, z)) {
+                        break;
+                    }
+                    y += 1;
+                }
+                add_box_faces(
+                    VoxelCoord {
+                        x: chunk_world_min.x + x,
+                        y: chunk_world_min.y + start,
+                        z: chunk_world_min.z + z,
+                    },
+                    origin_voxel,
+                    1.0,
+                    (y - start) as f32,
+                    1.0,
+                    material(id).color,
+                    &[false, false, false, true, false, false],
+                    &mut verts,
+                    &mut inds,
+                );
+            }
+        }
     }
 
     (verts, inds, min, max)
