@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 procgen-profile = []
+gpu-compute = []
 
 [dependencies]
 anyhow = "1"

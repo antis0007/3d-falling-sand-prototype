@@ -27,7 +27,8 @@ const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
 const ORIGIN_SHIFT_THRESHOLD: f32 = 128.0;
-const REMESH_BUDGET_PER_FRAME: usize = 24;
+const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
+const MESH_UPLOAD_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
 
 const GENERATOR_THREADS: usize = 3;
 const GENERATOR_QUEUE_BOUND: usize = 192;
@@ -709,7 +710,9 @@ pub async fn run() -> anyhow::Result<()> {
                         let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
                             origin_voxel,
-                            REMESH_BUDGET_PER_FRAME,
+                            player_chunk,
+                            REMESH_JOB_BUDGET_PER_FRAME,
+                            MESH_UPLOAD_BYTES_PER_FRAME,
                         );
                         ui.set_mesh_timing(mesh_stats.max_ms);
                         ui.profiler.desired_ms = desired_ms;
@@ -725,6 +728,12 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_ms = mesh_stats.total_ms;
                         ui.profiler.mesh_count = mesh_stats.mesh_count;
                         ui.profiler.dirty_backlog = mesh_stats.dirty_backlog + store.dirty_count();
+                        ui.profiler.mesh_queue_depth = mesh_stats.meshing_queue_depth;
+                        ui.profiler.mesh_completed_depth = mesh_stats.meshing_completed_depth;
+                        ui.profiler.mesh_upload_count = mesh_stats.upload_count;
+                        ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
+                        ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
+                        ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
 
