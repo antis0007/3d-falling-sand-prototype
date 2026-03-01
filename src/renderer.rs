@@ -437,6 +437,38 @@ impl Renderer {
             }
             stats.mesh_count += 1;
 
+            if inds.is_empty() {
+                self.store_meshes.remove(&coord);
+                store.mark_chunk_meshed(coord);
+                continue;
+            }
+
+            let vb = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk vb"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let ib = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("store chunk ib"),
+                    contents: bytemuck::cast_slice(&inds),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+
+            self.store_meshes.insert(
+                coord,
+                ChunkMesh {
+                    vb,
+                    ib,
+                    index_count: inds.len() as u32,
+                    aabb_min,
+                    aabb_max,
+                },
+            );
+            store.mark_chunk_meshed(coord);
             let job = MeshJob {
                 coord,
                 version,
