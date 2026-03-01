@@ -50,9 +50,8 @@ const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
-const GEN_THROTTLE_DIRTY_HIGH: usize = 1700;
-const GEN_THROTTLE_QUEUE_HIGH: usize = 1800;
-const GEN_MIN_THROTTLED_BUDGET: usize = 1;
+const GEN_DISPATCH_HIGH: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.9) as usize;
+const GEN_DISPATCH_LOW: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.5) as usize;
 const URGENT_GENERATION_BUDGET: usize = 4;
 const NEAR_GENERATION_BUDGET: usize = 24;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
@@ -203,31 +202,6 @@ impl AutoTuneState {
 
     fn is_active(self) -> bool {
         self.degrade_level > 0.01
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct GenThrottleState {
-    pressure: f32,
-    budget_scale: f32,
-}
-
-impl GenThrottleState {
-    fn update(&mut self, meshing_queue_depth: usize, dirty_backlog: usize) {
-        let dirty_pressure = dirty_backlog as f32 / GEN_THROTTLE_DIRTY_HIGH.max(1) as f32;
-        let queue_pressure = meshing_queue_depth as f32 / GEN_THROTTLE_QUEUE_HIGH.max(1) as f32;
-        self.pressure = dirty_pressure.max(queue_pressure);
-        self.budget_scale = if self.pressure < 1.0 {
-            1.0
-        } else if self.pressure < 2.0 {
-            2.0 - self.pressure
-        } else {
-            0.25
-        };
-    }
-
-    fn scaled_budget(self, budget: usize) -> usize {
-        (budget as f32 * self.budget_scale).round() as usize
     }
 }
 
@@ -492,7 +466,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut prior_dirty_backlog = 0usize;
     let mut prior_meshing_queue_depth = 0usize;
     let mut prior_upload_latency_ms = 0.0f32;
-    let mut gen_throttle_state = GenThrottleState::default();
+    let mut gen_dispatch_paused = false;
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
 
@@ -972,7 +946,20 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             frame_counter,
                         );
-                        gen_throttle_state.update(prior_meshing_queue_depth, prior_dirty_backlog);
+
+                        let gen_inflight_before_dispatch = streaming.generating.len();
+                        if gen_dispatch_paused {
+                            if gen_inflight_before_dispatch <= GEN_DISPATCH_LOW {
+                                gen_dispatch_paused = false;
+                            }
+                        } else if gen_inflight_before_dispatch >= GEN_DISPATCH_HIGH {
+                            gen_dispatch_paused = true;
+                        }
+                        let gen_pause_reason = if gen_dispatch_paused {
+                            "worker_queue_high_watermark"
+                        } else {
+                            "none"
+                        };
 
                         let mut gen_request_count = 0usize;
                         let mut urgent_missing = 0usize;
@@ -1001,14 +988,16 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        for coord in dispatch_urgent {
-                            if streaming.scheduled.insert(coord) {
-                                streaming.mark_canceled(coord);
-                                streaming.scheduled.insert(coord);
-                            }
-                            if chunk_generator.try_request(coord) {
-                                streaming.mark_dispatched(coord);
-                                gen_request_count += 1;
+                        if !gen_dispatch_paused {
+                            for coord in dispatch_urgent {
+                                if streaming.scheduled.insert(coord) {
+                                    streaming.mark_canceled(coord);
+                                    streaming.scheduled.insert(coord);
+                                }
+                                if chunk_generator.try_request(coord) {
+                                    streaming.mark_dispatched(coord);
+                                    gen_request_count += 1;
+                                }
                             }
                         }
 
@@ -1018,9 +1007,11 @@ pub async fn run() -> anyhow::Result<()> {
                             streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        let generate_drain_budget = gen_throttle_state
-                            .scaled_budget(base_generate_drain_budget)
-                            .max(GEN_MIN_THROTTLED_BUDGET);
+                        let generate_drain_budget = if gen_dispatch_paused {
+                            0
+                        } else {
+                            base_generate_drain_budget
+                        };
 
                         let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
                         let mut near_sent = 0usize;
@@ -1073,8 +1064,8 @@ pub async fn run() -> anyhow::Result<()> {
                         let gen_inflight = streaming.generating.len();
                         if gen_inflight >= 96 && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
-                            let starvation_reason = if gen_throttle_state.pressure > 1.0 {
-                                "pressure > 1.0"
+                            let starvation_reason = if gen_dispatch_paused {
+                                "worker_dispatch_paused"
                             } else if gen_recv_disconnected {
                                 "generator_channel_disconnected"
                             } else if gen_recv_empty {
@@ -1176,14 +1167,15 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} gen_pause_reason={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
                             cached_desired.far.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
-                            gen_throttle_state.pressure > 1.0,
+                            gen_dispatch_paused,
+                            gen_pause_reason,
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
@@ -1338,7 +1330,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
-                        ui.profiler.gen_paused_by_mesh_pressure = gen_throttle_state.pressure > 1.0;
+                        ui.profiler.gen_paused_by_worker_queue = gen_dispatch_paused;
                         ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
