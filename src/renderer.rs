@@ -59,7 +59,7 @@ pub struct Camera {
 impl Camera {
     pub fn view_proj(&self) -> Mat4 {
         let view = Mat4::look_to_rh(self.pos, self.dir, Vec3::Y);
-        let proj = Mat4::perspective_rh_gl(60f32.to_radians(), self.aspect.max(0.1), 0.1, 1200.0);
+        let proj = Mat4::perspective_rh(60f32.to_radians(), self.aspect.max(0.1), 0.1, 1200.0);
         proj * view
     }
 }
@@ -389,16 +389,44 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
                 1 => -clip.x + clip.w,
                 2 => clip.y + clip.w,
                 3 => -clip.y + clip.w,
-                4 => clip.z + clip.w,
+                // WGPU clip-space depth is [0, w], not [-w, w].
+                4 => clip.z,
                 _ => -clip.z + clip.w,
             };
             if v < 0.0 {
                 outside += 1;
             }
         }
-        if outside == 8 {
+        if outside == clips.len() {
             return false;
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frustum_culls_and_accepts_expected_aabbs() {
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let vp = camera.view_proj();
+
+        let visible_min = Vec3::new(-0.5, -0.5, -2.0);
+        let visible_max = Vec3::new(0.5, 0.5, -1.0);
+        assert!(aabb_in_view(vp, visible_min, visible_max));
+
+        let behind_camera_min = Vec3::new(-0.5, -0.5, 0.5);
+        let behind_camera_max = Vec3::new(0.5, 0.5, 1.5);
+        assert!(!aabb_in_view(vp, behind_camera_min, behind_camera_max));
+
+        let beyond_far_min = Vec3::new(-1.0, -1.0, -1300.0);
+        let beyond_far_max = Vec3::new(1.0, 1.0, -1250.0);
+        assert!(!aabb_in_view(vp, beyond_far_min, beyond_far_max));
+    }
 }
