@@ -21,6 +21,15 @@ const MACROCHUNK_SIZE: i32 = 64;
 const BIOME_COUNT: usize = 7;
 const DEFAULT_WORLD_MIN_Y: i32 = -256;
 const DEFAULT_WORLD_MAX_Y: i32 = 384;
+const CHUNK_HYDROLOGY_MIN_HALO_RADIUS: i32 = 8;
+const CHUNK_HYDROLOGY_MAX_HALO_RADIUS: i32 = 16;
+const CHUNK_HYDROLOGY_HALO_DIVISOR: i32 = 4;
+
+// Hydrology thresholds tuned with chunk-scale halo sampling.
+const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.43;
+const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.58;
+const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.58;
+const HYDRO_BASIN_MIN_CELL_COUNT: usize = 9;
 
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name)
@@ -694,9 +703,21 @@ fn build_hydrology_cache_for_chunk(
     let width = config.dims[0];
     let depth = config.dims[2];
     let len = width * depth;
-    let pad_x = (width as i32).max(16);
-    let pad_z = (depth as i32).max(16);
+    // Chunk-local generation needs several cells of upstream/downstream context so that river
+    // routing, basin ownership, and spill levels converge to the same answer regardless of which
+    // side of a seam the query starts from. A radius proportional to chunk size, clamped to
+    // 8..=16, was chosen as a practical balance: large enough for stable cross-chunk continuity,
+    // but still bounded so context grids do not grow CPU/memory cost superlinearly.
+    let pad_x = chunk_hydrology_halo_radius(width);
+    let pad_z = chunk_hydrology_halo_radius(depth);
     build_hydrology_cache_impl(config, columns, len, width, depth, pad_x, pad_z)
+}
+
+fn chunk_hydrology_halo_radius(chunk_axis_cells: usize) -> i32 {
+    ((chunk_axis_cells as i32) / CHUNK_HYDROLOGY_HALO_DIVISOR).clamp(
+        CHUNK_HYDROLOGY_MIN_HALO_RADIUS,
+        CHUNK_HYDROLOGY_MAX_HALO_RADIUS,
+    )
 }
 
 fn build_hydrology_cache_impl(
@@ -796,7 +817,7 @@ fn build_hydrology_cache_impl(
             let accum_norm = (flow_accum[idx].ln() / 6.0).clamp(0.0, 1.0);
             ocean_weight[local_idx] = context.cells[idx].ocean_weight;
             river_weight[local_idx] = smoothstep(
-                (accum_norm * 0.9 + context.cells[idx].river_weight * 0.75 - 0.38) / 0.45,
+                (accum_norm * 0.88 + context.cells[idx].river_weight * 0.72 - 0.40) / 0.42,
             );
         }
     }
@@ -879,7 +900,7 @@ fn build_hydrology_cache_impl(
     let mut river_level = vec![None; len];
     let mut river_mask = vec![false; ctx_len];
     for i in 0..ctx_len {
-        river_mask[i] = context.cells[i].river_weight > 0.45;
+        river_mask[i] = context.cells[i].river_weight > HYDRO_RIVER_MASK_THRESHOLD;
     }
     let mut channel_level_ctx = vec![None::<i32>; ctx_len];
     for i in 0..ctx_len {
@@ -891,7 +912,7 @@ fn build_hydrology_cache_impl(
             .map(|d| context.cells[d].surface_height)
             .unwrap_or(surface);
         let local_slope = (surface - downstream_surface).max(0) as f32;
-        let dist_term = (distance[i].max(0) as f32) * 0.16;
+        let dist_term = (distance[i].max(0) as f32) * 0.14;
         let slope_term = (1.0 / (local_slope + 1.0)).clamp(0.0, 1.0);
         let flow_term = flow_accum[i].ln().max(0.0) * 0.34;
         let incision = (1.0 + dist_term + slope_term + flow_term).round() as i32;
@@ -935,7 +956,9 @@ fn build_hydrology_cache_impl(
     let mut basin_cells: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for i in 0..ctx_len {
-        if context.cells[i].ocean_weight > 0.55 || context.cells[i].river_weight > 0.55 {
+        if context.cells[i].ocean_weight > HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD
+            || context.cells[i].river_weight > HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD
+        {
             continue;
         }
         if let Some(s) = sink_owner[i] {
@@ -944,7 +967,7 @@ fn build_hydrology_cache_impl(
     }
     let mut lake_level = vec![None; len];
     for (_sink, cells) in basin_cells {
-        if cells.len() < 4 {
+        if cells.len() < HYDRO_BASIN_MIN_CELL_COUNT {
             continue;
         }
         let mut in_basin = vec![false; ctx_len];
@@ -2570,6 +2593,18 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    fn river_width_bucket(weight: f32) -> u8 {
+        if weight > 0.82 {
+            3
+        } else if weight > 0.67 {
+            2
+        } else if weight > HYDRO_RIVER_MASK_THRESHOLD {
+            1
+        } else {
+            0
+        }
+    }
+
     fn is_surface_material(mat: MaterialId) -> bool {
         matches!(mat, TURF | SAND | STONE)
     }
@@ -3066,6 +3101,82 @@ mod tests {
             assert!(
                 (a - b).abs() <= 1,
                 "north/south sampled surface discontinuity at x={x}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_hydrology_seams_keep_river_presence_level_and_width_continuous() {
+        let size = 64i32;
+        let seed = 0x7135_AA91;
+        let center_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, 0]);
+        let east_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([size, 0, 0]);
+        let south_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, size]);
+        let timings = ProcGenPassTimings::default();
+
+        let (center_h, center_cols) = build_column_cache(&center_cfg, &timings);
+        let (east_h, east_cols) = build_column_cache(&east_cfg, &timings);
+        let (south_h, south_cols) = build_column_cache(&south_cfg, &timings);
+
+        let center =
+            build_hydrology_cache_for_chunk(&center_cfg, &center_h, &center_cols, &timings);
+        let east = build_hydrology_cache_for_chunk(&east_cfg, &east_h, &east_cols, &timings);
+        let south = build_hydrology_cache_for_chunk(&south_cfg, &south_h, &south_cols, &timings);
+
+        for z in 0..size as usize {
+            let center_idx = (size as usize - 1) + z * size as usize;
+            let east_idx = z * size as usize;
+
+            let center_present = center.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let east_present = east.river_weight[east_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_present, east_present,
+                "east/west river presence mismatch at z={z}: {:.3} vs {:.3}",
+                center.river_weight[center_idx], east.river_weight[east_idx]
+            );
+
+            if let (Some(a), Some(b)) = (center.river_level[center_idx], east.river_level[east_idx])
+            {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "east/west river level mismatch at z={z}: {a} vs {b}"
+                );
+            }
+
+            let a_width = river_width_bucket(center.river_weight[center_idx]);
+            let b_width = river_width_bucket(east.river_weight[east_idx]);
+            assert!(
+                (a_width as i32 - b_width as i32).abs() <= 1,
+                "east/west river width bucket mismatch at z={z}: {a_width} vs {b_width}"
+            );
+        }
+
+        for x in 0..size as usize {
+            let center_idx = x + (size as usize - 1) * size as usize;
+            let south_idx = x;
+
+            let center_present = center.river_weight[center_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            let south_present = south.river_weight[south_idx] > HYDRO_RIVER_MASK_THRESHOLD;
+            assert_eq!(
+                center_present, south_present,
+                "north/south river presence mismatch at x={x}: {:.3} vs {:.3}",
+                center.river_weight[center_idx], south.river_weight[south_idx]
+            );
+
+            if let (Some(a), Some(b)) =
+                (center.river_level[center_idx], south.river_level[south_idx])
+            {
+                assert!(
+                    (a - b).abs() <= 1,
+                    "north/south river level mismatch at x={x}: {a} vs {b}"
+                );
+            }
+
+            let a_width = river_width_bucket(center.river_weight[center_idx]);
+            let b_width = river_width_bucket(south.river_weight[south_idx]);
+            assert!(
+                (a_width as i32 - b_width as i32).abs() <= 1,
+                "north/south river width bucket mismatch at x={x}: {a_width} vs {b_width}"
             );
         }
     }
