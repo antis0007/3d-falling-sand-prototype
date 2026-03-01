@@ -272,6 +272,7 @@ impl Renderer {
 
             if inds.is_empty() {
                 self.store_meshes.remove(&coord);
+                store.mark_chunk_meshed(coord);
                 continue;
             }
 
@@ -300,6 +301,7 @@ impl Renderer {
                     aabb_max,
                 },
             );
+            store.mark_chunk_meshed(coord);
         }
         stats.dirty_backlog = self.pending_dirty.len();
         stats

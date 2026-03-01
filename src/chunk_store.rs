@@ -42,6 +42,73 @@ fn chunk_neighbors_6(coord: ChunkCoord) -> [ChunkCoord; 6] {
     ]
 }
 
+#[derive(Clone, Copy)]
+struct NeighborFace {
+    coord: ChunkCoord,
+    axis: usize,
+    edge: usize,
+}
+
+fn chunk_neighbor_faces(coord: ChunkCoord) -> [NeighborFace; 6] {
+    let last = CHUNK_SIZE_VOXELS as usize - 1;
+    [
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x - 1,
+                y: coord.y,
+                z: coord.z,
+            },
+            axis: 0,
+            edge: 0,
+        },
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x + 1,
+                y: coord.y,
+                z: coord.z,
+            },
+            axis: 0,
+            edge: last,
+        },
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x,
+                y: coord.y - 1,
+                z: coord.z,
+            },
+            axis: 1,
+            edge: 0,
+        },
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x,
+                y: coord.y + 1,
+                z: coord.z,
+            },
+            axis: 1,
+            edge: last,
+        },
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x,
+                y: coord.y,
+                z: coord.z - 1,
+            },
+            axis: 2,
+            edge: 0,
+        },
+        NeighborFace {
+            coord: ChunkCoord {
+                x: coord.x,
+                y: coord.y,
+                z: coord.z + 1,
+            },
+            axis: 2,
+            edge: last,
+        },
+    ]
+}
+
 #[derive(Clone)]
 pub struct Chunk {
     voxels: Box<[MaterialId]>,
@@ -74,11 +141,76 @@ impl Chunk {
     pub fn iter_raw(&self) -> &[MaterialId] {
         &self.voxels
     }
+
+    fn face_non_empty_mask(&self) -> u8 {
+        let mut mask = 0u8;
+        for (idx, face) in chunk_neighbor_faces(ChunkCoord { x: 0, y: 0, z: 0 })
+            .into_iter()
+            .enumerate()
+        {
+            if self.face_has_non_empty(face.axis, face.edge) {
+                mask |= 1 << idx;
+            }
+        }
+        mask
+    }
+
+    fn face_has_non_empty(&self, axis: usize, edge: usize) -> bool {
+        let last = CHUNK_SIZE_VOXELS as usize;
+        match axis {
+            0 => {
+                for z in 0..last {
+                    for y in 0..last {
+                        if self.get(edge, y, z) != EMPTY {
+                            return true;
+                        }
+                    }
+                }
+            }
+            1 => {
+                for z in 0..last {
+                    for x in 0..last {
+                        if self.get(x, edge, z) != EMPTY {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {
+                for y in 0..last {
+                    for x in 0..last {
+                        if self.get(x, y, edge) != EMPTY {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl From<LegacyChunk> for Chunk {
+    fn from(value: LegacyChunk) -> Self {
+        Self {
+            voxels: value.iter_raw().to_vec().into_boxed_slice(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NeighborDirtyPolicy {
+    MarkExisting,
+    GeneratedConditional,
+    None,
 }
 
 pub struct ChunkStore {
     chunks: HashMap<ChunkCoord, Chunk>,
     dirty_chunks: HashSet<ChunkCoord>,
+    unmeshed_chunks: HashSet<ChunkCoord>,
+    deferred_dirty_on_load: HashSet<ChunkCoord>,
+    deferred_neighbor_dirty_on_mesh: HashSet<ChunkCoord>,
 }
 
 impl ChunkStore {
@@ -86,6 +218,9 @@ impl ChunkStore {
         Self {
             chunks: HashMap::new(),
             dirty_chunks: HashSet::new(),
+            unmeshed_chunks: HashSet::new(),
+            deferred_dirty_on_load: HashSet::new(),
+            deferred_neighbor_dirty_on_mesh: HashSet::new(),
         }
     }
 
@@ -180,17 +315,33 @@ impl ChunkStore {
     }
 
     pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: LegacyChunk) {
-        let mut dst = Chunk::new_empty();
-        for z in 0..CHUNK_SIZE_VOXELS as usize {
-            for y in 0..CHUNK_SIZE_VOXELS as usize {
-                for x in 0..CHUNK_SIZE_VOXELS as usize {
-                    dst.set(x, y, z, chunk.get(x, y, z));
-                }
-            }
+        self.insert_chunk_with_policy(coord, chunk.into(), true, NeighborDirtyPolicy::MarkExisting);
+    }
+
+    pub fn insert_chunk_with_policy(
+        &mut self,
+        coord: ChunkCoord,
+        chunk: Chunk,
+        mark_self_dirty: bool,
+        neighbor_dirty: NeighborDirtyPolicy,
+    ) {
+        let new_face_mask = chunk.face_non_empty_mask();
+        let old_face_mask = self.chunks.get(&coord).map(Chunk::face_non_empty_mask);
+        self.chunks.insert(coord, chunk);
+        self.unmeshed_chunks.insert(coord);
+
+        if mark_self_dirty || self.deferred_dirty_on_load.remove(&coord) {
+            self.dirty_chunks.insert(coord);
         }
-        self.chunks.insert(coord, dst);
-        self.dirty_chunks.insert(coord);
-        self.mark_existing_neighbors_dirty(coord);
+
+        let should_defer_neighbors =
+            matches!(neighbor_dirty, NeighborDirtyPolicy::GeneratedConditional);
+        if should_defer_neighbors {
+            self.deferred_neighbor_dirty_on_mesh.insert(coord);
+            return;
+        }
+
+        self.apply_neighbor_dirty_policy(coord, neighbor_dirty, new_face_mask, old_face_mask);
     }
 
     pub fn remove_chunk(&mut self, coord: ChunkCoord) {
@@ -198,6 +349,8 @@ impl ChunkStore {
             self.mark_existing_neighbors_dirty(coord);
             self.chunks.remove(&coord);
             self.dirty_chunks.remove(&coord);
+            self.unmeshed_chunks.remove(&coord);
+            self.deferred_neighbor_dirty_on_mesh.remove(&coord);
             self.mark_existing_neighbors_dirty(coord);
         }
     }
@@ -205,6 +358,27 @@ impl ChunkStore {
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.dirty_chunks.clear();
+        self.unmeshed_chunks.clear();
+        self.deferred_dirty_on_load.clear();
+        self.deferred_neighbor_dirty_on_mesh.clear();
+    }
+
+    pub fn mark_chunk_meshed(&mut self, coord: ChunkCoord) {
+        if !self.unmeshed_chunks.remove(&coord) {
+            return;
+        }
+        if !self.deferred_neighbor_dirty_on_mesh.remove(&coord) {
+            return;
+        }
+
+        if let Some(chunk) = self.chunks.get(&coord) {
+            self.apply_neighbor_dirty_policy(
+                coord,
+                NeighborDirtyPolicy::GeneratedConditional,
+                chunk.face_non_empty_mask(),
+                None,
+            );
+        }
     }
 
     pub fn mark_dirty(&mut self, coord: ChunkCoord) {
@@ -232,12 +406,39 @@ impl ChunkStore {
     fn mark_neighbor_dirty(&mut self, coord: ChunkCoord) {
         if self.chunk_exists(coord) {
             self.dirty_chunks.insert(coord);
+        } else {
+            self.deferred_dirty_on_load.insert(coord);
         }
     }
 
     fn mark_existing_neighbors_dirty(&mut self, coord: ChunkCoord) {
         for neighbor_coord in chunk_neighbors_6(coord) {
             self.mark_neighbor_dirty(neighbor_coord);
+        }
+    }
+
+    fn apply_neighbor_dirty_policy(
+        &mut self,
+        coord: ChunkCoord,
+        policy: NeighborDirtyPolicy,
+        new_face_mask: u8,
+        old_face_mask: Option<u8>,
+    ) {
+        match policy {
+            NeighborDirtyPolicy::MarkExisting => self.mark_existing_neighbors_dirty(coord),
+            NeighborDirtyPolicy::GeneratedConditional => {
+                let old_mask = old_face_mask.unwrap_or(0);
+                let topology_changed = old_face_mask.is_some() && old_mask != new_face_mask;
+                for (idx, face) in chunk_neighbor_faces(coord).into_iter().enumerate() {
+                    let face_bit = 1u8 << idx;
+                    let boundary_non_empty = (new_face_mask & face_bit) != 0;
+                    let face_changed = (old_mask & face_bit) != (new_face_mask & face_bit);
+                    if boundary_non_empty || (topology_changed && face_changed) {
+                        self.mark_neighbor_dirty(face.coord);
+                    }
+                }
+            }
+            NeighborDirtyPolicy::None => {}
         }
     }
 }
@@ -255,6 +456,12 @@ mod tests {
                 }
             }
         }
+        chunk
+    }
+
+    fn store_chunk_with_voxel(x: usize, y: usize, z: usize, id: MaterialId) -> Chunk {
+        let mut chunk = Chunk::new_empty();
+        chunk.set(x, y, z, id);
         chunk
     }
 
@@ -302,5 +509,48 @@ mod tests {
         assert!(store.is_chunk_loaded(center));
         assert!(store.is_voxel_chunk_loaded(VoxelCoord { x: 15, y: 1, z: 15 }));
         assert!(!store.is_voxel_chunk_loaded(VoxelCoord { x: 16, y: 1, z: 15 }));
+    }
+
+    #[test]
+    fn generated_insert_defers_neighbor_remesh_until_meshed() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+        let last = CHUNK_SIZE_VOXELS as usize - 1;
+
+        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.take_dirty_chunks();
+
+        store.insert_chunk_with_policy(
+            center,
+            store_chunk_with_voxel(last, 0, 0, 2),
+            true,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+
+        assert!(store.is_dirty(center));
+        assert!(!store.is_dirty(east));
+
+        store.mark_chunk_meshed(center);
+        assert!(store.is_dirty(east));
+    }
+
+    #[test]
+    fn deferred_neighbor_dirty_applies_when_chunk_loads() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let west = ChunkCoord { x: -1, y: 0, z: 0 };
+
+        store.insert_chunk_with_policy(
+            center,
+            store_chunk_with_voxel(0, 0, 0, 2),
+            true,
+            NeighborDirtyPolicy::GeneratedConditional,
+        );
+        store.mark_chunk_meshed(center);
+        store.take_dirty_chunks();
+
+        store.insert_chunk_with_policy(west, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
+        assert!(store.is_dirty(west));
     }
 }

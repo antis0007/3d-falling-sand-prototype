@@ -44,7 +44,7 @@ struct GenJob {
 
 struct GenResult {
     coord: ChunkCoord,
-    chunk: crate::world::Chunk,
+    chunk: crate::chunk_store::Chunk,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
