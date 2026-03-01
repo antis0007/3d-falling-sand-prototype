@@ -80,6 +80,38 @@ pub struct ChunkMesh {
     aabb_max: Vec3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChunkLod {
+    Near,
+    Mid,
+    Far,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LodRadii {
+    pub near: i32,
+    pub mid: i32,
+    pub far: i32,
+    pub hysteresis: i32,
+}
+
+impl LodRadii {
+    pub fn normalized(mut self) -> Self {
+        self.near = self.near.max(0);
+        self.mid = self.mid.max(self.near);
+        self.far = self.far.max(self.mid);
+        self.hysteresis = self.hysteresis.max(0);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LodMeshingBudgets {
+    pub near: usize,
+    pub mid: usize,
+    pub far: usize,
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -94,11 +126,12 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
 
-    store_meshes: HashMap<ChunkCoord, ChunkMesh>,
+    store_meshes: HashMap<(ChunkCoord, ChunkLod), ChunkMesh>,
 
     pending_dirty: VecDeque<ChunkCoord>,
     pending_dirty_set: HashSet<ChunkCoord>,
-    mesh_versions: HashMap<ChunkCoord, u64>,
+    mesh_versions: HashMap<(ChunkCoord, ChunkLod), u64>,
+    lod_selection: HashMap<ChunkCoord, ChunkLod>,
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
@@ -119,6 +152,9 @@ pub struct MeshRebuildStats {
     pub upload_bytes: usize,
     pub upload_latency_ms: f32,
     pub stale_drop_count: usize,
+    pub near_mesh_count: usize,
+    pub mid_mesh_count: usize,
+    pub far_mesh_count: usize,
 }
 
 #[derive(Clone)]
@@ -149,16 +185,18 @@ impl ChunkSnapshot {
 }
 
 #[derive(Clone)]
-pub(crate) struct MeshJob {
-    pub(crate) coord: ChunkCoord,
-    pub(crate) version: u64,
-    pub(crate) origin_voxel: VoxelCoord,
-    pub(crate) queued_at: Instant,
-    pub(crate) snapshot: ChunkSnapshot,
+struct MeshJob {
+    coord: ChunkCoord,
+    lod: ChunkLod,
+    version: u64,
+    origin_voxel: VoxelCoord,
+    queued_at: Instant,
+    snapshot: ChunkSnapshot,
 }
 
 struct MeshResult {
     coord: ChunkCoord,
+    lod: ChunkLod,
     version: u64,
     queued_at: Instant,
     verts: Vec<Vertex>,
@@ -205,10 +243,11 @@ impl BackgroundMeshQueue {
                     let snapshot =
                         rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
                     let (verts, inds, aabb_min, aabb_max) =
-                        mesh_chunk_snapshot(job.coord, job.origin_voxel, &snapshot);
+                        mesh_chunk_snapshot(job.coord, job.origin_voxel, &job.snapshot, job.lod);
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
+                            lod: job.lod,
                             version: job.version,
                             queued_at: job.queued_at,
                             verts,
@@ -386,7 +425,8 @@ impl Renderer {
             pending_dirty: VecDeque::new(),
             pending_dirty_set: HashSet::new(),
             mesh_versions: HashMap::new(),
-            mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
+            lod_selection: HashMap::new(),
+            mesh_queue: BackgroundMeshQueue::new(2, 256),
             completed_meshes: Vec::new(),
             day: true,
             mesh_backend,
@@ -412,22 +452,25 @@ impl Renderer {
         player_chunk: ChunkCoord,
         mesh_budget: usize,
         upload_byte_budget: usize,
+        lod_radii: LodRadii,
+        lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
+        let lod_radii = lod_radii.normalized();
         for coord in store.take_dirty_chunks() {
             if self.pending_dirty_set.insert(coord) {
                 self.pending_dirty.push_back(coord);
             }
-            let version = self.mesh_versions.entry(coord).or_insert(0);
-            *version = version.saturating_add(1);
+            for lod in [ChunkLod::Near, ChunkLod::Mid, ChunkLod::Far] {
+                let version = self.mesh_versions.entry((coord, lod)).or_insert(0);
+                *version = version.saturating_add(1);
+            }
         }
 
         let mut stats = MeshRebuildStats::default();
-        for _ in 0..mesh_budget {
-            let Some(coord) = self.pending_dirty.pop_front() else {
-                break;
-            };
-
-            let version = *self.mesh_versions.get(&coord).unwrap_or(&0);
+        let mut near_jobs = Vec::new();
+        let mut mid_jobs = Vec::new();
+        let mut far_jobs = Vec::new();
+        while let Some(coord) = self.pending_dirty.pop_front() {
             let t0 = Instant::now();
             let snapshot = build_chunk_snapshot(store, coord);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -435,6 +478,16 @@ impl Renderer {
             if ms > stats.max_ms {
                 stats.max_ms = ms;
             }
+            let push_job = |lod: ChunkLod, jobs: &mut Vec<MeshJob>| {
+                let version = *self.mesh_versions.get(&(coord, lod)).unwrap_or(&0);
+                jobs.push(MeshJob {
+                    coord,
+                    lod,
+                    version,
+                    origin_voxel,
+                    queued_at: Instant::now(),
+                    snapshot: snapshot.clone(),
+                });
             stats.mesh_count += 1;
 
             if inds.is_empty() {
@@ -476,18 +529,55 @@ impl Renderer {
                 queued_at: Instant::now(),
                 snapshot,
             };
-            match self.mesh_queue.try_submit(job) {
-                Ok(()) => {
-                    self.pending_dirty_set.remove(&coord);
+            push_job(ChunkLod::Near, &mut near_jobs);
+            push_job(ChunkLod::Mid, &mut mid_jobs);
+            push_job(ChunkLod::Far, &mut far_jobs);
+            self.pending_dirty_set.remove(&coord);
+        }
+
+        far_jobs
+            .sort_by_key(|job| std::cmp::Reverse(chunk_chebyshev_dist(player_chunk, job.coord)));
+        near_jobs.sort_by_key(|job| chunk_chebyshev_dist(player_chunk, job.coord));
+        mid_jobs.sort_by_key(|job| chunk_chebyshev_dist(player_chunk, job.coord));
+
+        let mut submitted = 0usize;
+        let mut submit_from =
+            |jobs: &mut Vec<MeshJob>, budget: usize, stats: &mut MeshRebuildStats| {
+                let mut taken = 0usize;
+                while taken < budget && submitted < mesh_budget {
+                    let Some(job) = jobs.pop() else {
+                        break;
+                    };
+                    match self.mesh_queue.try_submit(job.clone()) {
+                        Ok(()) => {
+                            taken += 1;
+                            submitted += 1;
+                            stats.mesh_count += 1;
+                            match job.lod {
+                                ChunkLod::Near => stats.near_mesh_count += 1,
+                                ChunkLod::Mid => stats.mid_mesh_count += 1,
+                                ChunkLod::Far => stats.far_mesh_count += 1,
+                            }
+                        }
+                        Err(TrySendError::Full(job)) => {
+                            jobs.push(job);
+                            break;
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
+                    }
                 }
-                Err(TrySendError::Full(job)) => {
-                    self.pending_dirty.push_front(job.coord);
-                    break;
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    self.pending_dirty_set.remove(&coord);
-                    break;
-                }
+            };
+
+        submit_from(&mut near_jobs, lod_budgets.near, &mut stats);
+        submit_from(&mut far_jobs, lod_budgets.far, &mut stats);
+        submit_from(&mut mid_jobs, lod_budgets.mid, &mut stats);
+        submit_from(&mut far_jobs, mesh_budget, &mut stats);
+        submit_from(&mut near_jobs, mesh_budget, &mut stats);
+        submit_from(&mut mid_jobs, mesh_budget, &mut stats);
+
+        for job in near_jobs.into_iter().chain(mid_jobs).chain(far_jobs) {
+            if self.pending_dirty_set.insert(job.coord) {
+                self.pending_dirty.push_back(job.coord);
             }
         }
 
@@ -507,7 +597,11 @@ impl Renderer {
         let mut total_latency_ms = 0.0f32;
         let mut deferred = Vec::new();
         for result in self.completed_meshes.drain(..) {
-            let current_version = self.mesh_versions.get(&result.coord).copied().unwrap_or(0);
+            let current_version = self
+                .mesh_versions
+                .get(&(result.coord, result.lod))
+                .copied()
+                .unwrap_or(0);
             if current_version != result.version || store.is_dirty(result.coord) {
                 stats.stale_drop_count += 1;
                 continue;
@@ -521,7 +615,7 @@ impl Renderer {
             }
 
             if result.inds.is_empty() {
-                self.store_meshes.remove(&result.coord);
+                self.store_meshes.remove(&(result.coord, result.lod));
             } else {
                 let vb = self
                     .device
@@ -539,7 +633,7 @@ impl Renderer {
                     });
 
                 self.store_meshes.insert(
-                    result.coord,
+                    (result.coord, result.lod),
                     ChunkMesh {
                         vb,
                         ib,
@@ -566,6 +660,29 @@ impl Renderer {
         stats.dirty_backlog = self.pending_dirty.len();
         stats.meshing_queue_depth = self.pending_dirty.len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = self.completed_meshes.len();
+
+        let mut drop_keys = Vec::new();
+        for &(coord, _) in self.store_meshes.keys() {
+            if chunk_chebyshev_dist(player_chunk, coord) > lod_radii.far {
+                drop_keys.push(coord);
+            }
+        }
+        for coord in drop_keys {
+            self.store_meshes.remove(&(coord, ChunkLod::Near));
+            self.store_meshes.remove(&(coord, ChunkLod::Mid));
+            self.store_meshes.remove(&(coord, ChunkLod::Far));
+            self.lod_selection.remove(&coord);
+        }
+
+        let mut coords = HashSet::new();
+        for &(coord, _) in self.store_meshes.keys() {
+            coords.insert(coord);
+        }
+        for coord in coords {
+            let prev = self.lod_selection.get(&coord).copied();
+            let lod = select_lod(coord, player_chunk, lod_radii, prev);
+            self.lod_selection.insert(coord, lod);
+        }
         stats
     }
     pub fn clear_mesh_cache(&mut self) {
@@ -574,11 +691,21 @@ impl Renderer {
         self.pending_dirty_set.clear();
         self.completed_meshes.clear();
         self.mesh_versions.clear();
+        self.lod_selection.clear();
     }
     pub fn mesh_draw_stats(&self, vp: glam::Mat4) -> (usize, u64) {
         let mut chunks = 0usize;
         let mut inds = 0u64;
-        for m in self.store_meshes.values() {
+        for (&(coord, lod), m) in &self.store_meshes {
+            if self
+                .lod_selection
+                .get(&coord)
+                .copied()
+                .unwrap_or(ChunkLod::Near)
+                != lod
+            {
+                continue;
+            }
             if aabb_in_view(vp, m.aabb_min, m.aabb_max) {
                 chunks += 1;
                 inds += m.index_count as u64;
@@ -601,7 +728,16 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
-        for mesh in self.store_meshes.values() {
+        for (&(coord, lod), mesh) in &self.store_meshes {
+            if self
+                .lod_selection
+                .get(&coord)
+                .copied()
+                .unwrap_or(ChunkLod::Near)
+                != lod
+            {
+                continue;
+            }
             if !aabb_in_view(vp, mesh.aabb_min, mesh.aabb_max) {
                 continue;
             }
@@ -646,6 +782,7 @@ fn mesh_chunk_snapshot(
     coord: ChunkCoord,
     origin_voxel: VoxelCoord,
     snapshot: &ChunkSnapshot,
+    lod: ChunkLod,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
@@ -653,9 +790,22 @@ fn mesh_chunk_snapshot(
     let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
 
-    for lz in 0..CHUNK_SIZE_VOXELS {
-        for ly in 0..CHUNK_SIZE_VOXELS {
-            for lx in 0..CHUNK_SIZE_VOXELS {
+    let (step, top_only) = match lod {
+        ChunkLod::Near => (1, false),
+        ChunkLod::Mid => (2, false),
+        ChunkLod::Far => (4, true),
+    };
+
+    let mut lz = 0;
+    while lz < CHUNK_SIZE_VOXELS {
+        let mut ly = if top_only {
+            CHUNK_SIZE_VOXELS - step
+        } else {
+            0
+        };
+        while ly < CHUNK_SIZE_VOXELS {
+            let mut lx = 0;
+            while lx < CHUNK_SIZE_VOXELS {
                 let world_voxel = VoxelCoord {
                     x: chunk_world_min.x + lx,
                     y: chunk_world_min.y + ly,
@@ -667,20 +817,92 @@ fn mesh_chunk_snapshot(
                 }
 
                 let color = material(id).color;
-                add_snapshot_voxel_faces(
-                    snapshot,
-                    world_voxel,
-                    origin_voxel,
-                    id,
-                    color,
-                    &mut verts,
-                    &mut inds,
-                );
+                if top_only {
+                    add_snapshot_voxel_top(
+                        snapshot,
+                        world_voxel,
+                        origin_voxel,
+                        color,
+                        &mut verts,
+                        &mut inds,
+                    );
+                } else {
+                    add_snapshot_voxel_faces(
+                        snapshot,
+                        world_voxel,
+                        origin_voxel,
+                        id,
+                        color,
+                        &mut verts,
+                        &mut inds,
+                    );
+                }
+
+                lx += step;
             }
+            ly += step;
         }
+        lz += step;
     }
 
     (verts, inds, min, max)
+}
+
+fn add_snapshot_voxel_top(
+    snapshot: &ChunkSnapshot,
+    world_voxel: VoxelCoord,
+    origin_voxel: VoxelCoord,
+    color: [u8; 4],
+    verts: &mut Vec<Vertex>,
+    inds: &mut Vec<u32>,
+) {
+    let neighbor = VoxelCoord {
+        x: world_voxel.x,
+        y: world_voxel.y + 1,
+        z: world_voxel.z,
+    };
+    if snapshot.get_world(neighbor) != EMPTY {
+        return;
+    }
+    let b = verts.len() as u32;
+    let shaded = shade_color(color, 0.9);
+    let quad = [[0., 1., 1.], [1., 1., 1.], [1., 1., 0.], [0., 1., 0.]];
+    for v in quad {
+        verts.push(Vertex {
+            pos: [
+                (world_voxel.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                (world_voxel.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                (world_voxel.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+            ],
+            color: shaded,
+        });
+    }
+    inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+}
+
+fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
+    (a.x - b.x)
+        .abs()
+        .max((a.y - b.y).abs())
+        .max((a.z - b.z).abs())
+}
+
+fn select_lod(
+    coord: ChunkCoord,
+    player_chunk: ChunkCoord,
+    radii: LodRadii,
+    prev: Option<ChunkLod>,
+) -> ChunkLod {
+    let d = chunk_chebyshev_dist(coord, player_chunk);
+    let h = radii.hysteresis;
+    match prev.unwrap_or(ChunkLod::Far) {
+        ChunkLod::Near if d <= radii.near + h => ChunkLod::Near,
+        ChunkLod::Mid if d >= radii.near.saturating_sub(h) && d <= radii.mid + h => ChunkLod::Mid,
+        ChunkLod::Far if d >= radii.mid.saturating_sub(h) => ChunkLod::Far,
+        _ if d <= radii.near => ChunkLod::Near,
+        _ if d <= radii.mid => ChunkLod::Mid,
+        _ => ChunkLod::Far,
+    }
 }
 
 fn add_snapshot_voxel_faces(
