@@ -1738,6 +1738,11 @@ pub async fn run() -> anyhow::Result<()> {
                                     && !streaming.scheduled_generate.contains(coord)
                             })
                             .count();
+                        ui.profiler.loaded_chunks = store.iter_loaded_chunks().count();
+                        ui.profiler.resident_chunks = streaming.resident.len();
+                        ui.profiler.scheduled_chunks = streaming.scheduled_generate.len();
+                        ui.profiler.generating_chunks = streaming.dispatched_generate.len();
+                        ui.profiler.sim_region_chunks = cached_sim_region.len();
 
                         let preview_local: Vec<[i32; 3]> = preview_block_list
                             .iter()
@@ -1773,8 +1778,13 @@ pub async fn run() -> anyhow::Result<()> {
                                             [130, 130, 130, 110]
                                         };
                                         let world_min = crate::types::chunk_to_world_min(coord);
+                                        let local_min = crate::types::VoxelCoord {
+                                            x: world_min.x - origin_voxel.x,
+                                            y: world_min.y - origin_voxel.y,
+                                            z: world_min.z - origin_voxel.z,
+                                        };
                                         entries.push(ChunkDebugOverlayEntry {
-                                            chunk_min: [world_min.x, world_min.y, world_min.z],
+                                            chunk_min: [local_min.x, local_min.y, local_min.z],
                                             color,
                                         });
                                     }

@@ -75,6 +75,11 @@ pub struct ProfilerStats {
     pub culled_chunks: usize,
     pub frustum_culled_chunks: usize,
     pub gpu_upload_bytes_frame: usize,
+    pub loaded_chunks: usize,
+    pub resident_chunks: usize,
+    pub scheduled_chunks: usize,
+    pub generating_chunks: usize,
+    pub sim_region_chunks: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -426,33 +431,88 @@ pub fn draw(
             .collapsible(true)
             .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(20, 22, 28)))
             .show(ctx, |ui| {
-                ui.label("These toggles help isolate CPU-heavy overlays and show key stats.");
+                let frame_ms = ui_state.profiler.frame_ms.max(0.0);
+                let budget_ms = FRAME_TIME_BUDGET_MS;
+                let frame_ratio = if budget_ms > 0.0 {
+                    (frame_ms / budget_ms).clamp(0.0, 2.0)
+                } else {
+                    0.0
+                };
+                let health_color = if frame_ms <= budget_ms {
+                    egui::Color32::from_rgb(90, 210, 120)
+                } else if frame_ms <= budget_ms * 1.33 {
+                    egui::Color32::from_rgb(240, 190, 80)
+                } else {
+                    egui::Color32::from_rgb(240, 100, 90)
+                };
+
+                ui.horizontal(|ui| {
+                    ui.heading("Frame Health");
+                    ui.colored_label(
+                        health_color,
+                        format!("{frame_ms:.2} ms / {budget_ms:.2} ms"),
+                    );
+                });
+                ui.add(
+                    egui::ProgressBar::new(frame_ratio)
+                        .desired_width(f32::INFINITY)
+                        .fill(health_color),
+                );
+                ui.label("These panels group stream/mesh/sim metrics for quick diagnosis.");
                 ui.separator();
 
-                ui.heading("Profiler");
-                ui.monospace(format!("frame_ms: {:.2}", ui_state.profiler.frame_ms));
-                ui.monospace(format!(
-                    "desired_ms: {:.2} | streaming_ms: {:.2}",
-                    ui_state.profiler.desired_ms, ui_state.profiler.streaming_ms
-                ));
-                ui.monospace(format!(
-                    "gen requested/inflight/completed: {}/{}/{} | paused_by_worker_queue: {}",
-                    ui_state.profiler.gen_request_count,
-                    ui_state.profiler.gen_inflight_count,
-                    ui_state.profiler.gen_completed_count,
-                    ui_state.profiler.gen_paused_by_worker_queue
-                ));
+                ui.collapsing("World + Streaming", |ui| {
+                    egui::Grid::new("debug_world_stream_grid")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Loaded chunks");
+                            ui.monospace(ui_state.profiler.loaded_chunks.to_string());
+                            ui.end_row();
+                            ui.label("Resident chunks");
+                            ui.monospace(ui_state.profiler.resident_chunks.to_string());
+                            ui.end_row();
+                            ui.label("Scheduled generation");
+                            ui.monospace(ui_state.profiler.scheduled_chunks.to_string());
+                            ui.end_row();
+                            ui.label("Generating (inflight)");
+                            ui.monospace(ui_state.profiler.generating_chunks.to_string());
+                            ui.end_row();
+                            ui.label("Simulation region chunks");
+                            ui.monospace(ui_state.profiler.sim_region_chunks.to_string());
+                            ui.end_row();
+                            ui.label("Missing in desired radius");
+                            ui.monospace(ui_state.profiler.missing_in_radius.to_string());
+                            ui.end_row();
+                        });
+                });
+
+                ui.collapsing("Generation + Apply", |ui| {
+                    ui.monospace(format!(
+                        "desired_ms: {:.2} | streaming_ms: {:.2}",
+                        ui_state.profiler.desired_ms, ui_state.profiler.streaming_ms
+                    ));
+                    ui.monospace(format!(
+                        "gen requested/inflight/completed: {}/{}/{} | paused_by_worker_queue: {}",
+                        ui_state.profiler.gen_request_count,
+                        ui_state.profiler.gen_inflight_count,
+                        ui_state.profiler.gen_completed_count,
+                        ui_state.profiler.gen_paused_by_worker_queue
+                    ));
+                    ui.monospace(format!(
+                        "apply: {:.2} ms ({}) | evict: {:.2} ms ({})",
+                        ui_state.profiler.apply_ms,
+                        ui_state.profiler.apply_count,
+                        ui_state.profiler.evict_ms,
+                        ui_state.profiler.evict_count
+                    ));
+                });
+
+                ui.collapsing("Meshing", |ui| {
                 ui.monospace(format!(
                     "gen completed total: {} | desired budget drops: {}",
                     ui_state.profiler.gen_completed_total,
                     ui_state.profiler.desired_budget_drop_count
-                ));
-                ui.monospace(format!(
-                    "apply: {:.2} ms ({}) | evict: {:.2} ms ({})",
-                    ui_state.profiler.apply_ms,
-                    ui_state.profiler.apply_count,
-                    ui_state.profiler.evict_ms,
-                    ui_state.profiler.evict_count
                 ));
                 ui.monospace(format!(
                     "mesh: {:.2} ms ({}) | dirty backlog: {}",
@@ -505,6 +565,9 @@ pub fn draw(
                     ui_state.profiler.mesh_upload_bytes,
                     ui_state.profiler.mesh_upload_latency_ms,
                 ));
+                });
+
+                ui.collapsing("Simulation", |ui| {
                 ui.monospace(format!(
                     "collision blocked by unloaded chunk: {} samples | {:.1} ms",
                     ui_state.profiler.collision_blocked_unloaded_count,
@@ -526,6 +589,7 @@ pub fn draw(
                     ui_state.profiler.sim_accumulator_cap_steps,
                     ui_state.profiler.sim_accumulator_clamped,
                 ));
+                });
                 ui.separator();
                 ui.heading("Simulation Tuning");
                 ui.add(
@@ -567,10 +631,8 @@ pub fn draw(
                     ui_state.chunks_drawn, ui_state.total_indices
                 ));
                 ui.monospace(format!(
-                    "missing in radius: {} | culled: {} (frustum {})",
-                    ui_state.profiler.missing_in_radius,
-                    ui_state.profiler.culled_chunks,
-                    ui_state.profiler.frustum_culled_chunks,
+                    "culled: {} (frustum {})",
+                    ui_state.profiler.culled_chunks, ui_state.profiler.frustum_culled_chunks,
                 ));
                 ui.monospace(format!(
                     "gpu upload bytes/frame: {}",
@@ -579,7 +641,7 @@ pub fn draw(
                 ui.separator();
                 ui.heading("Renderer Debug");
                 ui.checkbox(&mut ui_state.show_chunk_overlay, "Chunk state overlay");
-                ui.monospace("overlay key: resident=green scheduled=yellow generating=orange dirty=blue unloaded=gray");
+                ui.monospace("overlay key: dirty=blue generating=orange scheduled=yellow resident=green unloaded=gray");
                 ui.checkbox(&mut ui_state.renderer_frustum_culling, "Frustum culling");
                 ui.checkbox(
                     &mut ui_state.renderer_greedy_meshing,
@@ -1106,7 +1168,7 @@ pub fn draw_fps_overlays(
     }
 
     if let Some(entries) = chunk_overlay {
-        let chunk_world_size = CHUNK_SIZE as f32 * voxel_size;
+        let chunk_size_voxels = CHUNK_SIZE as f32;
         for entry in entries {
             draw_chunk_outline(
                 &painter,
@@ -1114,7 +1176,8 @@ pub fn draw_fps_overlays(
                 viewport,
                 ctx.pixels_per_point(),
                 entry.chunk_min,
-                chunk_world_size,
+                voxel_size,
+                chunk_size_voxels,
                 egui::Color32::from_rgba_unmultiplied(
                     entry.color[0],
                     entry.color[1],
@@ -1146,6 +1209,8 @@ pub fn draw_fps_overlays(
         );
     }
 }
+
+const FRAME_TIME_BUDGET_MS: f32 = 16.67;
 
 fn draw_held_tool_sprite(
     painter: &egui::Painter,
@@ -1260,15 +1325,16 @@ fn draw_chunk_outline(
     viewport: [u32; 2],
     pixels_per_point: f32,
     chunk_min: [i32; 3],
-    chunk_world_size: f32,
+    voxel_size: f32,
+    chunk_size_voxels: f32,
     color: egui::Color32,
 ) {
     let b = Vec3::new(
         chunk_min[0] as f32,
         chunk_min[1] as f32,
         chunk_min[2] as f32,
-    );
-    let s = chunk_world_size;
+    ) * voxel_size;
+    let s = chunk_size_voxels * voxel_size;
     let corners = [
         b,
         b + Vec3::new(s, 0.0, 0.0),
