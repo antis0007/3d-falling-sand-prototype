@@ -1,4 +1,4 @@
-use crate::chunk_store::ChunkStore;
+use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
     cpu_generate_material_field, rebuilt_snapshot_from_materials, GpuComputeRuntime,
     MeshPipelineBackend,
@@ -11,6 +11,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
@@ -171,27 +172,53 @@ pub struct MeshRebuildStats {
 #[derive(Clone)]
 pub(crate) struct ChunkSnapshot {
     pub(crate) world_min: VoxelCoord,
-    pub(crate) dim: i32,
-    pub(crate) voxels: Vec<MaterialId>,
+    pub(crate) center_voxels: Arc<[MaterialId]>,
+    pub(crate) border_strips: Arc<ChunkBorderStrips>,
 }
 
 impl ChunkSnapshot {
-    fn get_world(&self, voxel: VoxelCoord) -> MaterialId {
-        let local_x = voxel.x - self.world_min.x;
-        let local_y = voxel.y - self.world_min.y;
-        let local_z = voxel.z - self.world_min.z;
-        if local_x < 0
-            || local_y < 0
-            || local_z < 0
-            || local_x >= self.dim
-            || local_y >= self.dim
-            || local_z >= self.dim
+    fn get_local(&self, local_x: i32, local_y: i32, local_z: i32) -> MaterialId {
+        let side = CHUNK_SIZE_VOXELS;
+        if (0..side).contains(&local_x)
+            && (0..side).contains(&local_y)
+            && (0..side).contains(&local_z)
         {
-            return EMPTY;
+            let idx = ((local_z as usize * side as usize + local_y as usize) * side as usize)
+                + local_x as usize;
+            return self.center_voxels[idx];
         }
-        let dim = self.dim as usize;
-        let idx = (local_z as usize * dim + local_y as usize) * dim + local_x as usize;
-        self.voxels[idx]
+
+        let strips = self.border_strips.as_ref();
+        let idx = |u: i32, v: i32| (u as usize) * side as usize + v as usize;
+
+        if local_x == -1 && (0..side).contains(&local_y) && (0..side).contains(&local_z) {
+            return strips.neg_x[idx(local_y, local_z)];
+        }
+        if local_x == side && (0..side).contains(&local_y) && (0..side).contains(&local_z) {
+            return strips.pos_x[idx(local_y, local_z)];
+        }
+        if local_y == -1 && (0..side).contains(&local_x) && (0..side).contains(&local_z) {
+            return strips.neg_y[idx(local_x, local_z)];
+        }
+        if local_y == side && (0..side).contains(&local_x) && (0..side).contains(&local_z) {
+            return strips.pos_y[idx(local_x, local_z)];
+        }
+        if local_z == -1 && (0..side).contains(&local_x) && (0..side).contains(&local_y) {
+            return strips.neg_z[idx(local_x, local_y)];
+        }
+        if local_z == side && (0..side).contains(&local_x) && (0..side).contains(&local_y) {
+            return strips.pos_z[idx(local_x, local_y)];
+        }
+
+        EMPTY
+    }
+
+    pub(crate) fn with_center_materials(&self, materials: Vec<MaterialId>) -> Self {
+        Self {
+            world_min: self.world_min,
+            center_voxels: Arc::from(materials),
+            border_strips: Arc::clone(&self.border_strips),
+        }
     }
 }
 
@@ -519,12 +546,13 @@ impl Renderer {
                     let Some(job) = jobs.pop() else {
                         break;
                     };
-                    match self.mesh_queue.try_submit(job.clone()) {
+                    let lod = job.lod;
+                    match self.mesh_queue.try_submit(job) {
                         Ok(()) => {
                             taken += 1;
                             submitted += 1;
                             stats.mesh_count += 1;
-                            match job.lod {
+                            match lod {
                                 ChunkLod::Near => stats.near_mesh_count += 1,
                                 ChunkLod::Mid => stats.mid_mesh_count += 1,
                                 ChunkLod::Far => stats.far_mesh_count += 1,
@@ -733,32 +761,16 @@ impl Renderer {
 }
 
 fn build_chunk_snapshot(store: &ChunkStore, coord: ChunkCoord) -> ChunkSnapshot {
-    let chunk_world_min = chunk_to_world_min(ChunkCoord {
-        x: coord.x - 1,
-        y: coord.y - 1,
-        z: coord.z - 1,
-    });
-    let dim = CHUNK_SIZE_VOXELS * 3;
-    let mut voxels = vec![EMPTY; (dim * dim * dim) as usize];
-
-    for z in 0..dim {
-        for y in 0..dim {
-            for x in 0..dim {
-                let world = VoxelCoord {
-                    x: chunk_world_min.x + x,
-                    y: chunk_world_min.y + y,
-                    z: chunk_world_min.z + z,
-                };
-                let idx = ((z * dim + y) * dim + x) as usize;
-                voxels[idx] = store.get_voxel(world);
-            }
-        }
-    }
+    let chunk_world_min = chunk_to_world_min(coord);
+    let center_voxels = store
+        .get_chunk(coord)
+        .map(|chunk| Arc::<[MaterialId]>::from(chunk.iter_raw().to_vec()))
+        .unwrap_or_else(|| Arc::from(vec![EMPTY; (CHUNK_SIZE_VOXELS.pow(3)) as usize]));
 
     ChunkSnapshot {
         world_min: chunk_world_min,
-        dim,
-        voxels,
+        center_voxels,
+        border_strips: Arc::new(store.chunk_border_strips(coord)),
     }
 }
 
@@ -795,8 +807,9 @@ fn mesh_chunk_snapshot(
                     y: chunk_world_min.y + ly,
                     z: chunk_world_min.z + lz,
                 };
-                let id = snapshot.get_world(world_voxel);
+                let id = snapshot.get_local(lx, ly, lz);
                 if id == EMPTY {
+                    lx += step;
                     continue;
                 }
 
@@ -804,6 +817,9 @@ fn mesh_chunk_snapshot(
                 if top_only {
                     add_snapshot_voxel_top(
                         snapshot,
+                        lx,
+                        ly,
+                        lz,
                         world_voxel,
                         origin_voxel,
                         color,
@@ -813,6 +829,9 @@ fn mesh_chunk_snapshot(
                 } else {
                     add_snapshot_voxel_faces(
                         snapshot,
+                        lx,
+                        ly,
+                        lz,
                         world_voxel,
                         origin_voxel,
                         id,
@@ -834,18 +853,16 @@ fn mesh_chunk_snapshot(
 
 fn add_snapshot_voxel_top(
     snapshot: &ChunkSnapshot,
+    local_x: i32,
+    local_y: i32,
+    local_z: i32,
     world_voxel: VoxelCoord,
     origin_voxel: VoxelCoord,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
 ) {
-    let neighbor = VoxelCoord {
-        x: world_voxel.x,
-        y: world_voxel.y + 1,
-        z: world_voxel.z,
-    };
-    if snapshot.get_world(neighbor) != EMPTY {
+    if snapshot.get_local(local_x, local_y + 1, local_z) != EMPTY {
         return;
     }
     let b = verts.len() as u32;
@@ -891,6 +908,9 @@ fn select_lod(
 
 fn add_snapshot_voxel_faces(
     snapshot: &ChunkSnapshot,
+    local_x: i32,
+    local_y: i32,
+    local_z: i32,
     world_voxel: VoxelCoord,
     origin_voxel: VoxelCoord,
     id: MaterialId,
@@ -932,12 +952,10 @@ fn add_snapshot_voxel_faces(
     ];
 
     for (d, quad, shade) in dirs {
-        let neighbor = VoxelCoord {
-            x: world_voxel.x + d[0],
-            y: world_voxel.y + d[1],
-            z: world_voxel.z + d[2],
-        };
-        if is_face_occluded(id, snapshot.get_world(neighbor)) {
+        if is_face_occluded(
+            id,
+            snapshot.get_local(local_x + d[0], local_y + d[1], local_z + d[2]),
+        ) {
             continue;
         }
 

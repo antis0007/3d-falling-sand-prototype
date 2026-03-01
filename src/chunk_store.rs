@@ -10,6 +10,29 @@ const CHUNK_SIDE: usize = CHUNK_SIZE_VOXELS as usize;
 const CHUNK_BORDER_AREA: usize = CHUNK_SIDE * CHUNK_SIDE;
 
 #[derive(Clone)]
+pub struct ChunkBorderStrips {
+    pub neg_x: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_x: [MaterialId; CHUNK_BORDER_AREA],
+    pub neg_y: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_y: [MaterialId; CHUNK_BORDER_AREA],
+    pub neg_z: [MaterialId; CHUNK_BORDER_AREA],
+    pub pos_z: [MaterialId; CHUNK_BORDER_AREA],
+}
+
+impl Default for ChunkBorderStrips {
+    fn default() -> Self {
+        Self {
+            neg_x: [EMPTY; CHUNK_BORDER_AREA],
+            pos_x: [EMPTY; CHUNK_BORDER_AREA],
+            neg_y: [EMPTY; CHUNK_BORDER_AREA],
+            pos_y: [EMPTY; CHUNK_BORDER_AREA],
+            neg_z: [EMPTY; CHUNK_BORDER_AREA],
+            pos_z: [EMPTY; CHUNK_BORDER_AREA],
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ChunkMeshingInput<'a> {
     pub voxels: &'a [MaterialId],
     pub neg_x: [MaterialId; CHUNK_BORDER_AREA],
@@ -162,7 +185,7 @@ impl Chunk {
         &self.voxels
     }
 
-    fn face_non_empty_mask(&self) -> u8 {
+    pub fn face_non_empty_mask(&self) -> u8 {
         let mut mask = 0u8;
         for (idx, face) in chunk_neighbor_faces(ChunkCoord { x: 0, y: 0, z: 0 })
             .into_iter()
@@ -207,6 +230,38 @@ impl Chunk {
             }
         }
         false
+    }
+
+    pub fn fill_face_border(
+        &self,
+        axis: usize,
+        edge: usize,
+        out: &mut [MaterialId; CHUNK_BORDER_AREA],
+    ) {
+        let last = CHUNK_SIZE_VOXELS as usize;
+        match axis {
+            0 => {
+                for z in 0..last {
+                    for y in 0..last {
+                        out[ChunkMeshingInput::border_index(y, z)] = self.get(edge, y, z);
+                    }
+                }
+            }
+            1 => {
+                for z in 0..last {
+                    for x in 0..last {
+                        out[ChunkMeshingInput::border_index(x, z)] = self.get(x, edge, z);
+                    }
+                }
+            }
+            _ => {
+                for y in 0..last {
+                    for x in 0..last {
+                        out[ChunkMeshingInput::border_index(x, y)] = self.get(x, y, edge);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -336,24 +391,36 @@ impl ChunkStore {
 
     pub fn build_meshing_input(&self, coord: ChunkCoord) -> Option<ChunkMeshingInput<'_>> {
         let current = self.get_chunk(coord)?;
+        let borders = self.chunk_border_strips(coord);
 
-        let mut neg_x = [EMPTY; CHUNK_BORDER_AREA];
-        let mut pos_x = [EMPTY; CHUNK_BORDER_AREA];
-        let mut neg_y = [EMPTY; CHUNK_BORDER_AREA];
-        let mut pos_y = [EMPTY; CHUNK_BORDER_AREA];
-        let mut neg_z = [EMPTY; CHUNK_BORDER_AREA];
-        let mut pos_z = [EMPTY; CHUNK_BORDER_AREA];
+        Some(ChunkMeshingInput {
+            voxels: current.iter_raw(),
+            neg_x: borders.neg_x,
+            pos_x: borders.pos_x,
+            neg_y: borders.neg_y,
+            pos_y: borders.pos_y,
+            neg_z: borders.neg_z,
+            pos_z: borders.pos_z,
+        })
+    }
 
+    pub fn chunk_face_non_empty_mask(&self, coord: ChunkCoord) -> u8 {
+        self.get_chunk(coord)
+            .map(Chunk::face_non_empty_mask)
+            .unwrap_or(0)
+    }
+
+    pub fn chunk_border_strips(&self, coord: ChunkCoord) -> ChunkBorderStrips {
+        let mut borders = ChunkBorderStrips::default();
         let last = CHUNK_SIDE - 1;
+
         if let Some(chunk) = self.get_chunk(ChunkCoord {
             x: coord.x - 1,
             y: coord.y,
             z: coord.z,
         }) {
-            for z in 0..CHUNK_SIDE {
-                for y in 0..CHUNK_SIDE {
-                    neg_x[ChunkMeshingInput::border_index(y, z)] = chunk.get(last, y, z);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 1)) != 0 {
+                chunk.fill_face_border(0, last, &mut borders.neg_x);
             }
         }
         if let Some(chunk) = self.get_chunk(ChunkCoord {
@@ -361,10 +428,8 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z,
         }) {
-            for z in 0..CHUNK_SIDE {
-                for y in 0..CHUNK_SIDE {
-                    pos_x[ChunkMeshingInput::border_index(y, z)] = chunk.get(0, y, z);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 0)) != 0 {
+                chunk.fill_face_border(0, 0, &mut borders.pos_x);
             }
         }
         if let Some(chunk) = self.get_chunk(ChunkCoord {
@@ -372,10 +437,8 @@ impl ChunkStore {
             y: coord.y - 1,
             z: coord.z,
         }) {
-            for z in 0..CHUNK_SIDE {
-                for x in 0..CHUNK_SIDE {
-                    neg_y[ChunkMeshingInput::border_index(x, z)] = chunk.get(x, last, z);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 3)) != 0 {
+                chunk.fill_face_border(1, last, &mut borders.neg_y);
             }
         }
         if let Some(chunk) = self.get_chunk(ChunkCoord {
@@ -383,10 +446,8 @@ impl ChunkStore {
             y: coord.y + 1,
             z: coord.z,
         }) {
-            for z in 0..CHUNK_SIDE {
-                for x in 0..CHUNK_SIDE {
-                    pos_y[ChunkMeshingInput::border_index(x, z)] = chunk.get(x, 0, z);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 2)) != 0 {
+                chunk.fill_face_border(1, 0, &mut borders.pos_y);
             }
         }
         if let Some(chunk) = self.get_chunk(ChunkCoord {
@@ -394,10 +455,8 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z - 1,
         }) {
-            for y in 0..CHUNK_SIDE {
-                for x in 0..CHUNK_SIDE {
-                    neg_z[ChunkMeshingInput::border_index(x, y)] = chunk.get(x, y, last);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 5)) != 0 {
+                chunk.fill_face_border(2, last, &mut borders.neg_z);
             }
         }
         if let Some(chunk) = self.get_chunk(ChunkCoord {
@@ -405,22 +464,12 @@ impl ChunkStore {
             y: coord.y,
             z: coord.z + 1,
         }) {
-            for y in 0..CHUNK_SIDE {
-                for x in 0..CHUNK_SIDE {
-                    pos_z[ChunkMeshingInput::border_index(x, y)] = chunk.get(x, y, 0);
-                }
+            if (chunk.face_non_empty_mask() & (1 << 4)) != 0 {
+                chunk.fill_face_border(2, 0, &mut borders.pos_z);
             }
         }
 
-        Some(ChunkMeshingInput {
-            voxels: current.iter_raw(),
-            neg_x,
-            pos_x,
-            neg_y,
-            pos_y,
-            neg_z,
-            pos_z,
-        })
+        borders
     }
 
     pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: LegacyChunk) {
@@ -644,6 +693,47 @@ mod tests {
         assert!(store.is_dirty(east));
     }
 
+    #[test]
+    fn chunk_border_strips_capture_neighbor_boundary_voxels() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let east = ChunkCoord { x: 1, y: 0, z: 0 };
+        let west = ChunkCoord { x: -1, y: 0, z: 0 };
+
+        store.insert_chunk_with_policy(
+            center,
+            Chunk::new_empty(),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+        store.insert_chunk_with_policy(
+            east,
+            store_chunk_with_voxel(0, 3, 7, 7),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+        let last = CHUNK_SIZE_VOXELS as usize - 1;
+        store.insert_chunk_with_policy(
+            west,
+            store_chunk_with_voxel(last, 5, 9, 9),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let borders = store.chunk_border_strips(center);
+        assert_eq!(borders.pos_x[ChunkMeshingInput::border_index(3, 7)], 7);
+        assert_eq!(borders.neg_x[ChunkMeshingInput::border_index(5, 9)], 9);
+        assert_eq!(borders.pos_x[ChunkMeshingInput::border_index(2, 2)], EMPTY);
+    }
+
+    #[test]
+    fn chunk_face_non_empty_mask_returns_zero_for_unloaded_chunk() {
+        let store = ChunkStore::new();
+        assert_eq!(
+            store.chunk_face_non_empty_mask(ChunkCoord { x: 4, y: 5, z: 6 }),
+            0
+        );
+    }
     #[test]
     fn deferred_neighbor_dirty_applies_when_chunk_loads() {
         let mut store = ChunkStore::new();

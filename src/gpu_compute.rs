@@ -224,14 +224,19 @@ impl GpuComputeRuntime {
         &self,
         state: &WorkerGpuState,
         job: &MeshJob,
-        page_index: u32,
-    ) -> anyhow::Result<DrawIndirectArgs> {
-        let page_params = device_page_params(job, page_index);
-        let page_params_buf = state
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gpu page params"),
-                contents: bytemuck::cast_slice(&page_params),
+    ) -> anyhow::Result<ComputedChunkArtifacts> {
+        #[cfg(not(feature = "gpu-compute"))]
+        {
+            let _ = (device, queue, job);
+            anyhow::bail!("gpu compute feature disabled")
+        }
+
+        #[cfg(feature = "gpu-compute")]
+        {
+            let volume = job.snapshot.center_voxels.len();
+            let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gpu input voxels"),
+                contents: bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let frontier_buf = state
@@ -481,8 +486,8 @@ fn map_readback<T: Pod>(device: &wgpu::Device, buffer: &wgpu::Buffer) -> anyhow:
 }
 
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
-    let mut out = vec![EMPTY; job.snapshot.voxels.len()];
-    out.copy_from_slice(&job.snapshot.voxels);
+    let mut out = vec![EMPTY; job.snapshot.center_voxels.len()];
+    out.copy_from_slice(job.snapshot.center_voxels.as_ref());
     let surface = out.iter().filter(|v| **v != EMPTY).count() as u32;
     ComputedChunkArtifacts {
         generated_materials: out,
@@ -499,9 +504,5 @@ pub(crate) fn rebuilt_snapshot_from_materials(
     job: &MeshJob,
     materials: Vec<MaterialId>,
 ) -> crate::renderer::ChunkSnapshot {
-    crate::renderer::ChunkSnapshot {
-        world_min: job.snapshot.world_min,
-        dim: job.snapshot.dim,
-        voxels: materials,
-    }
+    job.snapshot.with_center_materials(materials)
 }
