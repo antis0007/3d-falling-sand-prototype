@@ -1174,7 +1174,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
