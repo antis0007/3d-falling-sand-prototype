@@ -31,7 +31,7 @@ pub struct ProfilerStats {
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
-    pub gen_paused_by_mesh_pressure: bool,
+    pub gen_paused_by_worker_queue: bool,
     pub desired_budget_drop_count: usize,
     pub near_radius: i32,
     pub mid_radius: i32,
@@ -401,11 +401,11 @@ pub fn draw(
                     ui_state.profiler.desired_ms, ui_state.profiler.streaming_ms
                 ));
                 ui.monospace(format!(
-                    "gen requested/inflight/completed: {}/{}/{} | paused_by_mesh_pressure: {}",
+                    "gen requested/inflight/completed: {}/{}/{} | paused_by_worker_queue: {}",
                     ui_state.profiler.gen_request_count,
                     ui_state.profiler.gen_inflight_count,
                     ui_state.profiler.gen_completed_count,
-                    ui_state.profiler.gen_paused_by_mesh_pressure
+                    ui_state.profiler.gen_paused_by_worker_queue
                 ));
                 ui.monospace(format!(
                     "gen completed total: {} | desired budget drops: {}",

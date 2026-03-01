@@ -16,7 +16,7 @@ use crate::ui::{
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::Vec3;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,9 +50,8 @@ const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
-const GEN_THROTTLE_DIRTY_HIGH: usize = 1700;
-const GEN_THROTTLE_QUEUE_HIGH: usize = 1800;
-const GEN_MIN_THROTTLED_BUDGET: usize = 1;
+const GEN_DISPATCH_HIGH: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.9) as usize;
+const GEN_DISPATCH_LOW: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.5) as usize;
 const URGENT_GENERATION_BUDGET: usize = 4;
 const NEAR_GENERATION_BUDGET: usize = 24;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
@@ -69,6 +68,80 @@ const SPAWN_SEARCH_RADIUS: i32 = 48;
 const SPAWN_HEADROOM: i32 = 3;
 const SPAWN_CLEARANCE: f32 = 3.4;
 const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
+const MAX_CACHED_MODIFIED: usize = 2048;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModifiedChunkCacheMetrics {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+struct ModifiedChunkCache {
+    max_entries: usize,
+    entries: HashMap<ChunkCoord, crate::chunk_store::Chunk>,
+    recency: VecDeque<ChunkCoord>,
+    metrics: ModifiedChunkCacheMetrics,
+}
+
+impl ModifiedChunkCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            metrics: ModifiedChunkCacheMetrics::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+    }
+
+    fn insert(&mut self, coord: ChunkCoord, chunk: crate::chunk_store::Chunk) {
+        self.entries.insert(coord, chunk);
+        self.touch(coord);
+        self.enforce_limit();
+    }
+
+    fn take(&mut self, coord: ChunkCoord) -> Option<crate::chunk_store::Chunk> {
+        let chunk = self.entries.remove(&coord);
+        if chunk.is_some() {
+            self.metrics.hits += 1;
+            self.remove_from_recency(coord);
+        } else {
+            self.metrics.misses += 1;
+        }
+        chunk
+    }
+
+    fn metrics(&self) -> ModifiedChunkCacheMetrics {
+        self.metrics
+    }
+
+    fn touch(&mut self, coord: ChunkCoord) {
+        self.remove_from_recency(coord);
+        self.recency.push_back(coord);
+    }
+
+    fn remove_from_recency(&mut self, coord: ChunkCoord) {
+        if let Some(index) = self.recency.iter().position(|queued| *queued == coord) {
+            self.recency.remove(index);
+        }
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
+            if self.entries.remove(&oldest).is_some() {
+                self.metrics.evictions += 1;
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct GenJob {
@@ -203,31 +276,6 @@ impl AutoTuneState {
 
     fn is_active(self) -> bool {
         self.degrade_level > 0.01
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct GenThrottleState {
-    pressure: f32,
-    budget_scale: f32,
-}
-
-impl GenThrottleState {
-    fn update(&mut self, meshing_queue_depth: usize, dirty_backlog: usize) {
-        let dirty_pressure = dirty_backlog as f32 / GEN_THROTTLE_DIRTY_HIGH.max(1) as f32;
-        let queue_pressure = meshing_queue_depth as f32 / GEN_THROTTLE_QUEUE_HIGH.max(1) as f32;
-        self.pressure = dirty_pressure.max(queue_pressure);
-        self.budget_scale = if self.pressure < 1.0 {
-            1.0
-        } else if self.pressure < 2.0 {
-            2.0 - self.pressure
-        } else {
-            0.25
-        };
-    }
-
-    fn scaled_budget(self, budget: usize) -> usize {
-        (budget as f32 * self.budget_scale).round() as usize
     }
 }
 
@@ -456,10 +504,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut floating_origin_state = FloatingOriginState::new();
     let mut origin_voxel = floating_origin_state.origin_translation;
     let floating_origin_config = FloatingOriginConfig::default();
-    let mut cached_modified_chunks: std::collections::HashMap<
-        ChunkCoord,
-        crate::chunk_store::Chunk,
-    > = std::collections::HashMap::new();
+    let mut cached_modified_chunks = ModifiedChunkCache::new(MAX_CACHED_MODIFIED);
+    let mut cached_modified_last_metrics = ModifiedChunkCacheMetrics::default();
     let mut preview_block_list: Vec<[i32; 3]> = Vec::new();
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
@@ -476,7 +522,7 @@ pub async fn run() -> anyhow::Result<()> {
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
-        &std::collections::HashMap::new(),
+        &HashMap::new(),
         0,
     );
     let mut stream_debug = String::new();
@@ -492,7 +538,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut prior_dirty_backlog = 0usize;
     let mut prior_meshing_queue_depth = 0usize;
     let mut prior_upload_latency_ms = 0.0f32;
-    let mut gen_throttle_state = GenThrottleState::default();
+    let mut gen_dispatch_paused = false;
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
 
@@ -796,6 +842,12 @@ pub async fn run() -> anyhow::Result<()> {
                                 if chunk_generator.try_request(coord) {
                                     streaming.scheduled_generate.insert(coord);
                                     streaming.mark_dispatch_succeeded(coord);
+                                if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                    apply_generated_chunk(&mut store, coord, chunk);
+                                    streaming.mark_generated(coord, frame_counter);
+                                    forced_local_requests += 1;
+                                } else if chunk_generator.try_request(coord) {
+                                    streaming.generating.insert(coord);
                                     forced_local_requests += 1;
                                 }
                             }
@@ -974,7 +1026,20 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             frame_counter,
                         );
-                        gen_throttle_state.update(prior_meshing_queue_depth, prior_dirty_backlog);
+
+                        let gen_inflight_before_dispatch = streaming.generating.len();
+                        if gen_dispatch_paused {
+                            if gen_inflight_before_dispatch <= GEN_DISPATCH_LOW {
+                                gen_dispatch_paused = false;
+                            }
+                        } else if gen_inflight_before_dispatch >= GEN_DISPATCH_HIGH {
+                            gen_dispatch_paused = true;
+                        }
+                        let gen_pause_reason = if gen_dispatch_paused {
+                            "worker_queue_high_watermark"
+                        } else {
+                            "none"
+                        };
 
                         let mut gen_request_count = 0usize;
                         let mut urgent_missing = 0usize;
@@ -1013,18 +1078,33 @@ pub async fn run() -> anyhow::Result<()> {
                                 gen_request_count += 1;
                             } else {
                                 streaming.mark_dispatch_failed_or_deferred(coord);
+                        if !gen_dispatch_paused {
+                            for coord in dispatch_urgent {
+                                if streaming.scheduled.insert(coord) {
+                                    streaming.mark_canceled(coord);
+                                    streaming.scheduled.insert(coord);
+                                }
+                                if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                    apply_generated_chunk(&mut store, coord, chunk);
+                                    streaming.mark_generated(coord, frame_counter);
+                                } else if chunk_generator.try_request(coord) {
+                                    streaming.mark_dispatched(coord);
+                                    gen_request_count += 1;
+                                }
                             }
                         }
 
                         let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
                             stream_tuning.max_generate_drain_items,
-                            streaming.pending_generate_count() + generated_ready.len(),
+                            streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        let generate_drain_budget = gen_throttle_state
-                            .scaled_budget(base_generate_drain_budget)
-                            .max(GEN_MIN_THROTTLED_BUDGET);
+                        let generate_drain_budget = if gen_dispatch_paused {
+                            0
+                        } else {
+                            base_generate_drain_budget
+                        };
 
                         let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
                         let mut near_sent = 0usize;
@@ -1032,6 +1112,12 @@ pub async fn run() -> anyhow::Result<()> {
                             let Some(coord) = streaming.next_generation_job() else { break; };
                             if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatch_succeeded(coord);
+                            if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                apply_generated_chunk(&mut store, coord, chunk);
+                                streaming.mark_generated(coord, frame_counter);
+                                near_sent += 1;
+                            } else if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 near_sent += 1;
                             } else {
@@ -1045,6 +1131,12 @@ pub async fn run() -> anyhow::Result<()> {
                             let Some(coord) = streaming.next_generation_job() else { break; };
                             if chunk_generator.try_request(coord) {
                                 streaming.mark_dispatch_succeeded(coord);
+                            if let Some(chunk) = cached_modified_chunks.take(coord) {
+                                apply_generated_chunk(&mut store, coord, chunk);
+                                streaming.mark_generated(coord, frame_counter);
+                                far_budget -= 1;
+                            } else if chunk_generator.try_request(coord) {
+                                streaming.mark_dispatched(coord);
                                 gen_request_count += 1;
                                 far_budget -= 1;
                             } else {
@@ -1079,8 +1171,8 @@ pub async fn run() -> anyhow::Result<()> {
                         let gen_inflight = streaming.dispatched_generate.len();
                         if gen_inflight >= 96 && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
-                            let starvation_reason = if gen_throttle_state.pressure > 1.0 {
-                                "pressure > 1.0"
+                            let starvation_reason = if gen_dispatch_paused {
+                                "worker_dispatch_paused"
                             } else if gen_recv_disconnected {
                                 "generator_channel_disconnected"
                             } else if gen_recv_empty {
@@ -1090,10 +1182,9 @@ pub async fn run() -> anyhow::Result<()> {
                             };
                             ui.log_once_per_second("gen_starvation", now_secs, || {
                                 format!(
-                                    "gen starvation inflight={} pending_generate={} apply_queue={} recv_ms={:.3} reason={}",
+                                    "gen starvation inflight={} pending_generate={} recv_ms={:.3} reason={}",
                                     gen_inflight,
                                     streaming.pending_generate_count(),
-                                    generated_ready.len(),
                                     gen_recv_ms,
                                     starvation_reason
                                 )
@@ -1139,6 +1230,26 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let streaming_ms = streaming_t0.elapsed().as_secs_f32() * 1000.0;
                         let now_secs = start.elapsed().as_secs_f32();
+                        let cache_metrics = cached_modified_chunks.metrics();
+                        let cache_hit_delta = cache_metrics.hits.saturating_sub(cached_modified_last_metrics.hits);
+                        let cache_miss_delta = cache_metrics.misses.saturating_sub(cached_modified_last_metrics.misses);
+                        let cache_evict_delta = cache_metrics
+                            .evictions
+                            .saturating_sub(cached_modified_last_metrics.evictions);
+                        if cache_hit_delta > 0 || cache_miss_delta > 0 || cache_evict_delta > 0 {
+                            ui.log_once_per_second("modified_cache", now_secs, || {
+                                format!(
+                                    "modified_cache hit={} miss={} evict={} totals[h={}, m={}, e={}]",
+                                    cache_hit_delta,
+                                    cache_miss_delta,
+                                    cache_evict_delta,
+                                    cache_metrics.hits,
+                                    cache_metrics.misses,
+                                    cache_metrics.evictions,
+                                )
+                            });
+                            cached_modified_last_metrics = cache_metrics;
+                        }
                         if player_chunk_changed {
                             ui.log_once_per_second("chunk_change", now_secs, || format!(
                                 "chunk_change player=({}, {}, {}) desired={} newly_desired={} requested={} applied={} evicted={} pending_apply={} pending_evict={}",
@@ -1167,6 +1278,14 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.log_once_per_second("apply_budget", now_secs, || {
                                 format!("apply budget hit: remaining queue={}", generated_ready.len())
                             });
+                            ui.log_once_per_second("apply_pipeline_health", now_secs, || {
+                                format!(
+                                    "apply pipeline backlog queue={} apply_budget_items={} gen_pending={}",
+                                    generated_ready.len(),
+                                    apply_budget_items,
+                                    streaming.pending_generate_count()
+                                )
+                            });
                         }
                         if streaming.pending_evict_count() > streaming.max_evict_schedule_per_update {
                             ui.log_once_per_second("evict_budget", now_secs, || {
@@ -1175,14 +1294,15 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         stream_debug = format!(
-                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
+                            "Stream: resident={} near={} mid={} far={} gen_pending={} apply_queue={} gen_paused={} gen_pause_reason={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
                             cached_desired.near.len(),
                             cached_desired.mid.len(),
                             cached_desired.far.len(),
                             streaming.pending_generate_count(),
                             generated_ready.len(),
-                            gen_throttle_state.pressure > 1.0,
+                            gen_dispatch_paused,
+                            gen_pause_reason,
                             player_chunk.x,
                             player_chunk.y,
                             player_chunk.z,
@@ -1337,7 +1457,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
-                        ui.profiler.gen_paused_by_mesh_pressure = gen_throttle_state.pressure > 1.0;
+                        ui.profiler.gen_paused_by_worker_queue = gen_dispatch_paused;
                         ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = stream_tuning.mid_radius_xz;
