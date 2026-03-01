@@ -1195,7 +1195,7 @@ fn mesh_chunk_snapshot(
                 mesh_chunk_voxel_faces(snapshot, chunk_world_min, 1)
             }
         }
-        ChunkLod::Mid => mesh_chunk_voxel_faces(snapshot, chunk_world_min, 2),
+        ChunkLod::Mid => mesh_chunk_coarse_solid(snapshot, chunk_world_min, 2),
         ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, 4),
         ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, 8),
     }
