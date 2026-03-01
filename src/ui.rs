@@ -51,8 +51,16 @@ pub struct ProfilerStats {
     pub mesh_mid_count: usize,
     pub mesh_far_count: usize,
     pub mesh_ultra_count: usize,
+    pub collision_blocked_unloaded_count: u64,
+    pub collision_blocked_unloaded_ms: f32,
     pub sim_ms: f32,
     pub sim_chunk_steps: usize,
+    pub sim_substeps_executed: usize,
+    pub sim_substeps_budget: usize,
+    pub sim_substeps_budget_effective: usize,
+    pub sim_accumulator_steps: f32,
+    pub sim_accumulator_cap_steps: f32,
+    pub sim_accumulator_clamped: bool,
     pub render_submit_ms: f32,
     pub egui_ms: f32,
     pub missing_in_radius: usize,
@@ -108,6 +116,10 @@ pub struct UiState {
     pub day: bool,
     pub mouse_sensitivity: f32,
     pub sim_speed: f32,
+    pub sim_max_substeps_per_frame: usize,
+    pub sim_accumulator_cap_frames: f32,
+    pub sim_adaptive_substeps: bool,
+    pub sim_adaptive_frame_time_ratio: f32,
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
@@ -137,6 +149,12 @@ impl UiState {
     pub const SIM_SPEED_MIN: f32 = 0.1;
     pub const SIM_SPEED_MAX: f32 = 4.0;
     pub const SIM_SPEED_STEP: f32 = 0.1;
+    pub const SIM_MAX_SUBSTEPS_MIN: usize = 1;
+    pub const SIM_MAX_SUBSTEPS_MAX: usize = 12;
+    pub const SIM_ACC_CAP_FRAMES_MIN: f32 = 1.0;
+    pub const SIM_ACC_CAP_FRAMES_MAX: f32 = 6.0;
+    pub const SIM_ADAPTIVE_THRESHOLD_MIN: f32 = 1.0;
+    pub const SIM_ADAPTIVE_THRESHOLD_MAX: f32 = 2.5;
 
     pub fn clamp_quantize_sim_speed(value: f32) -> f32 {
         let steps = (value / Self::SIM_SPEED_STEP).round();
@@ -220,6 +238,10 @@ impl Default for UiState {
             day: true,
             mouse_sensitivity: 0.001,
             sim_speed: 1.0,
+            sim_max_substeps_per_frame: 3,
+            sim_accumulator_cap_frames: 3.0,
+            sim_adaptive_substeps: true,
+            sim_adaptive_frame_time_ratio: 1.25,
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
@@ -474,9 +496,58 @@ pub fn draw(
                     ui_state.profiler.mesh_upload_latency_ms,
                 ));
                 ui.monospace(format!(
+                    "collision blocked by unloaded chunk: {} samples | {:.1} ms",
+                    ui_state.profiler.collision_blocked_unloaded_count,
+                    ui_state.profiler.collision_blocked_unloaded_ms,
+                ));
+                ui.monospace(format!(
                     "sim: {:.2} ms | chunk_steps: {}",
                     ui_state.profiler.sim_ms, ui_state.profiler.sim_chunk_steps
                 ));
+                ui.monospace(format!(
+                    "sim substeps executed/budget/effective: {}/{}/{}",
+                    ui_state.profiler.sim_substeps_executed,
+                    ui_state.profiler.sim_substeps_budget,
+                    ui_state.profiler.sim_substeps_budget_effective,
+                ));
+                ui.monospace(format!(
+                    "sim accumulator steps: {:.2}/{:.2} | clamped: {}",
+                    ui_state.profiler.sim_accumulator_steps,
+                    ui_state.profiler.sim_accumulator_cap_steps,
+                    ui_state.profiler.sim_accumulator_clamped,
+                ));
+                ui.separator();
+                ui.heading("Simulation Tuning");
+                ui.add(
+                    egui::Slider::new(
+                        &mut ui_state.sim_max_substeps_per_frame,
+                        UiState::SIM_MAX_SUBSTEPS_MIN..=UiState::SIM_MAX_SUBSTEPS_MAX,
+                    )
+                    .text("Max substeps/frame"),
+                );
+                ui.add(
+                    egui::Slider::new(
+                        &mut ui_state.sim_accumulator_cap_frames,
+                        UiState::SIM_ACC_CAP_FRAMES_MIN..=UiState::SIM_ACC_CAP_FRAMES_MAX,
+                    )
+                    .text("Accumulator cap (frames)")
+                    .step_by(0.25),
+                );
+                ui.checkbox(
+                    &mut ui_state.sim_adaptive_substeps,
+                    "Adaptive substep reduction on slow frames",
+                );
+                ui.add_enabled_ui(ui_state.sim_adaptive_substeps, |ui| {
+                    ui.add(
+                        egui::Slider::new(
+                            &mut ui_state.sim_adaptive_frame_time_ratio,
+                            UiState::SIM_ADAPTIVE_THRESHOLD_MIN
+                                ..=UiState::SIM_ADAPTIVE_THRESHOLD_MAX,
+                        )
+                        .text("Adaptive trigger (x frame target)")
+                        .step_by(0.05),
+                    );
+                });
                 ui.monospace(format!(
                     "render_submit_ms: {:.2} | egui_ms: {:.2}",
                     ui_state.profiler.render_submit_ms, ui_state.profiler.egui_ms

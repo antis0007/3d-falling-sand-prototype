@@ -8,14 +8,14 @@ use crate::renderer::{
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::{step_region_profiled, Rng};
-use crate::streaming::{is_urgent_chunk, ChunkStreaming, DesiredChunks};
+use crate::streaming::{is_urgent_chunk, ChunkStreaming, DesiredChunks, VisibilityContext};
 use crate::types::{voxel_to_chunk, ChunkCoord, VoxelCoord};
 use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     UiState, HOTBAR_SLOTS,
 };
 use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
-use glam::Vec3;
+use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
@@ -35,6 +35,7 @@ const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
 const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
+const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 
 const GENERATOR_THREADS: usize = 3;
@@ -46,6 +47,8 @@ const DESIRED_MID_PER_FRAME_CAP: usize = 320;
 const DESIRED_FAR_PER_FRAME_CAP: usize = 448;
 const DESIRED_MAX_TOTAL_BUDGET: usize = 2600;
 const DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV: i32 = 1;
+const RESIDENT_KEEP_MID_CAP: usize = 512;
+const RESIDENT_KEEP_FAR_CAP: usize = 640;
 const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
@@ -62,6 +65,9 @@ const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
+const COLLISION_URGENT_DISPATCH_BOOST: usize = 12;
+const COLLISION_STRICT_FALLBACK_WINDOW_SECS: f32 = 0.35;
+const COLLISION_TIMEOUT_DAMPING_FACTOR: f32 = 0.78;
 const HITCH_CAPTURE_FRAME_MS: f32 = 120.0;
 const HITCH_CAPTURE_RING_SIZE: usize = 64;
 const SPAWN_SEARCH_RADIUS: i32 = 48;
@@ -298,6 +304,25 @@ fn chebyshev_from_player(player_chunk: ChunkCoord, coord: ChunkCoord) -> i32 {
         .max((coord.z - player_chunk.z).abs())
 }
 
+fn extract_frustum_planes(vp: Mat4) -> [Vec4; 6] {
+    let m = vp.transpose().to_cols_array();
+    let row = |idx: usize| Vec4::new(m[idx], m[4 + idx], m[8 + idx], m[12 + idx]);
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+
+    let mut planes = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+    for plane in &mut planes {
+        let normal = plane.truncate();
+        let inv_len = normal.length_recip();
+        if inv_len.is_finite() {
+            *plane *= inv_len;
+        }
+    }
+    planes
+}
+
 fn cap_desired_generation_order(
     desired: &DesiredChunks,
     player_chunk: ChunkCoord,
@@ -518,10 +543,13 @@ pub async fn run() -> anyhow::Result<()> {
         ChunkCoord { x: 0, y: 0, z: 0 },
         Vec3::ZERO,
         Vec3::Z,
+        None,
         stream_tuning.near_radius_xz,
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
         stream_tuning.vertical_radius,
+        RESIDENT_KEEP_MID_CAP,
+        RESIDENT_KEEP_FAR_CAP,
         &HashMap::new(),
         0,
     );
@@ -533,6 +561,11 @@ pub async fn run() -> anyhow::Result<()> {
     let mut collision_unknown_samples = 0usize;
     let mut collision_unknown_blocks_as_solid = 0usize;
     let mut collision_axis_reverts = 0usize;
+    let mut collision_missing_since: HashMap<ChunkCoord, f32> = HashMap::new();
+    let mut collision_local_urgent_boost = 0usize;
+    let mut collision_soft_timeout_active = false;
+    let mut collision_blocked_unloaded_count_total = 0u64;
+    let mut collision_blocked_unloaded_ms_total = 0.0f32;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
     let mut prior_dirty_backlog = 0usize;
@@ -814,22 +847,27 @@ pub async fn run() -> anyhow::Result<()> {
                         let player_local_for_collision = ctrl.position;
                         let player_world_for_collision = local_to_world_voxel(player_local_for_collision, origin_voxel);
                         let (player_chunk_for_collision, _) = voxel_to_chunk(player_world_for_collision);
-                        let collision_neighborhood_loaded = collision_neighborhood_loaded(
+                        let missing_collision_chunks = collision_neighborhood_missing_chunks(
                             &store,
                             player_local_for_collision,
                             origin_voxel,
                             COLLISION_SAFETY_RADIUS_VOXELS,
                         );
+                        let collision_neighborhood_loaded = missing_collision_chunks.is_empty();
+                        let now_secs = start.elapsed().as_secs_f32();
+                        let mut present_missing: HashSet<ChunkCoord> = HashSet::new();
+                        for coord in &missing_collision_chunks {
+                            present_missing.insert(*coord);
+                            collision_missing_since.entry(*coord).or_insert(now_secs);
+                        }
+                        collision_missing_since.retain(|coord, _| present_missing.contains(coord));
 
                         // Soft-fallback collision policy: no hard movement freeze when chunks are missing.
 
                         if !collision_neighborhood_loaded {
-                            let missing_coords = collision_neighborhood_missing_chunks(
-                                &store,
-                                player_local_for_collision,
-                                origin_voxel,
-                                COLLISION_SAFETY_RADIUS_VOXELS,
-                            );
+                            let missing_coords = missing_collision_chunks.clone();
+                            let local_dispatch_budget = COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET
+                                .max(URGENT_GENERATION_BUDGET + COLLISION_URGENT_DISPATCH_BOOST);
                             let mut forced_local_requests = 0usize;
                             let mut urgent_missing = Vec::new();
                             let mut non_urgent_missing = Vec::new();
@@ -873,15 +911,22 @@ pub async fn run() -> anyhow::Result<()> {
                                     )
                                 });
                             }
+                            collision_local_urgent_boost = collision_local_urgent_boost
+                                .max(forced_local_requests)
+                                .max(COLLISION_URGENT_DISPATCH_BOOST);
+                        } else {
+                            collision_local_urgent_boost = 0;
                         }
 
 
                         collision_used_unloaded_chunks = false;
                         collision_unknown_samples = 0;
                         collision_unknown_blocks_as_solid = 0;
+                        collision_soft_timeout_active = false;
                         let look_active = !(gameplay_blocked || spawn_pending) && !egui_c;
                         let ctrl_input = input.clone();
                         let origin_for_ctrl = origin_voxel;
+                        let collision_position_before_step = ctrl.position;
                         let collision_step = ctrl.step(
                             |x, y, z| {
                                 let voxel = VoxelCoord { x, y, z };
@@ -893,8 +938,17 @@ pub async fn run() -> anyhow::Result<()> {
                                     within_collision_safety_radius(voxel, player_local_for_collision, origin_for_ctrl, COLLISION_SAFETY_RADIUS_VOXELS);
                                 if near_player {
                                     collision_used_unloaded_chunks = true;
-                                    collision_unknown_blocks_as_solid = collision_unknown_blocks_as_solid.saturating_add(1);
-                                    return 1u16;
+                                    let (missing_chunk, _) = voxel_to_chunk(voxel);
+                                    let missing_for_secs = collision_missing_since
+                                        .get(&missing_chunk)
+                                        .map(|seen_secs| now_secs - *seen_secs)
+                                        .unwrap_or(0.0);
+                                    if missing_for_secs <= COLLISION_STRICT_FALLBACK_WINDOW_SECS {
+                                        collision_unknown_blocks_as_solid = collision_unknown_blocks_as_solid.saturating_add(1);
+                                        return 1u16;
+                                    }
+
+                                    collision_soft_timeout_active = true;
                                 }
 
                                 0u16
@@ -906,6 +960,16 @@ pub async fn run() -> anyhow::Result<()> {
                             origin_for_ctrl,
                         );
                         collision_axis_reverts = collision_step.axis_reverts;
+                        if collision_soft_timeout_active {
+                            let damped_delta = ctrl.position - collision_position_before_step;
+                            ctrl.position = collision_position_before_step
+                                + damped_delta * COLLISION_TIMEOUT_DAMPING_FACTOR;
+                        }
+                        if collision_unknown_blocks_as_solid > 0 {
+                            collision_blocked_unloaded_count_total = collision_blocked_unloaded_count_total
+                                .saturating_add(collision_unknown_blocks_as_solid as u64);
+                            collision_blocked_unloaded_ms_total += dt * 1000.0;
+                        }
 
                         // Streaming regions in WORLD voxel space
                         let player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
@@ -977,14 +1041,31 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                             desired_recompute_reason = reasons.join("|");
 
+                            let chunk_size_meters = crate::types::CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
+                            let camera_pos_world = camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE);
+                            let camera_pos_chunks = camera_pos_world / chunk_size_meters;
+                            let chunk_camera = Camera {
+                                pos: camera_pos_chunks,
+                                dir: look_dir,
+                                aspect: renderer.config.width as f32 / renderer.config.height.max(1) as f32,
+                            };
+                            let visibility_context = VisibilityContext {
+                                camera_pos_chunks,
+                                cone_inner_cos: (35.0f32).to_radians().cos(),
+                                cone_outer_cos: (75.0f32).to_radians().cos(),
+                                frustum_planes: Some(extract_frustum_planes(chunk_camera.view_proj())),
+                            };
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
                                 player_velocity_chunks,
                                 look_dir,
+                                Some(&visibility_context),
                                 effective_stream_tuning.near_radius_xz,
                                 effective_stream_tuning.mid_radius_xz,
                                 Some(effective_stream_tuning.far_radius_xz),
                                 effective_stream_tuning.vertical_radius,
+                                RESIDENT_KEEP_MID_CAP,
+                                RESIDENT_KEEP_FAR_CAP,
                                 &visible_history,
                                 frame_counter,
                             );
@@ -1073,8 +1154,9 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        if !gen_dispatch_paused {
-                            for coord in dispatch_urgent {
+                        let urgent_dispatch_budget = URGENT_GENERATION_BUDGET + collision_local_urgent_boost;
+                        if !gen_dispatch_paused || collision_local_urgent_boost > 0 {
+                            for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
                                 if let Some(chunk) = cached_modified_chunks.take(coord) {
                                     apply_generated_chunk(&mut store, coord, chunk);
                                     streaming.mark_generated(coord, frame_counter);
@@ -1353,17 +1435,53 @@ pub async fn run() -> anyhow::Result<()> {
                         let do_step = sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
                         let sim_t0 = Instant::now();
                         let mut sim_chunk_steps = 0usize;
+                        let mut sim_substeps_executed = 0usize;
+                        let sim_substeps_budget = ui
+                            .sim_max_substeps_per_frame
+                            .clamp(UiState::SIM_MAX_SUBSTEPS_MIN, UiState::SIM_MAX_SUBSTEPS_MAX);
+                        ui.sim_max_substeps_per_frame = sim_substeps_budget;
+                        let sim_accumulator_cap_frames = ui.sim_accumulator_cap_frames.clamp(
+                            UiState::SIM_ACC_CAP_FRAMES_MIN,
+                            UiState::SIM_ACC_CAP_FRAMES_MAX,
+                        );
+                        ui.sim_accumulator_cap_frames = sim_accumulator_cap_frames;
+                        let adaptive_trigger_ratio = ui.sim_adaptive_frame_time_ratio.clamp(
+                            UiState::SIM_ADAPTIVE_THRESHOLD_MIN,
+                            UiState::SIM_ADAPTIVE_THRESHOLD_MAX,
+                        );
+                        ui.sim_adaptive_frame_time_ratio = adaptive_trigger_ratio;
+                        let sim_accumulator_cap_seconds =
+                            sim_accumulator_cap_frames * FIXED_SIM_STEP_SECONDS;
+                        let mut sim_accumulator_clamped = false;
+                        let mut sim_substeps_budget_effective = sim_substeps_budget;
                         if do_step {
                             sim_acc += dt * ui.sim_speed;
-                            while sim_acc >= 1.0 / 60.0 {
+                            if sim_acc > sim_accumulator_cap_seconds {
+                                sim_acc = sim_accumulator_cap_seconds;
+                                sim_accumulator_clamped = true;
+                            }
+                            if ui.sim_adaptive_substeps {
+                                let frame_ms = dt * 1000.0;
+                                let adaptive_trigger_ms = FRAME_TIME_TARGET_MS * adaptive_trigger_ratio;
+                                if frame_ms > adaptive_trigger_ms {
+                                    let overload = (frame_ms / adaptive_trigger_ms).floor() as usize;
+                                    let reduction = overload.min(sim_substeps_budget.saturating_sub(1));
+                                    sim_substeps_budget_effective =
+                                        sim_substeps_budget.saturating_sub(reduction).max(1);
+                                }
+                            }
+                            let ready_steps = (sim_acc / FIXED_SIM_STEP_SECONDS).floor() as usize;
+                            let steps_to_run = ready_steps.min(sim_substeps_budget_effective);
+                            for _ in 0..steps_to_run {
                                 sim_chunk_steps += step_region_profiled(
                                     &mut store,
                                     &cached_sim_region,
                                     player_chunk,
                                     &mut rng,
                                 );
-                                sim_acc -= 1.0 / 60.0;
                             }
+                            sim_substeps_executed = steps_to_run;
+                            sim_acc -= steps_to_run as f32 * FIXED_SIM_STEP_SECONDS;
                         } else if step_once && !ui.paused_menu {
                             sim_chunk_steps += step_region_profiled(
                                 &mut store,
@@ -1371,6 +1489,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 player_chunk,
                                 &mut rng,
                             );
+                            sim_substeps_executed = 1;
                             step_once = false;
                         }
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
@@ -1465,8 +1584,17 @@ pub async fn run() -> anyhow::Result<()> {
                         prior_meshing_queue_depth = mesh_stats.meshing_queue_depth;
                         prior_upload_latency_ms = mesh_stats.upload_latency_ms;
                         ui.profiler.mesh_ultra_count = mesh_stats.ultra_mesh_count;
+                        ui.profiler.collision_blocked_unloaded_count = collision_blocked_unloaded_count_total;
+                        ui.profiler.collision_blocked_unloaded_ms = collision_blocked_unloaded_ms_total;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
+                        ui.profiler.sim_substeps_executed = sim_substeps_executed;
+                        ui.profiler.sim_substeps_budget = sim_substeps_budget;
+                        ui.profiler.sim_substeps_budget_effective = sim_substeps_budget_effective;
+                        ui.profiler.sim_accumulator_steps = sim_acc / FIXED_SIM_STEP_SECONDS;
+                        ui.profiler.sim_accumulator_cap_steps =
+                            sim_accumulator_cap_seconds / FIXED_SIM_STEP_SECONDS;
+                        ui.profiler.sim_accumulator_clamped = sim_accumulator_clamped;
 
                         // Egui
                         let egui_t0 = Instant::now();
