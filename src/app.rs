@@ -10,7 +10,7 @@ use crate::ui::{
     assign_hotbar_slot, draw, draw_fps_overlays, load_tool_textures, selected_material, ToolKind,
     UiState, HOTBAR_SLOTS,
 };
-use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape};
+use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHUNK_SIZE, EMPTY};
 use glam::Vec3;
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -43,6 +43,10 @@ const FREEZE_UNTIL_COLLISION_RESIDENT: bool = true;
 const COLLISION_FREEZE_MAX_DURATION: Duration = Duration::from_millis(1500);
 const COLLISION_FREEZE_BACKOFF_DURATION: Duration = Duration::from_millis(900);
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
+const SPAWN_SEARCH_RADIUS: i32 = 48;
+const SPAWN_HEADROOM: i32 = 3;
+const SPAWN_CLEARANCE: f32 = 3.4;
+const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
 
 #[derive(Clone)]
 struct GenJob {
@@ -262,6 +266,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut previous_collision_freeze_active = false;
     let mut last_player_world_voxel = local_to_world_voxel(ctrl.position, origin_voxel);
     let mut prior_mesh_backlog = 0usize;
+    let mut spawn_pending = true;
 
     let _ = set_cursor(window, false);
 
@@ -456,6 +461,29 @@ pub async fn run() -> anyhow::Result<()> {
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
 
+                        if spawn_pending {
+                            if let Some(spawn_world) =
+                                find_safe_spawn_in_loaded_chunks(&store, streaming.seed)
+                            {
+                                ctrl.position = world_spawn_to_local_pos(spawn_world, origin_voxel);
+                                let neighborhood_loaded = collision_neighborhood_loaded(
+                                    &store,
+                                    ctrl.position,
+                                    origin_voxel,
+                                    COLLISION_SAFETY_RADIUS_VOXELS,
+                                );
+                                spawn_pending = !neighborhood_loaded;
+                                if !spawn_pending {
+                                    collision_freeze_started_at = None;
+                                    collision_freeze_backoff_until = None;
+                                    previous_collision_freeze_active = false;
+                                    last_player_chunk = None;
+                                    cached_desired = DesiredChunks::default();
+                                    cached_sim_region.clear();
+                                }
+                            }
+                        }
+
                         if cursor_should_unlock != cursor_is_unlocked {
                             let _ = set_cursor(window, cursor_should_unlock);
                             cursor_is_unlocked = cursor_should_unlock;
@@ -514,7 +542,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let should_consider_freeze = FREEZE_UNTIL_COLLISION_RESIDENT
                             && !collision_neighborhood_loaded
-                            && !gameplay_blocked
+                            && !(gameplay_blocked || spawn_pending)
                             && !egui_c;
                         let within_backoff = collision_freeze_backoff_until
                             .is_some_and(|until| now_instant < until);
@@ -617,7 +645,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         collision_used_unloaded_chunks = false;
-                        let look_active = !gameplay_blocked && !egui_c;
+                        let look_active = !(gameplay_blocked || spawn_pending) && !egui_c;
                         let mut ctrl_input = input.clone();
                         if collision_freeze_active {
                             ctrl_input.pressed.remove(&KeyCode::KeyW);
@@ -967,6 +995,13 @@ pub async fn run() -> anyhow::Result<()> {
                                 cached_sim_region.clear();
                                 generated_ready.clear();
                                 total_generated_chunks = 0;
+                                origin_voxel = VoxelCoord { x: 0, y: 0, z: 0 };
+                                ctrl.position = Vec3::new(8.0, 6.0, 8.0);
+                                spawn_pending = true;
+                                collision_freeze_active = false;
+                                collision_freeze_started_at = None;
+                                collision_freeze_backoff_until = None;
+                                previous_collision_freeze_active = false;
                             }
                         });
                         egui_state.handle_platform_output(window, out.platform_output);
@@ -1169,6 +1204,115 @@ fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {
         y: local_pos.y.floor() as i32 + origin.y,
         z: local_pos.z.floor() as i32 + origin.z,
     }
+}
+
+fn world_spawn_to_local_pos(spawn_world: VoxelCoord, origin: VoxelCoord) -> Vec3 {
+    Vec3::new(
+        spawn_world.x as f32 + 0.5 - origin.x as f32,
+        spawn_world.y as f32 + SPAWN_CLEARANCE - origin.y as f32,
+        spawn_world.z as f32 + 0.5 - origin.z as f32,
+    )
+}
+
+fn find_safe_spawn_in_loaded_chunks(store: &ChunkStore, seed: u64) -> Option<VoxelCoord> {
+    let center = VoxelCoord { x: 0, y: 0, z: 0 };
+    let mut candidate: Option<VoxelCoord> = None;
+
+    for r in 0..=SPAWN_SEARCH_RADIUS {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if r > 0 && dx.abs() < r && dz.abs() < r {
+                    continue;
+                }
+                let x = center.x + dx;
+                let z = center.z + dz;
+                let bias = spawn_bias(seed, x, z);
+                if bias < 0.08 {
+                    continue;
+                }
+                if let Some(y) = valid_loaded_spawn_y(store, x, z) {
+                    return Some(VoxelCoord { x, y, z });
+                }
+            }
+        }
+    }
+
+    if store.is_chunk_loaded(ChunkCoord { x: 0, y: 0, z: 0 }) {
+        let sea_level = (18).min(CHUNK_SIZE as i32 - 10).max(10);
+        candidate = Some(VoxelCoord {
+            x: center.x,
+            y: sea_level + SPAWN_FALLBACK_EXTRA_HEIGHT,
+            z: center.z,
+        });
+    }
+
+    candidate
+}
+
+fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
+    let min_y = -64;
+    let max_y = CHUNK_SIZE as i32 * 3;
+    for y in (min_y..=max_y).rev() {
+        let base = VoxelCoord { x, y, z };
+        if !store.is_voxel_chunk_loaded(base) {
+            continue;
+        }
+        let base_id = store.get_voxel(base);
+        if base_id == EMPTY || base_id == 5 {
+            continue;
+        }
+
+        let mut has_headroom = true;
+        for dy in 1..=SPAWN_HEADROOM {
+            let head = VoxelCoord { x, y: y + dy, z };
+            if !store.is_voxel_chunk_loaded(head) || store.get_voxel(head) != EMPTY {
+                has_headroom = false;
+                break;
+            }
+        }
+        if !has_headroom {
+            continue;
+        }
+
+        let mut near_water = false;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let sample = VoxelCoord {
+                    x: x + dx,
+                    y: y + 1,
+                    z: z + dz,
+                };
+                if !store.is_voxel_chunk_loaded(sample) {
+                    continue;
+                }
+                if store.get_voxel(sample) == 5 {
+                    near_water = true;
+                    break;
+                }
+            }
+            if near_water {
+                break;
+            }
+        }
+        if near_water {
+            continue;
+        }
+
+        return Some(y);
+    }
+    None
+}
+
+fn spawn_bias(seed: u64, x: i32, z: i32) -> f32 {
+    let mut h = seed ^ 0xABCD_0001;
+    h ^= (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= (z as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    ((h >> 40) as f32) / ((1u64 << 24) as f32)
 }
 
 fn within_collision_safety_radius(
