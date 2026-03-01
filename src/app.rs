@@ -2,7 +2,7 @@ use crate::chunk_store::ChunkStore;
 use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
 use crate::gpu_compute::take_gpu_compute_profiler_snapshot;
 use crate::input::{FpsController, InputState};
-use crate::player::camera_world_pos_from_blocks;
+use crate::player::{camera_world_pos_from_blocks, grounded_eye_y_blocks};
 use crate::procgen::{apply_generated_chunk, generate_chunk};
 use crate::renderer::{
     Camera, LodMeshingBudgets, LodRadii, Renderer, RendererSettings,
@@ -76,8 +76,7 @@ const COLLISION_TIMEOUT_DAMPING_FACTOR: f32 = 0.78;
 const HITCH_CAPTURE_FRAME_MS: f32 = 120.0;
 const HITCH_CAPTURE_RING_SIZE: usize = 64;
 const SPAWN_SEARCH_RADIUS: i32 = 48;
-const SPAWN_HEADROOM: i32 = 3;
-const SPAWN_CLEARANCE: f32 = 3.4;
+const SPAWN_HEADROOM: i32 = 4;
 const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
 const SPAWN_CEILING_PROBE_HEIGHT: i32 = 20;
 const SPAWN_MAX_SLOPE_DELTA: i32 = 3;
@@ -681,6 +680,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last = Instant::now();
     let start = Instant::now();
     let mut cursor_is_unlocked = false;
+    let mut cursor_position_known = false;
 
     let mut floating_origin_state = FloatingOriginState::new();
     let mut origin_voxel = floating_origin_state.origin_translation;
@@ -739,6 +739,12 @@ pub async fn run() -> anyhow::Result<()> {
     event_loop
         .run(move |event, elwt| match &event {
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
+                match event {
+                    WindowEvent::CursorMoved { .. } => cursor_position_known = true,
+                    WindowEvent::CursorLeft { .. } => cursor_position_known = false,
+                    _ => {}
+                }
+
                 // Only let egui see Tab/pointer when UI intends to own them.
                 let block_tab_for_egui = matches!(
                     event,
@@ -756,7 +762,17 @@ pub async fn run() -> anyhow::Result<()> {
                             | WindowEvent::MouseWheel { .. }
                             | WindowEvent::TouchpadPressure { .. }
                     );
-                let egui_c = if block_tab_for_egui || block_pointer_for_egui {
+                let pointer_button_without_position = !cursor_position_known
+                    && matches!(
+                        event,
+                        WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. }
+                            | WindowEvent::TouchpadPressure { .. }
+                    );
+                let egui_c = if block_tab_for_egui
+                    || block_pointer_for_egui
+                    || pointer_button_without_position
+                {
                     false
                 } else {
                     egui_state.on_window_event(window, event).consumed
@@ -2182,9 +2198,10 @@ fn local_to_world_voxel(local_pos: Vec3, origin: VoxelCoord) -> VoxelCoord {
 }
 
 fn world_spawn_to_local_pos(spawn_world: VoxelCoord, origin: VoxelCoord) -> Vec3 {
+    let eye_height_above_surface = 1.0 + grounded_eye_y_blocks();
     Vec3::new(
         spawn_world.x as f32 + 0.5 - origin.x as f32,
-        spawn_world.y as f32 + SPAWN_CLEARANCE - origin.y as f32,
+        spawn_world.y as f32 + eye_height_above_surface - origin.y as f32,
         spawn_world.z as f32 + 0.5 - origin.z as f32,
     )
 }
