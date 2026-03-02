@@ -5,6 +5,7 @@ mod floating_origin;
 mod gpu_compute;
 mod input;
 mod meshing;
+mod physics_gpu;
 mod player;
 mod procgen;
 mod renderer;
