@@ -1311,7 +1311,32 @@ fn surface_layering_pass(
             let sediment_context =
                 coastal > 0.38 || river_bank > 0.42 || (desert_surface > 0.55 && slope < 4.0);
             let deep_stone_context =
-                highlands > 0.58 || slope > 4.2 || top_y > config.sea_level_local() + 10;
+                highlands > 0.72 || slope > 5.8 || top_y > config.sea_level_local() + 18;
+
+            let rock_bias = (highlands * 0.72 + slope * 0.10 - anti_stripe * 0.45).clamp(0.0, 1.0);
+            let mut rock_exposure = (rock_bias - 0.68).max(0.0) * 1.8;
+            let exposure_dither = hash01(config.seed ^ 0x3344_91AB, wx, top_y, wz);
+            rock_exposure += (exposure_dither - 0.5) * 0.24;
+            let mut rocky_neighbors = 0;
+            let mut sampled_neighbors = 0;
+            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let nx = lx + dx;
+                let nz = lz + dz;
+                let Some(neighbor) = cache.local_column(nx, nz) else {
+                    continue;
+                };
+                sampled_neighbors += 1;
+                let n_rock_bias = (neighbor.weights[biome_index(BiomeType::Highlands)] * 0.72
+                    + neighbor.slope as f32 * 0.10)
+                    .clamp(0.0, 1.0);
+                if n_rock_bias > 0.69 {
+                    rocky_neighbors += 1;
+                }
+            }
+            if sampled_neighbors > 0 {
+                let neighbor_factor = rocky_neighbors as f32 / sampled_neighbors as f32;
+                rock_exposure += (neighbor_factor - 0.5) * 0.40;
+            }
 
             for d in 0..(dirt_depth + sand_depth + 2) {
                 let y = top_y - d;
@@ -1322,12 +1347,14 @@ fn surface_layering_pass(
                     - slope * 0.05
                     + anti_stripe)
                     .clamp(0.0, 1.0);
-                let rock_bias =
-                    (highlands * 0.75 + slope * 0.12 - anti_stripe * 0.5).clamp(0.0, 1.0);
-                let mut top_cover = if rock_bias > 0.65 && top_y > config.sea_level_local() + 4 {
+                let lowland_variant = hash01(config.seed ^ 0x55A1_0F0F, wx, top_y, wz);
+                let mut top_cover = if rock_exposure > 0.35 && top_y > config.sea_level_local() + 5
+                {
                     STONE
                 } else if sand_bias > 0.52 && sediment_context {
                     SAND
+                } else if plains > 0.58 && slope <= 2.0 && lowland_variant < 0.28 {
+                    DIRT
                 } else {
                     TURF
                 };
@@ -1351,7 +1378,13 @@ fn surface_layering_pass(
                     col.landmark,
                     Some(LandmarkKind::BoulderField | LandmarkKind::Ravine)
                 ) {
-                    top_cover = STONE;
+                    let landmark_core = hash01(config.seed ^ 0x6B1D_17C4, wx, top_y, wz);
+                    let edge_blend = hash01(config.seed ^ 0x6B1D_17C5, wx, top_y + 1, wz);
+                    if landmark_core > 0.62 {
+                        top_cover = STONE;
+                    } else if edge_blend > 0.54 {
+                        top_cover = if sand_bias > 0.56 { SAND } else { DIRT };
+                    }
                 }
                 if matches!(col.landmark, Some(LandmarkKind::Oasis)) {
                     top_cover = TURF;
@@ -4612,5 +4645,61 @@ mod tests {
                 }
             }
         }
+    }
+    fn top_surface_histogram(world: &World) -> HashMap<MaterialId, usize> {
+        let mut counts = HashMap::new();
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 {
+                let mut recorded = false;
+                for y in (1..world.dims[1] as i32).rev() {
+                    let mat = world.get(x, y, z);
+                    if matches!(mat, STONE | DIRT | SAND | TURF) {
+                        *counts.entry(mat).or_insert(0) += 1;
+                        recorded = true;
+                        break;
+                    }
+                    if mat != EMPTY && mat != WATER {
+                        continue;
+                    }
+                }
+                if !recorded {
+                    *counts.entry(STONE).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    #[test]
+    fn surface_layering_histogram_balances_rock_and_cover_variants() {
+        let seeds = [0x1234_5678, 0xBEEF_CAFE, 0xA11C_E5ED, 0xDADA_2025];
+        let mut stone = 0usize;
+        let mut turf = 0usize;
+        let mut sand = 0usize;
+        let mut total = 0usize;
+
+        for seed in seeds {
+            let config = ProcGenConfig::for_size(64, seed).with_origin([0, 0, 0]);
+            let world = generate_world(config);
+            let histogram = top_surface_histogram(&world);
+            stone += histogram.get(&STONE).copied().unwrap_or(0);
+            turf += histogram.get(&TURF).copied().unwrap_or(0);
+            sand += histogram.get(&SAND).copied().unwrap_or(0);
+            total += world.dims[0] * world.dims[2];
+        }
+
+        let stone_ratio = stone as f32 / total as f32;
+        let turf_ratio = turf as f32 / total as f32;
+        let sand_ratio = sand as f32 / total as f32;
+
+        assert!(
+            stone_ratio < 0.42,
+            "stone dominance regression: {stone_ratio:.3}"
+        );
+        assert!(turf_ratio > 0.18, "turf too sparse: {turf_ratio:.3}");
+        assert!(
+            sand_ratio > 0.03,
+            "sand variants too sparse: {sand_ratio:.3}"
+        );
     }
 }

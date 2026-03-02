@@ -1010,8 +1010,20 @@ mod tests {
         let mut rng_cpu = XorShift32::new(123);
         let mut rng_compute = XorShift32::new(123);
         for _ in 0..6 {
-            sim_cpu.step_region(&mut store_a, &region, chunk, &mut rng_cpu);
-            sim_compute_emulated.step_region(&mut store_b, &region, chunk, &mut rng_compute);
+            sim_cpu.step_region(
+                &mut store_a,
+                &region,
+                chunk,
+                &mut rng_cpu,
+                crate::simulation::SimulationStepMetadata::default(),
+            );
+            sim_compute_emulated.step_region(
+                &mut store_b,
+                &region,
+                chunk,
+                &mut rng_compute,
+                crate::simulation::SimulationStepMetadata::default(),
+            );
         }
 
         let soa_cpu = sim_cpu.build_soa_for_chunk(&store_a, chunk).unwrap();

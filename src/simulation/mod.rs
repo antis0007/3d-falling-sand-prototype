@@ -26,6 +26,9 @@ pub struct SimulationStepStats {
     pub stepped_chunks: usize,
     pub skipped_chunks: usize,
     pub boundary_dissipated_particles: usize,
+    pub processed_frontier_voxels: usize,
+    pub skipped_active_chunks: usize,
+    pub avg_chunk_wait_ticks: f32,
 }
 
 pub trait SimulationBackend {
