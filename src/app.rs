@@ -3,7 +3,7 @@ use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
 use crate::gpu_compute::take_gpu_compute_profiler_snapshot;
 use crate::input::{FpsController, InputState};
 use crate::player::{camera_world_pos_from_blocks, grounded_eye_y_blocks};
-use crate::procgen::{apply_generated_chunk, generate_chunk};
+use crate::procgen::{apply_generated_chunk, biome_hint_at_world, generate_chunk};
 use crate::renderer::{
     Camera, LodMeshingBudgets, LodRadii, Renderer, RendererSettings,
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
@@ -1892,6 +1892,17 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.sim_accumulator_cap_steps =
                             sim_accumulator_cap_seconds / FIXED_SIM_STEP_SECONDS;
                         ui.profiler.sim_accumulator_clamped = sim_accumulator_clamped;
+
+                        let player_biome = biome_hint_at_world(
+                            &crate::procgen::ProcGenConfig::for_size(CHUNK_SIZE, streaming.seed),
+                            player_world_voxel.x,
+                            player_world_voxel.z,
+                        );
+                        ui.set_biome_hint(
+                            player_biome.label(),
+                            player_world_voxel.x,
+                            player_world_voxel.z,
+                        );
 
                         // Egui
                         let egui_t0 = Instant::now();

@@ -556,7 +556,7 @@ impl ProcGenConfig {
             sky_ceiling_start: 160,
             terrain_scale: 1.0,
             cave_density: 0.13,
-            tree_density: 0.012,
+            tree_density: 0.028,
         }
     }
 
@@ -2379,7 +2379,7 @@ fn has_consistent_neighbor_support(
             supported += 1;
         }
     }
-    sampled >= 3 && supported >= 3
+    sampled >= 2 && supported >= 2
 }
 
 fn has_deterministic_tree_support(
@@ -4133,8 +4133,14 @@ mod tests {
             }
         }
 
-        assert!(ew_samples > 0, "no east/west shoreline samples collected for seed {seed:#X}");
-        assert!(ns_samples > 0, "no north/south shoreline samples collected for seed {seed:#X}");
+        assert!(
+            ew_samples > 0,
+            "no east/west shoreline samples collected for seed {seed:#X}"
+        );
+        assert!(
+            ns_samples > 0,
+            "no north/south shoreline samples collected for seed {seed:#X}"
+        );
 
         let ew_ratio = ew_mismatch as f32 / ew_samples as f32;
         let ns_ratio = ns_mismatch as f32 / ns_samples as f32;
@@ -4274,8 +4280,8 @@ mod tests {
                     if world.get(x, y, z) != WATER {
                         continue;
                     }
-                    let boundary_source = (x == 0 || z == 0 || x == width - 1 || z == depth - 1)
-                        && y <= sea;
+                    let boundary_source =
+                        (x == 0 || z == 0 || x == width - 1 || z == depth - 1) && y <= sea;
                     let grounded = world.get(x, y - 1, z) != EMPTY;
                     if boundary_source || grounded {
                         let idx = idx3(x, y, z);
