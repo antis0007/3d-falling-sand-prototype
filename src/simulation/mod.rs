@@ -74,6 +74,7 @@ pub struct SimulationRuntime {
     cpu: CpuCellularBackend,
     gpu: GpuFluidBackend,
     fallback: CpuFallbackBackend,
+    warned_gpu_emulation: bool,
 }
 
 impl SimulationRuntime {
@@ -95,7 +96,15 @@ impl SimulationRuntime {
     ) -> usize {
         match mode {
             SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng),
-            SimulationMode::GpuFluid => self.gpu.step(store, region, center, rng),
+            SimulationMode::GpuFluid => {
+                if !self.warned_gpu_emulation {
+                    log::warn!(
+                        "GPU simulation mode is currently running deterministic CPU emulation; enable the `gpu-compute` feature for WGSL compute pipelines"
+                    );
+                    self.warned_gpu_emulation = true;
+                }
+                self.gpu.step(store, region, center, rng)
+            }
             SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng),
         }
     }
