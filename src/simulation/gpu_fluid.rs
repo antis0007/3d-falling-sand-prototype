@@ -4,7 +4,7 @@ use crate::chunk_store::ChunkStore;
 use crate::sim::material;
 use crate::sim::Phase;
 use crate::sim_world::Rng;
-use crate::simulation::SimulationBackend;
+use crate::simulation::{SimulationBackend, SimulationStepMetadata, SimulationStepStats};
 use crate::types::{chunk_to_world_min, voxel_to_chunk, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::EMPTY;
 
@@ -37,7 +37,8 @@ impl SimulationBackend for GpuFluidBackend {
         region: &HashSet<ChunkCoord>,
         _center: ChunkCoord,
         _rng: &mut Rng,
-    ) -> usize {
+        _metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
         let mut stepped_chunks: HashSet<ChunkCoord> = HashSet::new();
 
         let edited_chunks = self.stage_edit_commands(store, region);
@@ -49,7 +50,11 @@ impl SimulationBackend for GpuFluidBackend {
         }
 
         self.frame_index = self.frame_index.wrapping_add(1);
-        stepped_chunks.len()
+        SimulationStepStats {
+            stepped_chunks: stepped_chunks.len(),
+            skipped_chunks: 0,
+            boundary_dissipated_particles: 0,
+        }
     }
 
     fn queue_place_edit(&mut self, coord: VoxelCoord, material_id: u16) {
