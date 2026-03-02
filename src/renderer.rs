@@ -175,7 +175,7 @@ impl Default for RendererSettings {
         Self {
             frustum_culling: true,
             greedy_meshing: true,
-            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Aggressive,
+            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Conservative,
         }
     }
 }
