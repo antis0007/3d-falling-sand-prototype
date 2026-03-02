@@ -333,7 +333,7 @@ impl Default for UiState {
             profiler: ProfilerStats::default(),
             renderer_frustum_culling: true,
             renderer_greedy_meshing: true,
-            renderer_conservative_neighbors: false,
+            renderer_conservative_neighbors: true,
             show_chunk_overlay: false,
 
             log_last_seconds: HashMap::new(),
