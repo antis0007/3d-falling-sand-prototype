@@ -44,7 +44,32 @@ pub struct GpuComputeRuntime {
     project_pipeline: wgpu::ComputePipeline,
     material_advect_pipeline: wgpu::ComputePipeline,
     meshing_pipeline: wgpu::ComputePipeline,
-    compute_bgl: wgpu::BindGroupLayout,
+    simulation_bgl: wgpu::BindGroupLayout,
+    meshing_bgl: wgpu::BindGroupLayout,
+}
+
+#[cfg(feature = "gpu-compute")]
+struct SimulationBindResources<'a> {
+    atlas_voxels: &'a wgpu::Buffer,
+    velocity_mac: &'a wgpu::Buffer,
+    pressure: &'a wgpu::Buffer,
+    divergence: &'a wgpu::Buffer,
+    material_density: &'a wgpu::Buffer,
+    active_tiles: &'a wgpu::Buffer,
+    active_tile_counter: &'a wgpu::Buffer,
+    edit_commands: &'a wgpu::Buffer,
+    page_params: &'a wgpu::Buffer,
+}
+
+#[cfg(feature = "gpu-compute")]
+struct MeshingBindResources<'a> {
+    atlas_voxels: &'a wgpu::Buffer,
+    active_tiles: &'a wgpu::Buffer,
+    page_params: &'a wgpu::Buffer,
+    page_indirect: &'a wgpu::Buffer,
+    dirty_chunk_ids: &'a wgpu::Buffer,
+    dirty_chunk_counter: &'a wgpu::Buffer,
+    diagnostics: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -73,7 +98,8 @@ struct WorkerGpuState {
     page_params: wgpu::Buffer,
     dirty_chunk_ids: wgpu::Buffer,
     dirty_chunk_counter: wgpu::Buffer,
-    compute_bg: wgpu::BindGroup,
+    simulation_bg: wgpu::BindGroup,
+    meshing_bg: wgpu::BindGroup,
     frontier_len: u32,
 }
 
@@ -179,10 +205,10 @@ impl GpuComputeRuntime {
                 });
             let meshing_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("chunk meshing shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("compute_meshing.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/meshing.wgsl").into()),
             });
 
-            let entries = [
+            let simulation_entries = [
                 bgl_entry(0, false),
                 bgl_entry(1, false),
                 bgl_entry(2, false),
@@ -192,66 +218,81 @@ impl GpuComputeRuntime {
                 bgl_entry(6, false),
                 bgl_entry(7, true),
                 bgl_entry(8, true),
+            ];
+            let simulation_bgl =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("simulation compute bgl"),
+                    entries: &simulation_entries,
+                });
+            let meshing_entries = [
+                bgl_entry(0, false),
+                bgl_entry(5, false),
+                bgl_entry(8, true),
                 bgl_entry(9, false),
                 bgl_entry(10, false),
                 bgl_entry(11, false),
                 bgl_entry(12, false),
             ];
-            let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("compute bgl"),
-                entries: &entries,
+            let meshing_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("meshing compute bgl"),
+                entries: &meshing_entries,
             });
-            let compute_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("compute layout"),
-                bind_group_layouts: &[&compute_bgl],
+            let simulation_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("simulation compute layout"),
+                bind_group_layouts: &[&simulation_bgl],
+                push_constant_ranges: &[],
+            });
+            let meshing_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("meshing compute layout"),
+                bind_group_layouts: &[&meshing_bgl],
                 push_constant_ranges: &[],
             });
 
             let force_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("fluid forces pipeline"),
-                layout: Some(&compute_pl),
+                layout: Some(&simulation_pl),
                 module: &fluid_advect_module,
                 entry_point: "main",
             });
             let advect_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("fluid advect pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&simulation_pl),
                     module: &fluid_advect_module,
                     entry_point: "main",
                 });
             let divergence_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("fluid divergence pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&simulation_pl),
                     module: &fluid_divergence_module,
                     entry_point: "main",
                 });
             let pressure_jacobi_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("fluid pressure jacobi pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&simulation_pl),
                     module: &fluid_pressure_jacobi_module,
                     entry_point: "main",
                 });
             let project_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("fluid project pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&simulation_pl),
                     module: &fluid_project_module,
                     entry_point: "main",
                 });
             let material_advect_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("fluid material advect pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&simulation_pl),
                     module: &fluid_material_advect_module,
                     entry_point: "main",
                 });
             let meshing_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("meshing pipeline"),
-                    layout: Some(&compute_pl),
+                    layout: Some(&meshing_pl),
                     module: &meshing_module,
                     entry_point: "meshing_main",
                 });
@@ -264,7 +305,8 @@ impl GpuComputeRuntime {
                 project_pipeline,
                 material_advect_pipeline,
                 meshing_pipeline,
-                compute_bgl,
+                simulation_bgl,
+                meshing_bgl,
             })
         }
     }
@@ -308,7 +350,7 @@ impl GpuComputeRuntime {
             .div_ceil(64);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_bind_group(0, &state.compute_bg, &[]);
+            pass.set_bind_group(0, &state.simulation_bg, &[]);
 
             // 1. external forces/gravity
             pass.set_pipeline(&self.force_pipeline);
@@ -330,8 +372,13 @@ impl GpuComputeRuntime {
             // 6. material advection + boundaries
             pass.set_pipeline(&self.material_advect_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
+        }
 
-            // meshing stays independent and only consumes the post-fluid state.
+        // Pass ordering on one command encoder provides a clear storage barrier between
+        // simulation writes and meshing reads.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_bind_group(0, &state.meshing_bg, &[]);
             pass.set_pipeline(&self.meshing_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
         }
@@ -349,6 +396,99 @@ impl GpuComputeRuntime {
         }
 
         Ok(DrawIndirectArgs::default())
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+impl GpuComputeRuntime {
+    fn create_simulation_bind_group(
+        &self,
+        device: &wgpu::Device,
+        resources: SimulationBindResources<'_>,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("simulation compute bg"),
+            layout: &self.simulation_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: resources.atlas_voxels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: resources.velocity_mac.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: resources.pressure.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: resources.divergence.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: resources.material_density.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: resources.active_tiles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: resources.active_tile_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: resources.edit_commands.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: resources.page_params.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn create_meshing_bind_group(
+        &self,
+        device: &wgpu::Device,
+        resources: MeshingBindResources<'_>,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("meshing compute bg"),
+            layout: &self.meshing_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: resources.atlas_voxels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: resources.active_tiles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: resources.page_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: resources.page_indirect.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: resources.dirty_chunk_ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: resources.dirty_chunk_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: resources.diagnostics.as_entire_binding(),
+                },
+            ],
+        })
     }
 }
 
@@ -488,64 +628,28 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             let full_frontier: Vec<u32> = (0..frontier_len).collect();
             queue.write_buffer(&frontier, 0, bytemuck::cast_slice(full_frontier.as_slice()));
 
-            let compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("compute bg"),
-                layout: &runtime.compute_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: atlas_voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: velocity_mac.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: pressure.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: divergence.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: material_density.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: frontier.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: active_tile_counter.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: edit_commands.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: page_params.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: page_indirect.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 10,
-                        resource: dirty_chunk_ids.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 11,
-                        resource: dirty_chunk_counter.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 12,
-                        resource: diagnostics.as_entire_binding(),
-                    },
-                ],
-            });
+            let simulation_resources = SimulationBindResources {
+                atlas_voxels: &atlas_voxels,
+                velocity_mac: &velocity_mac,
+                pressure: &pressure,
+                divergence: &divergence,
+                material_density: &material_density,
+                active_tiles: &frontier,
+                active_tile_counter: &active_tile_counter,
+                edit_commands: &edit_commands,
+                page_params: &page_params,
+            };
+            let simulation_bg = runtime.create_simulation_bind_group(&device, simulation_resources);
+            let meshing_resources = MeshingBindResources {
+                atlas_voxels: &atlas_voxels,
+                active_tiles: &frontier,
+                page_params: &page_params,
+                page_indirect: &page_indirect,
+                dirty_chunk_ids: &dirty_chunk_ids,
+                dirty_chunk_counter: &dirty_chunk_counter,
+                diagnostics: &diagnostics,
+            };
+            let meshing_bg = runtime.create_meshing_bind_group(&device, meshing_resources);
             Ok(WorkerGpuState {
                 device,
                 queue,
@@ -561,7 +665,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 page_params,
                 dirty_chunk_ids,
                 dirty_chunk_counter,
-                compute_bg,
+                simulation_bg,
+                meshing_bg,
                 frontier_len,
             })
         });
