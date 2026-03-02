@@ -31,8 +31,8 @@ const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.54;
 const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.52;
 const HYDRO_BASIN_MIN_CELL_COUNT: usize = 6;
 const TREE_ANCHOR_CELL_SIZE: i32 = 11;
-const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 3;
-const TREE_ANCHOR_MIN_SPACING: i32 = 7;
+const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 5;
+const TREE_ANCHOR_MIN_SPACING: i32 = 6;
 const TREE_ANCHOR_INFLUENCE_RADIUS: i32 = 2;
 
 fn env_i32(name: &str, default: i32) -> i32 {
@@ -556,7 +556,7 @@ impl ProcGenConfig {
             sky_ceiling_start: 160,
             terrain_scale: 1.0,
             cave_density: 0.13,
-            tree_density: 0.042,
+            tree_density: 0.086,
         }
     }
 
@@ -2178,7 +2178,7 @@ fn vegetation_pass_chunk(
                 };
                 let climate = field.climate;
                 let weights = field.weights;
-                let ground_world_y = config.world_origin[1] + field.surface_height;
+                let ground_world_y = field.surface_height;
                 let slope = field.slope;
                 let ocean = weights[biome_index(BiomeType::Ocean)];
                 let shore_w = smoothstep((ocean - 0.24) / 0.34);
@@ -2267,10 +2267,7 @@ fn vegetation_pass_chunk(
             };
             let climate = field.climate;
             let weights = field.weights;
-            let local_surface = field.surface_height;
-            // `local_surface` is chunk-local Y. Convert once to world-space and use that
-            // consistently for all tree anchoring/roll decisions.
-            let ground_world_y = config.world_origin[1] + local_surface;
+            let ground_world_y = field.surface_height;
             let slope = field.slope;
             let ocean = weights[biome_index(BiomeType::Ocean)];
             let shore_w = smoothstep((ocean - 0.24) / 0.34);
@@ -2398,7 +2395,7 @@ fn has_consistent_neighbor_support(
     cache: &ProcGenFieldCache,
     wx: i32,
     wz: i32,
-    local_ground_y: i32,
+    ground_world_y: i32,
 ) -> bool {
     let mut sampled = 0;
     let mut supported = 0;
@@ -2409,8 +2406,8 @@ fn has_consistent_neighbor_support(
             continue;
         };
         sampled += 1;
-        let n_ground_world_y = config.world_origin[1] + nfield.surface_height;
-        if nfield.surface_height >= local_ground_y - 1
+        let n_ground_world_y = nfield.surface_height;
+        if nfield.surface_height >= ground_world_y - 1
             && !is_submerged_or_shoreline_overwater(config, nfield, n_ground_world_y)
         {
             supported += 1;
@@ -2429,14 +2426,13 @@ fn has_deterministic_tree_support(
     let Some(field) = cache.cell_world(config, wx, wz) else {
         return false;
     };
-    let local_ground_y = ground_world_y - config.world_origin[1];
-    if field.surface_height != local_ground_y {
+    if field.surface_height != ground_world_y {
         return false;
     }
     if is_submerged_or_shoreline_overwater(config, field, ground_world_y) {
         return false;
     }
-    has_consistent_neighbor_support(config, cache, wx, wz, local_ground_y)
+    has_consistent_neighbor_support(config, cache, wx, wz, ground_world_y)
 }
 
 fn has_tree_support_and_headroom(
