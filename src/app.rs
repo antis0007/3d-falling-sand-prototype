@@ -2,6 +2,7 @@ use crate::chunk_store::ChunkStore;
 use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
 use crate::gpu_compute::take_gpu_compute_profiler_snapshot;
 use crate::input::{FpsController, InputState};
+use crate::physics_gpu::{PhysicsGpuSimulator, SimulationMode};
 use crate::player::{camera_world_pos_from_blocks, grounded_eye_y_blocks};
 use crate::procgen::{apply_generated_chunk, biome_hint_at_world, generate_chunk};
 use crate::renderer::{
@@ -701,7 +702,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut cached_stream_tuning = stream_tuning.clone();
     let mut auto_tune = AutoTuneState::default();
     let mut rng = Rng::new(0x1234_5678);
-    let mut sim_world = SimWorld::default();
+    let mut physics_gpu = PhysicsGpuSimulator::default();
+    //let mut sim_world = SimWorld::default();
+    // NOTE: INVESTIGATE SIMWORLD, WHICH IMPLEMENTATION IS BETTER? UNIFY ALL THE BEST PARTS INTO ONE WHEN REFACTORING
     let mut sim_acc = 0.0f32;
 
     let mut input = InputState::default();
@@ -1832,6 +1835,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 now,
                                 raycast,
                                 ui.active_tool,
+                                &mut physics_gpu,
                             )
                         {
                             // dirtied by set_voxel
@@ -1877,8 +1881,16 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                             let ready_steps = (sim_acc / FIXED_SIM_STEP_SECONDS).floor() as usize;
                             let steps_to_run = ready_steps.min(sim_substeps_budget_effective);
+                            let sim_mode = if ui.sim_use_gpu_pipeline {
+                                SimulationMode::GpuFluidPipeline
+                            } else {
+                                SimulationMode::CandidateSwapCaFallback
+                            };
                             for _ in 0..steps_to_run {
-                                sim_chunk_steps += sim_world.step_region(
+                                //sim_chunk_steps += sim_world.step_region( 
+                                //Investigate this, is this function better or worse?
+                                sim_chunk_steps += physics_gpu.step(
+                                    sim_mode,
                                     &mut store,
                                     &cached_sim_region,
                                     player_chunk,
@@ -1888,7 +1900,14 @@ pub async fn run() -> anyhow::Result<()> {
                             sim_substeps_executed = steps_to_run;
                             sim_acc -= steps_to_run as f32 * FIXED_SIM_STEP_SECONDS;
                         } else if step_once && !ui.paused_menu {
-                            sim_chunk_steps += sim_world.step_region(
+                            let sim_mode = if ui.sim_use_gpu_pipeline {
+                                SimulationMode::GpuFluidPipeline
+                            } else {
+                                SimulationMode::CandidateSwapCaFallback
+                            };
+                            //sim_chunk_steps += sim_world.step_region(
+                            sim_chunk_steps += physics_gpu.step(
+                                sim_mode,
                                 &mut store,
                                 &cached_sim_region,
                                 player_chunk,
@@ -2819,6 +2838,7 @@ fn apply_mouse_edit(
     now: Instant,
     raycast: RaycastResult,
     active_tool: ToolKind,
+    physics_gpu: &mut PhysicsGpuSimulator,
 ) -> bool {
     let requested_mode = held_action_mode(input);
     let Some(mode) = requested_mode else {
@@ -2841,14 +2861,13 @@ fn apply_mouse_edit(
 
     let target = if mode == BrushMode::Place { mat } else { 0 };
     for p in preview_blocks(store, brush, raycast, mode, active_tool) {
-        store.set_voxel(
-            VoxelCoord {
-                x: p[0],
-                y: p[1],
-                z: p[2],
-            },
-            target,
-        );
+        let coord = VoxelCoord {
+            x: p[0],
+            y: p[1],
+            z: p[2],
+        };
+        store.set_voxel(coord, target);
+        physics_gpu.queue_place_edit(coord, target);
     }
     edit_runtime.last_edit_at = Some(now);
     edit_runtime.last_edit_mode = Some(mode);

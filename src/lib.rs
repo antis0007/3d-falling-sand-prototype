@@ -5,6 +5,7 @@ pub mod edits;
 pub mod floating_origin;
 pub mod gpu_compute;
 pub mod meshing;
+pub mod physics_gpu;
 pub mod renderer;
 pub mod sim;
 pub mod sim_world;

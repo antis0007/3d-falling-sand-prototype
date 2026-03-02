@@ -137,6 +137,7 @@ pub struct UiState {
     pub sim_accumulator_cap_frames: f32,
     pub sim_adaptive_substeps: bool,
     pub sim_adaptive_frame_time_ratio: f32,
+    pub sim_use_gpu_pipeline: bool,
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
@@ -316,6 +317,7 @@ impl Default for UiState {
             sim_accumulator_cap_frames: 3.0,
             sim_adaptive_substeps: true,
             sim_adaptive_frame_time_ratio: 1.25,
+            sim_use_gpu_pipeline: false,
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
@@ -685,6 +687,7 @@ pub fn draw(
                         .step_by(0.05),
                     );
                 });
+                ui.checkbox(&mut ui_state.sim_use_gpu_pipeline, "Use GPU fluid pipeline (CA fallback toggle)");
                 ui.monospace(format!(
                     "render_submit_ms: {:.2} | egui_ms: {:.2}",
                     ui_state.profiler.render_submit_ms, ui_state.profiler.egui_ms
