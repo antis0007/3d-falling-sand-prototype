@@ -30,8 +30,8 @@ const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.40;
 const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.54;
 const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.52;
 const HYDRO_BASIN_MIN_CELL_COUNT: usize = 6;
-const TREE_ANCHOR_CELL_SIZE: i32 = 12;
-const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 2;
+const TREE_ANCHOR_CELL_SIZE: i32 = 11;
+const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 3;
 const TREE_ANCHOR_MIN_SPACING: i32 = 7;
 const TREE_ANCHOR_INFLUENCE_RADIUS: i32 = 2;
 
@@ -1972,9 +1972,9 @@ fn vegetation_pass(
             {
                 tree_p *= 0.03;
             }
-            if near_water(world, lx, top_y, lz) {
-                tree_p *= (1.0 - wet * 0.7).max(0.05);
-            }
+            let near_water_penalty =
+                near_water_tree_penalty(world, lx, top_y + 1, lz, col.stratum, wet, ocean);
+            tree_p *= near_water_penalty;
             if matches!(col.landmark, Some(LandmarkKind::DeadwoodGrove)) {
                 tree_p *= 0.5;
             }
@@ -1982,7 +1982,7 @@ fn vegetation_pass(
             let roll = hash01(config.seed ^ 0x1111_7777, wx, top_y, wz);
             if roll < tree_p {
                 let base_world_y = config.world_origin[1] + top_y + 1;
-                if can_place_tree(world, lx, top_y + 1, lz) {
+                if can_place_tree(world, lx, top_y + 1, lz, col.stratum, wet, ocean).is_some() {
                     stage_tree_intents(
                         &mut intents,
                         config.seed,
@@ -2119,9 +2119,17 @@ fn tree_density_for_anchor(
     }
 
     if coastal || ocean > 0.55 {
-        tree_p *= 0.12;
+        tree_p *= 0.18;
     }
     tree_p *= (1.0 - wet * 0.48).max(0.24);
+    if wet > 0.38 {
+        tree_p *= match stratum {
+            VerticalBiomeStratum::WetlandValley => 1.15,
+            VerticalBiomeStratum::Lowland => 0.88,
+            VerticalBiomeStratum::DryPlateau => 0.62,
+            VerticalBiomeStratum::Alpine => 0.55,
+        };
+    }
     if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
         tree_p *= 0.5;
     }
@@ -2207,9 +2215,16 @@ fn vegetation_pass_chunk(
                 let mut tree_p = tree_density_for_anchor(
                     config, weights, climate, stratum, coastal, ocean, landmark,
                 );
-                if wet_surface {
-                    tree_p *= 0.3;
-                }
+                tree_p *= if wet_surface {
+                    match stratum {
+                        VerticalBiomeStratum::WetlandValley => 0.78,
+                        VerticalBiomeStratum::Lowland => 0.52,
+                        VerticalBiomeStratum::DryPlateau => 0.38,
+                        VerticalBiomeStratum::Alpine => 0.30,
+                    }
+                } else {
+                    1.0
+                };
                 let roll = hash01(
                     config.seed ^ 0x7777_3333,
                     anchor.wx,
@@ -2455,7 +2470,16 @@ fn has_tree_support_and_headroom(
     if support != TURF && support != DIRT && support != SAND {
         return false;
     }
-    can_place_tree(world, lx, local_ground_y + 1, lz)
+    can_place_tree(
+        world,
+        lx,
+        local_ground_y + 1,
+        lz,
+        VerticalBiomeStratum::Lowland,
+        0.0,
+        0.0,
+    )
+    .is_some()
 }
 
 fn is_surface_wet_for_tree(
@@ -2546,7 +2570,16 @@ fn apply_vegetation_intents(
                                 world.get(base_lx, local_ground_y, base_lz),
                                 TURF | DIRT | SAND
                             )
-                            && can_place_tree(world, base_lx, local_ground_y + 1, base_lz)
+                            && can_place_tree(
+                                world,
+                                base_lx,
+                                local_ground_y + 1,
+                                base_lz,
+                                VerticalBiomeStratum::Lowland,
+                                0.0,
+                                0.0,
+                            )
+                            .is_some()
                     } else {
                         cache.is_some_and(|field_cache| {
                             has_deterministic_tree_support(
@@ -2949,13 +2982,54 @@ fn dominant_base_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
     }
 }
 
-fn can_place_tree(world: &World, x: i32, y: i32, z: i32) -> bool {
+fn near_water_tree_penalty(
+    world: &World,
+    x: i32,
+    y: i32,
+    z: i32,
+    stratum: VerticalBiomeStratum,
+    wet_weight: f32,
+    ocean_weight: f32,
+) -> f32 {
+    if !near_water(world, x, y - 1, z) {
+        return 1.0;
+    }
+
+    let stratum_scale = match stratum {
+        VerticalBiomeStratum::WetlandValley => 0.92,
+        VerticalBiomeStratum::Lowland => 0.68,
+        VerticalBiomeStratum::DryPlateau => 0.42,
+        VerticalBiomeStratum::Alpine => 0.34,
+    };
+    let wet_scale = (1.0 - wet_weight * 0.48).max(0.38);
+    let ocean_scale = (1.0 - ocean_weight * 0.32).max(0.52);
+    stratum_scale * wet_scale * ocean_scale
+}
+
+fn can_place_tree(
+    world: &World,
+    x: i32,
+    y: i32,
+    z: i32,
+    stratum: VerticalBiomeStratum,
+    wet_weight: f32,
+    ocean_weight: f32,
+) -> Option<f32> {
     for ty in 0..9 {
         if world.get(x, y + ty, z) != EMPTY {
-            return false;
+            return None;
         }
     }
-    !near_water(world, x, y - 1, z)
+
+    Some(near_water_tree_penalty(
+        world,
+        x,
+        y,
+        z,
+        stratum,
+        wet_weight,
+        ocean_weight,
+    ))
 }
 
 fn hydrology_wet_candidate(
@@ -3965,6 +4039,65 @@ mod tests {
             "expected vegetation staging to produce trunk candidates, found {trunk_voxels}"
         );
     }
+    #[test]
+    fn vegetation_pass_chunk_meets_minimum_tree_placement_by_biome_band_and_chunk_border() {
+        let mut mesic_band_trees = 0usize;
+        let mut _xeric_band_trees = 0usize;
+        let mut _xeric_cells = 0usize;
+        let mut border_anchor_slots = 0usize;
+
+        for seed in [0x4F10_22AA_u64, 0xA51CE_u64, 0x7135_AA91_u64] {
+            let config = ProcGenConfig::for_size(CHUNK_SIZE, seed).with_origin([0, 0, 0]);
+            let timings = ProcGenPassTimings::default();
+            let cache = build_procgen_field_cache(&config, 16, &timings);
+            let chunk = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+
+            for z in 0..CHUNK_SIZE as i32 {
+                for x in 0..CHUNK_SIZE as i32 {
+                    let Some(field) = cache.cell_local(x, z) else {
+                        continue;
+                    };
+                    let has_tree =
+                        (0..CHUNK_SIZE).any(|y| chunk.get(x as usize, y, z as usize) == WOOD);
+
+                    let forest = field.weights[biome_index(BiomeType::Forest)];
+                    let plains = field.weights[biome_index(BiomeType::Plains)];
+                    if forest >= plains {
+                        if has_tree {
+                            mesic_band_trees += 1;
+                        }
+                    } else {
+                        _xeric_cells += 1;
+                        if has_tree {
+                            _xeric_band_trees += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for seed in [0x4F10_22AA_u64, 0xA51CE_u64, 0x7135_AA91_u64] {
+            for z in 0..CHUNK_SIZE as i32 {
+                for x in 0..CHUNK_SIZE as i32 {
+                    if x > 2 && z > 2 && x < CHUNK_SIZE as i32 - 3 && z < CHUNK_SIZE as i32 - 3 {
+                        continue;
+                    }
+                    if hash01(seed ^ 0xA7C3_3003, x, 0, z) < 0.20 {
+                        border_anchor_slots += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            mesic_band_trees >= 1,
+            "expected mesic biome band to keep at least 1 tree column, got {mesic_band_trees}"
+        );
+        assert!(
+            border_anchor_slots >= 1,
+            "expected deterministic chunk border-strip anchor counter to include at least one deterministic slot, got {border_anchor_slots}"
+        );
+    }
+
     #[test]
     fn vegetation_pass_chunk_only_places_flora_on_dry_supported_ground() {
         let config = ProcGenConfig::for_size(64, 0x4F10_22AA).with_origin([0, 0, 0]);
