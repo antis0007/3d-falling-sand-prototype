@@ -40,7 +40,27 @@ pub enum WorkItem {
 pub enum GenerateJobClass {
     Urgent,
     Near,
-    Background,
+    Mid,
+    Far,
+}
+
+impl GenerateJobClass {
+    fn priority_rank(self) -> u8 {
+        match self {
+            Self::Urgent => 3,
+            Self::Near => 2,
+            Self::Mid => 1,
+            Self::Far => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GenerateQueueMeta {
+    class: Option<GenerateJobClass>,
+    score: f32,
+    enqueue_seq: u64,
+    far_version: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,6 +68,20 @@ pub struct StreamingUpdateStats {
     pub newly_desired: usize,
     pub queued_generate: usize,
     pub queued_evict: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueueAgeStat {
+    pub p50: u64,
+    pub p95: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueueAgeTelemetry {
+    pub urgent: QueueAgeStat,
+    pub near: QueueAgeStat,
+    pub mid: QueueAgeStat,
+    pub far: QueueAgeStat,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +116,9 @@ pub struct ChunkStreaming {
     pub scheduled_generate: HashSet<ChunkCoord>,
     pub dispatched_generate: HashSet<ChunkCoord>,
     pending_generate: VecDeque<ChunkCoord>,
+    generate_meta: HashMap<ChunkCoord, GenerateQueueMeta>,
+    enqueue_seq: u64,
+    far_generation_version: u64,
     pending_evict: VecDeque<ChunkCoord>,
     evict_not_desired_since: HashMap<ChunkCoord, u64>,
     queued_evict_set: HashSet<ChunkCoord>,
@@ -132,6 +169,9 @@ impl ChunkStreaming {
             scheduled_generate: HashSet::new(),
             dispatched_generate: HashSet::new(),
             pending_generate: VecDeque::new(),
+            generate_meta: HashMap::new(),
+            enqueue_seq: 0,
+            far_generation_version: 0,
             pending_evict: VecDeque::new(),
             evict_not_desired_since: HashMap::new(),
             queued_evict_set: HashSet::new(),
@@ -452,7 +492,7 @@ impl ChunkStreaming {
             }
 
             streaming.scheduled_generate.insert(coord);
-            streaming.pending_generate.push_back(coord);
+            streaming.enqueue_generate(coord, GenerateJobClass::Far, 0.0);
             streaming.work_items.push(WorkItem::Generate(coord));
             true
         };
@@ -539,7 +579,8 @@ impl ChunkStreaming {
     }
 
     pub fn next_generation_job(&mut self) -> Option<ChunkCoord> {
-        self.pending_generate.pop_front()
+        let index = self.best_generate_index()?;
+        self.pending_generate.remove(index)
     }
 
     pub fn mark_dispatch_succeeded(&mut self, coord: ChunkCoord) {
@@ -555,7 +596,7 @@ impl ChunkStreaming {
     }
 
     pub fn mark_dispatch_failed_or_deferred(&mut self, coord: ChunkCoord) {
-        self.defer_generation_dispatch(coord, GenerateJobClass::Background);
+        self.defer_generation_dispatch(coord, GenerateJobClass::Far);
     }
 
     pub fn dispatch_generation_for_class<F>(
@@ -587,12 +628,61 @@ impl ChunkStreaming {
         if self.pending_generate.contains(&coord) {
             return;
         }
-        match class {
-            GenerateJobClass::Urgent => self.pending_generate.push_front(coord),
-            GenerateJobClass::Near | GenerateJobClass::Background => {
-                self.pending_generate.push_back(coord)
+        self.enqueue_generate(coord, class, 0.0);
+    }
+
+    pub fn invalidate_far_jobs(&mut self) {
+        self.far_generation_version = self.far_generation_version.saturating_add(1);
+        let mut to_remove = Vec::new();
+        for coord in &self.pending_generate {
+            if let Some(meta) = self.generate_meta.get(coord) {
+                if matches!(
+                    meta.class,
+                    Some(GenerateJobClass::Mid | GenerateJobClass::Far)
+                ) {
+                    to_remove.push(*coord);
+                }
             }
         }
+        for coord in to_remove {
+            self.pending_generate.retain(|queued| *queued != coord);
+            self.scheduled_generate.remove(&coord);
+            self.generate_meta.remove(&coord);
+        }
+    }
+
+    pub fn far_generation_version(&self) -> u64 {
+        self.far_generation_version
+    }
+
+    pub fn queue_age_telemetry(&self) -> QueueAgeTelemetry {
+        let mut urgent = Vec::new();
+        let mut near = Vec::new();
+        let mut mid = Vec::new();
+        let mut far = Vec::new();
+        for coord in &self.pending_generate {
+            let meta = self.generate_meta.get(coord).copied().unwrap_or_default();
+            let age = self.enqueue_seq.saturating_sub(meta.enqueue_seq);
+            match meta.class.unwrap_or(GenerateJobClass::Far) {
+                GenerateJobClass::Urgent => urgent.push(age),
+                GenerateJobClass::Near => near.push(age),
+                GenerateJobClass::Mid => mid.push(age),
+                GenerateJobClass::Far => far.push(age),
+            }
+        }
+        QueueAgeTelemetry {
+            urgent: percentile_pair(&mut urgent),
+            near: percentile_pair(&mut near),
+            mid: percentile_pair(&mut mid),
+            far: percentile_pair(&mut far),
+        }
+    }
+
+    pub fn generation_version_for(&self, coord: ChunkCoord) -> u64 {
+        self.generate_meta
+            .get(&coord)
+            .map(|meta| meta.far_version)
+            .unwrap_or(self.far_generation_version)
     }
 
     pub fn drain_evict_requests(&mut self, limit: usize) -> Vec<ChunkCoord> {
@@ -632,12 +722,14 @@ impl ChunkStreaming {
         self.dispatched_generate.remove(&coord);
         self.scheduled_generate.remove(&coord);
         self.pending_generate.retain(|queued| *queued != coord);
+        self.generate_meta.remove(&coord);
     }
 
     pub fn mark_evicted(&mut self, coord: ChunkCoord, frame_index: u64) {
         self.dispatched_generate.remove(&coord);
         self.scheduled_generate.remove(&coord);
         self.pending_generate.retain(|queued| *queued != coord);
+        self.generate_meta.remove(&coord);
         self.resident.remove(&coord);
         self.evict_not_desired_since.remove(&coord);
         self.queued_evict_set.remove(&coord);
@@ -657,6 +749,7 @@ impl ChunkStreaming {
         self.scheduled_generate.clear();
         self.dispatched_generate.clear();
         self.pending_generate.clear();
+        self.generate_meta.clear();
         self.pending_evict.clear();
         self.evict_not_desired_since.clear();
         self.queued_evict_set.clear();
@@ -684,6 +777,21 @@ impl ChunkStreaming {
     }
 }
 
+fn percentile_pair(data: &mut Vec<u64>) -> QueueAgeStat {
+    if data.is_empty() {
+        return QueueAgeStat::default();
+    }
+    data.sort_unstable();
+    let pick = |q: f32| -> u64 {
+        let idx = ((data.len() - 1) as f32 * q).round() as usize;
+        data[idx]
+    };
+    QueueAgeStat {
+        p50: pick(0.50),
+        p95: pick(0.95),
+    }
+}
+
 impl ChunkStreaming {
     fn is_immediate_horizontal_neighbor(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
         let dx = (coord.x - player_chunk.x).abs();
@@ -705,6 +813,43 @@ impl ChunkStreaming {
             && !self.desired_resident_keep.contains(&coord)
             && !self.scheduled_generate.contains(&coord)
             && !self.dispatched_generate.contains(&coord)
+    }
+
+    fn enqueue_generate(&mut self, coord: ChunkCoord, class: GenerateJobClass, score: f32) {
+        self.enqueue_seq = self.enqueue_seq.saturating_add(1);
+        self.generate_meta.insert(
+            coord,
+            GenerateQueueMeta {
+                class: Some(class),
+                score,
+                enqueue_seq: self.enqueue_seq,
+                far_version: self.far_generation_version,
+            },
+        );
+        self.pending_generate.push_back(coord);
+    }
+
+    fn best_generate_index(&self) -> Option<usize> {
+        self.pending_generate
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                let meta_a = self.generate_meta.get(a).copied().unwrap_or_default();
+                let meta_b = self.generate_meta.get(b).copied().unwrap_or_default();
+                meta_a
+                    .class
+                    .map(GenerateJobClass::priority_rank)
+                    .unwrap_or(0)
+                    .cmp(
+                        &meta_b
+                            .class
+                            .map(GenerateJobClass::priority_rank)
+                            .unwrap_or(0),
+                    )
+                    .then_with(|| meta_a.score.total_cmp(&meta_b.score))
+                    .then_with(|| meta_b.enqueue_seq.cmp(&meta_a.enqueue_seq))
+            })
+            .map(|(idx, _)| idx)
     }
 }
 
@@ -895,11 +1040,9 @@ mod tests {
         let mut streaming = ChunkStreaming::new(1);
         let coord = ChunkCoord { x: 5, y: 0, z: 0 };
 
-        assert!(!streaming.dispatch_generation_for_class(
-            coord,
-            GenerateJobClass::Background,
-            |_coord| false,
-        ));
+        assert!(
+            !streaming.dispatch_generation_for_class(coord, GenerateJobClass::Far, |_coord| false,)
+        );
 
         assert!(streaming.scheduled_generate.contains(&coord));
         assert_eq!(streaming.next_generation_job(), Some(coord));
