@@ -109,11 +109,12 @@ impl SimulationRuntime {
     pub fn queue_place_edit(&mut self, mode: SimulationMode, coord: VoxelCoord, material_id: u16) {
         self.active_emitter_chunks
             .insert(crate::types::voxel_to_chunk(coord).0);
-        match mode {
-            SimulationMode::CpuCellular => self.cpu.queue_place_edit(coord, material_id),
-            SimulationMode::GpuFluid => self.gpu.queue_place_edit(coord, material_id),
-            SimulationMode::CpuFallback => self.fallback.queue_place_edit(coord, material_id),
-        }
+        // Keep all backends aware of user edits so mode switches do not strand queued writes
+        // in a single backend and appear as frozen particles.
+        self.cpu.queue_place_edit(coord, material_id);
+        self.gpu.queue_place_edit(coord, material_id);
+        self.fallback.queue_place_edit(coord, material_id);
+        let _ = mode;
     }
 
     pub fn active_emitter_chunks(&self) -> &HashSet<ChunkCoord> {
@@ -138,13 +139,60 @@ impl SimulationRuntime {
             SimulationMode::GpuFluid => {
                 if !self.warned_gpu_emulation {
                     log::warn!(
-                        "GPU simulation mode is currently running deterministic CPU emulation; routing to CPU cellular backend to avoid heavy snapshot stalls"
+                        "GPU simulation mode uses deterministic CPU emulation while compute integration is in progress"
                     );
                     self.warned_gpu_emulation = true;
                 }
-                self.cpu.step(store, region, center, rng, metadata)
+                self.gpu.step(store, region, center, rng, metadata)
             }
             SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng, metadata),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chunk_store::ChunkStore;
+    use crate::sim::XorShift32;
+    use crate::types::{ChunkCoord, VoxelCoord};
+    use crate::world::EMPTY;
+    use std::collections::HashSet;
+
+    #[test]
+    fn gpu_mode_consumes_queued_edits_and_moves_material() {
+        let mut runtime = SimulationRuntime::default();
+        let mut store = ChunkStore::new();
+        let mut rng = XorShift32::new(7);
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut region = HashSet::new();
+        region.insert(center);
+
+        runtime.queue_place_edit(SimulationMode::GpuFluid, VoxelCoord { x: 4, y: 4, z: 4 }, 3);
+
+        let _stats = runtime.step(
+            SimulationMode::GpuFluid,
+            &mut store,
+            &region,
+            center,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
+
+        assert_eq!(store.get_voxel(VoxelCoord { x: 4, y: 4, z: 4 }), EMPTY);
+        let mut found_sand = false;
+        for y in 0..=4 {
+            for z in 3..=5 {
+                for x in 3..=5 {
+                    if store.get_voxel(VoxelCoord { x, y, z }) == 3 {
+                        found_sand = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_sand,
+            "queued GPU edit was not simulated into the store"
+        );
     }
 }
