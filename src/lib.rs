@@ -4,6 +4,7 @@ pub mod chunk_store;
 pub mod edits;
 pub mod floating_origin;
 pub mod gpu_compute;
+pub mod material_ids;
 pub mod meshing;
 pub mod physics_gpu;
 pub mod renderer;

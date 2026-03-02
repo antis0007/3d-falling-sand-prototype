@@ -1,8 +1,6 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
 const CHUNK_SLICE: u32 = CHUNK_SIDE * CHUNK_SIDE;
-const EMPTY: u32 = 0u;
-const WATER: u32 = 5u;
 const DT: f32 = 0.1;
 const DENSITY_EPSILON: f32 = 1e-4;
 const DELTA_EPSILON: f32 = 1e-4;

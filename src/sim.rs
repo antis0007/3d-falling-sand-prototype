@@ -1,26 +1,8 @@
+use crate::material_ids::{
+    ACID, BUSH, DEAD_LEAF, DIRT, EMBER_ASH, EMBER_HOT, EMBER_WARM, FIRE_GAS, GRASS, LAVA, LEAVES,
+    PLANT, SMOKE, STEAM, STONE, TORCH, TREE_SEED, TURF, WATER, WEED, WOOD,
+};
 use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
-
-const STONE: MaterialId = 1;
-const WOOD: MaterialId = 2;
-const WATER: MaterialId = 5;
-const LAVA: MaterialId = 6;
-const ACID: MaterialId = 7;
-const SMOKE: MaterialId = 8;
-const STEAM: MaterialId = 9;
-const FIRE_GAS: MaterialId = 11;
-const TORCH: MaterialId = 12;
-const EMBER_HOT: MaterialId = 13;
-const EMBER_WARM: MaterialId = 14;
-const EMBER_ASH: MaterialId = 15;
-const DIRT: MaterialId = 16;
-const TURF: MaterialId = 17;
-const BUSH: MaterialId = 18;
-const GRASS: MaterialId = 19;
-const PLANT: MaterialId = 20;
-const WEED: MaterialId = 21;
-const TREE_SEED: MaterialId = 22;
-const LEAVES: MaterialId = 23;
-const DEAD_LEAF: MaterialId = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -1359,4 +1341,20 @@ fn side_dirs() -> [[i32; 2]; 8] {
         [-1, 1],
         [1, 1],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MATERIALS;
+    use crate::material_ids::GENERATED_MATERIAL_IDS;
+
+    #[test]
+    fn generated_material_ids_match_material_table() {
+        for &(name, id) in GENERATED_MATERIAL_IDS {
+            assert_eq!(
+                MATERIALS[id as usize].id, id,
+                "generated ID for {name} drifted from MATERIALS table"
+            );
+        }
+    }
 }
