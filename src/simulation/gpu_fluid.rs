@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::chunk_store::ChunkStore;
+use crate::renderer::{ChunkLod, ChunkSnapshot, MeshJob};
 use crate::sim::material;
 use crate::sim::Phase;
 use crate::sim_world::Rng;
@@ -39,20 +42,28 @@ impl SimulationBackend for GpuFluidBackend {
         _rng: &mut Rng,
         _metadata: SimulationStepMetadata,
     ) -> SimulationStepStats {
-        let mut stepped_chunks: HashSet<ChunkCoord> = HashSet::new();
-
-        let edited_chunks = self.stage_edit_commands(store, region);
-        stepped_chunks.extend(edited_chunks);
-
-        for substep in 0..SUBSTEPS {
-            let touched = self.dispatch_substep(store, region, substep as u64);
-            stepped_chunks.extend(touched);
+        #[cfg(feature = "gpu-compute")]
+        {
+            return self.step_gpu_native(store, region);
         }
 
-        self.frame_index = self.frame_index.wrapping_add(1);
-        SimulationStepStats {
-            stepped_chunks: stepped_chunks.len(),
-            ..SimulationStepStats::default()
+        #[cfg(not(feature = "gpu-compute"))]
+        {
+            let mut stepped_chunks: HashSet<ChunkCoord> = HashSet::new();
+
+            let edited_chunks = self.stage_edit_commands(store, region);
+            stepped_chunks.extend(edited_chunks);
+
+            for substep in 0..SUBSTEPS {
+                let touched = self.dispatch_substep(store, region, substep as u64);
+                stepped_chunks.extend(touched);
+            }
+
+            self.frame_index = self.frame_index.wrapping_add(1);
+            SimulationStepStats {
+                stepped_chunks: stepped_chunks.len(),
+                ..SimulationStepStats::default()
+            }
         }
     }
 
@@ -62,6 +73,61 @@ impl SimulationBackend for GpuFluidBackend {
 }
 
 impl GpuFluidBackend {
+    #[cfg(feature = "gpu-compute")]
+    fn step_gpu_native(
+        &mut self,
+        store: &mut ChunkStore,
+        region: &HashSet<ChunkCoord>,
+    ) -> SimulationStepStats {
+        let mut stepped_chunks: HashSet<ChunkCoord> = self.stage_edit_commands(store, region);
+
+        for &chunk_coord in region {
+            let Some(chunk) = store.get_chunk(chunk_coord) else {
+                continue;
+            };
+            let input_materials: Vec<u16> = chunk.iter_raw().to_vec();
+            let job = MeshJob {
+                coord: chunk_coord,
+                lod: ChunkLod::Near,
+                version: self.frame_index,
+                queued_at: Instant::now(),
+                snapshot: ChunkSnapshot {
+                    world_min: chunk_to_world_min(chunk_coord),
+                    center_voxels: Arc::from(input_materials.clone()),
+                    border_strips: Arc::new(crate::chunk_store::ChunkBorderStrips::default()),
+                },
+                greedy: true,
+            };
+
+            let Ok(output) = crate::gpu_compute::run_chunk_job_on_worker(&job) else {
+                continue;
+            };
+            for (idx, &next) in output.generated_materials.iter().enumerate() {
+                if input_materials.get(idx).copied() == Some(next) {
+                    continue;
+                }
+                let x = (idx % CHUNK_SIZE_VOXELS as usize) as i32;
+                let y = ((idx / CHUNK_SIZE_VOXELS as usize) % CHUNK_SIZE_VOXELS as usize) as i32;
+                let z = (idx / (CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize)) as i32;
+                store.set_voxel(
+                    VoxelCoord {
+                        x: chunk_to_world_min(chunk_coord).x + x,
+                        y: chunk_to_world_min(chunk_coord).y + y,
+                        z: chunk_to_world_min(chunk_coord).z + z,
+                    },
+                    next,
+                );
+                stepped_chunks.insert(chunk_coord);
+            }
+        }
+
+        self.frame_index = self.frame_index.wrapping_add(1);
+        SimulationStepStats {
+            stepped_chunks: stepped_chunks.len(),
+            ..SimulationStepStats::default()
+        }
+    }
+
     fn stage_edit_commands(
         &mut self,
         store: &mut ChunkStore,
