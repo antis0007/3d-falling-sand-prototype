@@ -778,13 +778,15 @@ fn turf_face_color(id: MaterialId, dir: [i32; 3], fallback: [u8; 4]) -> [u8; 4] 
     if id != TURF_ID {
         return fallback;
     }
+    // Legacy history only preserves the prior turf constants and foliage tint files.
+    // Retune as a single profile: stronger grass top, dirt side, and darker underside.
     if dir == [0, 1, 0] {
-        return [92, 171, 78, 255];
+        return [96, 186, 88, 255];
     }
     if dir == [0, -1, 0] {
-        return [121, 88, 56, 255];
+        return [92, 68, 44, 255];
     }
-    [116, 103, 61, 255]
+    [121, 88, 56, 255]
 }
 
 fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {

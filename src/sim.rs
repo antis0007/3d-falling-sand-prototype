@@ -278,7 +278,7 @@ pub const MATERIALS: [Material; 25] = [
     Material {
         id: 17,
         name: "Turf",
-        color: [114, 108, 67, 255],
+        color: [96, 186, 88, 255],
         phase: Phase::Solid,
         density: 65,
         flammable: false,
@@ -291,7 +291,7 @@ pub const MATERIALS: [Material; 25] = [
     Material {
         id: 18,
         name: "Bush",
-        color: [72, 156, 64, 220],
+        color: [74, 156, 70, 220],
         phase: Phase::Solid,
         density: 10,
         flammable: true,
@@ -304,7 +304,7 @@ pub const MATERIALS: [Material; 25] = [
     Material {
         id: 19,
         name: "Grass",
-        color: [94, 186, 72, 220],
+        color: [96, 186, 88, 220],
         phase: Phase::Solid,
         density: 8,
         flammable: true,
