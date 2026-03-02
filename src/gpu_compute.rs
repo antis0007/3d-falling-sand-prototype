@@ -12,6 +12,8 @@ use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
+#[cfg(feature = "gpu-compute")]
+const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
@@ -130,6 +132,7 @@ impl GpuComputeRuntime {
             downlevel
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+                && limits.max_storage_buffers_per_shader_stage >= COMPUTE_STORAGE_BINDING_COUNT
                 && limits.max_storage_buffer_binding_size
                     >= (CHUNK_VOLUME * std::mem::size_of::<u32>() * 2 * GPU_PAGE_CAPACITY as usize)
                         as u32
@@ -384,9 +387,22 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     force_fallback_adapter: false,
                 }))
                 .context("compute adapter")?;
-            let (device, queue) = pollster::block_on(
-                adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
-            )?;
+            let (device, queue) = pollster::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::empty(),
+                    required_limits: adapter.limits(),
+                    label: Some("gpu-compute worker device"),
+                },
+                None,
+            ))?;
+            let limits = device.limits();
+            if limits.max_storage_buffers_per_shader_stage < COMPUTE_STORAGE_BINDING_COUNT {
+                anyhow::bail!(
+                    "adapter exposes {} storage buffers per compute stage but runtime requires {}",
+                    limits.max_storage_buffers_per_shader_stage,
+                    COMPUTE_STORAGE_BINDING_COUNT
+                );
+            }
             let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
             let page_capacity = GPU_PAGE_CAPACITY as u64;
             let page_len = CHUNK_VOLUME as u64;
