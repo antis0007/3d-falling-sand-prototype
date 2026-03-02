@@ -4,6 +4,7 @@ mod edits;
 mod floating_origin;
 mod gpu_compute;
 mod input;
+mod material_ids;
 mod meshing;
 mod physics_gpu;
 mod player;

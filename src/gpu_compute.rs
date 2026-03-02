@@ -209,9 +209,21 @@ impl GpuComputeRuntime {
 
         #[cfg(feature = "gpu-compute")]
         {
+            let generated_material_ids_wgsl =
+                include_str!(concat!(env!("OUT_DIR"), "/material_ids.wgsl"));
+            let fluid_advect_source = format!(
+                "{}\n{}",
+                generated_material_ids_wgsl,
+                include_str!("shaders/fluid_advect.wgsl")
+            );
+            let fluid_material_advect_source = format!(
+                "{}\n{}",
+                generated_material_ids_wgsl,
+                include_str!("shaders/fluid_material_advect.wgsl")
+            );
             let fluid_advect_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fluid advect shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fluid_advect.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(fluid_advect_source.into()),
             });
             let fluid_divergence_module =
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -234,9 +246,7 @@ impl GpuComputeRuntime {
             let fluid_material_advect_module =
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("fluid material advect shader"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        include_str!("shaders/fluid_material_advect.wgsl").into(),
-                    ),
+                    source: wgpu::ShaderSource::Wgsl(fluid_material_advect_source.into()),
                 });
             let meshing_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("chunk meshing shader"),
