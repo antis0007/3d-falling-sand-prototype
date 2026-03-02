@@ -9,7 +9,9 @@ use crate::renderer::{
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::Rng;
-use crate::simulation::{SimulationMode, SimulationRuntime};
+use crate::simulation::{
+    SimulationMode, SimulationPhaseClass, SimulationRuntime, SimulationStepMetadata,
+};
 use crate::streaming::{
     is_urgent_chunk, ChunkStreaming, DesiredChunks, GenerateJobClass, VisibilityContext,
 };
@@ -43,6 +45,7 @@ const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
 const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
 const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
+const SIM_REGION_RECOMPUTE_CHUNK_DELTA: i32 = 2;
 
 const APPLY_BUDGET_MS: f32 = 1.5;
 const APPLY_NEAR_PROTECTED_BUDGET_MS: f32 = 1.0;
@@ -729,8 +732,11 @@ pub async fn run() -> anyhow::Result<()> {
 
     // === streaming/perf caches (MUST live outside RedrawRequested) ===
     let mut last_player_chunk: Option<ChunkCoord> = None;
+    let mut last_sim_region_player_anchor: Option<ChunkCoord> = None;
+    let mut cached_sim_region_emitters: HashSet<ChunkCoord> = HashSet::new();
     let mut cached_sim_region: HashSet<ChunkCoord> =
         chunk_cube(ChunkCoord { x: 0, y: 0, z: 0 }, SIMULATION_RADIUS_CHUNKS);
+    let mut cached_gas_sim_region = cached_sim_region.clone();
     let mut last_desired_look_dir: Option<Vec3> = None;
     let mut desired_recompute_reason = String::from("init");
     let mut cached_desired: DesiredChunks = ChunkStreaming::desired_set(
@@ -1315,7 +1321,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 frame_counter,
                             );
                             if player_chunk_changed {
-                                cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
                                 if let Some(previous_chunk) = last_player_chunk {
                                     let shift = (player_chunk.x - previous_chunk.x)
                                         .abs()
@@ -1333,6 +1338,30 @@ pub async fn run() -> anyhow::Result<()> {
                             desired_recompute_reason.clear();
                             desired_recompute_reason.push_str("none");
                         }
+
+                        let active_emitters = simulation_runtime.active_emitter_chunks().clone();
+                        let player_region_shift = last_sim_region_player_anchor
+                            .map(|anchor| {
+                                (player_chunk.x - anchor.x)
+                                    .abs()
+                                    .max((player_chunk.y - anchor.y).abs())
+                                    .max((player_chunk.z - anchor.z).abs())
+                            })
+                            .unwrap_or(i32::MAX);
+                        let emitter_set_changed = active_emitters != cached_sim_region_emitters;
+                        if player_region_shift >= SIM_REGION_RECOMPUTE_CHUNK_DELTA || emitter_set_changed {
+                            let (solid_region, gas_region) = build_adaptive_sim_regions(
+                                player_chunk,
+                                SIMULATION_RADIUS_CHUNKS,
+                                ui.sim_gas_vertical_range_chunks,
+                                &active_emitters,
+                            );
+                            cached_sim_region = solid_region;
+                            cached_gas_sim_region = gas_region;
+                            cached_sim_region_emitters = active_emitters;
+                            last_sim_region_player_anchor = Some(player_chunk);
+                        }
+
                         last_player_world_voxel = player_world_voxel;
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
@@ -1843,6 +1872,9 @@ pub async fn run() -> anyhow::Result<()> {
                         let do_step = sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
                         let sim_t0 = Instant::now();
                         let mut sim_chunk_steps = 0usize;
+                        let mut sim_skipped_chunks_non_gas = 0usize;
+                        let mut sim_skipped_chunks_gas = 0usize;
+                        let mut sim_boundary_dissipated_particles = 0usize;
                         let mut sim_substeps_executed = 0usize;
                         let sim_substeps_budget = ui
                             .sim_max_substeps_per_frame
@@ -1888,13 +1920,36 @@ pub async fn run() -> anyhow::Result<()> {
                             for _ in 0..steps_to_run {
                                 //sim_chunk_steps += sim_world.step_region( 
                                 //Investigate this, is this function better or worse?
-                                sim_chunk_steps += simulation_runtime.step(
+                                let non_gas = simulation_runtime.step(
                                     sim_mode,
                                     &mut store,
                                     &cached_sim_region,
                                     player_chunk,
                                     &mut rng,
+                                    SimulationStepMetadata {
+                                        phase_class: Some(SimulationPhaseClass::SolidsLiquidsPowders),
+                                        boundary_dissipation_strength: 0.0,
+                                        core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                    },
                                 );
+                                sim_chunk_steps += non_gas.stepped_chunks;
+                                sim_skipped_chunks_non_gas += non_gas.skipped_chunks;
+
+                                let gas = simulation_runtime.step(
+                                    sim_mode,
+                                    &mut store,
+                                    &cached_gas_sim_region,
+                                    player_chunk,
+                                    &mut rng,
+                                    SimulationStepMetadata {
+                                        phase_class: Some(SimulationPhaseClass::Gas),
+                                        boundary_dissipation_strength: ui.sim_gas_boundary_dissipation,
+                                        core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                    },
+                                );
+                                sim_chunk_steps += gas.stepped_chunks;
+                                sim_skipped_chunks_gas += gas.skipped_chunks;
+                                sim_boundary_dissipated_particles += gas.boundary_dissipated_particles;
                             }
                             sim_substeps_executed = steps_to_run;
                             sim_acc -= steps_to_run as f32 * FIXED_SIM_STEP_SECONDS;
@@ -1905,16 +1960,40 @@ pub async fn run() -> anyhow::Result<()> {
                                 SimulationMode::CpuCellular
                             };
                             //sim_chunk_steps += sim_world.step_region(
-                            sim_chunk_steps += simulation_runtime.step(
+                            let non_gas = simulation_runtime.step(
                                 sim_mode,
                                 &mut store,
                                 &cached_sim_region,
                                 player_chunk,
                                 &mut rng,
+                                SimulationStepMetadata {
+                                    phase_class: Some(SimulationPhaseClass::SolidsLiquidsPowders),
+                                    boundary_dissipation_strength: 0.0,
+                                    core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                },
                             );
+                            sim_chunk_steps += non_gas.stepped_chunks;
+                            sim_skipped_chunks_non_gas += non_gas.skipped_chunks;
+
+                            let gas = simulation_runtime.step(
+                                sim_mode,
+                                &mut store,
+                                &cached_gas_sim_region,
+                                player_chunk,
+                                &mut rng,
+                                SimulationStepMetadata {
+                                    phase_class: Some(SimulationPhaseClass::Gas),
+                                    boundary_dissipation_strength: ui.sim_gas_boundary_dissipation,
+                                    core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                },
+                            );
+                            sim_chunk_steps += gas.stepped_chunks;
+                            sim_skipped_chunks_gas += gas.skipped_chunks;
+                            sim_boundary_dissipated_particles += gas.boundary_dissipated_particles;
                             sim_substeps_executed = 1;
                             step_once = false;
                         }
+                        simulation_runtime.reset_active_emitters();
                         let sim_ms = sim_t0.elapsed().as_secs_f32() * 1000.0;
 
                         renderer.day = ui.day;
@@ -2016,6 +2095,10 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.collision_blocked_unloaded_ms = collision_blocked_unloaded_ms_total;
                         ui.profiler.sim_ms = sim_ms;
                         ui.profiler.sim_chunk_steps = sim_chunk_steps;
+                        ui.profiler.sim_skipped_chunks_non_gas = sim_skipped_chunks_non_gas;
+                        ui.profiler.sim_skipped_chunks_gas = sim_skipped_chunks_gas;
+                        ui.profiler.sim_boundary_dissipated_particles =
+                            sim_boundary_dissipated_particles;
                         ui.profiler.sim_substeps_executed = sim_substeps_executed;
                         ui.profiler.sim_substeps_budget = sim_substeps_budget;
                         ui.profiler.sim_substeps_budget_effective = sim_substeps_budget_effective;
@@ -2120,7 +2203,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.resident_chunks = streaming.resident.len();
                         ui.profiler.scheduled_chunks = streaming.scheduled_generate.len();
                         ui.profiler.generating_chunks = streaming.dispatched_generate.len();
-                        ui.profiler.sim_region_chunks = cached_sim_region.len();
+                        ui.profiler.sim_region_chunks = cached_sim_region.len().max(cached_gas_sim_region.len());
 
                         let preview_local: Vec<[i32; 3]> = preview_block_list
                             .iter()
@@ -2662,6 +2745,46 @@ fn collision_neighborhood_missing_chunks(
     let mut ordered: Vec<ChunkCoord> = missing.into_iter().collect();
     ordered.sort_by_key(|&coord| ChunkStreaming::sort_key(player_chunk, coord));
     ordered
+}
+
+fn build_adaptive_sim_regions(
+    player_chunk: ChunkCoord,
+    solid_radius: i32,
+    gas_vertical_range_chunks: i32,
+    active_emitters: &HashSet<ChunkCoord>,
+) -> (HashSet<ChunkCoord>, HashSet<ChunkCoord>) {
+    let solid_region = chunk_cube(player_chunk, solid_radius);
+    let mut gas_region = solid_region.clone();
+
+    let gas_radius_xz = solid_radius + 1;
+    let gas_down = solid_radius;
+    for dz in -gas_radius_xz..=gas_radius_xz {
+        for dy in -gas_down..=gas_vertical_range_chunks {
+            for dx in -gas_radius_xz..=gas_radius_xz {
+                gas_region.insert(ChunkCoord {
+                    x: player_chunk.x + dx,
+                    y: player_chunk.y + dy,
+                    z: player_chunk.z + dz,
+                });
+            }
+        }
+    }
+
+    for &emitter_chunk in active_emitters {
+        for dz in -1..=1 {
+            for dy in -1..=gas_vertical_range_chunks {
+                for dx in -1..=1 {
+                    gas_region.insert(ChunkCoord {
+                        x: emitter_chunk.x + dx,
+                        y: emitter_chunk.y + dy,
+                        z: emitter_chunk.z + dz,
+                    });
+                }
+            }
+        }
+    }
+
+    (solid_region, gas_region)
 }
 
 fn chunk_cube(center: ChunkCoord, radius: i32) -> HashSet<ChunkCoord> {

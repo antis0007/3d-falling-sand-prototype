@@ -84,6 +84,9 @@ pub struct ProfilerStats {
     pub scheduled_chunks: usize,
     pub generating_chunks: usize,
     pub sim_region_chunks: usize,
+    pub sim_skipped_chunks_non_gas: usize,
+    pub sim_skipped_chunks_gas: usize,
+    pub sim_boundary_dissipated_particles: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +141,8 @@ pub struct UiState {
     pub sim_adaptive_substeps: bool,
     pub sim_adaptive_frame_time_ratio: f32,
     pub sim_use_gpu_pipeline: bool,
+    pub sim_gas_vertical_range_chunks: i32,
+    pub sim_gas_boundary_dissipation: f32,
     pub hotbar: [MaterialId; HOTBAR_SLOTS],
     pub hovered_palette_material: Option<MaterialId>,
     pub tab_palette_open: bool,
@@ -187,6 +192,8 @@ impl UiState {
     pub const SIM_ACC_CAP_FRAMES_MAX: f32 = 6.0;
     pub const SIM_ADAPTIVE_THRESHOLD_MIN: f32 = 1.0;
     pub const SIM_ADAPTIVE_THRESHOLD_MAX: f32 = 2.5;
+    pub const SIM_GAS_VERTICAL_RANGE_MIN: i32 = 1;
+    pub const SIM_GAS_VERTICAL_RANGE_MAX: i32 = 12;
     const BIOME_HINT_STALE_AFTER_FRAMES: u64 = 30;
 
     pub fn clamp_quantize_sim_speed(value: f32) -> f32 {
@@ -318,6 +325,8 @@ impl Default for UiState {
             sim_adaptive_substeps: true,
             sim_adaptive_frame_time_ratio: 1.25,
             sim_use_gpu_pipeline: false,
+            sim_gas_vertical_range_chunks: 5,
+            sim_gas_boundary_dissipation: 0.04,
             hotbar: [1, 2, 3, 4, 5, 6, 7, 11, 12, 16],
             hovered_palette_material: None,
             tab_palette_open: false,
@@ -654,6 +663,15 @@ pub fn draw(
                     ui_state.profiler.sim_accumulator_cap_steps,
                     ui_state.profiler.sim_accumulator_clamped,
                 ));
+                ui.monospace(format!(
+                    "skipped chunks (non-gas/gas): {}/{}",
+                    ui_state.profiler.sim_skipped_chunks_non_gas,
+                    ui_state.profiler.sim_skipped_chunks_gas,
+                ));
+                ui.monospace(format!(
+                    "boundary dissipated particles: {}",
+                    ui_state.profiler.sim_boundary_dissipated_particles,
+                ));
                 });
                 ui.separator();
                 ui.heading("Simulation Tuning");
@@ -687,6 +705,18 @@ pub fn draw(
                         .step_by(0.05),
                     );
                 });
+                ui.add(
+                    egui::Slider::new(
+                        &mut ui_state.sim_gas_vertical_range_chunks,
+                        UiState::SIM_GAS_VERTICAL_RANGE_MIN..=UiState::SIM_GAS_VERTICAL_RANGE_MAX,
+                    )
+                    .text("Gas vertical range (chunks)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut ui_state.sim_gas_boundary_dissipation, 0.0..=1.0)
+                        .text("Gas boundary dissipation")
+                        .step_by(0.01),
+                );
                 ui.checkbox(&mut ui_state.sim_use_gpu_pipeline, "Use GPU fluid pipeline (CA fallback toggle)");
                 ui.monospace(format!(
                     "render_submit_ms: {:.2} | egui_ms: {:.2}",

@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use crate::chunk_store::ChunkStore;
 use crate::sim::{material, Phase, XorShift32};
+use crate::simulation::{SimulationPhaseClass, SimulationStepMetadata, SimulationStepStats};
 use crate::types::{chunk_to_world_min, voxel_to_chunk, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::EMPTY;
 
@@ -166,7 +167,8 @@ impl SimWorld {
         region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-    ) -> usize {
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
         self.seed_region_frontier_if_needed(store, region);
         self.enqueue_dirty_voxels(store, region);
         let step_start = Instant::now();
@@ -176,7 +178,7 @@ impl SimWorld {
             candidates.truncate(MAX_CHUNKS_PER_STEP);
         }
 
-        let mut stepped_chunks = 0usize;
+        let mut stats = SimulationStepStats::default();
         for chunk_coord in candidates {
             if !store.is_chunk_loaded(chunk_coord) {
                 self.chunks.remove(&chunk_coord);
@@ -192,9 +194,11 @@ impl SimWorld {
                     continue;
                 }
 
-                stepped_chunks += 1;
+                stats.stepped_chunks += 1;
                 state.clear_step_scratch();
                 let mut moved_any = false;
+                let mut processed_matching_phase = false;
+                let mut encountered_other_phase = false;
 
                 let frontier_len = state.frontier.len();
                 let elapsed_ms = step_start.elapsed().as_secs_f32() * 1000.0;
@@ -242,6 +246,25 @@ impl SimWorld {
                     }
 
                     let mat = material(mat_id);
+                    if !phase_matches_class(mat.phase, metadata.phase_class) {
+                        encountered_other_phase = true;
+                        continue;
+                    }
+                    processed_matching_phase = true;
+
+                    if matches!(mat.phase, Phase::Gas)
+                        && metadata.boundary_dissipation_strength > 0.0
+                        && chunk_chebyshev_distance(chunk_coord, center)
+                            > metadata.core_radius_chunks
+                        && rng.chance(metadata.boundary_dissipation_strength.clamp(0.0, 1.0))
+                    {
+                        state.pending_writes.push((source, EMPTY));
+                        stats.boundary_dissipated_particles += 1;
+                        moved_any = true;
+                        state.activation_centers.push(source);
+                        break;
+                    }
+
                     let candidates = movement_candidates(source, mat_id, mat.phase, rng);
 
                     for destination in candidates {
@@ -301,6 +324,10 @@ impl SimWorld {
                 state.moving_avg_processed =
                     (state.moving_avg_processed * 0.85) + (processed_count * 0.15);
 
+                if !processed_matching_phase && encountered_other_phase {
+                    stats.skipped_chunks += 1;
+                }
+
                 if moved_any {
                     state.cooldown_ticks = 0;
                     state.recent_activity = state.recent_activity.saturating_add(4);
@@ -316,7 +343,7 @@ impl SimWorld {
             }
         }
 
-        stepped_chunks
+        stats
     }
 
     pub fn build_soa_for_chunk(
@@ -467,6 +494,21 @@ impl SimWorld {
             (dist2, std::cmp::Reverse(*activity))
         });
         out.into_iter().map(|(coord, _)| coord).collect()
+    }
+}
+
+fn chunk_chebyshev_distance(a: ChunkCoord, b: ChunkCoord) -> i32 {
+    (a.x - b.x)
+        .abs()
+        .max((a.y - b.y).abs())
+        .max((a.z - b.z).abs())
+}
+
+fn phase_matches_class(phase: Phase, class: Option<SimulationPhaseClass>) -> bool {
+    match class {
+        None => true,
+        Some(SimulationPhaseClass::Gas) => matches!(phase, Phase::Gas),
+        Some(SimulationPhaseClass::SolidsLiquidsPowders) => !matches!(phase, Phase::Gas),
     }
 }
 
@@ -805,12 +847,25 @@ pub fn step_region_profiled(
     rng: &mut Rng,
 ) -> usize {
     let mut sim = SimWorld::default();
-    sim.step_region(store, region, center, rng)
+    sim.step_region(
+        store,
+        region,
+        center,
+        rng,
+        SimulationStepMetadata::default(),
+    )
+    .stepped_chunks
 }
 
 pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &mut Rng) {
     let mut sim = SimWorld::default();
-    let _ = sim.step_region(store, region, ChunkCoord { x: 0, y: 0, z: 0 }, rng);
+    let _ = sim.step_region(
+        store,
+        region,
+        ChunkCoord { x: 0, y: 0, z: 0 },
+        rng,
+        SimulationStepMetadata::default(),
+    );
 }
 
 fn enqueue_world_neighbors_to_chunks(

@@ -8,6 +8,26 @@ mod gpu_fluid;
 
 pub use gpu_fluid::GpuFluidBackend;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimulationPhaseClass {
+    SolidsLiquidsPowders,
+    Gas,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimulationStepMetadata {
+    pub phase_class: Option<SimulationPhaseClass>,
+    pub boundary_dissipation_strength: f32,
+    pub core_radius_chunks: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SimulationStepStats {
+    pub stepped_chunks: usize,
+    pub skipped_chunks: usize,
+    pub boundary_dissipated_particles: usize,
+}
+
 pub trait SimulationBackend {
     fn step(
         &mut self,
@@ -15,7 +35,8 @@ pub trait SimulationBackend {
         region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-    ) -> usize;
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats;
 
     fn queue_place_edit(&mut self, _coord: VoxelCoord, _material_id: u16) {}
 }
@@ -32,8 +53,10 @@ impl SimulationBackend for CpuCellularBackend {
         region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-    ) -> usize {
-        self.sim_world.step_region(store, region, center, rng)
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
+        self.sim_world
+            .step_region(store, region, center, rng, metadata)
     }
 
     fn queue_place_edit(&mut self, coord: VoxelCoord, _material_id: u16) {
@@ -60,8 +83,9 @@ impl SimulationBackend for CpuFallbackBackend {
         region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-    ) -> usize {
-        self.cpu.step(store, region, center, rng)
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
+        self.cpu.step(store, region, center, rng, metadata)
     }
 
     fn queue_place_edit(&mut self, coord: VoxelCoord, material_id: u16) {
@@ -75,15 +99,26 @@ pub struct SimulationRuntime {
     gpu: GpuFluidBackend,
     fallback: CpuFallbackBackend,
     warned_gpu_emulation: bool,
+    active_emitter_chunks: HashSet<ChunkCoord>,
 }
 
 impl SimulationRuntime {
     pub fn queue_place_edit(&mut self, mode: SimulationMode, coord: VoxelCoord, material_id: u16) {
+        self.active_emitter_chunks
+            .insert(crate::types::voxel_to_chunk(coord).0);
         match mode {
             SimulationMode::CpuCellular => self.cpu.queue_place_edit(coord, material_id),
             SimulationMode::GpuFluid => self.gpu.queue_place_edit(coord, material_id),
             SimulationMode::CpuFallback => self.fallback.queue_place_edit(coord, material_id),
         }
+    }
+
+    pub fn active_emitter_chunks(&self) -> &HashSet<ChunkCoord> {
+        &self.active_emitter_chunks
+    }
+
+    pub fn reset_active_emitters(&mut self) {
+        self.active_emitter_chunks.clear();
     }
 
     pub fn step(
@@ -93,9 +128,10 @@ impl SimulationRuntime {
         region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-    ) -> usize {
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
         match mode {
-            SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng),
+            SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng, metadata),
             SimulationMode::GpuFluid => {
                 if !self.warned_gpu_emulation {
                     log::warn!(
@@ -103,9 +139,9 @@ impl SimulationRuntime {
                     );
                     self.warned_gpu_emulation = true;
                 }
-                self.gpu.step(store, region, center, rng)
+                self.gpu.step(store, region, center, rng, metadata)
             }
-            SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng),
+            SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng, metadata),
         }
     }
 }
