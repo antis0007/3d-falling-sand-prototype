@@ -518,7 +518,7 @@ pub fn draw(
                 });
                 ui.add(
                     egui::ProgressBar::new(frame_ratio)
-                        .desired_width(f32::INFINITY)
+                        .desired_width(ui.available_width())
                         .fill(health_color),
                 );
                 ui.label("These panels group stream/mesh/sim metrics for quick diagnosis.");
