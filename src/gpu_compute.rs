@@ -79,6 +79,9 @@ struct ChunkPageAtlas {
     page_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
     version_for_chunk: HashMap<crate::types::ChunkCoord, u64>,
     state_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
+    frontier_len_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
+    tick_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
+    diagnostics_for_chunk: HashMap<crate::types::ChunkCoord, ChunkSimulationDiagnostics>,
     cached_materials: HashMap<crate::types::ChunkCoord, Vec<MaterialId>>,
     next_page: u32,
 }
@@ -101,7 +104,38 @@ struct WorkerGpuState {
     dirty_chunk_counter: wgpu::Buffer,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
-    frontier_len: u32,
+    runtime_config: GpuSimulationRuntimeConfig,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy)]
+struct GpuSimulationRuntimeConfig {
+    max_jacobi_iterations: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+impl Default for GpuSimulationRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_jacobi_iterations: 16,
+        }
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone)]
+struct SimulationJob {
+    chunk_coord: crate::types::ChunkCoord,
+    materials: Vec<MaterialId>,
+    active_frontier_count: u32,
+    simulation_tick: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ChunkSimulationDiagnostics {
+    pub changed_voxels: u32,
+    pub dropped_frontier_writes: u32,
+    pub cross_border_attempts: u32,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -317,15 +351,15 @@ impl GpuComputeRuntime {
     fn run_active_frontier(
         &self,
         state: &WorkerGpuState,
-        job: &MeshJob,
+        sim_job: &SimulationJob,
         page_index: u32,
         current_state: u32,
         edit_commands: &[EditCommand],
-    ) -> anyhow::Result<DrawIndirectArgs> {
+    ) -> anyhow::Result<()> {
         let t0 = Instant::now();
-        let frontier_len = state
-            .frontier_len
-            .min(job.snapshot.center_voxels.len() as u32);
+        let frontier_len = sim_job
+            .active_frontier_count
+            .min(sim_job.materials.len() as u32);
 
         if !edit_commands.is_empty() {
             state
@@ -333,11 +367,12 @@ impl GpuComputeRuntime {
                 .write_buffer(&state.edit_commands, 0, bytemuck::cast_slice(edit_commands));
         }
         let page_params = device_page_params(
-            job,
+            sim_job,
             page_index,
             frontier_len,
             current_state,
             edit_commands.len() as u32,
+            state.runtime_config,
         );
         state
             .queue
@@ -364,7 +399,7 @@ impl GpuComputeRuntime {
             pass.set_pipeline(&self.divergence_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
             // 4. Jacobi pressure iterations
-            for _ in 0..16 {
+            for _ in 0..state.runtime_config.max_jacobi_iterations {
                 pass.set_pipeline(&self.pressure_jacobi_pipeline);
                 pass.dispatch_workgroups(groups, 1, 1);
             }
@@ -376,14 +411,6 @@ impl GpuComputeRuntime {
             pass.dispatch_workgroups(groups, 1, 1);
         }
 
-        // Pass ordering on one command encoder provides a clear storage barrier between
-        // simulation writes and meshing reads.
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_bind_group(0, &state.meshing_bg, &[]);
-            pass.set_pipeline(&self.meshing_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-        }
         state.queue.submit(Some(encoder.finish()));
 
         #[cfg(feature = "gpu-compute")]
@@ -397,6 +424,37 @@ impl GpuComputeRuntime {
             GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
         }
 
+        Ok(())
+    }
+
+    fn run_meshing_dispatch(
+        &self,
+        state: &WorkerGpuState,
+        sim_job: &SimulationJob,
+        page_index: u32,
+        current_state: u32,
+    ) -> anyhow::Result<DrawIndirectArgs> {
+        let page_params = device_page_params(
+            sim_job,
+            page_index,
+            sim_job.active_frontier_count,
+            current_state,
+            0,
+            state.runtime_config,
+        );
+        state
+            .queue
+            .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&page_params));
+        let groups = sim_job.active_frontier_count.max(1).div_ceil(64);
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_bind_group(0, &state.meshing_bg, &[]);
+        pass.set_pipeline(&self.meshing_pipeline);
+        pass.dispatch_workgroups(groups, 1, 1);
+        drop(pass);
+        state.queue.submit(Some(encoder.finish()));
         Ok(DrawIndirectArgs::default())
     }
 }
@@ -630,10 +688,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
-            let frontier_len = CHUNK_VOLUME as u32;
-            let full_frontier: Vec<u32> = (0..frontier_len).collect();
-            queue.write_buffer(&frontier, 0, bytemuck::cast_slice(full_frontier.as_slice()));
-
             let simulation_resources = SimulationBindResources {
                 atlas_voxels: &atlas_voxels,
                 velocity_mac: &velocity_mac,
@@ -674,7 +728,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 dirty_chunk_counter,
                 simulation_bg,
                 meshing_bg,
-                frontier_len,
+                runtime_config: GpuSimulationRuntimeConfig::default(),
             })
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -688,6 +742,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 atlas.page_for_chunk.clear();
                 atlas.version_for_chunk.clear();
                 atlas.state_for_chunk.clear();
+                atlas.frontier_len_for_chunk.clear();
+                atlas.tick_for_chunk.clear();
+                atlas.diagnostics_for_chunk.clear();
+                atlas.cached_materials.clear();
                 atlas.next_page = 0;
             }
             let page = atlas.next_page;
@@ -701,6 +759,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .copied()
             .unwrap_or(0);
         let current_state = atlas.state_for_chunk.get(&job.coord).copied().unwrap_or(0);
+        let previous_frontier = atlas
+            .frontier_len_for_chunk
+            .get(&job.coord)
+            .copied()
+            .unwrap_or(0);
+        let tick = atlas.tick_for_chunk.get(&job.coord).copied().unwrap_or(0);
         let mut edit_commands = Vec::new();
         let incoming = job.snapshot.center_voxels.as_ref();
         let cached = atlas
@@ -721,26 +785,66 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 *prev = next;
             }
         }
+        let seeded_active = incoming.iter().filter(|m| **m != EMPTY).count() as u32;
+        let active_frontier_count = seeded_active
+            .max(previous_frontier)
+            .max(edit_commands.len() as u32);
+        let sim_job = SimulationJob {
+            chunk_coord: job.coord,
+            materials: incoming.to_vec(),
+            active_frontier_count,
+            simulation_tick: tick,
+        };
         atlas.version_for_chunk.insert(job.coord, job.version);
         atlas
             .state_for_chunk
             .insert(job.coord, (current_state + 1) & 1);
+        atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
+        atlas
+            .frontier_len_for_chunk
+            .insert(job.coord, active_frontier_count);
+        atlas.diagnostics_for_chunk.insert(
+            job.coord,
+            ChunkSimulationDiagnostics {
+                changed_voxels: edit_commands.len() as u32,
+                dropped_frontier_writes: edit_commands
+                    .len()
+                    .saturating_sub(active_frontier_count as usize)
+                    as u32,
+                cross_border_attempts: 0,
+            },
+        );
         drop(atlas);
 
-        let indirect = if last_version != job.version {
+        if active_frontier_count > 0 {
             state.runtime.run_active_frontier(
                 state,
-                job,
+                &sim_job,
                 page_index,
                 current_state,
                 &edit_commands,
             )?
+        }
+        let indirect = if !edit_commands.is_empty() || last_version != job.version {
+            state
+                .runtime
+                .run_meshing_dispatch(state, &sim_job, page_index, current_state)?
         } else {
             DrawIndirectArgs::default()
         };
 
+        let diagnostics = state
+            .atlas
+            .lock()
+            .expect("atlas lock")
+            .diagnostics_for_chunk
+            .get(&job.coord)
+            .copied()
+            .unwrap_or_default();
+
         Ok(ComputedChunkArtifacts {
             generated_materials: job.snapshot.center_voxels.to_vec(),
+            simulation_diagnostics: diagnostics,
             mesh_indirect: if indirect.vertex_count == 0 {
                 DrawIndirectArgs {
                     vertex_count: (job
@@ -776,6 +880,7 @@ struct FrameParams {
     page_index: u32,
     voxel_count: u32,
     frontier_len: u32,
+    simulation_tick: u32,
     state_index: u32,
     edit_count: u32,
     active_tile_budget: u32,
@@ -784,20 +889,22 @@ struct FrameParams {
 }
 
 fn device_page_params(
-    job: &MeshJob,
+    sim_job: &SimulationJob,
     page_index: u32,
     frontier_len: u32,
     state_index: u32,
     edit_count: u32,
+    runtime_config: GpuSimulationRuntimeConfig,
 ) -> [FrameParams; 1] {
     [FrameParams {
         page_index,
-        voxel_count: job.snapshot.center_voxels.len() as u32,
+        voxel_count: sim_job.materials.len() as u32,
         frontier_len,
+        simulation_tick: sim_job.simulation_tick,
         state_index,
         edit_count,
         active_tile_budget: frontier_len,
-        jacobi_iterations: 16,
+        jacobi_iterations: runtime_config.max_jacobi_iterations,
         jacobi_iteration: 0,
     }]
 }
@@ -813,6 +920,7 @@ pub struct DrawIndirectArgs {
 
 pub struct ComputedChunkArtifacts {
     pub generated_materials: Vec<MaterialId>,
+    pub simulation_diagnostics: ChunkSimulationDiagnostics,
     pub mesh_indirect: DrawIndirectArgs,
 }
 
@@ -828,6 +936,7 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
     let surface = out.iter().filter(|v| **v != EMPTY).count() as u32;
     ComputedChunkArtifacts {
         generated_materials: out,
+        simulation_diagnostics: ChunkSimulationDiagnostics::default(),
         mesh_indirect: DrawIndirectArgs {
             vertex_count: surface.saturating_mul(6),
             instance_count: 1,
