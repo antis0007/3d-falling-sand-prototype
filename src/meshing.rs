@@ -744,14 +744,14 @@ fn is_transparent_material(id: MaterialId) -> bool {
 
 fn is_occluding_sample(sample: NeighborSample) -> bool {
     match sample {
-        NeighborSample::Unknown => true,
+        NeighborSample::Unknown => false,
         NeighborSample::Known(id) => is_occluding_material(id),
     }
 }
 
 fn is_face_occluded(self_id: MaterialId, neighbor: NeighborSample) -> bool {
     let NeighborSample::Known(neighbor_id) = neighbor else {
-        return true;
+        return false;
     };
 
     if neighbor_id == EMPTY {
@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_neighbor_not_treated_as_known_empty_for_boundary_faces() {
+    fn unknown_neighbor_treated_as_empty_for_boundary_faces() {
         let mut store = ChunkStore::new();
         store.insert_chunk_with_policy(
             coord(),
@@ -844,7 +844,7 @@ mod tests {
         );
 
         let no_neighbor = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
-        assert_eq!(no_neighbor.opaque_verts.len(), 20);
+        assert_eq!(no_neighbor.opaque_verts.len(), 24);
 
         store.insert_chunk_with_policy(
             ChunkCoord { x: 1, y: 0, z: 0 },
@@ -857,14 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_neighbor_only_culls_voxels_touching_unknown_boundary() {
+    fn unknown_neighbor_does_not_cull_crossed_billboard_voxels() {
         let mut store = ChunkStore::new();
-        let mut chunk = Chunk::new_empty();
-        chunk.set(CHUNK_SIDE / 2, CHUNK_SIDE / 2, CHUNK_SIDE / 2, 1);
-        store.insert_chunk_with_policy(coord(), chunk, false, NeighborDirtyPolicy::None);
+        store.insert_chunk_with_policy(
+            coord(),
+            chunk_with_voxel(CHUNK_SIDE / 2, CHUNK_SIDE - 1, CHUNK_SIDE / 2, GRASS_ID),
+            false,
+            NeighborDirtyPolicy::None,
+        );
 
         let mesh = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
         assert!(!mesh.opaque_verts.is_empty());
+        assert_eq!(mesh.opaque_verts.len(), 8);
     }
 
     #[test]

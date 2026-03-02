@@ -27,6 +27,12 @@ pub enum UnknownNeighborOcclusionPolicy {
     Aggressive,
 }
 
+impl Default for UnknownNeighborOcclusionPolicy {
+    fn default() -> Self {
+        Self::Conservative
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
@@ -175,7 +181,7 @@ impl Default for RendererSettings {
         Self {
             frustum_culling: true,
             greedy_meshing: true,
-            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::Conservative,
+            unknown_neighbor_policy: UnknownNeighborOcclusionPolicy::default(),
         }
     }
 }
