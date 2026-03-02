@@ -5,6 +5,28 @@ use crate::sim::{material, Phase, XorShift32};
 use crate::types::{chunk_to_world_min, voxel_to_chunk, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::EMPTY;
 
+const STONE: u16 = 1;
+const WOOD: u16 = 2;
+const WATER: u16 = 5;
+const LAVA: u16 = 6;
+const ACID: u16 = 7;
+const SMOKE: u16 = 8;
+const STEAM: u16 = 9;
+const FIRE_GAS: u16 = 11;
+const TORCH: u16 = 12;
+const EMBER_HOT: u16 = 13;
+const EMBER_WARM: u16 = 14;
+const EMBER_ASH: u16 = 15;
+const DIRT: u16 = 16;
+const TURF: u16 = 17;
+const BUSH: u16 = 18;
+const GRASS: u16 = 19;
+const PLANT: u16 = 20;
+const WEED: u16 = 21;
+const TREE_SEED: u16 = 22;
+const LEAVES: u16 = 23;
+const DEAD_LEAF: u16 = 24;
+
 pub type Rng = XorShift32;
 
 const CHUNK_COOLDOWN_TICKS: u8 = 8;
@@ -138,8 +160,14 @@ impl SimWorld {
                     if mat_id == EMPTY {
                         continue;
                     }
+                    if react_voxel(store, source, mat_id, rng) {
+                        moved_any = true;
+                        activation_centers.push(source);
+                        continue;
+                    }
+
                     let mat = material(mat_id);
-                    let candidates = movement_candidates(source, mat.phase, rng);
+                    let candidates = movement_candidates(source, mat_id, mat.phase, rng);
 
                     for destination in candidates {
                         if claimed_destinations.contains(&destination) {
@@ -334,6 +362,334 @@ impl SimWorld {
     }
 }
 
+fn react_voxel(store: &mut ChunkStore, p: VoxelCoord, id: u16, rng: &mut Rng) -> bool {
+    let mut reacted = false;
+    let mat = material(id);
+
+    if id == FIRE_GAS {
+        let mut neighbors = neighbor_dirs6();
+        rng.shuffle(&mut neighbors);
+        for [dx, dy, dz] in neighbors {
+            let np = offset_voxel(p, dx, dy, dz);
+            let nid = store.get_voxel(np);
+            if nid != EMPTY && material(nid).flammable && rng.chance(0.2) {
+                let replacement = if nid == WOOD {
+                    EMBER_HOT
+                } else if rng.chance(0.5) {
+                    FIRE_GAS
+                } else {
+                    SMOKE
+                };
+                store.set_voxel(np, replacement);
+                reacted = true;
+            }
+        }
+
+        if rng.chance(0.06) {
+            store.set_voxel(p, SMOKE);
+            reacted = true;
+        } else if rng.chance(0.08) {
+            store.set_voxel(p, EMPTY);
+            reacted = true;
+        }
+    }
+
+    if id == STEAM
+        && rng.chance(0.02)
+        && !has_neighbor(store, p, LAVA)
+        && !has_neighbor(store, p, FIRE_GAS)
+    {
+        store.set_voxel(p, WATER);
+        reacted = true;
+    }
+
+    if id == SMOKE && rng.chance(0.015) {
+        store.set_voxel(p, EMPTY);
+        reacted = true;
+    }
+
+    if id == ACID {
+        let mut neighbors = neighbor_dirs6();
+        rng.shuffle(&mut neighbors);
+        for [dx, dy, dz] in neighbors {
+            let np = offset_voxel(p, dx, dy, dz);
+            let nid = store.get_voxel(np);
+            if !is_acid_dissolvable(nid) || !rng.chance(0.24) {
+                continue;
+            }
+            store.set_voxel(np, EMPTY);
+            reacted = true;
+            if rng.chance(0.40) {
+                let byproduct = if rng.chance(0.55) { STEAM } else { SMOKE };
+                let _ = spawn_reaction_product(store, np, byproduct, rng);
+            }
+            if rng.chance(0.10) {
+                store.set_voxel(p, EMPTY);
+            }
+            break;
+        }
+    }
+
+    if id == LAVA || id == WATER {
+        let mut neighbors = neighbor_dirs6();
+        rng.shuffle(&mut neighbors);
+        for [dx, dy, dz] in neighbors {
+            let np = offset_voxel(p, dx, dy, dz);
+            let nid = store.get_voxel(np);
+            let nmat = material(nid);
+
+            if ((id == LAVA && nid == WATER) || (id == WATER && nid == LAVA)) && rng.chance(0.35) {
+                store.set_voxel(p, STONE);
+                let replacement = if rng.chance(0.60) { STEAM } else { EMPTY };
+                store.set_voxel(np, replacement);
+                reacted = true;
+                break;
+            }
+
+            if id == LAVA
+                && nid != LAVA
+                && nmat.transforms_on_contact
+                    == Some(crate::sim::ContactReaction::LavaCoolsToWaterOrSteam)
+                && rng.chance(0.45)
+            {
+                let replacement = if rng.chance(0.65) { WATER } else { STEAM };
+                store.set_voxel(np, replacement);
+                reacted = true;
+                continue;
+            }
+
+            if id == LAVA && nmat.flammable && rng.chance(0.18) {
+                let replacement = if rng.chance(0.55) { FIRE_GAS } else { SMOKE };
+                store.set_voxel(np, replacement);
+                let _ = spawn_reaction_product(store, np, SMOKE, rng);
+                reacted = true;
+            }
+        }
+    }
+
+    if mat.flammable && rng.chance(0.06) {
+        for [dx, dy, dz] in neighbor_dirs6() {
+            let np = offset_voxel(p, dx, dy, dz);
+            let nid = store.get_voxel(np);
+            if nid == LAVA || nid == FIRE_GAS {
+                let replacement = if rng.chance(0.6) { FIRE_GAS } else { SMOKE };
+                store.set_voxel(p, replacement);
+                let _ = spawn_reaction_product(store, p, SMOKE, rng);
+                reacted = true;
+                break;
+            }
+        }
+    }
+
+    if id == TORCH {
+        if rng.chance(0.55) {
+            reacted |= spawn_reaction_product(store, p, FIRE_GAS, rng);
+        }
+        if rng.chance(0.18) {
+            reacted |= spawn_reaction_product(store, p, SMOKE, rng);
+        }
+    }
+
+    if id == WOOD && has_ignition_neighbor(store, p) && rng.chance(0.52) {
+        store.set_voxel(p, EMBER_HOT);
+        let _ = spawn_reaction_product(store, p, FIRE_GAS, rng);
+        reacted = true;
+    }
+
+    if id == EMBER_HOT {
+        if rng.chance(0.52) {
+            let _ = spawn_reaction_product(store, p, FIRE_GAS, rng);
+            reacted = true;
+        }
+        if rng.chance(0.03) {
+            store.set_voxel(p, EMBER_WARM);
+            reacted = true;
+        }
+    } else if id == EMBER_WARM {
+        if rng.chance(0.26) {
+            let _ = spawn_reaction_product(store, p, SMOKE, rng);
+            reacted = true;
+        }
+        if rng.chance(0.02) {
+            store.set_voxel(p, EMBER_ASH);
+            reacted = true;
+        }
+    } else if id == EMBER_ASH && rng.chance(0.003) {
+        store.set_voxel(p, EMPTY);
+        reacted = true;
+    }
+
+    if id == LEAVES && !has_tree_support(store, p) {
+        store.set_voxel(p, DEAD_LEAF);
+        reacted = true;
+    }
+
+    if matches!(id, BUSH | GRASS) && !has_solid_support_below(store, p) {
+        store.set_voxel(p, EMPTY);
+        reacted = true;
+    }
+
+    if id == DIRT && is_exposed_to_sky(store, p) && rng.chance(0.008) {
+        store.set_voxel(p, TURF);
+        reacted = true;
+    }
+
+    if id == TURF {
+        let above = store.get_voxel(offset_voxel(p, 0, 1, 0));
+        if above != EMPTY && material(above).phase != Phase::Gas {
+            if rng.chance(0.20) {
+                store.set_voxel(p, DIRT);
+                reacted = true;
+            }
+        } else if rng.chance(0.0004) {
+            let grow_id = if rng.chance(0.55) { GRASS } else { BUSH };
+            let above_pos = offset_voxel(p, 0, 1, 0);
+            if store.get_voxel(above_pos) == EMPTY && has_solid_support_below(store, above_pos) {
+                store.set_voxel(above_pos, grow_id);
+                reacted = true;
+            }
+        }
+    }
+
+    if id == PLANT {
+        if !has_neighbor(store, p, WATER) && rng.chance(0.008) {
+            store.set_voxel(p, WEED);
+            reacted = true;
+        } else if has_neighbor(store, p, WATER) && rng.chance(0.012) {
+            let np = offset_voxel(p, 0, 1, 0);
+            if store.get_voxel(np) == EMPTY && has_solid_support_below(store, np) {
+                store.set_voxel(np, PLANT);
+                reacted = true;
+            }
+        }
+    }
+
+    if id == WEED {
+        if has_neighbor(store, p, WATER) && rng.chance(0.08) {
+            store.set_voxel(p, PLANT);
+            reacted = true;
+        } else if rng.chance(0.006) {
+            let np = offset_voxel(p, 0, 1, 0);
+            if store.get_voxel(np) == EMPTY && has_solid_support_below(store, np) {
+                store.set_voxel(np, WEED);
+                reacted = true;
+            }
+        }
+    }
+
+    if id == TREE_SEED && has_solid_support_below(store, p) && rng.chance(0.015) {
+        store.set_voxel(p, WOOD);
+        reacted = true;
+    }
+
+    reacted
+}
+
+fn is_acid_dissolvable(id: u16) -> bool {
+    if id == EMPTY {
+        return false;
+    }
+    let mat = material(id);
+    matches!(mat.phase, Phase::Solid | Phase::Powder) && !mat.acid_resistant
+}
+
+fn has_neighbor(store: &ChunkStore, p: VoxelCoord, target: u16) -> bool {
+    neighbor_dirs6()
+        .into_iter()
+        .any(|[dx, dy, dz]| store.get_voxel(offset_voxel(p, dx, dy, dz)) == target)
+}
+
+fn has_solid_support_below(store: &ChunkStore, p: VoxelCoord) -> bool {
+    let below = store.get_voxel(offset_voxel(p, 0, -1, 0));
+    below != EMPTY && material(below).phase != Phase::Gas
+}
+
+fn has_tree_support(store: &ChunkStore, p: VoxelCoord) -> bool {
+    for dz in -2..=2 {
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                if dx * dx + dy * dy + dz * dz > 5 {
+                    continue;
+                }
+                let nid = store.get_voxel(offset_voxel(p, dx, dy, dz));
+                if matches!(nid, WOOD | LEAVES) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_exposed_to_sky(store: &ChunkStore, p: VoxelCoord) -> bool {
+    for y in (p.y + 1)..=(p.y + CHUNK_SIZE_VOXELS * 2) {
+        if store.get_voxel(VoxelCoord { x: p.x, y, z: p.z }) != EMPTY {
+            return false;
+        }
+    }
+    true
+}
+
+fn spawn_reaction_product(
+    store: &mut ChunkStore,
+    origin: VoxelCoord,
+    product: u16,
+    rng: &mut Rng,
+) -> bool {
+    let mut dirs = neighbor_dirs6();
+    rng.shuffle(&mut dirs);
+    for [dx, dy, dz] in dirs {
+        let np = offset_voxel(origin, dx, dy, dz);
+        if store.get_voxel(np) == EMPTY {
+            store.set_voxel(np, product);
+            return true;
+        }
+    }
+    false
+}
+
+fn has_ignition_neighbor(store: &ChunkStore, p: VoxelCoord) -> bool {
+    for dz in -2..=2 {
+        for dy in -1..=2 {
+            for dx in -2..=2 {
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                if dx * dx + dy * dy + dz * dz > 5 {
+                    continue;
+                }
+                let nid = store.get_voxel(offset_voxel(p, dx, dy, dz));
+                if matches!(nid, LAVA | FIRE_GAS | TORCH | EMBER_HOT | EMBER_WARM) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn neighbor_dirs6() -> [[i32; 3]; 6] {
+    [
+        [1, 0, 0],
+        [-1, 0, 0],
+        [0, 1, 0],
+        [0, -1, 0],
+        [0, 0, 1],
+        [0, 0, -1],
+    ]
+}
+
+fn offset_voxel(p: VoxelCoord, dx: i32, dy: i32, dz: i32) -> VoxelCoord {
+    VoxelCoord {
+        x: p.x + dx,
+        y: p.y + dy,
+        z: p.z + dz,
+    }
+}
+
 pub fn step_region_profiled(
     store: &mut ChunkStore,
     region: &HashSet<ChunkCoord>,
@@ -396,8 +752,13 @@ fn local_index_to_world(chunk_coord: ChunkCoord, idx: u16) -> VoxelCoord {
     }
 }
 
-fn movement_candidates(source: VoxelCoord, phase: Phase, rng: &mut Rng) -> Vec<VoxelCoord> {
-    let mut lateral = vec![
+fn movement_candidates(
+    source: VoxelCoord,
+    mat_id: u16,
+    phase: Phase,
+    rng: &mut Rng,
+) -> Vec<VoxelCoord> {
+    let mut cardinal_lateral = vec![
         VoxelCoord {
             x: source.x - 1,
             y: source.y,
@@ -419,7 +780,31 @@ fn movement_candidates(source: VoxelCoord, phase: Phase, rng: &mut Rng) -> Vec<V
             z: source.z + 1,
         },
     ];
-    rng.shuffle(&mut lateral);
+    rng.shuffle(&mut cardinal_lateral);
+
+    let mut diagonal_lateral = vec![
+        VoxelCoord {
+            x: source.x - 1,
+            y: source.y,
+            z: source.z - 1,
+        },
+        VoxelCoord {
+            x: source.x + 1,
+            y: source.y,
+            z: source.z - 1,
+        },
+        VoxelCoord {
+            x: source.x - 1,
+            y: source.y,
+            z: source.z + 1,
+        },
+        VoxelCoord {
+            x: source.x + 1,
+            y: source.y,
+            z: source.z + 1,
+        },
+    ];
+    rng.shuffle(&mut diagonal_lateral);
 
     match phase {
         Phase::Powder => {
@@ -460,16 +845,60 @@ fn movement_candidates(source: VoxelCoord, phase: Phase, rng: &mut Rng) -> Vec<V
                 y: source.y - 1,
                 z: source.z,
             }];
-            candidates.extend(lateral);
+            match mat_id {
+                LAVA => {
+                    candidates.extend(cardinal_lateral.into_iter().take(2));
+                    if rng.chance(0.2) {
+                        candidates.extend(diagonal_lateral.into_iter().take(1));
+                    }
+                }
+                WATER => {
+                    candidates.extend(cardinal_lateral);
+                    candidates.extend(diagonal_lateral.into_iter().take(2));
+                }
+                ACID => {
+                    candidates.extend(cardinal_lateral);
+                    candidates.extend(diagonal_lateral.into_iter().take(1));
+                }
+                _ => {
+                    candidates.extend(cardinal_lateral);
+                }
+            }
             candidates
         }
         Phase::Gas => {
+            let mut upward_diagonal = vec![
+                VoxelCoord {
+                    x: source.x - 1,
+                    y: source.y + 1,
+                    z: source.z,
+                },
+                VoxelCoord {
+                    x: source.x + 1,
+                    y: source.y + 1,
+                    z: source.z,
+                },
+                VoxelCoord {
+                    x: source.x,
+                    y: source.y + 1,
+                    z: source.z - 1,
+                },
+                VoxelCoord {
+                    x: source.x,
+                    y: source.y + 1,
+                    z: source.z + 1,
+                },
+            ];
+            rng.shuffle(&mut upward_diagonal);
             let mut candidates = vec![VoxelCoord {
                 x: source.x,
                 y: source.y + 1,
                 z: source.z,
             }];
-            candidates.extend(lateral);
+            let mat = material(mat_id);
+            let lateral = (mat.flow_speed.max(1) as usize).min(4);
+            candidates.extend(upward_diagonal.into_iter().take(lateral));
+            candidates.extend(cardinal_lateral.into_iter().take(lateral));
             candidates
         }
         Phase::Solid => Vec::new(),
