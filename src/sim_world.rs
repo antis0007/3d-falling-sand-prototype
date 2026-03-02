@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::chunk_store::ChunkStore;
 use crate::sim::{material, Phase, XorShift32};
@@ -31,34 +32,64 @@ pub type Rng = XorShift32;
 
 const CHUNK_COOLDOWN_TICKS: u8 = 8;
 const MAX_CHUNKS_PER_STEP: usize = 96;
+const CHUNK_VOLUME: usize = (CHUNK_SIZE_VOXELS as usize).pow(3);
+const CHUNK_WORDS: usize = CHUNK_VOLUME.div_ceil(64);
+const MAX_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 768;
+const MIN_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 64;
+const SIM_WORK_BUDGET_MS: f32 = 2.8;
+
+fn phase_likely_to_move(phase: Phase) -> bool {
+    matches!(phase, Phase::Gas | Phase::Liquid | Phase::Powder)
+}
+
+fn mat_likely_to_move_or_react(mat_id: u16) -> bool {
+    if mat_id == EMPTY {
+        return false;
+    }
+    let mat = material(mat_id);
+    phase_likely_to_move(mat.phase)
+        || mat.transforms_on_contact.is_some()
+        || mat.flammable
+        || matches!(
+            mat_id,
+            FIRE_GAS | LAVA | ACID | STEAM | SMOKE | EMBER_HOT | EMBER_WARM
+        )
+}
 
 #[derive(Default)]
 struct ChunkFrontierState {
     active_bits: Vec<u64>,
     frontier: Vec<u16>,
+    carry_frontier: Vec<u16>,
+    pending_writes: Vec<(VoxelCoord, u16)>,
+    activation_centers: Vec<VoxelCoord>,
+    moved_sources_bits: Vec<u64>,
+    claimed_destinations_bits: Vec<u64>,
+    rotate_offset: usize,
+    seed_scan_cursor: usize,
+    seed_scan_complete: bool,
     cooldown_ticks: u8,
     recent_activity: u16,
+    moving_avg_processed: f32,
 }
 
 impl ChunkFrontierState {
     fn new() -> Self {
-        let chunk_volume = (CHUNK_SIZE_VOXELS as usize).pow(3);
-        let words = chunk_volume.div_ceil(64);
         Self {
-            active_bits: vec![0; words],
+            active_bits: vec![0; CHUNK_WORDS],
             frontier: Vec::with_capacity(512),
+            carry_frontier: Vec::with_capacity(512),
+            pending_writes: Vec::with_capacity(1024),
+            activation_centers: Vec::with_capacity(512),
+            moved_sources_bits: vec![0; CHUNK_WORDS],
+            claimed_destinations_bits: vec![0; CHUNK_WORDS],
+            rotate_offset: 0,
+            seed_scan_cursor: 0,
+            seed_scan_complete: false,
             cooldown_ticks: 0,
             recent_activity: 0,
+            moving_avg_processed: 0.0,
         }
-    }
-
-    fn take_frontier(&mut self) -> Vec<u16> {
-        std::mem::take(&mut self.frontier)
-    }
-
-    fn return_frontier_buffer(&mut self, mut buffer: Vec<u16>) {
-        buffer.clear();
-        self.frontier = buffer;
     }
 
     fn enqueue_local(&mut self, idx: u16) {
@@ -82,6 +113,34 @@ impl ChunkFrontierState {
     fn is_empty(&self) -> bool {
         self.frontier.is_empty()
     }
+
+    fn clear_step_scratch(&mut self) {
+        self.pending_writes.clear();
+        self.activation_centers.clear();
+        self.carry_frontier.clear();
+        self.moved_sources_bits.fill(0);
+        self.claimed_destinations_bits.fill(0);
+    }
+
+    fn mark_source_moved(&mut self, idx: u16) {
+        let i = idx as usize;
+        self.moved_sources_bits[i / 64] |= 1u64 << (i % 64);
+    }
+
+    fn source_moved(&self, idx: u16) -> bool {
+        let i = idx as usize;
+        (self.moved_sources_bits[i / 64] & (1u64 << (i % 64))) != 0
+    }
+
+    fn try_claim_local_destination(&mut self, idx: usize) -> bool {
+        let word = idx / 64;
+        let bit = 1u64 << (idx % 64);
+        if (self.claimed_destinations_bits[word] & bit) != 0 {
+            return false;
+        }
+        self.claimed_destinations_bits[word] |= bit;
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,7 +153,6 @@ pub struct SimSoAChunkBuffer {
 #[derive(Default)]
 pub struct SimWorld {
     chunks: HashMap<ChunkCoord, ChunkFrontierState>,
-    known_seeded_chunks: HashSet<ChunkCoord>,
 }
 
 impl SimWorld {
@@ -111,6 +169,7 @@ impl SimWorld {
     ) -> usize {
         self.seed_region_frontier_if_needed(store, region);
         self.enqueue_dirty_voxels(store, region);
+        let step_start = Instant::now();
 
         let mut candidates = self.prioritized_chunks(center, region);
         if candidates.len() > MAX_CHUNKS_PER_STEP {
@@ -134,20 +193,36 @@ impl SimWorld {
                 }
 
                 stepped_chunks += 1;
-                let mut frontier = state.take_frontier();
-                rng.shuffle(&mut frontier);
-
-                let mut pending_writes: Vec<(VoxelCoord, u16)> = Vec::new();
-                let mut moved_sources: HashSet<u16> = HashSet::new();
-                let mut claimed_destinations: HashSet<VoxelCoord> = HashSet::new();
+                state.clear_step_scratch();
                 let mut moved_any = false;
 
-                for &idx in &frontier {
-                    state.clear_active(idx);
+                let frontier_len = state.frontier.len();
+                let elapsed_ms = step_start.elapsed().as_secs_f32() * 1000.0;
+                let mut process_cap = MAX_FRONTIER_PROCESSED_PER_SUBSTEP;
+                if elapsed_ms > SIM_WORK_BUDGET_MS {
+                    process_cap = (MAX_FRONTIER_PROCESSED_PER_SUBSTEP / 2)
+                        .max(MIN_FRONTIER_PROCESSED_PER_SUBSTEP);
                 }
+                let ema_cap = state.moving_avg_processed as usize;
+                if ema_cap > 0 {
+                    process_cap = process_cap.min(ema_cap.saturating_add(128));
+                }
+                process_cap = process_cap.min(frontier_len).max(frontier_len.min(1));
+                let start = if frontier_len > 0 {
+                    state.rotate_offset % frontier_len
+                } else {
+                    0
+                };
 
-                for idx in frontier.iter().copied() {
-                    if moved_sources.contains(&idx) {
+                for processed in 0..frontier_len {
+                    let pos = (start + processed) % frontier_len;
+                    let idx = state.frontier[pos];
+                    if processed >= process_cap {
+                        state.carry_frontier.push(idx);
+                        continue;
+                    }
+                    state.clear_active(idx);
+                    if state.source_moved(idx) {
                         continue;
                     }
                     let source = local_index_to_world(chunk_coord, idx);
@@ -170,12 +245,20 @@ impl SimWorld {
                     let candidates = movement_candidates(source, mat_id, mat.phase, rng);
 
                     for destination in candidates {
-                        if claimed_destinations.contains(&destination) {
-                            continue;
-                        }
                         let (destination_chunk, _) = voxel_to_chunk(destination);
                         if !store.is_chunk_loaded(destination_chunk) {
                             continue;
+                        }
+                        if destination_chunk == chunk_coord {
+                            let local = voxel_to_chunk(destination).1;
+                            let local_idx = local_to_index(
+                                local[0] as usize,
+                                local[1] as usize,
+                                local[2] as usize,
+                            );
+                            if !state.try_claim_local_destination(local_idx) {
+                                continue;
+                            }
                         }
 
                         let target_id = store.get_voxel(destination);
@@ -193,20 +276,30 @@ impl SimWorld {
                             continue;
                         }
 
-                        pending_writes.push((source, EMPTY));
-                        pending_writes.push((destination, mat_id));
-                        moved_sources.insert(idx);
-                        claimed_destinations.insert(destination);
+                        state.pending_writes.push((source, EMPTY));
+                        state.pending_writes.push((destination, mat_id));
+                        state.mark_source_moved(idx);
                         moved_any = true;
-                        activation_centers.push(source);
-                        activation_centers.push(destination);
+                        state.activation_centers.push(source);
+                        state.activation_centers.push(destination);
                         break;
                     }
                 }
 
-                for (coord, mat_id) in pending_writes {
+                for (coord, mat_id) in state.pending_writes.iter().copied() {
                     store.set_voxel(coord, mat_id);
                 }
+
+                if !state.carry_frontier.is_empty() {
+                    state.frontier.clear();
+                    state.frontier.append(&mut state.carry_frontier);
+                } else {
+                    state.frontier.clear();
+                }
+                state.rotate_offset = state.rotate_offset.wrapping_add(17);
+                let processed_count = process_cap as f32;
+                state.moving_avg_processed =
+                    (state.moving_avg_processed * 0.85) + (processed_count * 0.15);
 
                 if moved_any {
                     state.cooldown_ticks = 0;
@@ -215,8 +308,7 @@ impl SimWorld {
                     state.cooldown_ticks = CHUNK_COOLDOWN_TICKS;
                     state.recent_activity = state.recent_activity.saturating_sub(1);
                 }
-
-                state.return_frontier_buffer(frontier);
+                activation_centers.append(&mut state.activation_centers);
             }
 
             for center in activation_centers {
@@ -269,19 +361,28 @@ impl SimWorld {
     }
 
     fn seed_region_frontier_if_needed(&mut self, store: &ChunkStore, region: &HashSet<ChunkCoord>) {
+        const SEED_SCAN_BATCH: usize = 1024;
         for &chunk_coord in region {
-            if !store.is_chunk_loaded(chunk_coord)
-                || self.known_seeded_chunks.contains(&chunk_coord)
-            {
+            if !store.is_chunk_loaded(chunk_coord) {
                 continue;
             }
-            self.known_seeded_chunks.insert(chunk_coord);
+            let mut seed_worlds = Vec::new();
+            let state = self
+                .chunks
+                .entry(chunk_coord)
+                .or_insert_with(ChunkFrontierState::new);
+            if state.seed_scan_complete {
+                continue;
+            }
             let Some(chunk) = store.get_chunk(chunk_coord) else {
                 continue;
             };
             let base = chunk_to_world_min(chunk_coord);
-            for (idx, &mat_id) in chunk.iter_raw().iter().enumerate() {
-                if mat_id == EMPTY {
+            let raw = chunk.iter_raw();
+            let end = (state.seed_scan_cursor + SEED_SCAN_BATCH).min(raw.len());
+            for idx in state.seed_scan_cursor..end {
+                let mat_id = raw[idx];
+                if !mat_likely_to_move_or_react(mat_id) {
                     continue;
                 }
                 let x = idx % CHUNK_SIZE_VOXELS as usize;
@@ -292,6 +393,13 @@ impl SimWorld {
                     y: base.y + y as i32,
                     z: base.z + z as i32,
                 };
+                seed_worlds.push(world);
+            }
+            state.seed_scan_cursor = end;
+            if state.seed_scan_cursor >= raw.len() {
+                state.seed_scan_complete = true;
+            }
+            for world in seed_worlds {
                 self.enqueue_with_neighbors_if_in_region(world, region);
             }
         }
