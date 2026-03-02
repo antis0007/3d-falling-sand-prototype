@@ -138,11 +138,11 @@ impl SimulationRuntime {
             SimulationMode::GpuFluid => {
                 if !self.warned_gpu_emulation {
                     log::warn!(
-                        "GPU simulation mode is currently running deterministic CPU emulation; enable the `gpu-compute` feature for WGSL compute pipelines"
+                        "GPU simulation mode is currently running deterministic CPU emulation; routing to CPU cellular backend to avoid heavy snapshot stalls"
                     );
                     self.warned_gpu_emulation = true;
                 }
-                self.gpu.step(store, region, center, rng, metadata)
+                self.cpu.step(store, region, center, rng, metadata)
             }
             SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng, metadata),
         }
