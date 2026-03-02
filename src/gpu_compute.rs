@@ -92,6 +92,7 @@ struct WorkerGpuState {
     queue: wgpu::Queue,
     runtime: GpuComputeRuntime,
     atlas: Mutex<ChunkPageAtlas>,
+    atlas_voxels: wgpu::Buffer,
     velocity_mac: wgpu::Buffer,
     pressure: wgpu::Buffer,
     divergence: wgpu::Buffer,
@@ -470,6 +471,46 @@ impl GpuComputeRuntime {
 }
 
 #[cfg(feature = "gpu-compute")]
+fn readback_page_materials(
+    state: &WorkerGpuState,
+    page_index: u32,
+    state_index: u32,
+    voxel_count: usize,
+) -> anyhow::Result<Vec<MaterialId>> {
+    let atlas_offset_voxels =
+        (page_index as u64 * CHUNK_VOLUME as u64 * 2) + (state_index as u64 * CHUNK_VOLUME as u64);
+    let byte_offset = atlas_offset_voxels * std::mem::size_of::<u32>() as u64;
+    let byte_len = voxel_count as u64 * std::mem::size_of::<u32>() as u64;
+    let readback = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("chunk materials readback"),
+        size: byte_len,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = state
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_buffer_to_buffer(&state.atlas_voxels, byte_offset, &readback, 0, byte_len);
+    state.queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    state.device.poll(wgpu::Maintain::Wait);
+    rx.recv().context("gpu readback completion")??;
+
+    let bytes = slice.get_mapped_range();
+    let words: &[u32] = bytemuck::cast_slice(&bytes);
+    let materials = words.iter().map(|m| *m as MaterialId).collect();
+    drop(bytes);
+    readback.unmap();
+    Ok(materials)
+}
+
+#[cfg(feature = "gpu-compute")]
 impl GpuComputeRuntime {
     fn create_simulation_bind_group(
         &self,
@@ -726,6 +767,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 queue,
                 runtime,
                 atlas: Mutex::new(ChunkPageAtlas::default()),
+                atlas_voxels,
                 velocity_mac,
                 pressure,
                 divergence,
@@ -851,9 +893,16 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .get(&job.coord)
             .copied()
             .unwrap_or_default();
+        let generated_materials = readback_page_materials(
+            state,
+            page_index,
+            (current_state + 1) & 1,
+            job.snapshot.center_voxels.len(),
+        )
+        .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
 
         Ok(ComputedChunkArtifacts {
-            generated_materials: job.snapshot.center_voxels.to_vec(),
+            generated_materials,
             simulation_diagnostics: diagnostics,
             mesh_indirect: if indirect.vertex_count == 0 {
                 DrawIndirectArgs {

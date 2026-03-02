@@ -101,7 +101,6 @@ pub struct SimulationRuntime {
     cpu: CpuCellularBackend,
     gpu: GpuFluidBackend,
     fallback: CpuFallbackBackend,
-    warned_gpu_emulation: bool,
     active_emitter_chunks: HashSet<ChunkCoord>,
 }
 
@@ -136,15 +135,7 @@ impl SimulationRuntime {
     ) -> SimulationStepStats {
         match mode {
             SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng, metadata),
-            SimulationMode::GpuFluid => {
-                if !self.warned_gpu_emulation {
-                    log::warn!(
-                        "GPU simulation mode uses deterministic CPU emulation while compute integration is in progress"
-                    );
-                    self.warned_gpu_emulation = true;
-                }
-                self.gpu.step(store, region, center, rng, metadata)
-            }
+            SimulationMode::GpuFluid => self.gpu.step(store, region, center, rng, metadata),
             SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng, metadata),
         }
     }
