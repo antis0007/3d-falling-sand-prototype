@@ -385,6 +385,10 @@ pub fn material(id: MaterialId) -> &'static Material {
     MATERIALS.get(id as usize).unwrap_or(&MATERIALS[0])
 }
 
+pub fn is_player_passable_vegetation(id: MaterialId) -> bool {
+    matches!(id, BUSH | GRASS)
+}
+
 #[derive(Clone)]
 pub struct SimState {
     pub running: bool,
