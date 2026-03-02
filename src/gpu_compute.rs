@@ -48,6 +48,7 @@ struct ChunkPageAtlas {
     page_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
     version_for_chunk: HashMap<crate::types::ChunkCoord, u64>,
     state_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
+    cached_materials: HashMap<crate::types::ChunkCoord, Vec<MaterialId>>,
     next_page: u32,
 }
 
@@ -57,12 +58,21 @@ struct WorkerGpuState {
     queue: wgpu::Queue,
     runtime: GpuComputeRuntime,
     atlas: Mutex<ChunkPageAtlas>,
-    input_voxels: wgpu::Buffer,
+    velocity_pressure: wgpu::Buffer,
+    pressure: wgpu::Buffer,
+    active_tiles: wgpu::Buffer,
+    active_tile_counter: wgpu::Buffer,
+    edit_commands: wgpu::Buffer,
     page_params: wgpu::Buffer,
+    dirty_chunk_ids: wgpu::Buffer,
+    dirty_chunk_counter: wgpu::Buffer,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
     frontier_len: u32,
 }
+
+#[cfg(feature = "gpu-compute")]
+const MAX_EDIT_COMMANDS: u32 = CHUNK_VOLUME as u32;
 
 #[derive(Default, Clone, Copy)]
 pub struct GpuComputeProfilerSnapshot {
@@ -137,12 +147,17 @@ impl GpuComputeRuntime {
             });
 
             let entries = [
-                bgl_entry(0, true),
+                bgl_entry(0, false),
                 bgl_entry(1, false),
-                bgl_entry(2, true),
-                bgl_entry(3, true),
+                bgl_entry(2, false),
+                bgl_entry(3, false),
                 bgl_entry(4, false),
-                bgl_entry(5, false),
+                bgl_entry(5, true),
+                bgl_entry(6, true),
+                bgl_entry(7, false),
+                bgl_entry(8, false),
+                bgl_entry(9, false),
+                bgl_entry(10, false),
             ];
             let simulation_bgl =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -196,18 +211,25 @@ impl GpuComputeRuntime {
         job: &MeshJob,
         page_index: u32,
         current_state: u32,
+        edit_commands: &[EditCommand],
     ) -> anyhow::Result<DrawIndirectArgs> {
         let t0 = Instant::now();
         let frontier_len = state
             .frontier_len
             .min(job.snapshot.center_voxels.len() as u32);
 
-        state.queue.write_buffer(
-            &state.input_voxels,
-            0,
-            bytemuck::cast_slice(job.snapshot.center_voxels.as_ref()),
+        if !edit_commands.is_empty() {
+            state
+                .queue
+                .write_buffer(&state.edit_commands, 0, bytemuck::cast_slice(edit_commands));
+        }
+        let page_params = device_page_params(
+            job,
+            page_index,
+            frontier_len,
+            current_state,
+            edit_commands.len() as u32,
         );
-        let page_params = device_page_params(job, page_index, frontier_len, current_state);
         state
             .queue
             .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&page_params));
@@ -215,7 +237,10 @@ impl GpuComputeRuntime {
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let groups = frontier_len.max(1).div_ceil(64);
+        let groups = frontier_len
+            .max(edit_commands.len() as u32)
+            .max(1)
+            .div_ceil(64);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.simulation_pipeline);
@@ -232,7 +257,8 @@ impl GpuComputeRuntime {
         {
             GPU_DISPATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             GPU_TRANSFER_BYTES.fetch_add(
-                (job.snapshot.center_voxels.len() * std::mem::size_of::<u32>()) as u64,
+                (edit_commands.len() * std::mem::size_of::<EditCommand>()
+                    + std::mem::size_of::<FrameParams>()) as u64,
                 Ordering::Relaxed,
             );
             GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
@@ -295,15 +321,21 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
-            let input_voxels = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk input voxels"),
-                size: page_len * std::mem::size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            let velocity_pressure = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk velocity atlas"),
+                size: page_capacity * page_len * std::mem::size_of::<[f32; 4]>() as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let pressure = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk pressure atlas"),
+                size: page_capacity * page_len * std::mem::size_of::<f32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
             let page_params = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk page params"),
-                size: std::mem::size_of::<PageParams>() as u64,
+                size: std::mem::size_of::<FrameParams>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -311,6 +343,30 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 label: Some("chunk active frontier"),
                 size: page_len * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let active_tile_counter = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("active tile counter"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let edit_commands = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("edit command buffer"),
+                size: MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let dirty_chunk_ids = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dirty chunk ids"),
+                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let dirty_chunk_counter = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dirty chunk counter"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
             let diagnostics = device.create_buffer(&wgpu::BufferDescriptor {
@@ -329,26 +385,46 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: input_voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
                         resource: atlas_voxels.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: velocity_pressure.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: frontier.as_entire_binding(),
+                        resource: pressure.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: page_params.as_entire_binding(),
+                        resource: frontier.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: page_indirect.as_entire_binding(),
+                        resource: active_tile_counter.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
+                        resource: edit_commands.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: page_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: page_indirect.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: dirty_chunk_ids.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: dirty_chunk_counter.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
                         resource: diagnostics.as_entire_binding(),
                     },
                 ],
@@ -359,26 +435,46 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: input_voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
                         resource: atlas_voxels.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: velocity_pressure.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: frontier.as_entire_binding(),
+                        resource: pressure.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: page_params.as_entire_binding(),
+                        resource: frontier.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: page_indirect.as_entire_binding(),
+                        resource: active_tile_counter.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
+                        resource: edit_commands.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: page_params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: page_indirect.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: dirty_chunk_ids.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: dirty_chunk_counter.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
                         resource: diagnostics.as_entire_binding(),
                     },
                 ],
@@ -389,8 +485,14 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 queue,
                 runtime,
                 atlas: Mutex::new(ChunkPageAtlas::default()),
-                input_voxels,
+                velocity_pressure,
+                pressure,
+                active_tiles: frontier,
+                active_tile_counter,
+                edit_commands,
                 page_params,
+                dirty_chunk_ids,
+                dirty_chunk_counter,
                 simulation_bg,
                 meshing_bg,
                 frontier_len,
@@ -420,6 +522,26 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .copied()
             .unwrap_or(0);
         let current_state = atlas.state_for_chunk.get(&job.coord).copied().unwrap_or(0);
+        let mut edit_commands = Vec::new();
+        let incoming = job.snapshot.center_voxels.as_ref();
+        let cached = atlas
+            .cached_materials
+            .entry(job.coord)
+            .or_insert_with(|| vec![EMPTY; incoming.len()]);
+        if cached.len() != incoming.len() {
+            cached.resize(incoming.len(), EMPTY);
+        }
+        for (idx, (&next, prev)) in incoming.iter().zip(cached.iter_mut()).enumerate() {
+            if next != *prev {
+                edit_commands.push(EditCommand {
+                    voxel_index: idx as u32,
+                    material_id: next as u32,
+                    flags: 0,
+                    _pad: 0,
+                });
+                *prev = next;
+            }
+        }
         atlas.version_for_chunk.insert(job.coord, job.version);
         atlas
             .state_for_chunk
@@ -427,9 +549,13 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         drop(atlas);
 
         let indirect = if last_version != job.version {
-            state
-                .runtime
-                .run_active_frontier(state, job, page_index, current_state)?
+            state.runtime.run_active_frontier(
+                state,
+                job,
+                page_index,
+                current_state,
+                &edit_commands,
+            )?
         } else {
             DrawIndirectArgs::default()
         };
@@ -458,11 +584,24 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
-struct PageParams {
+struct EditCommand {
+    voxel_index: u32,
+    material_id: u32,
+    flags: u32,
+    _pad: u32,
+}
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct FrameParams {
     page_index: u32,
     voxel_count: u32,
     frontier_len: u32,
     state_index: u32,
+    edit_count: u32,
+    active_tile_budget: u32,
+    camera_region_meta0: u32,
+    camera_region_meta1: u32,
 }
 
 fn device_page_params(
@@ -470,12 +609,17 @@ fn device_page_params(
     page_index: u32,
     frontier_len: u32,
     state_index: u32,
-) -> [PageParams; 1] {
-    [PageParams {
+    edit_count: u32,
+) -> [FrameParams; 1] {
+    [FrameParams {
         page_index,
         voxel_count: job.snapshot.center_voxels.len() as u32,
         frontier_len,
         state_index,
+        edit_count,
+        active_tile_budget: frontier_len,
+        camera_region_meta0: 0,
+        camera_region_meta1: 0,
     }]
 }
 
