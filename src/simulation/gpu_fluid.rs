@@ -8,8 +8,7 @@ use crate::simulation::SimulationBackend;
 use crate::types::{chunk_to_world_min, voxel_to_chunk, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::EMPTY;
 
-const CHUNK_EDGE: usize = CHUNK_SIZE_VOXELS as usize;
-const CHUNK_VOLUME: usize = CHUNK_EDGE * CHUNK_EDGE * CHUNK_EDGE;
+const CHUNK_EDGE: i32 = CHUNK_SIZE_VOXELS as i32;
 const SUBSTEPS: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
@@ -18,31 +17,17 @@ struct SimCommand {
     material_id: u16,
 }
 
-#[derive(Default)]
-struct DirtyRegionMetadata {
-    dirty_chunks: HashSet<ChunkCoord>,
-    dirty_voxel_indices: HashMap<ChunkCoord, Vec<usize>>,
-}
-
-#[derive(Default)]
-struct ChunkGpuBuffers {
-    occupancy_material: Vec<u16>,
-}
-
-impl ChunkGpuBuffers {
-    fn ensure_allocated(&mut self) {
-        if self.occupancy_material.len() == CHUNK_VOLUME {
-            return;
-        }
-        self.occupancy_material = vec![EMPTY; CHUNK_VOLUME];
-    }
+#[derive(Clone, Copy, Debug)]
+struct MoveIntent {
+    from: VoxelCoord,
+    to: VoxelCoord,
+    priority: u64,
 }
 
 #[derive(Default)]
 pub struct GpuFluidBackend {
-    chunk_buffers: HashMap<ChunkCoord, ChunkGpuBuffers>,
     command_buffer: Vec<SimCommand>,
-    dirty_regions: DirtyRegionMetadata,
+    frame_index: u64,
 }
 
 impl SimulationBackend for GpuFluidBackend {
@@ -53,14 +38,18 @@ impl SimulationBackend for GpuFluidBackend {
         _center: ChunkCoord,
         _rng: &mut Rng,
     ) -> usize {
-        self.stage_edit_commands();
+        let mut stepped_chunks: HashSet<ChunkCoord> = HashSet::new();
 
-        for _ in 0..SUBSTEPS {
-            self.dispatch_substep(region);
+        let edited_chunks = self.stage_edit_commands(store, region);
+        stepped_chunks.extend(edited_chunks);
+
+        for substep in 0..SUBSTEPS {
+            let touched = self.dispatch_substep(store, region, substep as u64);
+            stepped_chunks.extend(touched);
         }
 
-        self.read_back_modified_chunks(store);
-        region.len()
+        self.frame_index = self.frame_index.wrapping_add(1);
+        stepped_chunks.len()
     }
 
     fn queue_place_edit(&mut self, coord: VoxelCoord, material_id: u16) {
@@ -69,94 +58,196 @@ impl SimulationBackend for GpuFluidBackend {
 }
 
 impl GpuFluidBackend {
-    fn stage_edit_commands(&mut self) {
+    fn stage_edit_commands(
+        &mut self,
+        store: &mut ChunkStore,
+        region: &HashSet<ChunkCoord>,
+    ) -> HashSet<ChunkCoord> {
+        let mut touched = HashSet::new();
         let staged: Vec<_> = self.command_buffer.drain(..).collect();
         for cmd in staged {
+            store.set_voxel(cmd.coord, cmd.material_id);
             let (chunk_coord, local) = voxel_to_chunk(cmd.coord);
-            let index = linear_idx(local);
-            let buffers = self.chunk_buffers.entry(chunk_coord).or_default();
-            buffers.ensure_allocated();
-            buffers.occupancy_material[index] = cmd.material_id;
-            self.mark_dirty(chunk_coord, index);
+            if region.contains(&chunk_coord) {
+                touched.insert(chunk_coord);
+            }
+            for neighbor in voxel_neighbors_26(cmd.coord) {
+                let (neighbor_chunk, _) = voxel_to_chunk(neighbor);
+                if region.contains(&neighbor_chunk) {
+                    touched.insert(neighbor_chunk);
+                }
+            }
+            let last_local = (CHUNK_SIZE_VOXELS - 1) as u32;
+            if local[0] == 0 || local[0] == last_local {
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x - 1,
+                    y: chunk_coord.y,
+                    z: chunk_coord.z,
+                });
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x + 1,
+                    y: chunk_coord.y,
+                    z: chunk_coord.z,
+                });
+            }
+            if local[1] == 0 || local[1] == last_local {
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x,
+                    y: chunk_coord.y - 1,
+                    z: chunk_coord.z,
+                });
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x,
+                    y: chunk_coord.y + 1,
+                    z: chunk_coord.z,
+                });
+            }
+            if local[2] == 0 || local[2] == last_local {
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x,
+                    y: chunk_coord.y,
+                    z: chunk_coord.z - 1,
+                });
+                touched.insert(ChunkCoord {
+                    x: chunk_coord.x,
+                    y: chunk_coord.y,
+                    z: chunk_coord.z + 1,
+                });
+            }
         }
+        touched.retain(|coord| region.contains(coord));
+        touched
     }
 
-    fn dispatch_substep(&mut self, region: &HashSet<ChunkCoord>) {
-        for &chunk_coord in region {
-            let Some(buffers) = self.chunk_buffers.get_mut(&chunk_coord) else {
-                continue;
-            };
-            Self::advect_material_states(buffers, &mut self.dirty_regions, chunk_coord);
+    fn dispatch_substep(
+        &self,
+        store: &mut ChunkStore,
+        region: &HashSet<ChunkCoord>,
+        substep: u64,
+    ) -> HashSet<ChunkCoord> {
+        let snapshot = self.build_region_snapshot(store, region);
+        let intents = self.advect_material_states(region, &snapshot, substep);
+        self.apply_intents(store, region, &snapshot, intents)
+    }
+
+    fn build_region_snapshot(
+        &self,
+        store: &ChunkStore,
+        region: &HashSet<ChunkCoord>,
+    ) -> HashMap<VoxelCoord, u16> {
+        let mut snapshot = HashMap::new();
+        for &chunk in region {
+            let origin = chunk_to_world_min(chunk);
+            for z in -1..=CHUNK_EDGE {
+                for y in -1..=CHUNK_EDGE {
+                    for x in -1..=CHUNK_EDGE {
+                        let coord = VoxelCoord {
+                            x: origin.x + x,
+                            y: origin.y + y,
+                            z: origin.z + z,
+                        };
+                        snapshot
+                            .entry(coord)
+                            .or_insert_with(|| store.get_voxel(coord));
+                    }
+                }
+            }
         }
+        snapshot
     }
 
     fn advect_material_states(
-        buffers: &mut ChunkGpuBuffers,
-        dirty_regions: &mut DirtyRegionMetadata,
-        chunk_coord: ChunkCoord,
-    ) {
-        for i in (0..CHUNK_VOLUME).rev() {
-            let mat_id = buffers.occupancy_material[i];
-            if mat_id == EMPTY {
-                continue;
-            }
-            let phase = material(mat_id).phase;
-            let candidates = movement_candidates(i, phase);
-            if candidates.is_empty() {
-                continue;
-            }
-            for next in candidates {
-                if buffers.occupancy_material[next] != EMPTY {
-                    continue;
+        &self,
+        region: &HashSet<ChunkCoord>,
+        snapshot: &HashMap<VoxelCoord, u16>,
+        substep: u64,
+    ) -> Vec<MoveIntent> {
+        let mut intents = Vec::new();
+        for &chunk_coord in region {
+            let origin = chunk_to_world_min(chunk_coord);
+            for z in (0..CHUNK_EDGE).rev() {
+                for y in (0..CHUNK_EDGE).rev() {
+                    for x in 0..CHUNK_EDGE {
+                        let from = VoxelCoord {
+                            x: origin.x + x,
+                            y: origin.y + y,
+                            z: origin.z + z,
+                        };
+                        let mat_id = *snapshot.get(&from).unwrap_or(&EMPTY);
+                        if mat_id == EMPTY {
+                            continue;
+                        }
+                        let phase = material(mat_id).phase;
+                        let candidates = movement_candidates(from, phase);
+                        for to in candidates {
+                            if *snapshot.get(&to).unwrap_or(&EMPTY) != EMPTY {
+                                continue;
+                            }
+                            intents.push(MoveIntent {
+                                from,
+                                to,
+                                priority: intent_priority(
+                                    self.frame_index,
+                                    substep,
+                                    chunk_coord,
+                                    from,
+                                    to,
+                                ),
+                            });
+                            break;
+                        }
+                    }
                 }
-                buffers.occupancy_material[next] = buffers.occupancy_material[i];
-                buffers.occupancy_material[i] = EMPTY;
-                dirty_regions.dirty_chunks.insert(chunk_coord);
-                dirty_regions
-                    .dirty_voxel_indices
-                    .entry(chunk_coord)
-                    .or_default()
-                    .extend_from_slice(&[i, next]);
-                break;
             }
         }
+        intents
     }
 
-    fn mark_dirty(&mut self, chunk_coord: ChunkCoord, voxel_index: usize) {
-        self.dirty_regions.dirty_chunks.insert(chunk_coord);
-        self.dirty_regions
-            .dirty_voxel_indices
-            .entry(chunk_coord)
-            .or_default()
-            .push(voxel_index);
-    }
+    fn apply_intents(
+        &self,
+        store: &mut ChunkStore,
+        region: &HashSet<ChunkCoord>,
+        snapshot: &HashMap<VoxelCoord, u16>,
+        mut intents: Vec<MoveIntent>,
+    ) -> HashSet<ChunkCoord> {
+        intents.sort_by_key(|intent| intent.priority);
 
-    fn read_back_modified_chunks(&mut self, store: &mut ChunkStore) {
-        let dirty_chunks: Vec<_> = self.dirty_regions.dirty_chunks.drain().collect();
-        for chunk_coord in dirty_chunks {
-            let Some(buffers) = self.chunk_buffers.get(&chunk_coord) else {
+        let mut claimed_src = HashSet::new();
+        let mut claimed_dst = HashSet::new();
+        let mut touched_chunks = HashSet::new();
+
+        for intent in intents {
+            if claimed_src.contains(&intent.from) || claimed_dst.contains(&intent.to) {
                 continue;
-            };
-            let Some(indices) = self.dirty_regions.dirty_voxel_indices.remove(&chunk_coord) else {
+            }
+            let src_material = *snapshot.get(&intent.from).unwrap_or(&EMPTY);
+            if src_material == EMPTY {
                 continue;
-            };
-            let world_origin = chunk_to_world_min(chunk_coord);
-            for index in indices {
-                let local = idx_to_local(index);
-                let world = VoxelCoord {
-                    x: world_origin.x + local[0] as i32,
-                    y: world_origin.y + local[1] as i32,
-                    z: world_origin.z + local[2] as i32,
-                };
-                store.set_voxel(world, buffers.occupancy_material[index]);
+            }
+            if *snapshot.get(&intent.to).unwrap_or(&EMPTY) != EMPTY {
+                continue;
+            }
+            claimed_src.insert(intent.from);
+            claimed_dst.insert(intent.to);
+
+            store.set_voxel(intent.to, src_material);
+            store.set_voxel(intent.from, EMPTY);
+
+            let (src_chunk, _) = voxel_to_chunk(intent.from);
+            let (dst_chunk, _) = voxel_to_chunk(intent.to);
+            if region.contains(&src_chunk) {
+                touched_chunks.insert(src_chunk);
+            }
+            if region.contains(&dst_chunk) {
+                touched_chunks.insert(dst_chunk);
             }
         }
+
+        touched_chunks
     }
 }
 
-fn movement_candidates(index: usize, phase: Phase) -> Vec<usize> {
-    let [x, y, z] = idx_to_local(index);
-    let (x, y, z) = (x as i32, y as i32, z as i32);
+fn movement_candidates(origin: VoxelCoord, phase: Phase) -> Vec<VoxelCoord> {
     let dirs: &[(i32, i32, i32)] = match phase {
         Phase::Solid => &[],
         Phase::Powder => &[
@@ -189,35 +280,55 @@ fn movement_candidates(index: usize, phase: Phase) -> Vec<usize> {
     };
 
     dirs.iter()
-        .filter_map(|(dx, dy, dz)| {
-            let nx = x + dx;
-            let ny = y + dy;
-            let nz = z + dz;
-            if nx < 0
-                || ny < 0
-                || nz < 0
-                || nx >= CHUNK_EDGE as i32
-                || ny >= CHUNK_EDGE as i32
-                || nz >= CHUNK_EDGE as i32
-            {
-                return None;
-            }
-            Some(linear_idx([nx as u32, ny as u32, nz as u32]))
+        .map(|(dx, dy, dz)| VoxelCoord {
+            x: origin.x + dx,
+            y: origin.y + dy,
+            z: origin.z + dz,
         })
         .collect()
 }
 
-fn linear_idx(local: [u32; 3]) -> usize {
-    local[0] as usize + local[1] as usize * CHUNK_EDGE + local[2] as usize * CHUNK_EDGE * CHUNK_EDGE
+fn voxel_neighbors_26(origin: VoxelCoord) -> impl Iterator<Item = VoxelCoord> {
+    (-1..=1).flat_map(move |dz| {
+        (-1..=1).flat_map(move |dy| {
+            (-1..=1).filter_map(move |dx| {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    None
+                } else {
+                    Some(VoxelCoord {
+                        x: origin.x + dx,
+                        y: origin.y + dy,
+                        z: origin.z + dz,
+                    })
+                }
+            })
+        })
+    })
 }
 
-fn idx_to_local(index: usize) -> [u32; 3] {
-    let plane = CHUNK_EDGE * CHUNK_EDGE;
-    let z = index / plane;
-    let rem = index % plane;
-    let y = rem / CHUNK_EDGE;
-    let x = rem % CHUNK_EDGE;
-    [x as u32, y as u32, z as u32]
+fn intent_priority(
+    frame_index: u64,
+    substep: u64,
+    chunk_coord: ChunkCoord,
+    from: VoxelCoord,
+    to: VoxelCoord,
+) -> u64 {
+    let mut h = frame_index ^ (substep.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    h ^= mix_i32(chunk_coord.x).rotate_left(7);
+    h ^= mix_i32(chunk_coord.y).rotate_left(19);
+    h ^= mix_i32(chunk_coord.z).rotate_left(31);
+    h ^= mix_i32(from.x).rotate_left(11);
+    h ^= mix_i32(from.y).rotate_left(23);
+    h ^= mix_i32(from.z).rotate_left(37);
+    h ^= mix_i32(to.x).rotate_left(13);
+    h ^= mix_i32(to.y).rotate_left(29);
+    h ^= mix_i32(to.z).rotate_left(43);
+    h ^ (h >> 33).wrapping_mul(0xff51_afd7_ed55_8ccd)
+}
+
+fn mix_i32(v: i32) -> u64 {
+    let x = v as i64 as u64;
+    x.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 #[cfg(test)]
@@ -226,15 +337,30 @@ mod tests {
 
     #[test]
     fn powder_prefers_downward_candidates() {
-        let idx = linear_idx([10, 10, 10]);
-        let candidates = movement_candidates(idx, Phase::Powder);
-        assert_eq!(candidates.first().copied(), Some(linear_idx([10, 9, 10])));
+        let origin = VoxelCoord {
+            x: 10,
+            y: 10,
+            z: 10,
+        };
+        let candidates = movement_candidates(origin, Phase::Powder);
+        assert_eq!(
+            candidates.first().copied(),
+            Some(VoxelCoord { x: 10, y: 9, z: 10 })
+        );
     }
 
     #[test]
     fn gas_candidates_include_upward_motion() {
-        let idx = linear_idx([12, 12, 12]);
-        let candidates = movement_candidates(idx, Phase::Gas);
-        assert!(candidates.contains(&linear_idx([12, 13, 12])));
+        let origin = VoxelCoord {
+            x: 12,
+            y: 12,
+            z: 12,
+        };
+        let candidates = movement_candidates(origin, Phase::Gas);
+        assert!(candidates.contains(&VoxelCoord {
+            x: 12,
+            y: 13,
+            z: 12
+        }));
     }
 }
