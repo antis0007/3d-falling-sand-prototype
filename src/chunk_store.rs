@@ -346,6 +346,7 @@ pub struct ChunkStore {
     unmeshed_chunks: HashSet<ChunkCoord>,
     deferred_dirty_on_load: HashSet<ChunkCoord>,
     deferred_neighbor_dirty_on_mesh: HashMap<ChunkCoord, Option<u8>>,
+    sim_dirty_voxels: Vec<VoxelCoord>,
 }
 
 impl ChunkStore {
@@ -357,6 +358,7 @@ impl ChunkStore {
             unmeshed_chunks: HashSet::new(),
             deferred_dirty_on_load: HashSet::new(),
             deferred_neighbor_dirty_on_mesh: HashMap::new(),
+            sim_dirty_voxels: Vec::new(),
         }
     }
 
@@ -391,6 +393,7 @@ impl ChunkStore {
             return;
         }
         chunk.set(x, y, z, material);
+        self.sim_dirty_voxels.push(coord);
         self.dirty_chunks.insert(chunk_coord);
         self.modified_chunks.insert(chunk_coord);
 
@@ -597,6 +600,7 @@ impl ChunkStore {
         self.unmeshed_chunks.clear();
         self.deferred_dirty_on_load.clear();
         self.deferred_neighbor_dirty_on_mesh.clear();
+        self.sim_dirty_voxels.clear();
     }
 
     pub fn mark_chunk_meshed(&mut self, coord: ChunkCoord) {
@@ -633,6 +637,10 @@ impl ChunkStore {
 
     pub fn dirty_chunks_snapshot(&self) -> Vec<ChunkCoord> {
         self.dirty_chunks.iter().copied().collect()
+    }
+
+    pub fn take_sim_dirty_voxels(&mut self) -> Vec<VoxelCoord> {
+        std::mem::take(&mut self.sim_dirty_voxels)
     }
 
     pub fn iter_loaded_chunks(&self) -> impl Iterator<Item = &ChunkCoord> {
@@ -762,6 +770,19 @@ mod tests {
             y: 1,
             z: edge,
         }));
+    }
+
+    #[test]
+    fn set_voxel_tracks_sim_dirty_voxel_edits() {
+        let mut store = ChunkStore::new();
+        let v = VoxelCoord { x: 2, y: 3, z: 4 };
+
+        store.set_voxel(v, 7);
+        store.set_voxel(v, 7);
+
+        let dirty = store.take_sim_dirty_voxels();
+        assert_eq!(dirty, vec![v]);
+        assert!(store.take_sim_dirty_voxels().is_empty());
     }
 
     #[test]
