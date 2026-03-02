@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
-use crate::sim::{material, Phase};
+use crate::sim::{is_player_passable_vegetation, material, Phase};
 use crate::types::VoxelCoord;
 
 #[derive(Default, Clone)]
@@ -169,6 +169,9 @@ impl FpsController {
                 for x in min.x..=max.x {
                     let id = get_voxel(x, y, z);
                     if id == 0 {
+                        continue;
+                    }
+                    if is_player_passable_vegetation(id) {
                         continue;
                     }
                     let phase = material(id).phase;

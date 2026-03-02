@@ -2303,13 +2303,32 @@ fn vegetation_pass_chunk(
                 continue;
             }
             if flora_roll < flora_p {
-                let ground = if let Some(local_idx) = cache.local_idx(lx, lz) {
-                    world.get(lx, cache.local_heights[local_idx], lz)
-                } else if weights[biome_index(BiomeType::Desert)] > 0.40 {
-                    SAND
-                } else {
-                    TURF
-                };
+                let support_lx = wx - config.world_origin[0];
+                let support_ly = ground_world_y - config.world_origin[1];
+                let support_lz = wz - config.world_origin[2];
+                let place_ly = support_ly + 1;
+                if support_lx < 0
+                    || support_lx >= world.dims[0] as i32
+                    || support_lz < 0
+                    || support_lz >= world.dims[2] as i32
+                    || support_ly < 0
+                    || support_ly >= world.dims[1] as i32
+                    || place_ly < 0
+                    || place_ly >= world.dims[1] as i32
+                {
+                    continue;
+                }
+
+                let support = world.get(support_lx, support_ly, support_lz);
+                let placement_cell = world.get(support_lx, place_ly, support_lz);
+                if !matches!(support, TURF | DIRT | SAND)
+                    || support == WATER
+                    || placement_cell == WATER
+                {
+                    continue;
+                }
+
+                let ground = support;
                 let pseudo_col = ColumnGenData {
                     wx,
                     wz,
@@ -3870,6 +3889,33 @@ mod tests {
             trunk_voxels > 0,
             "expected vegetation staging to produce trunk candidates, found {trunk_voxels}"
         );
+    }
+    #[test]
+    fn vegetation_pass_chunk_only_places_flora_on_dry_supported_ground() {
+        let config = ProcGenConfig::for_size(64, 0x4F10_22AA).with_origin([0, 0, 0]);
+        let world = generate_world(config);
+
+        let mut flora_count = 0usize;
+        for z in 0..world.dims[2] as i32 {
+            for x in 0..world.dims[0] as i32 {
+                let Some(top) = surface_y(&world, x, z) else {
+                    continue;
+                };
+                let above = world.get(x, top + 1, z);
+                if matches!(above, GRASS | BUSH) {
+                    let support = world.get(x, top, z);
+                    assert!(
+                        matches!(support, TURF | DIRT | SAND),
+                        "flora should only be placed on turf/dirt/sand support, found {support}"
+                    );
+                    assert_ne!(support, WATER, "flora support voxel must not be submerged");
+                    assert_ne!(above, WATER, "flora placement voxel must not be submerged");
+                    flora_count += 1;
+                }
+            }
+        }
+
+        assert!(flora_count < world.dims[0] * world.dims[2]);
     }
 
     #[test]
