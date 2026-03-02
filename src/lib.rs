@@ -9,6 +9,7 @@ pub mod physics_gpu;
 pub mod renderer;
 pub mod sim;
 pub mod sim_world;
+pub mod simulation;
 pub mod streaming;
 pub mod types;
 

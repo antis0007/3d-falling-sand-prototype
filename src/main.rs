@@ -11,6 +11,7 @@ mod procgen;
 mod renderer;
 mod sim;
 mod sim_world;
+mod simulation;
 mod streaming;
 mod types;
 mod ui;
