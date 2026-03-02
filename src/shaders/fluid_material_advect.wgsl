@@ -1,7 +1,6 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
-const EMPTY: u32 = 0u;
-const WATER: u32 = 5u;
+// Material IDs are injected from generated sim_ids.wgsl at shader load time.
 
 struct FrameParams {
     page_index: u32,

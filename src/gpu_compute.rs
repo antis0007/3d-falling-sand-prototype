@@ -13,6 +13,17 @@ use std::time::Instant;
 const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
 
+#[cfg(feature = "gpu-compute")]
+const GENERATED_SIM_IDS_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/sim_ids.wgsl"));
+
+#[cfg(feature = "gpu-compute")]
+fn with_generated_sim_ids(shader_src: &str) -> String {
+    format!(
+        "{GENERATED_SIM_IDS_WGSL}
+{shader_src}"
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
     Cpu,
@@ -147,7 +158,9 @@ impl GpuComputeRuntime {
         {
             let fluid_advect_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("fluid advect shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fluid_advect.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    with_generated_sim_ids(include_str!("shaders/fluid_advect.wgsl")).into(),
+                ),
             });
             let fluid_divergence_module =
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -171,12 +184,15 @@ impl GpuComputeRuntime {
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("fluid material advect shader"),
                     source: wgpu::ShaderSource::Wgsl(
-                        include_str!("shaders/fluid_material_advect.wgsl").into(),
+                        with_generated_sim_ids(include_str!("shaders/fluid_material_advect.wgsl"))
+                            .into(),
                     ),
                 });
             let meshing_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("chunk meshing shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("compute_meshing.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    with_generated_sim_ids(include_str!("compute_meshing.wgsl")).into(),
+                ),
             });
 
             let entries = [
