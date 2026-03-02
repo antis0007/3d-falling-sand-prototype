@@ -433,9 +433,8 @@ pub fn draw(
                         .color(egui::Color32::from_rgb(220, 240, 255))
                         .strong();
 
-                    // SelectableLabel can't set text color directly; use RichText.
                     let resp = ui
-                        .add(egui::SelectableLabel::new(ui_state.show_debug, label))
+                        .add(egui::Button::new(label).selected(ui_state.show_debug))
                         .on_hover_text("Toggle debug/performance panel");
 
                     if resp.clicked() {
