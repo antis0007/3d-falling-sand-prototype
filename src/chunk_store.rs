@@ -631,6 +631,10 @@ impl ChunkStore {
         self.dirty_chunks.drain().collect()
     }
 
+    pub fn dirty_chunks_snapshot(&self) -> Vec<ChunkCoord> {
+        self.dirty_chunks.iter().copied().collect()
+    }
+
     pub fn iter_loaded_chunks(&self) -> impl Iterator<Item = &ChunkCoord> {
         self.chunks.keys()
     }

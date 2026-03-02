@@ -8,7 +8,7 @@ use crate::renderer::{
     Camera, LodMeshingBudgets, LodRadii, Renderer, RendererSettings,
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
-use crate::sim_world::{step_region_profiled, Rng};
+use crate::sim_world::{Rng, SimWorld};
 use crate::streaming::{
     is_urgent_chunk, ChunkStreaming, DesiredChunks, GenerateJobClass, VisibilityContext,
 };
@@ -665,6 +665,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut cached_stream_tuning = stream_tuning.clone();
     let mut auto_tune = AutoTuneState::default();
     let mut rng = Rng::new(0x1234_5678);
+    let mut sim_world = SimWorld::default();
     let mut sim_acc = 0.0f32;
 
     let mut input = InputState::default();
@@ -1765,7 +1766,7 @@ pub async fn run() -> anyhow::Result<()> {
                             let ready_steps = (sim_acc / FIXED_SIM_STEP_SECONDS).floor() as usize;
                             let steps_to_run = ready_steps.min(sim_substeps_budget_effective);
                             for _ in 0..steps_to_run {
-                                sim_chunk_steps += step_region_profiled(
+                                sim_chunk_steps += sim_world.step_region(
                                     &mut store,
                                     &cached_sim_region,
                                     player_chunk,
@@ -1775,7 +1776,7 @@ pub async fn run() -> anyhow::Result<()> {
                             sim_substeps_executed = steps_to_run;
                             sim_acc -= steps_to_run as f32 * FIXED_SIM_STEP_SECONDS;
                         } else if step_once && !ui.paused_menu {
-                            sim_chunk_steps += step_region_profiled(
+                            sim_chunk_steps += sim_world.step_region(
                                 &mut store,
                                 &cached_sim_region,
                                 player_chunk,
