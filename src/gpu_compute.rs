@@ -520,3 +520,72 @@ pub(crate) fn rebuilt_snapshot_from_materials(
 ) -> crate::renderer::ChunkSnapshot {
     job.snapshot.with_center_materials(materials)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::chunk_store::ChunkStore;
+    use crate::sim::XorShift32;
+    use crate::sim_world::SimWorld;
+    use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord};
+    use std::collections::HashSet;
+
+    #[test]
+    fn emulated_compute_matches_cpu_reference_with_zero_tolerance() {
+        let mut store_a = ChunkStore::new();
+        let mut store_b = ChunkStore::new();
+        let chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let base = chunk_to_world_min(chunk);
+        let seed_voxels = [
+            VoxelCoord {
+                x: base.x + 4,
+                y: base.y + 8,
+                z: base.z + 4,
+            },
+            VoxelCoord {
+                x: base.x + 5,
+                y: base.y + 10,
+                z: base.z + 4,
+            },
+            VoxelCoord {
+                x: base.x + 6,
+                y: base.y + 12,
+                z: base.z + 4,
+            },
+        ];
+        for v in seed_voxels {
+            store_a.set_voxel(v, 3);
+            store_b.set_voxel(v, 3);
+        }
+
+        let region = HashSet::from([chunk]);
+        let mut sim_cpu = SimWorld::default();
+        let mut sim_compute_emulated = SimWorld::default();
+        for v in seed_voxels {
+            sim_cpu.notify_voxel_edit(v);
+            sim_compute_emulated.notify_voxel_edit(v);
+        }
+
+        let mut rng_cpu = XorShift32::new(123);
+        let mut rng_compute = XorShift32::new(123);
+        for _ in 0..6 {
+            sim_cpu.step_region(&mut store_a, &region, chunk, &mut rng_cpu);
+            sim_compute_emulated.step_region(&mut store_b, &region, chunk, &mut rng_compute);
+        }
+
+        let soa_cpu = sim_cpu.build_soa_for_chunk(&store_a, chunk).unwrap();
+        let soa_compute = sim_compute_emulated
+            .build_soa_for_chunk(&store_b, chunk)
+            .unwrap();
+        let mismatches = soa_cpu
+            .material_ids
+            .iter()
+            .zip(soa_compute.material_ids.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            mismatches <= 0,
+            "mismatch count {} exceeded tolerance",
+            mismatches
+        );
+    }
+}
