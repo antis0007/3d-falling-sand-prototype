@@ -247,6 +247,21 @@ impl SimWorld {
                     for destination in candidates {
                         let (destination_chunk, _) = voxel_to_chunk(destination);
                         if !store.is_chunk_loaded(destination_chunk) {
+                            if mat.phase == Phase::Gas {
+                                let escape_chance = gas_boundary_escape_chance(
+                                    source,
+                                    source_chunk,
+                                    center,
+                                    destination.y > source.y,
+                                );
+                                if rng.chance(escape_chance) {
+                                    state.pending_writes.push((source, EMPTY));
+                                    state.mark_source_moved(idx);
+                                    moved_any = true;
+                                    state.activation_centers.push(source);
+                                    break;
+                                }
+                            }
                             continue;
                         }
                         if destination_chunk == chunk_coord {
@@ -749,8 +764,15 @@ fn spawn_reaction_product(
 ) -> bool {
     let mut dirs = neighbor_dirs6();
     rng.shuffle(&mut dirs);
+    let product_phase = material(product).phase;
     for [dx, dy, dz] in dirs {
         let np = offset_voxel(origin, dx, dy, dz);
+        if !store.is_voxel_chunk_loaded(np) {
+            if product_phase == Phase::Gas {
+                return true;
+            }
+            continue;
+        }
         if store.get_voxel(np) == EMPTY {
             store.set_voxel(np, product);
             return true;
@@ -1013,6 +1035,29 @@ fn movement_candidates(
     }
 }
 
+fn gas_boundary_escape_chance(
+    source: VoxelCoord,
+    source_chunk: ChunkCoord,
+    center_chunk: ChunkCoord,
+    is_upward_attempt: bool,
+) -> f32 {
+    let local = voxel_to_chunk(source).1;
+    let max_local_y = (CHUNK_SIZE_VOXELS - 1) as f32;
+    let height = (local[1] as f32 / max_local_y).clamp(0.0, 1.0);
+
+    let dx = (source_chunk.x - center_chunk.x).abs() as f32;
+    let dy = (source_chunk.y - center_chunk.y).abs() as f32;
+    let dz = (source_chunk.z - center_chunk.z).abs() as f32;
+    let distance = ((dx * dx) + (dy * dy) + (dz * dz)).sqrt();
+    let distance_factor = (distance / 4.0).clamp(0.0, 1.0);
+
+    let mut chance = 0.06 + (height * 0.24) + (distance_factor * 0.20);
+    if is_upward_attempt {
+        chance += 0.18 + (height * distance_factor * 0.22);
+    }
+    chance.clamp(0.0, 0.95)
+}
+
 fn can_displace(
     mover_phase: Phase,
     mover_density: i16,
@@ -1150,5 +1195,73 @@ mod tests {
         assert_eq!(soa.material_ids.len(), (CHUNK_SIZE_VOXELS as usize).pow(3));
         assert_eq!(soa.phases.len(), soa.material_ids.len());
         assert_eq!(soa.settled.len(), soa.material_ids.len());
+    }
+
+    #[test]
+    fn gas_escape_chance_increases_with_height_distance_and_upward_bias() {
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near_chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let far_chunk = ChunkCoord { x: 3, y: 0, z: 3 };
+
+        let low = VoxelCoord { x: 0, y: 0, z: 0 };
+        let high = VoxelCoord {
+            x: 0,
+            y: CHUNK_SIZE_VOXELS - 1,
+            z: 0,
+        };
+
+        let low_chance = gas_boundary_escape_chance(low, near_chunk, center, false);
+        let high_chance = gas_boundary_escape_chance(high, near_chunk, center, false);
+        let far_upward_chance = gas_boundary_escape_chance(high, far_chunk, center, true);
+
+        assert!(high_chance > low_chance);
+        assert!(far_upward_chance > high_chance);
+    }
+
+    #[test]
+    fn gas_dissipates_against_unloaded_boundary_without_chunk_spawn() {
+        let mut store = ChunkStore::new();
+        let source_chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let base = chunk_to_world_min(source_chunk);
+        let top_center = VoxelCoord {
+            x: base.x + (CHUNK_SIZE_VOXELS / 2),
+            y: base.y + CHUNK_SIZE_VOXELS - 1,
+            z: base.z + (CHUNK_SIZE_VOXELS / 2),
+        };
+
+        let mut chunk = LegacyChunk::new();
+        for z in 0..CHUNK_SIZE_VOXELS as usize {
+            for y in 0..CHUNK_SIZE_VOXELS as usize {
+                for x in 0..CHUNK_SIZE_VOXELS as usize {
+                    chunk.set(x, y, z, STONE);
+                }
+            }
+        }
+        chunk.set(
+            (CHUNK_SIZE_VOXELS / 2) as usize,
+            (CHUNK_SIZE_VOXELS - 1) as usize,
+            (CHUNK_SIZE_VOXELS / 2) as usize,
+            SMOKE,
+        );
+        store.insert_chunk(source_chunk, chunk);
+
+        let region = HashSet::from([source_chunk]);
+        let mut rng = XorShift32::new(3);
+        let mut sim = SimWorld::default();
+        sim.notify_voxel_edit(top_center);
+
+        for _ in 0..64 {
+            sim.step_region(&mut store, &region, source_chunk, &mut rng);
+            if store.get_voxel(top_center) == EMPTY {
+                break;
+            }
+        }
+
+        assert_eq!(store.get_voxel(top_center), EMPTY);
+        assert!(!store.is_chunk_loaded(ChunkCoord {
+            x: source_chunk.x,
+            y: source_chunk.y + 1,
+            z: source_chunk.z,
+        }));
     }
 }
