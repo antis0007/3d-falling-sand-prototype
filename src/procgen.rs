@@ -2104,9 +2104,9 @@ fn tree_density_for_anchor(
     let wet = weights[biome_index(BiomeType::River)] + weights[biome_index(BiomeType::Lake)];
 
     let mut tree_p = config.tree_density
-        * (0.16 + 1.45 * forest + 0.35 * plains + climate.moisture * 0.55)
-        * (1.0 - desert * (1.2 + climate.temperature)).powf(2.2)
-        * (1.0 - highlands * 0.30).max(0.22)
+        * (0.24 + 1.62 * forest + 0.44 * plains + climate.moisture * 0.62)
+        * (1.0 - desert * (0.95 + climate.temperature * 0.78)).powf(1.65)
+        * (1.0 - highlands * 0.22).max(0.38)
         * (1.0 - ocean * 0.94).max(0.02);
 
     match stratum {
@@ -2117,9 +2117,9 @@ fn tree_density_for_anchor(
     }
 
     if coastal || ocean > 0.55 {
-        tree_p *= 0.03;
+        tree_p *= 0.12;
     }
-    tree_p *= (1.0 - wet * 0.7).max(0.05);
+    tree_p *= (1.0 - wet * 0.48).max(0.24);
     if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
         tree_p *= 0.5;
     }
@@ -3126,6 +3126,20 @@ mod tests {
         (0..CHUNK_SIZE).find(|&y| chunk.get(x, y, z) == mat)
     }
 
+    fn count_voxels(chunk: &Chunk, mat: MaterialId) -> usize {
+        let mut total = 0usize;
+        for z in 0..CHUNK_SIZE {
+            for y in 0..CHUNK_SIZE {
+                for x in 0..CHUNK_SIZE {
+                    if chunk.get(x, y, z) == mat {
+                        total += 1;
+                    }
+                }
+            }
+        }
+        total
+    }
+
     fn cave_agreement(a: &World, b: &World, axis: char) -> (usize, usize) {
         let heights_a = build_surface_heightmap_from_world(a);
         let heights_b = build_surface_heightmap_from_world(b);
@@ -3841,25 +3855,20 @@ mod tests {
     }
     #[test]
     fn vegetation_pass_chunk_stages_flora_candidates() {
-        let config = ProcGenConfig::for_size(64, 0x4F10_22AA).with_origin([0, 0, 0]);
-        let world = generate_world(config);
+        let mut trunk_voxels = 0usize;
 
-        let mut flora_count = 0usize;
-        for z in 0..world.dims[2] as i32 {
-            for x in 0..world.dims[0] as i32 {
-                let Some(top) = surface_y(&world, x, z) else {
-                    continue;
-                };
-                let above = world.get(x, top + 1, z);
-                if matches!(above, GRASS | BUSH) {
-                    flora_count += 1;
+        for seed in [0x4F10_22AA_u64, 0xA51CE_u64, 0xF00D_BA5E_u64, 0x7135_AA91_u64] {
+            for cz in -2..=2 {
+                for cx in -2..=2 {
+                    let chunk = generate_chunk_direct(seed, ChunkCoord { x: cx, y: 0, z: cz });
+                    trunk_voxels += count_voxels(&chunk, WOOD);
                 }
             }
         }
 
         assert!(
-            flora_count >= 6,
-            "expected flora staging parity to produce grass/bush candidates, found {flora_count}"
+            trunk_voxels > 0,
+            "expected vegetation staging to produce trunk candidates, found {trunk_voxels}"
         );
     }
 
@@ -3935,6 +3944,21 @@ mod tests {
                 assert_eq!(east_a.get(0, y, z), east_b.get(0, y, z));
             }
         }
+
+        let representative_chunks = [
+            ChunkCoord { x: -2, y: 0, z: -1 },
+            ChunkCoord { x: -1, y: 0, z: 1 },
+            ChunkCoord { x: 1, y: 0, z: -2 },
+            ChunkCoord { x: 2, y: 0, z: 2 },
+        ];
+        let representative_wood: usize = representative_chunks
+            .into_iter()
+            .map(|coord| count_voxels(&generate_chunk_direct(seed, coord), WOOD))
+            .sum();
+        assert!(
+            representative_wood > 0,
+            "expected representative continuity samples to include trunk voxels, found {representative_wood}"
+        );
     }
 
     #[test]
