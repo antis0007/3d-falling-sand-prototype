@@ -26,10 +26,10 @@ const CHUNK_HYDROLOGY_MAX_HALO_RADIUS: i32 = 16;
 const CHUNK_HYDROLOGY_HALO_DIVISOR: i32 = 4;
 
 // Hydrology thresholds tuned with chunk-scale halo sampling.
-const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.43;
-const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.58;
-const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.58;
-const HYDRO_BASIN_MIN_CELL_COUNT: usize = 9;
+const HYDRO_RIVER_MASK_THRESHOLD: f32 = 0.40;
+const HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD: f32 = 0.54;
+const HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD: f32 = 0.52;
+const HYDRO_BASIN_MIN_CELL_COUNT: usize = 6;
 const TREE_ANCHOR_CELL_SIZE: i32 = 12;
 const TREE_ANCHOR_CANDIDATES_PER_CELL: i32 = 2;
 const TREE_ANCHOR_MIN_SPACING: i32 = 7;
@@ -920,7 +920,7 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
             let accum_norm = (flow_accum[idx].ln() / 6.0).clamp(0.0, 1.0);
             ocean_weight[local_idx] = context.cells[idx].ocean_weight;
             river_weight[local_idx] = smoothstep(
-                (accum_norm * 0.9 + context.cells[idx].river_weight * 0.75 - 0.38) / 0.45,
+                (accum_norm * 0.95 + context.cells[idx].river_weight * 0.80 - 0.33) / 0.48,
             );
         }
     }
@@ -1003,7 +1003,7 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
     let mut river_level = vec![None; len];
     let mut river_mask = vec![false; ctx_len];
     for i in 0..ctx_len {
-        river_mask[i] = context.cells[i].river_weight > 0.45;
+        river_mask[i] = context.cells[i].river_weight > HYDRO_RIVER_MASK_THRESHOLD;
     }
     let mut channel_level_ctx = vec![None::<i32>; ctx_len];
     for i in 0..ctx_len {
@@ -1058,7 +1058,9 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
 
     let mut basin_cells: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..ctx_len {
-        if context.cells[i].ocean_weight > 0.55 || context.cells[i].river_weight > 0.55 {
+        if context.cells[i].ocean_weight > HYDRO_BASIN_OCEAN_EXCLUDE_THRESHOLD
+            || context.cells[i].river_weight > HYDRO_BASIN_RIVER_EXCLUDE_THRESHOLD
+        {
             continue;
         }
         if let Some(s) = sink_owner[i] {
@@ -1067,7 +1069,7 @@ fn build_hydrology_cache_impl(config: &ProcGenConfig, cache: &ProcGenFieldCache)
     }
     let mut lake_level = vec![None; len];
     for (_sink, cells) in basin_cells {
-        if cells.len() < 4 {
+        if cells.len() < HYDRO_BASIN_MIN_CELL_COUNT {
             continue;
         }
         let mut in_basin = vec![false; ctx_len];
@@ -1639,8 +1641,8 @@ fn hydrology_fill_pass(
             }
 
             if let Some(level) = hydrology.river_level[idx] {
-                let river_fill = smoothstep((river_w - 0.24) / 0.50);
-                if river_fill <= 0.02 {
+                let river_fill = smoothstep((river_w - 0.20) / 0.55);
+                if river_fill <= 0.008 {
                     continue;
                 }
                 if estuary {
@@ -1652,7 +1654,7 @@ fn hydrology_fill_pass(
                 if floor < 1 || top < floor {
                     continue;
                 }
-                let can_fill = open_sky || top >= surface - 1;
+                let can_fill = open_sky || aquifer || top >= surface - 2;
                 if !can_fill {
                     continue;
                 }
@@ -3137,6 +3139,58 @@ mod tests {
         None
     }
 
+    fn count_river_water_columns(
+        world: &World,
+        heights: &[i32],
+        hydrology: &HydrologyData,
+    ) -> usize {
+        let width = world.dims[0] as i32;
+        let depth = world.dims[2] as i32;
+        let mut total = 0usize;
+        for z in 0..depth {
+            for x in 0..width {
+                let idx = x as usize + z as usize * width as usize;
+                if hydrology.river_weight[idx] <= HYDRO_RIVER_MASK_THRESHOLD {
+                    continue;
+                }
+                let surface = heights[idx].max(1);
+                let mut has_water = false;
+                for y in 1..=surface {
+                    if world.get(x, y, z) == WATER {
+                        has_water = true;
+                        break;
+                    }
+                }
+                if has_water {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
+    fn count_river_channel_columns(hydrology: &HydrologyData) -> usize {
+        hydrology
+            .river_level
+            .iter()
+            .filter(|level| level.is_some())
+            .count()
+    }
+
+    fn count_water_columns(world: &World) -> usize {
+        let width = world.dims[0] as i32;
+        let depth = world.dims[2] as i32;
+        let mut total = 0usize;
+        for z in 0..depth {
+            for x in 0..width {
+                if water_surface(world, x, z).is_some() {
+                    total += 1;
+                }
+            }
+        }
+        total
+    }
+
     fn column_contains(chunk: &Chunk, x: usize, z: usize, mat: MaterialId) -> bool {
         (0..CHUNK_SIZE).any(|y| chunk.get(x, y, z) == mat)
     }
@@ -3375,6 +3429,7 @@ mod tests {
         let timings = ProcGenPassTimings::default();
         let (heights, columns) = build_column_cache(&config, &timings);
         let hydrology = build_hydrology_cache(&config, &heights, &columns, &timings);
+        let world = generate_world(config);
         let sea = config.sea_level_local();
 
         let mut saw_river_channel = false;
@@ -3394,6 +3449,11 @@ mod tests {
             assert!(
                 found_above_sea,
                 "expected inland river levels to remain above local sea level"
+            );
+            let river_water_cols = count_river_water_columns(&world, &heights, &hydrology);
+            assert!(
+                river_water_cols >= 24,
+                "expected at least 24 inland river-water columns for seed 0xBADC_0FFE, got {river_water_cols}"
             );
         }
     }
@@ -3689,7 +3749,7 @@ mod tests {
     #[test]
     fn chunk_hydrology_seams_keep_river_presence_level_and_width_continuous() {
         let size = 64i32;
-        let seed = 0x7135_AA91;
+        let seed = 0xBADC_0FFE;
         let center_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, 0]);
         let east_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([size, 0, 0]);
         let south_cfg = ProcGenConfig::for_size(size as usize, seed).with_origin([0, 0, size]);
@@ -3876,7 +3936,12 @@ mod tests {
     fn vegetation_pass_chunk_stages_flora_candidates() {
         let mut trunk_voxels = 0usize;
 
-        for seed in [0x4F10_22AA_u64, 0xA51CE_u64, 0xF00D_BA5E_u64, 0x7135_AA91_u64] {
+        for seed in [
+            0x4F10_22AA_u64,
+            0xA51CE_u64,
+            0xF00D_BA5E_u64,
+            0x7135_AA91_u64,
+        ] {
             for cz in -2..=2 {
                 for cx in -2..=2 {
                     let chunk = generate_chunk_direct(seed, ChunkCoord { x: cx, y: 0, z: cz });
@@ -4116,6 +4181,15 @@ mod tests {
         let center_hydro = build_hydrology_cache_for_chunk(&center_cfg, &center_cache, &timings);
         let east_hydro = build_hydrology_cache_for_chunk(&east_cfg, &east_cache, &timings);
         let south_hydro = build_hydrology_cache_for_chunk(&south_cfg, &south_cache, &timings);
+
+        let river_probe_cfg =
+            ProcGenConfig::for_size(CHUNK_SIZE, 0xBADC_0FFE).with_origin([0, 0, 0]);
+        let river_probe_world = generate_world(river_probe_cfg);
+        let river_probe_cols = count_water_columns(&river_probe_world);
+        assert!(
+            river_probe_cols >= 8,
+            "expected at least 8 river-water columns for seam probe seed 0xBADC_0FFE, got {river_probe_cols}"
+        );
 
         for z in 0..CHUNK_SIZE {
             let center_idx = CHUNK_SIZE - 1 + z * CHUNK_SIZE;
