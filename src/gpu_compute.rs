@@ -59,6 +59,7 @@ struct SimulationBindResources<'a> {
     active_tile_counter: &'a wgpu::Buffer,
     edit_commands: &'a wgpu::Buffer,
     page_params: &'a wgpu::Buffer,
+    diagnostics: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -218,6 +219,7 @@ impl GpuComputeRuntime {
                 bgl_entry(6, false),
                 bgl_entry(7, true),
                 bgl_entry(8, true),
+                bgl_entry(12, false),
             ];
             let simulation_bgl =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -446,6 +448,10 @@ impl GpuComputeRuntime {
                     binding: 8,
                     resource: resources.page_params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: resources.diagnostics.as_entire_binding(),
+                },
             ],
         })
     }
@@ -638,6 +644,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 active_tile_counter: &active_tile_counter,
                 edit_commands: &edit_commands,
                 page_params: &page_params,
+                diagnostics: &diagnostics,
             };
             let simulation_bg = runtime.create_simulation_bind_group(&device, simulation_resources);
             let meshing_resources = MeshingBindResources {
