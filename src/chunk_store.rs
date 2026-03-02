@@ -793,6 +793,27 @@ mod tests {
     }
 
     #[test]
+    fn chunk_border_strips_keep_unknown_neighbors_unset() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        store.insert_chunk_with_policy(
+            center,
+            Chunk::new_empty(),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let borders = store.chunk_border_strips(center);
+        assert_eq!(borders.known_neighbor_mask, 0);
+        assert!(borders.neg_x.iter().all(|&id| id == EMPTY));
+        assert!(borders.pos_x.iter().all(|&id| id == EMPTY));
+        assert!(borders.neg_y.iter().all(|&id| id == EMPTY));
+        assert!(borders.pos_y.iter().all(|&id| id == EMPTY));
+        assert!(borders.neg_z.iter().all(|&id| id == EMPTY));
+        assert!(borders.pos_z.iter().all(|&id| id == EMPTY));
+    }
+
+    #[test]
     fn chunk_border_strips_capture_neighbor_boundary_voxels() {
         let mut store = ChunkStore::new();
         let center = ChunkCoord { x: 0, y: 0, z: 0 };
@@ -865,6 +886,12 @@ mod tests {
 
         let input = store.build_meshing_input(center).expect("center input");
         assert_eq!(input.known_neighbor_mask, 0);
+        assert!(input.neg_x.iter().all(|&id| id == EMPTY));
+        assert!(input.pos_x.iter().all(|&id| id == EMPTY));
+        assert!(input.neg_y.iter().all(|&id| id == EMPTY));
+        assert!(input.pos_y.iter().all(|&id| id == EMPTY));
+        assert!(input.neg_z.iter().all(|&id| id == EMPTY));
+        assert!(input.pos_z.iter().all(|&id| id == EMPTY));
 
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
         store.insert_chunk_with_policy(east, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
