@@ -1,48 +1,37 @@
-# Macrochunk Migration Foundation
+# Simulation + Procgen Migration Notes
 
-This document captures the target interfaces for a chunk-first world pipeline. This PR intentionally adds only type/module scaffolding so follow-up PRs can implement behavior incrementally while keeping the current macrochunk path intact.
+## Removed / reduced redundant systems
 
-## Canonical Types
+- Retained `SimulationRuntime` as the only simulation entry point and removed the old pseudo-fluid velocity/pressure path inside `GpuFluidBackend`.
+- `GpuFluidBackend` now uses a deterministic state-class transport model (solid/powder/liquid/gas) that shares behavior classification with `sim::material`.
+- Added explicit runtime warning when GPU simulation mode is selected but only deterministic CPU emulation is active, preventing silent feature failure.
 
-- `types::MaterialId`: canonical voxel material identifier (currently re-exported from `world`).
-- `types::VoxelCoord { x, y, z }`: world-space voxel coordinates.
-- `types::ChunkCoord { x, y, z }`: chunk-grid coordinates (not macrochunk coordinates).
-- `types::CHUNK_SIZE_VOXELS`: chunk edge length in voxels (currently mirrors `world::CHUNK_SIZE`).
+## Unified data flow
 
-Helpers:
+1. **Generation** (`procgen.rs`): noise/biome/hydrology -> chunk voxels + vegetation intents.
+2. **Simulation** (`simulation/mod.rs`, `simulation/gpu_fluid.rs`, `sim_world.rs`): runtime routes to a selected backend; both backends now use common material phase semantics.
+3. **Meshing** (`meshing.rs`, `gpu_compute.rs`): consumes post-simulation chunk state.
+4. **Rendering** (`renderer.rs`): consumes meshed geometry.
 
-- `voxel_to_chunk(voxel) -> (ChunkCoord, [u32; 3])`
-  - floor-divides world voxel coordinates into chunk coordinates
-  - returns non-negative local coordinates (`0..CHUNK_SIZE_VOXELS`)
-- `chunk_to_world_min(chunk) -> VoxelCoord`
-  - returns the minimum world voxel coordinate covered by a chunk
+## Tunables
 
-## ChunkStore API Draft
+### Terrain
 
-`chunk_store::ChunkStore` is intended to become the authoritative sparse chunk map.
+- `ProcGenConfig::terrain_scale`
+- `ProcGenConfig::cave_density`
+- Added stratified inland variation band in `terrain_height` for more ecosystem relief transitions.
 
-Planned primary API:
+### Vegetation
 
-- `get_voxel(coord) -> Option<MaterialId>`
-- `set_voxel(coord, material)`
-- `get_chunk(coord) -> Option<&Chunk>`
-- `mark_dirty(coord)`
+- `ProcGenConfig::tree_density` default increased from `0.028` to `0.042`.
+- Wet-surface tree anchors are damped instead of hard-rejected (`tree_p *= 0.3`) to preserve riparian vegetation while avoiding full waterline overgrowth.
 
-## Streaming API Draft
+### Simulation
 
-`streaming::StreamingState` will own chunk residency decisions.
+- `SUBSTEPS` in GPU-emulation backend increased to 3 for better settling/advection stability.
+- State movement priority table in `movement_candidates` controls powder, liquid, and gas transport characteristics.
 
-Planned primary API:
+## Known limitations
 
-- `ensure_resident(region)`
-- `get_resident_set() -> &HashSet<ChunkCoord>`
-
-## Floating Origin Draft
-
-`floating_origin` will manage large-world recentering.
-
-Planned responsibilities:
-
-- recenter threshold configuration
-- origin translation state and updates
-- coordination hooks for renderer/simulation transforms
+- Full world-simulation WGSL execution is not yet wired into `SimulationRuntime`; current `GpuFluid` mode is deterministic CPU emulation with diagnostics.
+- Cross-chunk fluid pressure continuity is still approximated by chunk-local movement and dirty-region readback.

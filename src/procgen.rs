@@ -556,7 +556,7 @@ impl ProcGenConfig {
             sky_ceiling_start: 160,
             terrain_scale: 1.0,
             cave_density: 0.13,
-            tree_density: 0.028,
+            tree_density: 0.042,
         }
     }
 
@@ -2194,7 +2194,7 @@ fn vegetation_pass_chunk(
                     ground_world_y,
                 );
 
-                if is_surface_wet_for_tree(
+                let wet_surface = is_surface_wet_for_tree(
                     config,
                     cache,
                     hydrology,
@@ -2202,13 +2202,14 @@ fn vegetation_pass_chunk(
                     anchor.wz,
                     ground_world_y,
                     ocean,
-                ) {
-                    continue;
-                }
+                );
 
-                let tree_p = tree_density_for_anchor(
+                let mut tree_p = tree_density_for_anchor(
                     config, weights, climate, stratum, coastal, ocean, landmark,
                 );
+                if wet_surface {
+                    tree_p *= 0.3;
+                }
                 let roll = hash01(
                     config.seed ^ 0x7777_3333,
                     anchor.wx,
@@ -2785,6 +2786,15 @@ fn terrain_height(config: &ProcGenConfig, x: i32, z: i32, weights: [f32; BIOME_C
     let valley_cut = valley * (4.2 + highlands * 2.4 + plains * 1.2);
     inland -= valley_cut;
     inland -= lake * 4.2;
+
+    let strata_warp = fbm2(
+        config.seed ^ 0x4E71_553A,
+        x as f32 * 0.018 * scale,
+        z as f32 * 0.018 * scale,
+        3,
+    ) - 0.5;
+    let strata_band = ((inland - sea_level_world) * 0.12 + strata_warp * 2.4).sin();
+    inland += strata_band * (0.8 + highlands * 2.2 + desert_land * 1.4);
 
     let ocean_depth_shape = (fbm2(
         config.seed ^ 0x0CEA_0001,
