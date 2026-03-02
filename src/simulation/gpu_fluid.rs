@@ -52,8 +52,7 @@ impl SimulationBackend for GpuFluidBackend {
         self.frame_index = self.frame_index.wrapping_add(1);
         SimulationStepStats {
             stepped_chunks: stepped_chunks.len(),
-            skipped_chunks: 0,
-            boundary_dissipated_particles: 0,
+            ..SimulationStepStats::default()
         }
     }
 

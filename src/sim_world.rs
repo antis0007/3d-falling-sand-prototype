@@ -31,8 +31,11 @@ const DEAD_LEAF: u16 = 24;
 
 pub type Rng = XorShift32;
 
-const CHUNK_COOLDOWN_TICKS: u8 = 8;
-const MAX_CHUNKS_PER_STEP: usize = 96;
+const BASE_CHUNK_COOLDOWN_TICKS: u8 = 8;
+const BASE_MAX_CHUNKS_PER_STEP: usize = 96;
+const MIN_CHUNKS_PER_STEP: usize = 24;
+const MAX_DYNAMIC_CHUNKS_PER_STEP: usize = 192;
+const CHUNK_STARVATION_WAIT_TICKS: u16 = 10;
 const CHUNK_VOLUME: usize = (CHUNK_SIZE_VOXELS as usize).pow(3);
 const CHUNK_WORDS: usize = CHUNK_VOLUME.div_ceil(64);
 const MAX_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 768;
@@ -72,6 +75,8 @@ struct ChunkFrontierState {
     cooldown_ticks: u8,
     recent_activity: u16,
     moving_avg_processed: f32,
+    dormant_water_bits: Vec<u64>,
+    wait_ticks: u16,
 }
 
 impl ChunkFrontierState {
@@ -90,6 +95,8 @@ impl ChunkFrontierState {
             cooldown_ticks: 0,
             recent_activity: 0,
             moving_avg_processed: 0.0,
+            dormant_water_bits: vec![0; CHUNK_WORDS],
+            wait_ticks: 0,
         }
     }
 
@@ -133,6 +140,20 @@ impl ChunkFrontierState {
         (self.moved_sources_bits[i / 64] & (1u64 << (i % 64))) != 0
     }
 
+    fn mark_water_dormant(&mut self, idx: u16) {
+        let i = idx as usize;
+        self.dormant_water_bits[i / 64] |= 1u64 << (i % 64);
+    }
+
+    fn clear_water_dormant(&mut self, idx: u16) {
+        let i = idx as usize;
+        self.dormant_water_bits[i / 64] &= !(1u64 << (i % 64));
+    }
+
+    fn water_dormant(&self, idx: u16) -> bool {
+        let i = idx as usize;
+        (self.dormant_water_bits[i / 64] & (1u64 << (i % 64))) != 0
+    }
     fn try_claim_local_destination(&mut self, idx: usize) -> bool {
         let word = idx / 64;
         let bit = 1u64 << (idx % 64);
@@ -174,11 +195,17 @@ impl SimWorld {
         let step_start = Instant::now();
 
         let mut candidates = self.prioritized_chunks(center, region);
-        if candidates.len() > MAX_CHUNKS_PER_STEP {
-            candidates.truncate(MAX_CHUNKS_PER_STEP);
+        let mut stats = SimulationStepStats::default();
+        let max_chunks_this_step = dynamic_chunk_budget(
+            candidates.len(),
+            step_start.elapsed().as_secs_f32() * 1000.0,
+        );
+        if candidates.len() > max_chunks_this_step {
+            stats.skipped_active_chunks += candidates.len() - max_chunks_this_step;
+            candidates.truncate(max_chunks_this_step);
         }
 
-        let mut stats = SimulationStepStats::default();
+        let mut total_wait_ticks = 0usize;
         for chunk_coord in candidates {
             if !store.is_chunk_loaded(chunk_coord) {
                 self.chunks.remove(&chunk_coord);
@@ -230,6 +257,13 @@ impl SimWorld {
                         continue;
                     }
                     let source = local_index_to_world(chunk_coord, idx);
+                    if state.water_dormant(idx) {
+                        let source_id = store.get_voxel(source);
+                        if source_id == WATER && water_cell_locally_settled(store, source) {
+                            continue;
+                        }
+                        state.clear_water_dormant(idx);
+                    }
                     let (source_chunk, _) = voxel_to_chunk(source);
                     if source_chunk != chunk_coord || !store.is_chunk_loaded(source_chunk) {
                         continue;
@@ -246,6 +280,10 @@ impl SimWorld {
                     }
 
                     let mat = material(mat_id);
+                    if mat_id == WATER && water_cell_locally_settled(store, source) {
+                        state.mark_water_dormant(idx);
+                        continue;
+                    }
                     if !phase_matches_class(mat.phase, metadata.phase_class) {
                         encountered_other_phase = true;
                         continue;
@@ -345,17 +383,26 @@ impl SimWorld {
 
                 if moved_any {
                     state.cooldown_ticks = 0;
+                    state.wait_ticks = 0;
                     state.recent_activity = state.recent_activity.saturating_add(4);
                 } else {
-                    state.cooldown_ticks = CHUNK_COOLDOWN_TICKS;
+                    state.cooldown_ticks =
+                        adaptive_chunk_cooldown(state.recent_activity, frontier_len);
+                    state.wait_ticks = state.wait_ticks.saturating_add(1);
                     state.recent_activity = state.recent_activity.saturating_sub(1);
                 }
+                stats.processed_frontier_voxels += process_cap;
+                total_wait_ticks += state.wait_ticks as usize;
                 activation_centers.append(&mut state.activation_centers);
             }
 
             for center in activation_centers {
                 enqueue_world_neighbors_to_chunks(&mut self.chunks, center, region);
             }
+        }
+
+        if stats.stepped_chunks > 0 {
+            stats.avg_chunk_wait_ticks = total_wait_ticks as f32 / stats.stepped_chunks as f32;
         }
 
         stats
@@ -427,6 +474,12 @@ impl SimWorld {
                 if !mat_likely_to_move_or_react(mat_id) {
                     continue;
                 }
+                if mat_id == WATER {
+                    let local_idx = idx as u16;
+                    if state.water_dormant(local_idx) {
+                        continue;
+                    }
+                }
                 let x = idx % CHUNK_SIZE_VOXELS as usize;
                 let y = (idx / CHUNK_SIZE_VOXELS as usize) % CHUNK_SIZE_VOXELS as usize;
                 let z = idx / (CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize);
@@ -471,7 +524,9 @@ impl SimWorld {
                         .chunks
                         .entry(chunk_coord)
                         .or_insert_with(ChunkFrontierState::new);
-                    state.enqueue_local(idx as u16);
+                    let local_idx = idx as u16;
+                    state.clear_water_dormant(local_idx);
+                    state.enqueue_local(local_idx);
                     state.cooldown_ticks = 0;
                 }
             }
@@ -492,24 +547,86 @@ impl SimWorld {
                 if state.cooldown_ticks > 0 {
                     state.cooldown_ticks -= 1;
                 }
+                state.wait_ticks = state.wait_ticks.saturating_add(1);
                 continue;
             }
             if state.cooldown_ticks > 0 {
                 state.cooldown_ticks -= 1;
+                state.wait_ticks = state.wait_ticks.saturating_add(1);
                 continue;
             }
-            out.push((coord, state.recent_activity));
+            out.push((coord, state.recent_activity, state.wait_ticks));
         }
 
-        out.sort_by_key(|(coord, activity)| {
+        out.sort_by_key(|(coord, activity, wait_ticks)| {
             let dx = i64::from(coord.x - center.x);
             let dy = i64::from(coord.y - center.y);
             let dz = i64::from(coord.z - center.z);
             let dist2 = dx * dx + dy * dy + dz * dz;
-            (dist2, std::cmp::Reverse(*activity))
+            let starved = *wait_ticks >= CHUNK_STARVATION_WAIT_TICKS;
+            (
+                !starved,
+                dist2,
+                std::cmp::Reverse(*activity),
+                std::cmp::Reverse(*wait_ticks),
+                coord.x,
+                coord.y,
+                coord.z,
+            )
         });
-        out.into_iter().map(|(coord, _)| coord).collect()
+        out.into_iter().map(|(coord, _, _)| coord).collect()
     }
+}
+
+fn adaptive_chunk_cooldown(recent_activity: u16, frontier_len: usize) -> u8 {
+    let pressure =
+        (frontier_len as f32 / MAX_FRONTIER_PROCESSED_PER_SUBSTEP as f32).clamp(0.0, 2.0);
+    let activity = (recent_activity as f32 / 12.0).clamp(0.0, 1.0);
+    let cooldown = BASE_CHUNK_COOLDOWN_TICKS as f32 + pressure * 2.0 - activity * 4.0;
+    cooldown.round().clamp(1.0, 14.0) as u8
+}
+
+fn dynamic_chunk_budget(active_chunks: usize, elapsed_ms: f32) -> usize {
+    let load = (active_chunks as f32 / BASE_MAX_CHUNKS_PER_STEP as f32).clamp(0.2, 2.5);
+    let time_pressure = (elapsed_ms / SIM_WORK_BUDGET_MS).clamp(0.0, 2.5);
+    let budget = BASE_MAX_CHUNKS_PER_STEP as f32 / load + 48.0 - 20.0 * time_pressure;
+    budget.round().clamp(
+        MIN_CHUNKS_PER_STEP as f32,
+        MAX_DYNAMIC_CHUNKS_PER_STEP as f32,
+    ) as usize
+}
+
+fn water_cell_locally_settled(store: &ChunkStore, source: VoxelCoord) -> bool {
+    let below = offset_voxel(source, 0, -1, 0);
+    let below_id = store.get_voxel(below);
+    if below_id == EMPTY || material(below_id).phase == Phase::Gas {
+        return false;
+    }
+
+    let mut lateral_empty = false;
+    for [dx, _, dz] in neighbor_dirs4() {
+        let lateral = offset_voxel(source, dx, 0, dz);
+        let lateral_id = store.get_voxel(lateral);
+        if lateral_id == EMPTY {
+            lateral_empty = true;
+            break;
+        }
+        let lateral_phase = material(lateral_id).phase;
+        if lateral_phase == Phase::Gas {
+            lateral_empty = true;
+            break;
+        }
+        let below_lateral = offset_voxel(source, dx, -1, dz);
+        let below_lateral_id = store.get_voxel(below_lateral);
+        if below_lateral_id == EMPTY || material(below_lateral_id).phase == Phase::Gas {
+            return false;
+        }
+        if lateral_id != WATER {
+            return false;
+        }
+    }
+
+    !lateral_empty
 }
 
 fn chunk_chebyshev_distance(a: ChunkCoord, b: ChunkCoord) -> i32 {
@@ -854,6 +971,10 @@ fn neighbor_dirs6() -> [[i32; 3]; 6] {
     ]
 }
 
+fn neighbor_dirs4() -> [[i32; 3]; 4] {
+    [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
+}
+
 fn offset_voxel(p: VoxelCoord, dx: i32, dy: i32, dz: i32) -> VoxelCoord {
     VoxelCoord {
         x: p.x + dx,
@@ -911,7 +1032,9 @@ fn enqueue_world_neighbors_to_chunks(
                 let state = chunks
                     .entry(chunk_coord)
                     .or_insert_with(ChunkFrontierState::new);
-                state.enqueue_local(idx as u16);
+                let local_idx = idx as u16;
+                state.clear_water_dormant(local_idx);
+                state.enqueue_local(local_idx);
                 state.cooldown_ticks = 0;
             }
         }
@@ -1165,7 +1288,13 @@ mod tests {
         let mut rng = XorShift32::new(1);
         let mut sim = SimWorld::default();
 
-        sim.step_region(&mut store, &region, source_chunk, &mut rng);
+        sim.step_region(
+            &mut store,
+            &region,
+            source_chunk,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
 
         assert_eq!(store.get_voxel(source), 5);
         let destination = VoxelCoord {
@@ -1201,8 +1330,20 @@ mod tests {
         sim_ref.notify_voxel_edit(top);
 
         for _ in 0..4 {
-            sim.step_region(&mut store, &region, c, &mut rng_a);
-            sim_ref.step_region(&mut store_ref, &region, c, &mut rng_b);
+            sim.step_region(
+                &mut store,
+                &region,
+                c,
+                &mut rng_a,
+                SimulationStepMetadata::default(),
+            );
+            sim_ref.step_region(
+                &mut store_ref,
+                &region,
+                c,
+                &mut rng_b,
+                SimulationStepMetadata::default(),
+            );
         }
 
         assert_eq!(
@@ -1242,7 +1383,13 @@ mod tests {
         sim.notify_voxel_edit(v);
         let region = HashSet::from([c]);
         let mut rng = XorShift32::new(7);
-        sim.step_region(&mut store, &region, c, &mut rng);
+        sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
 
         let soa = sim
             .build_soa_for_chunk(&store, c)
@@ -1306,7 +1453,13 @@ mod tests {
         sim.notify_voxel_edit(top_center);
 
         for _ in 0..64 {
-            sim.step_region(&mut store, &region, source_chunk, &mut rng);
+            sim.step_region(
+                &mut store,
+                &region,
+                source_chunk,
+                &mut rng,
+                SimulationStepMetadata::default(),
+            );
             if store.get_voxel(top_center) == EMPTY {
                 break;
             }
@@ -1318,5 +1471,103 @@ mod tests {
             y: source_chunk.y + 1,
             z: source_chunk.z,
         }));
+    }
+    #[test]
+    fn flat_water_pool_goes_quiet_until_disturbed() {
+        let mut store = ChunkStore::new();
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        let base = chunk_to_world_min(c);
+        for z in 2..=8 {
+            for x in 2..=8 {
+                store.set_voxel(
+                    VoxelCoord {
+                        x: base.x + x,
+                        y: base.y,
+                        z: base.z + z,
+                    },
+                    STONE,
+                );
+                let boundary = x == 2 || x == 8 || z == 2 || z == 8;
+                store.set_voxel(
+                    VoxelCoord {
+                        x: base.x + x,
+                        y: base.y + 1,
+                        z: base.z + z,
+                    },
+                    if boundary { STONE } else { WATER },
+                );
+            }
+        }
+
+        let region = HashSet::from([c]);
+        let mut sim = SimWorld::default();
+        sim.notify_voxel_edit(VoxelCoord {
+            x: base.x + 5,
+            y: base.y + 1,
+            z: base.z + 5,
+        });
+        let mut rng = XorShift32::new(99);
+
+        let _ = sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
+        for _ in 0..4 {
+            let _ = sim.step_region(
+                &mut store,
+                &region,
+                c,
+                &mut rng,
+                SimulationStepMetadata::default(),
+            );
+        }
+
+        let mut quiet_before = Vec::new();
+        for z in 3..8 {
+            for x in 3..8 {
+                quiet_before.push(store.get_voxel(VoxelCoord {
+                    x: base.x + x,
+                    y: base.y + 1,
+                    z: base.z + z,
+                }));
+            }
+        }
+        let quiet_stats = sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
+        let mut quiet_after = Vec::new();
+        for z in 3..8 {
+            for x in 3..8 {
+                quiet_after.push(store.get_voxel(VoxelCoord {
+                    x: base.x + x,
+                    y: base.y + 1,
+                    z: base.z + z,
+                }));
+            }
+        }
+        assert_eq!(quiet_before, quiet_after);
+        let disturb = VoxelCoord {
+            x: base.x + 2,
+            y: base.y + 1,
+            z: base.z + 5,
+        };
+        store.set_voxel(disturb, WATER);
+        sim.notify_voxel_edit(disturb);
+        let wake_stats = sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata::default(),
+        );
+        assert!(wake_stats.processed_frontier_voxels > 0);
+        assert!(quiet_stats.processed_frontier_voxels <= wake_stats.processed_frontier_voxels);
     }
 }
