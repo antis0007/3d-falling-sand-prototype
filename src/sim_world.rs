@@ -31,7 +31,7 @@ const DEAD_LEAF: u16 = 24;
 
 pub type Rng = XorShift32;
 
-const BASE_CHUNK_COOLDOWN_TICKS: u8 = 8;
+const BASE_CHUNK_COOLDOWN_TICKS: u8 = 2;
 const BASE_MAX_CHUNKS_PER_STEP: usize = 96;
 const MIN_CHUNKS_PER_STEP: usize = 24;
 const MAX_DYNAMIC_CHUNKS_PER_STEP: usize = 192;
@@ -40,7 +40,7 @@ const CHUNK_VOLUME: usize = (CHUNK_SIZE_VOXELS as usize).pow(3);
 const CHUNK_WORDS: usize = CHUNK_VOLUME.div_ceil(64);
 const MAX_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 768;
 const MIN_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 64;
-const SIM_WORK_BUDGET_MS: f32 = 2.8;
+const SIM_WORK_BUDGET_MS: f32 = 6.0;
 
 fn phase_likely_to_move(phase: Phase) -> bool {
     matches!(phase, Phase::Gas | Phase::Liquid | Phase::Powder)

@@ -20,6 +20,8 @@ use winit::dpi::PhysicalSize;
 pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
+const BUSH_ID: MaterialId = 18;
+const GRASS_ID: MaterialId = 19;
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnknownNeighborOcclusionPolicy {
@@ -1234,6 +1236,12 @@ fn mesh_chunk_voxel_faces(
                     continue;
                 }
 
+                if is_billboard_material(id) {
+                    add_snapshot_billboard(world_voxel, id, &mut verts, &mut inds);
+                    lx += step;
+                    continue;
+                }
+
                 let color = material(id).color;
                 add_snapshot_voxel_faces(
                     snapshot,
@@ -1267,12 +1275,35 @@ fn mesh_chunk_voxel_faces_greedy(
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
 
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let id = snapshot.get_local(x, y, z);
+                if is_billboard_material(id) {
+                    add_snapshot_billboard(
+                        VoxelCoord {
+                            x: chunk_world_min.x + x,
+                            y: chunk_world_min.y + y,
+                            z: chunk_world_min.z + z,
+                        },
+                        id,
+                        &mut verts,
+                        &mut inds,
+                    );
+                }
+            }
+        }
+    }
+
     for y in 0..side {
         for z in 0..side {
             let mut x = 0;
             while x < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x + 1, y, z)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x + 1, y, z))
+                {
                     x += 1;
                     continue;
                 }
@@ -1307,7 +1338,10 @@ fn mesh_chunk_voxel_faces_greedy(
             let mut x = 0;
             while x < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x - 1, y, z)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x - 1, y, z))
+                {
                     x += 1;
                     continue;
                 }
@@ -1342,7 +1376,10 @@ fn mesh_chunk_voxel_faces_greedy(
             let mut z = 0;
             while z < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y, z + 1)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x, y, z + 1))
+                {
                     z += 1;
                     continue;
                 }
@@ -1377,7 +1414,10 @@ fn mesh_chunk_voxel_faces_greedy(
             let mut z = 0;
             while z < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y, z - 1)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x, y, z - 1))
+                {
                     z += 1;
                     continue;
                 }
@@ -1412,7 +1452,10 @@ fn mesh_chunk_voxel_faces_greedy(
             let mut y = 0;
             while y < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y + 1, z)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x, y + 1, z))
+                {
                     y += 1;
                     continue;
                 }
@@ -1447,7 +1490,10 @@ fn mesh_chunk_voxel_faces_greedy(
             let mut y = 0;
             while y < side {
                 let id = snapshot.get_local(x, y, z);
-                if id == EMPTY || is_face_occluded(id, snapshot.get_local(x, y - 1, z)) {
+                if id == EMPTY
+                    || is_billboard_material(id)
+                    || is_face_occluded(id, snapshot.get_local(x, y - 1, z))
+                {
                     y += 1;
                     continue;
                 }
@@ -1889,12 +1935,87 @@ fn add_snapshot_voxel_faces(
     }
 }
 
+fn is_billboard_material(id: MaterialId) -> bool {
+    matches!(id, BUSH_ID | GRASS_ID)
+}
+
+fn add_snapshot_billboard(
+    world_voxel: VoxelCoord,
+    id: MaterialId,
+    verts: &mut Vec<Vertex>,
+    inds: &mut Vec<u32>,
+) {
+    let color = material(id).color;
+    let quads: &[[[f32; 3]; 4]] = if id == GRASS_ID {
+        &[
+            [
+                [0.48, 0.0, 0.12],
+                [0.48, 1.08, 0.12],
+                [0.52, 1.08, 0.88],
+                [0.52, 0.0, 0.88],
+            ],
+            [
+                [0.12, 0.0, 0.48],
+                [0.12, 1.04, 0.48],
+                [0.88, 1.04, 0.52],
+                [0.88, 0.0, 0.52],
+            ],
+        ]
+    } else {
+        &[
+            [
+                [0.14, 0.0, 0.14],
+                [0.14, 0.90, 0.14],
+                [0.86, 0.90, 0.86],
+                [0.86, 0.0, 0.86],
+            ],
+            [
+                [0.14, 0.0, 0.86],
+                [0.14, 0.90, 0.86],
+                [0.86, 0.90, 0.14],
+                [0.86, 0.0, 0.14],
+            ],
+        ]
+    };
+
+    for quad in quads {
+        let b = verts.len() as u32;
+        for v in quad {
+            verts.push(Vertex {
+                pos: [
+                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                ],
+                color,
+            });
+        }
+        inds.extend_from_slice(&[
+            b,
+            b + 1,
+            b + 2,
+            b,
+            b + 2,
+            b + 3,
+            b,
+            b + 2,
+            b + 1,
+            b,
+            b + 3,
+            b + 2,
+        ]);
+    }
+}
+
 fn is_face_occluded(self_id: MaterialId, neighbor_id: MaterialId) -> bool {
     if neighbor_id == EMPTY {
         return false;
     }
     if neighbor_id == self_id {
         return true;
+    }
+    if is_billboard_material(neighbor_id) {
+        return false;
     }
     let neighbor = material(neighbor_id);
     if neighbor.color[3] < 255 {

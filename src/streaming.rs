@@ -9,8 +9,8 @@ pub const URGENT_CHUNK_VERTICAL_RADIUS: i32 = 1;
 const MID_RING_UPWARD_BIAS_BUDGET: i32 = 4;
 const FAR_RING_UPWARD_BIAS_BUDGET: i32 = 8;
 const DEPTH_PENALTY_START_DELTA_Y: i32 = 3;
-const DEPTH_PENALTY_PER_CHUNK: f32 = 0.035;
-const ABOVE_PLAYER_RING_BOOST: f32 = 0.08;
+const DEPTH_PENALTY_PER_CHUNK: f32 = 0.075;
+const ABOVE_PLAYER_RING_BOOST: f32 = 0.12;
 const HORIZONTAL_NEIGHBOR_SCHEDULE_FLOOR: usize = 4;
 
 pub fn is_urgent_chunk(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
