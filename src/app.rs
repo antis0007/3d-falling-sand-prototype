@@ -43,9 +43,8 @@ const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
 const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 
-const GENERATOR_THREADS: usize = 3;
-const GENERATOR_QUEUE_BOUND: usize = 192;
 const APPLY_BUDGET_MS: f32 = 1.5;
+const APPLY_NEAR_PROTECTED_BUDGET_MS: f32 = 1.0;
 const EVICT_BUDGET_MS: f32 = 1.0;
 const DESIRED_NEAR_PER_FRAME_CAP: usize = 224;
 const DESIRED_MID_PER_FRAME_CAP: usize = 320;
@@ -58,10 +57,10 @@ const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
-const GEN_DISPATCH_HIGH: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.9) as usize;
-const GEN_DISPATCH_LOW: usize = (GENERATOR_QUEUE_BOUND as f32 * 0.5) as usize;
 const URGENT_GENERATION_BUDGET: usize = 4;
 const NEAR_GENERATION_BUDGET: usize = 24;
+const MID_GENERATION_BUDGET: usize = 24;
+const PROTECTED_HIGH_PRIORITY_SLOTS: usize = 2;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
 const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
 const AUTO_TUNE_RAMP_UP_PER_SEC: f32 = 3.5;
@@ -213,6 +212,8 @@ impl ModifiedChunkCache {
 struct GenJob {
     coord: ChunkCoord,
     requested_at: Instant,
+    class: GenerateJobClass,
+    version: u64,
 }
 
 struct GenResult {
@@ -220,6 +221,36 @@ struct GenResult {
     chunk: crate::chunk_store::Chunk,
     requested_at: Instant,
     generated_at: Instant,
+    class: GenerateJobClass,
+    version: u64,
+}
+
+#[derive(Clone, Copy)]
+struct GeneratorConfig {
+    worker_count: usize,
+    queue_bound: usize,
+    dispatch_high: usize,
+    dispatch_low: usize,
+}
+
+fn generator_config_from_hardware() -> GeneratorConfig {
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let worker_count = cores.clamp(2, 12);
+    let queue_bound = if cores <= 4 {
+        128
+    } else if cores <= 8 {
+        256
+    } else {
+        384
+    };
+    GeneratorConfig {
+        worker_count,
+        queue_bound,
+        dispatch_high: ((queue_bound as f32) * 0.9) as usize,
+        dispatch_low: ((queue_bound as f32) * 0.5) as usize,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -486,12 +517,12 @@ struct BackgroundGenerator {
 }
 
 impl BackgroundGenerator {
-    fn new(seed: u64) -> Self {
-        let (tx, job_rx) = sync_channel::<GenJob>(GENERATOR_QUEUE_BOUND);
-        let (result_tx, rx) = sync_channel::<GenResult>(GENERATOR_QUEUE_BOUND);
+    fn new(seed: u64, config: GeneratorConfig) -> Self {
+        let (tx, job_rx) = sync_channel::<GenJob>(config.queue_bound);
+        let (result_tx, rx) = sync_channel::<GenResult>(config.queue_bound);
         let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
 
-        for i in 0..GENERATOR_THREADS {
+        for i in 0..config.worker_count {
             let worker_rx = std::sync::Arc::clone(&job_rx);
             let worker_tx = result_tx.clone();
             thread::Builder::new()
@@ -511,6 +542,8 @@ impl BackgroundGenerator {
                             chunk,
                             requested_at: job.requested_at,
                             generated_at: Instant::now(),
+                            class: job.class,
+                            version: job.version,
                         })
                         .is_err()
                     {
@@ -523,10 +556,12 @@ impl BackgroundGenerator {
         Self { tx, rx }
     }
 
-    fn try_request(&self, coord: ChunkCoord) -> bool {
+    fn try_request(&self, coord: ChunkCoord, class: GenerateJobClass, version: u64) -> bool {
         match self.tx.try_send(GenJob {
             coord,
             requested_at: Instant::now(),
+            class,
+            version,
         }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => false,
@@ -659,7 +694,8 @@ pub async fn run() -> anyhow::Result<()> {
         seed_selection.source.label()
     );
     let mut streaming = ChunkStreaming::new(seed_selection.seed);
-    let mut chunk_generator = BackgroundGenerator::new(streaming.seed);
+    let generator_config = generator_config_from_hardware();
+    let mut chunk_generator = BackgroundGenerator::new(streaming.seed, generator_config);
     let mut generated_ready: VecDeque<GenResult> = VecDeque::new();
     let mut stream_tuning = StreamingTuning::default().normalized();
     let mut cached_stream_tuning = stream_tuning.clone();
@@ -1103,7 +1139,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 } else if streaming.dispatch_generation_for_class(
                                     coord,
                                     class,
-                                    |coord| chunk_generator.try_request(coord),
+                                    |coord| chunk_generator.try_request(coord, class, 0),
                                 ) {
                                     forced_local_requests += 1;
                                 }
@@ -1279,6 +1315,15 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             if player_chunk_changed {
                                 cached_sim_region = chunk_cube(player_chunk, SIMULATION_RADIUS_CHUNKS);
+                                if let Some(previous_chunk) = last_player_chunk {
+                                    let shift = (player_chunk.x - previous_chunk.x)
+                                        .abs()
+                                        .max((player_chunk.y - previous_chunk.y).abs())
+                                        .max((player_chunk.z - previous_chunk.z).abs());
+                                    if shift >= 2 {
+                                        streaming.invalidate_far_jobs();
+                                    }
+                                }
                             }
                             last_player_chunk = Some(player_chunk);
                             cached_stream_tuning = effective_stream_tuning.clone();
@@ -1330,14 +1375,27 @@ pub async fn run() -> anyhow::Result<()> {
                             player_chunk,
                             &cached_desired.generation_scores,
                         );
+                        let queue_age = streaming.queue_age_telemetry();
+                        if queue_age.urgent.p95 > 24 {
+                            ui.log_once_per_second("urgent_queue_age_alert", start.elapsed().as_secs_f32(), || {
+                                format!(
+                                    "urgent queue age exceeded threshold p50={} p95={} near_p95={} mid_p95={} far_p95={}",
+                                    queue_age.urgent.p50,
+                                    queue_age.urgent.p95,
+                                    queue_age.near.p95,
+                                    queue_age.mid.p95,
+                                    queue_age.far.p95,
+                                )
+                            });
+                        }
 
                         let gen_dispatched_inflight_before_dispatch =
                             streaming.dispatched_generate.len();
                         if gen_dispatch_paused {
-                            if gen_dispatched_inflight_before_dispatch <= GEN_DISPATCH_LOW {
+                            if gen_dispatched_inflight_before_dispatch <= generator_config.dispatch_low {
                                 gen_dispatch_paused = false;
                             }
-                        } else if gen_dispatched_inflight_before_dispatch >= GEN_DISPATCH_HIGH {
+                        } else if gen_dispatched_inflight_before_dispatch >= generator_config.dispatch_high {
                             gen_dispatch_paused = true;
                         }
                         let gen_pause_reason = if gen_dispatch_paused {
@@ -1349,6 +1407,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut gen_request_count = 0usize;
                         let mut dispatch_urgent = Vec::new();
                         let mut dispatch_near = Vec::new();
+                        let mut dispatch_mid = Vec::new();
                         let mut dispatch_far = Vec::new();
 
                         for &coord in &generation_priority {
@@ -1362,6 +1421,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 dispatch_urgent.push(coord);
                             } else if cached_desired.near.contains(&coord) {
                                 dispatch_near.push(coord);
+                            } else if cached_desired.mid.contains(&coord) {
+                                dispatch_mid.push(coord);
                             } else {
                                 dispatch_far.push(coord);
                             }
@@ -1375,13 +1436,23 @@ pub async fn run() -> anyhow::Result<()> {
                                               streaming: &mut ChunkStreaming,
                                               cached_modified_chunks: &mut ModifiedChunkCache|
                          -> bool {
+                            let far_version_snapshot = streaming.far_generation_version();
                             if let Some(chunk) = cached_modified_chunks.take(coord) {
                                 apply_generated_chunk(store, coord, chunk);
                                 streaming.mark_generated(coord, frame_counter);
                                 return true;
                             }
                             streaming.dispatch_generation_for_class(coord, class, |coord| {
-                                if chunk_generator.try_request(coord) {
+                                let version = if matches!(class, GenerateJobClass::Mid | GenerateJobClass::Far) {
+                                    far_version_snapshot
+                                } else {
+                                    0
+                                };
+                                if chunk_generator.try_request(
+                                    coord,
+                                    class,
+                                    version,
+                                ) {
                                     *gen_request_count += 1;
                                     *gen_worker_inflight += 1;
                                     true
@@ -1421,7 +1492,9 @@ pub async fn run() -> anyhow::Result<()> {
                             base_generate_drain_budget
                         };
 
-                        let near_budget = generate_drain_budget.min(NEAR_GENERATION_BUDGET);
+                        let near_budget = generate_drain_budget
+                            .min(NEAR_GENERATION_BUDGET)
+                            .max(PROTECTED_HIGH_PRIORITY_SLOTS);
                         let mut near_sent = 0usize;
                         for coord in dispatch_near.into_iter().take(near_budget) {
                             if !dispatch_coord(
@@ -1439,13 +1512,32 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
+                        let mut mid_budget = far_budget.min(MID_GENERATION_BUDGET);
+                        for coord in dispatch_mid {
+                            if mid_budget == 0 {
+                                break;
+                            }
+                            if !dispatch_coord(
+                                coord,
+                                GenerateJobClass::Mid,
+                                &mut gen_request_count,
+                                &mut gen_worker_inflight,
+                                &mut store,
+                                &mut streaming,
+                                &mut cached_modified_chunks,
+                            ) {
+                                break;
+                            }
+                            mid_budget = mid_budget.saturating_sub(1);
+                            far_budget = far_budget.saturating_sub(1);
+                        }
                         for coord in dispatch_far {
                             if far_budget == 0 {
                                 break;
                             }
                             if !dispatch_coord(
                                 coord,
-                                GenerateJobClass::Background,
+                                GenerateJobClass::Far,
                                 &mut gen_request_count,
                                 &mut gen_worker_inflight,
                                 &mut store,
@@ -1463,7 +1555,7 @@ pub async fn run() -> anyhow::Result<()> {
                             };
                             if !dispatch_coord(
                                 coord,
-                                GenerateJobClass::Background,
+                                GenerateJobClass::Far,
                                 &mut gen_request_count,
                                 &mut gen_worker_inflight,
                                 &mut store,
@@ -1481,8 +1573,14 @@ pub async fn run() -> anyhow::Result<()> {
                         loop {
                             match chunk_generator.try_recv() {
                                 Ok(res) => {
-                                    generated_ready.push_back(res);
-                                    gen_completed_count += 1;
+                                    let stale_far = matches!(res.class, GenerateJobClass::Mid | GenerateJobClass::Far)
+                                        && res.version != streaming.far_generation_version();
+                                    if stale_far {
+                                        streaming.mark_generation_dropped(res.coord);
+                                    } else {
+                                        generated_ready.push_back(res);
+                                        gen_completed_count += 1;
+                                    }
                                     gen_worker_inflight = gen_worker_inflight.saturating_sub(1);
                                 }
                                 Err(TryRecvError::Empty) => {
@@ -1511,7 +1609,7 @@ pub async fn run() -> anyhow::Result<()> {
                         } else {
                             "blocked"
                         };
-                        if dispatched_count >= GEN_DISPATCH_HIGH && gen_completed_count == 0 {
+                        if dispatched_count >= generator_config.dispatch_high && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
                             ui.log_once_per_second("gen_starvation", now_secs, || {
                                 format!(
@@ -1560,6 +1658,20 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         let apply_t0 = Instant::now();
                         let mut apply_count = 0usize;
+                        while apply_count < apply_budget_items
+                            && apply_t0.elapsed()
+                                < Duration::from_secs_f32(APPLY_NEAR_PROTECTED_BUDGET_MS / 1000.0)
+                        {
+                            let Some(index) = generated_ready.iter().position(|done| {
+                                matches!(done.class, GenerateJobClass::Urgent | GenerateJobClass::Near)
+                            }) else {
+                                break;
+                            };
+                            let done = generated_ready.remove(index).expect("protected near result exists");
+                            apply_generated_chunk(&mut store, done.coord, done.chunk);
+                            streaming.mark_generated(done.coord, frame_counter);
+                            apply_count += 1;
+                        }
                         while apply_count < apply_budget_items
                             && apply_t0.elapsed() < Duration::from_secs_f32(APPLY_BUDGET_MS / 1000.0)
                         {
@@ -1928,7 +2040,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 };
                                 store.clear();
                                 streaming.reset_with_seed(next_seed);
-                                chunk_generator = BackgroundGenerator::new(next_seed);
+                                chunk_generator = BackgroundGenerator::new(next_seed, generator_config);
                                 last_player_chunk = None;
                                 cached_desired = DesiredChunks::default();
                                 cached_sim_region.clear();
