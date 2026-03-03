@@ -16,6 +16,19 @@ pub struct ChunkCoord {
     pub z: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunkOriginWorld {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct GpuPageIndex(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct MeshHandle(pub u32);
+
 #[inline]
 fn floor_div(value: i32, divisor: i32) -> i32 {
     value.div_euclid(divisor)

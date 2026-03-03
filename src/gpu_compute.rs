@@ -1,4 +1,5 @@
 use crate::renderer::MeshJob;
+use crate::types::{ChunkCoord, GpuPageIndex};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
@@ -68,22 +69,65 @@ struct MeshingBindResources<'a> {
     active_tiles: &'a wgpu::Buffer,
     page_params: &'a wgpu::Buffer,
     page_indirect: &'a wgpu::Buffer,
-    dirty_chunk_ids: &'a wgpu::Buffer,
-    dirty_chunk_counter: &'a wgpu::Buffer,
+    dirty_page_indices: &'a wgpu::Buffer,
+    dirty_page_counter: &'a wgpu::Buffer,
     diagnostics: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Default)]
 struct ChunkPageAtlas {
-    page_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
-    version_for_chunk: HashMap<crate::types::ChunkCoord, u64>,
-    state_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
-    frontier_len_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
-    tick_for_chunk: HashMap<crate::types::ChunkCoord, u32>,
-    diagnostics_for_chunk: HashMap<crate::types::ChunkCoord, ChunkSimulationDiagnostics>,
-    cached_materials: HashMap<crate::types::ChunkCoord, Vec<MaterialId>>,
-    next_page: u32,
+    page_for_chunk: HashMap<ChunkCoord, GpuPageIndex>,
+    chunk_for_page: HashMap<GpuPageIndex, ChunkCoord>,
+    version_for_chunk: HashMap<ChunkCoord, u64>,
+    state_for_chunk: HashMap<ChunkCoord, u32>,
+    frontier_len_for_chunk: HashMap<ChunkCoord, u32>,
+    tick_for_chunk: HashMap<ChunkCoord, u32>,
+    diagnostics_for_chunk: HashMap<ChunkCoord, ChunkSimulationDiagnostics>,
+    cached_materials: HashMap<ChunkCoord, Vec<MaterialId>>,
+    next_page: GpuPageIndex,
+}
+
+#[cfg(feature = "gpu-compute")]
+impl ChunkPageAtlas {
+    fn page_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> GpuPageIndex {
+        if let Some(existing) = self.page_for_chunk.get(&chunk).copied() {
+            return existing;
+        }
+
+        if self.next_page.0 >= GPU_PAGE_CAPACITY {
+            self.clear();
+        }
+
+        let page = self.next_page;
+        self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
+        self.page_for_chunk.insert(chunk, page);
+        self.chunk_for_page.insert(page, chunk);
+        page
+    }
+
+    fn resolve_chunk(&self, page_index: GpuPageIndex) -> Option<ChunkCoord> {
+        self.chunk_for_page.get(&page_index).copied()
+    }
+
+    fn assert_page_for_chunk(&self, chunk: ChunkCoord, page_index: GpuPageIndex) {
+        let resolved = self
+            .resolve_chunk(page_index)
+            .expect("gpu page must resolve to a chunk");
+        assert_eq!(resolved, chunk, "gpu page/chunk mapping mismatch");
+    }
+
+    fn clear(&mut self) {
+        self.page_for_chunk.clear();
+        self.chunk_for_page.clear();
+        self.version_for_chunk.clear();
+        self.state_for_chunk.clear();
+        self.frontier_len_for_chunk.clear();
+        self.tick_for_chunk.clear();
+        self.diagnostics_for_chunk.clear();
+        self.cached_materials.clear();
+        self.next_page = GpuPageIndex(0);
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -101,8 +145,8 @@ struct WorkerGpuState {
     active_tile_counter: wgpu::Buffer,
     edit_commands: wgpu::Buffer,
     page_params: wgpu::Buffer,
-    dirty_chunk_ids: wgpu::Buffer,
-    dirty_chunk_counter: wgpu::Buffer,
+    dirty_page_indices: wgpu::Buffer,
+    dirty_page_counter: wgpu::Buffer,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
     runtime_config: GpuSimulationRuntimeConfig,
@@ -126,7 +170,7 @@ impl Default for GpuSimulationRuntimeConfig {
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone)]
 struct SimulationJob {
-    chunk_coord: crate::types::ChunkCoord,
+    chunk_coord: ChunkCoord,
     materials: Vec<MaterialId>,
     active_frontier_count: u32,
     simulation_tick: u32,
@@ -363,10 +407,14 @@ impl GpuComputeRuntime {
         &self,
         state: &WorkerGpuState,
         sim_job: &SimulationJob,
-        page_index: u32,
+        page_index: GpuPageIndex,
         current_state: u32,
         edit_commands: &[EditCommand],
     ) -> anyhow::Result<()> {
+        {
+            let atlas = state.atlas.lock().expect("atlas lock");
+            atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
+        }
         let t0 = Instant::now();
         let frontier_len = sim_job
             .active_frontier_count
@@ -442,9 +490,13 @@ impl GpuComputeRuntime {
         &self,
         state: &WorkerGpuState,
         sim_job: &SimulationJob,
-        page_index: u32,
+        page_index: GpuPageIndex,
         current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
+        {
+            let atlas = state.atlas.lock().expect("atlas lock");
+            atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
+        }
         let page_params = device_page_params(
             sim_job,
             page_index,
@@ -473,12 +525,12 @@ impl GpuComputeRuntime {
 #[cfg(feature = "gpu-compute")]
 fn readback_page_materials(
     state: &WorkerGpuState,
-    page_index: u32,
+    page_index: GpuPageIndex,
     state_index: u32,
     voxel_count: usize,
 ) -> anyhow::Result<Vec<MaterialId>> {
-    let atlas_offset_voxels =
-        (page_index as u64 * CHUNK_VOLUME as u64 * 2) + (state_index as u64 * CHUNK_VOLUME as u64);
+    let atlas_offset_voxels = (page_index.0 as u64 * CHUNK_VOLUME as u64 * 2)
+        + (state_index as u64 * CHUNK_VOLUME as u64);
     let byte_offset = atlas_offset_voxels * std::mem::size_of::<u32>() as u64;
     let byte_len = voxel_count as u64 * std::mem::size_of::<u32>() as u64;
     let readback = state.device.create_buffer(&wgpu::BufferDescriptor {
@@ -592,11 +644,11 @@ impl GpuComputeRuntime {
                 },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: resources.dirty_chunk_ids.as_entire_binding(),
+                    resource: resources.dirty_page_indices.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: resources.dirty_chunk_counter.as_entire_binding(),
+                    resource: resources.dirty_page_counter.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 12,
@@ -723,14 +775,14 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let dirty_chunk_ids = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dirty chunk ids"),
+            let dirty_page_indices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dirty page indices"),
                 size: page_capacity * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
-            let dirty_chunk_counter = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dirty chunk counter"),
+            let dirty_page_counter = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dirty page counter"),
                 size: 16,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
@@ -759,8 +811,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 active_tiles: &frontier,
                 page_params: &page_params,
                 page_indirect: &page_indirect,
-                dirty_chunk_ids: &dirty_chunk_ids,
-                dirty_chunk_counter: &dirty_chunk_counter,
+                dirty_page_indices: &dirty_page_indices,
+                dirty_page_counter: &dirty_page_counter,
                 diagnostics: &diagnostics,
             };
             let meshing_bg = runtime.create_meshing_bind_group(&device, meshing_resources);
@@ -778,8 +830,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 active_tile_counter,
                 edit_commands,
                 page_params,
-                dirty_chunk_ids,
-                dirty_chunk_counter,
+                dirty_page_indices,
+                dirty_page_counter,
                 simulation_bg,
                 meshing_bg,
                 runtime_config: GpuSimulationRuntimeConfig::default(),
@@ -788,25 +840,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
         let mut atlas = state.atlas.lock().expect("atlas lock");
-        let page_index = if let Some(existing) = atlas.page_for_chunk.get(&job.coord).copied() {
-            existing
-        } else {
-            let page = atlas.next_page;
-            if page >= GPU_PAGE_CAPACITY {
-                atlas.page_for_chunk.clear();
-                atlas.version_for_chunk.clear();
-                atlas.state_for_chunk.clear();
-                atlas.frontier_len_for_chunk.clear();
-                atlas.tick_for_chunk.clear();
-                atlas.diagnostics_for_chunk.clear();
-                atlas.cached_materials.clear();
-                atlas.next_page = 0;
-            }
-            let page = atlas.next_page;
-            atlas.next_page = atlas.next_page.saturating_add(1);
-            atlas.page_for_chunk.insert(job.coord, page);
-            page
-        };
+        let page_index = atlas.page_for_chunk_or_allocate(job.coord);
+        atlas.assert_page_for_chunk(job.coord, page_index);
         let last_version = atlas
             .version_for_chunk
             .get(&job.coord)
@@ -887,14 +922,15 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             DrawIndirectArgs::default()
         };
 
-        let diagnostics = state
-            .atlas
-            .lock()
-            .expect("atlas lock")
-            .diagnostics_for_chunk
-            .get(&job.coord)
-            .copied()
-            .unwrap_or_default();
+        let diagnostics = {
+            let atlas = state.atlas.lock().expect("atlas lock");
+            atlas.assert_page_for_chunk(job.coord, page_index);
+            atlas
+                .diagnostics_for_chunk
+                .get(&job.coord)
+                .copied()
+                .unwrap_or_default()
+        };
         let generated_materials = readback_page_materials(
             state,
             page_index,
@@ -951,14 +987,14 @@ struct FrameParams {
 
 fn device_page_params(
     sim_job: &SimulationJob,
-    page_index: u32,
+    page_index: GpuPageIndex,
     frontier_len: u32,
     state_index: u32,
     edit_count: u32,
     runtime_config: GpuSimulationRuntimeConfig,
 ) -> [FrameParams; 1] {
     [FrameParams {
-        page_index,
+        page_index: page_index.0,
         voxel_count: sim_job.materials.len() as u32,
         frontier_len,
         simulation_tick: sim_job.simulation_tick,
