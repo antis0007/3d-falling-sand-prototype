@@ -6,6 +6,7 @@ struct FrameParams {
     page_index: u32,
     voxel_count: u32,
     frontier_len: u32,
+    simulation_tick: u32,
     state_index: u32,
     edit_count: u32,
     active_tile_budget: u32,
