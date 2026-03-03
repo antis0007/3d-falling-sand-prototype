@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
 
 use crate::chunk_store::ChunkStore;
-use crate::renderer::{ChunkLod, ChunkSnapshot, MeshJob};
 use crate::sim::material;
 use crate::sim::Phase;
 use crate::sim_world::Rng;
@@ -13,6 +10,8 @@ use crate::world::EMPTY;
 
 const CHUNK_EDGE: i32 = CHUNK_SIZE_VOXELS as i32;
 const SUBSTEPS: usize = 3;
+const CHUNK_VOLUME: usize =
+    CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize;
 
 #[derive(Clone, Copy, Debug)]
 struct SimCommand {
@@ -31,6 +30,44 @@ struct MoveIntent {
 pub struct GpuFluidBackend {
     command_buffer: Vec<SimCommand>,
     frame_index: u64,
+    resident_pages_current: HashMap<ChunkCoord, Vec<u16>>,
+    resident_pages_next: HashMap<ChunkCoord, Vec<u16>>,
+    last_dirty_metadata: DirtySimulationMetadata,
+}
+
+#[derive(Default)]
+struct DirtySimulationMetadata {
+    dirty_chunks: HashSet<ChunkCoord>,
+    dirty_regions: HashMap<ChunkCoord, DirtyChunkRegion>,
+    dirty_bounds: Option<(VoxelCoord, VoxelCoord)>,
+}
+
+#[derive(Clone, Copy)]
+struct DirtyChunkRegion {
+    min: [u32; 3],
+    max: [u32; 3],
+}
+
+struct HaloFaces {
+    neg_x: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    pos_x: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    neg_y: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    pos_y: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    neg_z: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    pos_z: [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+}
+
+impl Default for HaloFaces {
+    fn default() -> Self {
+        Self {
+            neg_x: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+            pos_x: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+            neg_y: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+            pos_y: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+            neg_z: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+            pos_z: [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+        }
+    }
 }
 
 impl SimulationBackend for GpuFluidBackend {
@@ -81,51 +118,301 @@ impl GpuFluidBackend {
     ) -> SimulationStepStats {
         let mut stepped_chunks: HashSet<ChunkCoord> = self.stage_edit_commands(store, region);
 
-        for &chunk_coord in region {
-            let Some(chunk) = store.get_chunk(chunk_coord) else {
-                continue;
-            };
-            let input_materials: Vec<u16> = chunk.iter_raw().to_vec();
-            let job = MeshJob {
-                coord: chunk_coord,
-                lod: ChunkLod::Near,
-                version: self.frame_index,
-                queued_at: Instant::now(),
-                snapshot: ChunkSnapshot {
-                    world_min: chunk_to_world_min(chunk_coord),
-                    center_voxels: Arc::from(input_materials.clone()),
-                    border_strips: Arc::new(crate::chunk_store::ChunkBorderStrips::default()),
-                },
-                greedy: true,
-            };
+        self.ensure_resident_pages(store, region);
+        self.last_dirty_metadata = DirtySimulationMetadata::default();
 
-            let Ok(output) = crate::gpu_compute::run_chunk_job_on_worker(&job) else {
-                continue;
-            };
-            for (idx, &next) in output.generated_materials.iter().enumerate() {
-                if input_materials.get(idx).copied() == Some(next) {
-                    continue;
-                }
-                let x = (idx % CHUNK_SIZE_VOXELS as usize) as i32;
-                let y = ((idx / CHUNK_SIZE_VOXELS as usize) % CHUNK_SIZE_VOXELS as usize) as i32;
-                let z = (idx / (CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize)) as i32;
-                store.set_voxel(
-                    VoxelCoord {
-                        x: chunk_to_world_min(chunk_coord).x + x,
-                        y: chunk_to_world_min(chunk_coord).y + y,
-                        z: chunk_to_world_min(chunk_coord).z + z,
-                    },
-                    next,
-                );
-                stepped_chunks.insert(chunk_coord);
-            }
+        for substep in 0..SUBSTEPS {
+            let halos = self.exchange_halos(region);
+            let intents = self.advect_material_states_gpu(region, &halos, substep as u64);
+            self.run_deterministic_passes(region, intents);
         }
+        let dirty_chunks = self.flush_targeted_updates_to_cpu(store, region);
+        stepped_chunks.extend(dirty_chunks.iter().copied());
+        self.last_dirty_metadata.dirty_chunks = dirty_chunks;
 
         self.frame_index = self.frame_index.wrapping_add(1);
         SimulationStepStats {
             stepped_chunks: stepped_chunks.len(),
             ..SimulationStepStats::default()
         }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn ensure_resident_pages(&mut self, store: &ChunkStore, region: &HashSet<ChunkCoord>) {
+        self.resident_pages_current
+            .retain(|coord, _| region.contains(coord));
+        self.resident_pages_next
+            .retain(|coord, _| region.contains(coord));
+        for &chunk in region {
+            self.resident_pages_current.entry(chunk).or_insert_with(|| {
+                store
+                    .get_chunk(chunk)
+                    .map(|c| c.iter_raw().to_vec())
+                    .unwrap_or_else(|| vec![EMPTY; CHUNK_VOLUME])
+            });
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn exchange_halos(&self, region: &HashSet<ChunkCoord>) -> HashMap<ChunkCoord, HaloFaces> {
+        let mut halos = HashMap::with_capacity(region.len());
+        for &chunk in region {
+            let mut faces = HaloFaces::default();
+            self.fill_halo_face(chunk, [-1, 0, 0], &mut faces.neg_x);
+            self.fill_halo_face(chunk, [1, 0, 0], &mut faces.pos_x);
+            self.fill_halo_face(chunk, [0, -1, 0], &mut faces.neg_y);
+            self.fill_halo_face(chunk, [0, 1, 0], &mut faces.pos_y);
+            self.fill_halo_face(chunk, [0, 0, -1], &mut faces.neg_z);
+            self.fill_halo_face(chunk, [0, 0, 1], &mut faces.pos_z);
+            halos.insert(chunk, faces);
+        }
+        halos
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn fill_halo_face(
+        &self,
+        chunk: ChunkCoord,
+        delta: [i32; 3],
+        out: &mut [u16; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize],
+    ) {
+        let neighbor = ChunkCoord {
+            x: chunk.x + delta[0],
+            y: chunk.y + delta[1],
+            z: chunk.z + delta[2],
+        };
+        let Some(voxels) = self.resident_pages_current.get(&neighbor) else {
+            *out = [EMPTY; CHUNK_SIZE_VOXELS as usize * CHUNK_SIZE_VOXELS as usize];
+            return;
+        };
+        let last = CHUNK_SIZE_VOXELS as usize - 1;
+        for v in 0..CHUNK_SIZE_VOXELS as usize {
+            for u in 0..CHUNK_SIZE_VOXELS as usize {
+                let (x, y, z) = if delta[0] != 0 {
+                    (if delta[0] < 0 { last } else { 0 }, u, v)
+                } else if delta[1] != 0 {
+                    (u, if delta[1] < 0 { last } else { 0 }, v)
+                } else {
+                    (u, v, if delta[2] < 0 { last } else { 0 })
+                };
+                out[u + v * CHUNK_SIZE_VOXELS as usize] =
+                    voxels[crate::chunk_store::Chunk::index(x, y, z)];
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn advect_material_states_gpu(
+        &self,
+        region: &HashSet<ChunkCoord>,
+        halos: &HashMap<ChunkCoord, HaloFaces>,
+        substep: u64,
+    ) -> Vec<MoveIntent> {
+        let mut chunk_coords: Vec<_> = region.iter().copied().collect();
+        chunk_coords.sort_by_key(|c| (c.z, c.y, c.x));
+        let mut intents = Vec::new();
+        for chunk_coord in chunk_coords {
+            let Some(voxels) = self.resident_pages_current.get(&chunk_coord) else {
+                continue;
+            };
+            let origin = chunk_to_world_min(chunk_coord);
+            for z in (0..CHUNK_EDGE).rev() {
+                for y in (0..CHUNK_EDGE).rev() {
+                    for x in 0..CHUNK_EDGE {
+                        let local = [x as usize, y as usize, z as usize];
+                        let from = VoxelCoord {
+                            x: origin.x + x,
+                            y: origin.y + y,
+                            z: origin.z + z,
+                        };
+                        let mat_id =
+                            voxels[crate::chunk_store::Chunk::index(local[0], local[1], local[2])];
+                        if mat_id == EMPTY {
+                            continue;
+                        }
+                        let phase = material(mat_id).phase;
+                        for to in movement_candidates(from, phase) {
+                            if self.read_material_with_halo(halos, to) != EMPTY {
+                                continue;
+                            }
+                            intents.push(MoveIntent {
+                                from,
+                                to,
+                                priority: intent_priority(
+                                    self.frame_index,
+                                    substep,
+                                    chunk_coord,
+                                    from,
+                                    to,
+                                ),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        intents
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn read_material_with_halo(
+        &self,
+        _halos: &HashMap<ChunkCoord, HaloFaces>,
+        coord: VoxelCoord,
+    ) -> u16 {
+        let (chunk, local) = voxel_to_chunk(coord);
+        self.resident_pages_current
+            .get(&chunk)
+            .map(|page| {
+                page[crate::chunk_store::Chunk::index(
+                    local[0] as usize,
+                    local[1] as usize,
+                    local[2] as usize,
+                )]
+            })
+            .unwrap_or(EMPTY)
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn run_deterministic_passes(&mut self, region: &HashSet<ChunkCoord>, intents: Vec<MoveIntent>) {
+        self.resident_pages_next = self.resident_pages_current.clone();
+        self.apply_intents_to_pages(region, intents);
+        // deterministic pass ordering placeholders
+        self.compute_divergence_pass();
+        self.pressure_solve_pass();
+        self.projection_pass();
+        self.material_update_pass();
+        std::mem::swap(
+            &mut self.resident_pages_current,
+            &mut self.resident_pages_next,
+        );
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn apply_intents_to_pages(
+        &mut self,
+        region: &HashSet<ChunkCoord>,
+        mut intents: Vec<MoveIntent>,
+    ) {
+        intents.sort_by_key(|intent| intent.priority);
+        let mut claimed_src = HashSet::new();
+        let mut claimed_dst = HashSet::new();
+        for intent in intents {
+            if claimed_src.contains(&intent.from) || claimed_dst.contains(&intent.to) {
+                continue;
+            }
+            let (src_chunk, src_local) = voxel_to_chunk(intent.from);
+            let (dst_chunk, dst_local) = voxel_to_chunk(intent.to);
+            if !region.contains(&src_chunk) || !region.contains(&dst_chunk) {
+                continue;
+            }
+            let Some(src_page_read) = self.resident_pages_current.get(&src_chunk) else {
+                continue;
+            };
+            let src_idx = crate::chunk_store::Chunk::index(
+                src_local[0] as usize,
+                src_local[1] as usize,
+                src_local[2] as usize,
+            );
+            let dst_idx = crate::chunk_store::Chunk::index(
+                dst_local[0] as usize,
+                dst_local[1] as usize,
+                dst_local[2] as usize,
+            );
+            let src_material = src_page_read[src_idx];
+            if src_material == EMPTY {
+                continue;
+            }
+            let dst_material = self
+                .resident_pages_current
+                .get(&dst_chunk)
+                .map(|p| p[dst_idx])
+                .unwrap_or(EMPTY);
+            if dst_material != EMPTY {
+                continue;
+            }
+            if let Some(src_page_write) = self.resident_pages_next.get_mut(&src_chunk) {
+                src_page_write[src_idx] = EMPTY;
+            }
+            if let Some(dst_page_write) = self.resident_pages_next.get_mut(&dst_chunk) {
+                dst_page_write[dst_idx] = src_material;
+            }
+            claimed_src.insert(intent.from);
+            claimed_dst.insert(intent.to);
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn compute_divergence_pass(&self) {}
+    #[cfg(feature = "gpu-compute")]
+    fn pressure_solve_pass(&self) {}
+    #[cfg(feature = "gpu-compute")]
+    fn projection_pass(&self) {}
+    #[cfg(feature = "gpu-compute")]
+    fn material_update_pass(&self) {}
+
+    #[cfg(feature = "gpu-compute")]
+    fn flush_targeted_updates_to_cpu(
+        &mut self,
+        store: &mut ChunkStore,
+        region: &HashSet<ChunkCoord>,
+    ) -> HashSet<ChunkCoord> {
+        let mut touched_chunks = HashSet::new();
+        for &chunk in region {
+            let Some(gpu_page) = self.resident_pages_current.get(&chunk).cloned() else {
+                continue;
+            };
+            let origin = chunk_to_world_min(chunk);
+            for z in 0..CHUNK_SIZE_VOXELS as usize {
+                for y in 0..CHUNK_SIZE_VOXELS as usize {
+                    for x in 0..CHUNK_SIZE_VOXELS as usize {
+                        let idx = crate::chunk_store::Chunk::index(x, y, z);
+                        let gpu_value = gpu_page[idx];
+                        let world = VoxelCoord {
+                            x: origin.x + x as i32,
+                            y: origin.y + y as i32,
+                            z: origin.z + z as i32,
+                        };
+                        if store.get_voxel(world) == gpu_value {
+                            continue;
+                        }
+                        store.set_voxel(world, gpu_value);
+                        touched_chunks.insert(chunk);
+                        self.record_dirty_voxel(chunk, [x as u32, y as u32, z as u32], world);
+                    }
+                }
+            }
+        }
+        touched_chunks
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn record_dirty_voxel(&mut self, chunk: ChunkCoord, local: [u32; 3], world: VoxelCoord) {
+        let entry = self
+            .last_dirty_metadata
+            .dirty_regions
+            .entry(chunk)
+            .or_insert(DirtyChunkRegion {
+                min: local,
+                max: local,
+            });
+        for axis in 0..3 {
+            entry.min[axis] = entry.min[axis].min(local[axis]);
+            entry.max[axis] = entry.max[axis].max(local[axis]);
+        }
+        self.last_dirty_metadata.dirty_bounds = match self.last_dirty_metadata.dirty_bounds {
+            None => Some((world, world)),
+            Some((mut min, mut max)) => {
+                min.x = min.x.min(world.x);
+                min.y = min.y.min(world.y);
+                min.z = min.z.min(world.z);
+                max.x = max.x.max(world.x);
+                max.y = max.y.max(world.y);
+                max.z = max.z.max(world.z);
+                Some((min, max))
+            }
+        };
     }
 
     fn stage_edit_commands(
@@ -419,6 +706,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn liquid_crosses_two_chunk_boundary() {
+        let mut backend = GpuFluidBackend::default();
+        let mut store = ChunkStore::new();
+        let a = ChunkCoord { x: 0, y: 0, z: 0 };
+        let b = ChunkCoord { x: 1, y: 0, z: 0 };
+        let region = HashSet::from([a, b]);
+
+        // water at +X edge of chunk A
+        store.set_voxel(VoxelCoord { x: 31, y: 4, z: 4 }, 5);
+        // block downward and in-chunk lateral options so +X neighbor is selected
+        store.set_voxel(VoxelCoord { x: 31, y: 3, z: 4 }, 1);
+        store.set_voxel(VoxelCoord { x: 30, y: 4, z: 4 }, 1);
+        store.set_voxel(VoxelCoord { x: 31, y: 4, z: 3 }, 1);
+        store.set_voxel(VoxelCoord { x: 31, y: 4, z: 5 }, 1);
+
+        let touched = backend.dispatch_substep(&mut store, &region, 0);
+        assert!(touched.contains(&a));
+        assert!(touched.contains(&b));
+        assert_eq!(store.get_voxel(VoxelCoord { x: 31, y: 4, z: 4 }), EMPTY);
+        assert_eq!(store.get_voxel(VoxelCoord { x: 32, y: 4, z: 4 }), 5);
+    }
+
+    #[test]
+    fn liquid_settles_continuously_across_boundary() {
+        let mut backend = GpuFluidBackend::default();
+        let mut store = ChunkStore::new();
+        let a = ChunkCoord { x: 0, y: 0, z: 0 };
+        let b = ChunkCoord { x: 1, y: 0, z: 0 };
+        let region = HashSet::from([a, b]);
+
+        store.set_voxel(VoxelCoord { x: 31, y: 8, z: 4 }, 5);
+        store.set_voxel(VoxelCoord { x: 32, y: 8, z: 4 }, 5);
+        for x in 30..=33 {
+            store.set_voxel(VoxelCoord { x, y: 0, z: 4 }, 1);
+        }
+
+        for substep in 0..16 {
+            backend.dispatch_substep(&mut store, &region, substep);
+        }
+
+        assert_eq!(store.get_voxel(VoxelCoord { x: 31, y: 1, z: 4 }), 5);
+        assert_eq!(store.get_voxel(VoxelCoord { x: 32, y: 1, z: 4 }), 5);
+    }
     #[test]
     fn gas_candidates_include_upward_motion() {
         let origin = VoxelCoord {
