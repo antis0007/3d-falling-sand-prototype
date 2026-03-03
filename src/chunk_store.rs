@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::types::{voxel_to_chunk, ChunkCoord, MaterialId, VoxelCoord, CHUNK_SIZE_VOXELS};
-use crate::world::Chunk as LegacyChunk;
 use crate::world::EMPTY;
 
 const CHUNK_VOLUME: usize =
@@ -320,18 +319,6 @@ impl Chunk {
     }
 }
 
-impl From<LegacyChunk> for Chunk {
-    fn from(value: LegacyChunk) -> Self {
-        let mut chunk = Self {
-            voxels: value.iter_raw().to_vec().into_boxed_slice(),
-            face_non_empty_counts: [0; 6],
-            face_non_empty_mask: 0,
-        };
-        chunk.rebuild_face_cache();
-        chunk
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NeighborDirtyPolicy {
     MarkExisting,
@@ -544,8 +531,8 @@ impl ChunkStore {
         borders
     }
 
-    pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: LegacyChunk) {
-        self.insert_chunk_with_policy(coord, chunk.into(), true, NeighborDirtyPolicy::MarkExisting);
+    pub fn insert_chunk(&mut self, coord: ChunkCoord, chunk: Chunk) {
+        self.insert_chunk_with_policy(coord, chunk, true, NeighborDirtyPolicy::MarkExisting);
     }
 
     pub fn insert_chunk_with_policy(
@@ -698,8 +685,8 @@ impl ChunkStore {
 mod tests {
     use super::*;
 
-    fn legacy_chunk_with_fill(fill: MaterialId) -> LegacyChunk {
-        let mut chunk = LegacyChunk::new();
+    fn chunk_with_fill(fill: MaterialId) -> Chunk {
+        let mut chunk = Chunk::new_empty();
         for z in 0..CHUNK_SIZE_VOXELS as usize {
             for y in 0..CHUNK_SIZE_VOXELS as usize {
                 for x in 0..CHUNK_SIZE_VOXELS as usize {
@@ -722,10 +709,10 @@ mod tests {
         let center = ChunkCoord { x: 0, y: 0, z: 0 };
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
 
-        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(1));
         store.take_dirty_chunks();
 
-        store.insert_chunk(center, legacy_chunk_with_fill(2));
+        store.insert_chunk(center, chunk_with_fill(2));
 
         assert!(store.is_dirty(center));
         assert!(store.is_dirty(east));
@@ -737,8 +724,8 @@ mod tests {
         let center = ChunkCoord { x: 0, y: 0, z: 0 };
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
 
-        store.insert_chunk(center, legacy_chunk_with_fill(1));
-        store.insert_chunk(east, legacy_chunk_with_fill(2));
+        store.insert_chunk(center, chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(2));
         store.take_dirty_chunks();
 
         store.remove_chunk(center);
@@ -755,7 +742,7 @@ mod tests {
         assert!(!store.is_chunk_loaded(center));
         assert!(!store.is_voxel_chunk_loaded(VoxelCoord { x: 0, y: 0, z: 0 }));
 
-        store.insert_chunk(center, legacy_chunk_with_fill(1));
+        store.insert_chunk(center, chunk_with_fill(1));
 
         assert!(store.is_chunk_loaded(center));
         let edge = CHUNK_SIZE_VOXELS - 1;
@@ -792,7 +779,7 @@ mod tests {
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
         let last = CHUNK_SIZE_VOXELS as usize - 1;
 
-        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(1));
         store.take_dirty_chunks();
 
         store.insert_chunk_with_policy(
@@ -953,7 +940,7 @@ mod tests {
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
         let last = CHUNK_SIDE - 1;
 
-        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(1));
         store.take_dirty_chunks();
 
         let mut first = Chunk::new_empty();
@@ -987,7 +974,7 @@ mod tests {
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
         let last = CHUNK_SIDE - 1;
 
-        store.insert_chunk(east, legacy_chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(1));
         store.take_dirty_chunks();
 
         let mut first = Chunk::new_empty();
@@ -1018,8 +1005,8 @@ mod tests {
         let center = ChunkCoord { x: 0, y: 0, z: 0 };
         let east = ChunkCoord { x: 1, y: 0, z: 0 };
 
-        store.insert_chunk(center, legacy_chunk_with_fill(1));
-        store.insert_chunk(east, legacy_chunk_with_fill(2));
+        store.insert_chunk(center, chunk_with_fill(1));
+        store.insert_chunk(east, chunk_with_fill(2));
         store.take_dirty_chunks();
 
         store.remove_chunk(center);

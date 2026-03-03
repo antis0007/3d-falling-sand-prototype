@@ -4,8 +4,10 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::chunk_store::{Chunk, ChunkStore, NeighborDirtyPolicy};
-use crate::types::ChunkCoord;
-use crate::world::{MaterialId, World, CHUNK_SIZE, EMPTY};
+use crate::types::{ChunkCoord, MaterialId, CHUNK_SIZE_VOXELS};
+
+const EMPTY: MaterialId = 0;
+const CHUNK_SIZE: usize = CHUNK_SIZE_VOXELS as usize;
 
 const STONE: MaterialId = 1;
 const WOOD: MaterialId = 2;
@@ -70,8 +72,7 @@ pub fn generate_chunk_direct(seed: u64, c: ChunkCoord) -> Chunk {
 }
 
 fn generate_chunk_from_config(config: ProcGenConfig) -> Chunk {
-    let mut world = World::new(config.dims);
-    world.clear_empty();
+    let mut world = ProcGenVolume::new(config.dims);
     let timings = ProcGenPassTimings::default();
     let stages = ProcGenStages::default();
     let cache = build_procgen_field_cache(&config, 16, &timings);
@@ -102,15 +103,67 @@ fn generate_chunk_from_config(config: ProcGenConfig) -> Chunk {
     if stages.vegetation {
         vegetation_pass_chunk(&mut world, &config, &cache, &hydrology, &timings);
     }
-    world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
+    world.into_single_chunk()
+}
 
-    let legacy = world
-        .chunks
-        .into_iter()
-        .next()
-        .unwrap_or_else(crate::world::Chunk::new);
-    legacy.into()
+#[derive(Clone)]
+struct ProcGenVolume {
+    dims: [usize; 3],
+    voxels: Vec<MaterialId>,
+}
+
+impl ProcGenVolume {
+    fn new(dims: [usize; 3]) -> Self {
+        let volume = dims[0] * dims[1] * dims[2];
+        Self {
+            dims,
+            voxels: vec![EMPTY; volume],
+        }
+    }
+
+    fn index(&self, x: usize, y: usize, z: usize) -> usize {
+        x + y * self.dims[0] + z * self.dims[0] * self.dims[1]
+    }
+
+    fn get(&self, x: i32, y: i32, z: i32) -> MaterialId {
+        if x < 0 || y < 0 || z < 0 {
+            return EMPTY;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        if x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
+            return EMPTY;
+        }
+        self.voxels[self.index(x, y, z)]
+    }
+
+    fn set_raw_no_side_effects(&mut self, x: i32, y: i32, z: i32, id: MaterialId) -> bool {
+        if x < 0 || y < 0 || z < 0 {
+            return false;
+        }
+        let (x, y, z) = (x as usize, y as usize, z as usize);
+        if x >= self.dims[0] || y >= self.dims[1] || z >= self.dims[2] {
+            return false;
+        }
+        let idx = self.index(x, y, z);
+        if self.voxels[idx] == id {
+            return false;
+        }
+        self.voxels[idx] = id;
+        true
+    }
+
+    fn into_single_chunk(self) -> Chunk {
+        let mut chunk = Chunk::new_empty();
+        for z in 0..self.dims[2] {
+            for y in 0..self.dims[1] {
+                for x in 0..self.dims[0] {
+                    chunk.set(x, y, z, self.voxels[self.index(x, y, z)]);
+                }
+            }
+        }
+        chunk
+    }
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
@@ -584,7 +637,7 @@ impl ProcGenConfig {
     }
 }
 
-fn generate_world(config: ProcGenConfig) -> World {
+fn generate_world(config: ProcGenConfig) -> ProcGenVolume {
     let never_cancel = |_epoch: u64| false;
     generate_world_with_control(
         config,
@@ -594,8 +647,7 @@ fn generate_world(config: ProcGenConfig) -> World {
         },
     )
     .unwrap_or_else(|| {
-        let mut world = World::new(config.dims);
-        world.clear_empty();
+        let mut world = ProcGenVolume::new(config.dims);
         world
     })
 }
@@ -603,9 +655,8 @@ fn generate_world(config: ProcGenConfig) -> World {
 fn generate_world_with_control(
     config: ProcGenConfig,
     control: ProcGenControl<'_>,
-) -> Option<World> {
-    let mut world = World::new(config.dims);
-    world.clear_empty();
+) -> Option<ProcGenVolume> {
+    let mut world = ProcGenVolume::new(config.dims);
     let timings = ProcGenPassTimings::default();
     let stages = ProcGenStages::default();
     let cache = build_procgen_field_cache(
@@ -661,7 +712,6 @@ fn generate_world_with_control(
             &timings,
         );
     }
-    world.finalize_generation_side_effects();
     timings.log_total(config.world_origin);
 
     Some(world)
@@ -1118,7 +1168,7 @@ fn pack_column_key(wx: i32, wz: i32) -> u64 {
 }
 
 fn base_terrain_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
@@ -1149,7 +1199,7 @@ fn base_terrain_pass(
 }
 
 fn cave_carve_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
@@ -1234,7 +1284,7 @@ fn cave_carve_pass(
 }
 
 fn cave_carve_pass_chunk(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
@@ -1243,7 +1293,7 @@ fn cave_carve_pass_chunk(
 }
 
 fn surface_layering_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     hydrology: &HydrologyData,
@@ -1447,7 +1497,7 @@ fn surface_layering_pass(
 }
 
 fn surface_layering_pass_chunk(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     hydrology: &HydrologyData,
@@ -1472,7 +1522,7 @@ fn slope_at_world(config: &ProcGenConfig, wx: i32, wz: i32) -> i32 {
 }
 
 fn shoreline_transition_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     timings: &ProcGenPassTimings,
@@ -1530,7 +1580,7 @@ fn shoreline_transition_pass(
     }
 }
 
-fn build_surface_heightmap_from_world(world: &World) -> Vec<i32> {
+fn build_surface_heightmap_from_world(world: &ProcGenVolume) -> Vec<i32> {
     let mut heights = vec![0; world.dims[0] * world.dims[2]];
     for z in 0..world.dims[2] as i32 {
         for x in 0..world.dims[0] as i32 {
@@ -1578,7 +1628,7 @@ fn flood_fill_columns(
 }
 
 fn hydrology_fill_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     heights: &[i32],
     columns: &[ColumnGenData],
@@ -1706,7 +1756,7 @@ fn hydrology_fill_pass(
 }
 
 fn apply_channel_edit(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     x: i32,
     z: i32,
     floor: i32,
@@ -1741,7 +1791,7 @@ fn apply_channel_edit(
     }
 }
 
-fn is_column_open_to_sky(world: &World, x: i32, z: i32, start_y: i32) -> bool {
+fn is_column_open_to_sky(world: &ProcGenVolume, x: i32, z: i32, start_y: i32) -> bool {
     for y in start_y.max(0)..world.dims[1] as i32 {
         let mat = world.get(x, y, z);
         if mat != EMPTY && mat != WATER {
@@ -1825,7 +1875,7 @@ fn explicit_rapid_or_fall(seed: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> bool
 }
 
 fn remove_unsupported_hanging_water_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     timings: &ProcGenPassTimings,
 ) {
@@ -1915,7 +1965,7 @@ fn remove_unsupported_hanging_water_pass(
 }
 
 fn enforce_subsea_materials_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     timings: &ProcGenPassTimings,
 ) {
@@ -1944,7 +1994,7 @@ fn enforce_subsea_materials_pass(
 }
 
 fn vegetation_pass(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     columns: &[ColumnGenData],
     hydrology: &HydrologyData,
@@ -2170,7 +2220,7 @@ fn tree_density_for_anchor(
 }
 
 fn vegetation_pass_chunk(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     hydrology: &HydrologyData,
@@ -2469,7 +2519,7 @@ fn has_deterministic_tree_support(
 }
 
 fn has_tree_support_and_headroom(
-    world: &World,
+    world: &ProcGenVolume,
     config: &ProcGenConfig,
     cache: &ProcGenFieldCache,
     wx: i32,
@@ -2545,7 +2595,7 @@ fn is_surface_wet_for_tree(
 }
 
 fn apply_vegetation_intents(
-    world: &mut World,
+    world: &mut ProcGenVolume,
     config: &ProcGenConfig,
     intents: &[VegetationIntent],
     cache: Option<&ProcGenFieldCache>,
@@ -2714,7 +2764,7 @@ fn stage_tree_intents(
     }
 }
 
-pub fn find_safe_spawn(world: &World, seed: u64) -> [f32; 3] {
+pub fn find_safe_spawn(world: &ProcGenVolume, seed: u64) -> [f32; 3] {
     let cx = (world.dims[0] / 2) as i32;
     let cz = (world.dims[2] / 2) as i32;
 
@@ -2744,7 +2794,7 @@ pub fn find_safe_spawn(world: &World, seed: u64) -> [f32; 3] {
     ]
 }
 
-fn valid_surface_spawn_y(world: &World, x: i32, z: i32) -> Option<i32> {
+fn valid_surface_spawn_y(world: &ProcGenVolume, x: i32, z: i32) -> Option<i32> {
     let top = surface_y(world, x, z)?;
     let base = world.get(x, top, z);
     if base == WATER || base == EMPTY {
@@ -3012,7 +3062,7 @@ fn dominant_base_biome(weights: [f32; BIOME_COUNT]) -> BiomeType {
 }
 
 fn near_water_tree_penalty(
-    world: &World,
+    world: &ProcGenVolume,
     x: i32,
     y: i32,
     z: i32,
@@ -3036,7 +3086,7 @@ fn near_water_tree_penalty(
 }
 
 fn can_place_tree(
-    world: &World,
+    world: &ProcGenVolume,
     x: i32,
     y: i32,
     z: i32,
@@ -3072,7 +3122,7 @@ fn hydrology_wet_candidate(
         || hydrology.river_level[idx].is_some_and(|level| surface_height <= level + 1)
 }
 
-fn surface_y(world: &World, x: i32, z: i32) -> Option<i32> {
+fn surface_y(world: &ProcGenVolume, x: i32, z: i32) -> Option<i32> {
     for y in (1..world.dims[1] as i32).rev() {
         let m = world.get(x, y, z);
         if m != EMPTY && m != WATER {
@@ -3082,7 +3132,7 @@ fn surface_y(world: &World, x: i32, z: i32) -> Option<i32> {
     None
 }
 
-fn near_water(world: &World, x: i32, y: i32, z: i32) -> bool {
+fn near_water(world: &ProcGenVolume, x: i32, y: i32, z: i32) -> bool {
     for dz in -2..=2 {
         for dx in -2..=2 {
             if world.get(x + dx, y, z + dz) == WATER || world.get(x + dx, y + 1, z + dz) == WATER {
@@ -3243,7 +3293,7 @@ mod tests {
         matches!(mat, STONE | DIRT | SAND | TURF)
     }
 
-    fn water_surface(world: &World, x: i32, z: i32) -> Option<i32> {
+    fn water_surface(world: &ProcGenVolume, x: i32, z: i32) -> Option<i32> {
         for y in (1..world.dims[1] as i32).rev() {
             if world.get(x, y, z) == WATER {
                 return Some(y);
@@ -3253,7 +3303,7 @@ mod tests {
     }
 
     fn count_river_water_columns(
-        world: &World,
+        world: &ProcGenVolume,
         heights: &[i32],
         hydrology: &HydrologyData,
     ) -> usize {
@@ -3290,7 +3340,7 @@ mod tests {
             .count()
     }
 
-    fn count_water_columns(world: &World) -> usize {
+    fn count_water_columns(world: &ProcGenVolume) -> usize {
         let width = world.dims[0] as i32;
         let depth = world.dims[2] as i32;
         let mut total = 0usize;
@@ -3326,7 +3376,7 @@ mod tests {
         total
     }
 
-    fn cave_agreement(a: &World, b: &World, axis: char) -> (usize, usize) {
+    fn cave_agreement(a: &ProcGenVolume, b: &ProcGenVolume, axis: char) -> (usize, usize) {
         let heights_a = build_surface_heightmap_from_world(a);
         let heights_b = build_surface_heightmap_from_world(b);
         let mut matches = 0usize;
@@ -4646,7 +4696,7 @@ mod tests {
             }
         }
     }
-    fn top_surface_histogram(world: &World) -> HashMap<MaterialId, usize> {
+    fn top_surface_histogram(world: &ProcGenVolume) -> HashMap<MaterialId, usize> {
         let mut counts = HashMap::new();
         for z in 0..world.dims[2] as i32 {
             for x in 0..world.dims[0] as i32 {

@@ -1259,8 +1259,9 @@ fn can_displace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk_store::Chunk;
     use crate::sim::XorShift32;
-    use crate::world::{Chunk as LegacyChunk, EMPTY};
+    use crate::world::EMPTY;
 
     #[test]
     fn skips_cross_chunk_moves_into_unloaded_destination_chunks() {
@@ -1273,7 +1274,7 @@ mod tests {
             z: source_world.z,
         };
 
-        let mut chunk = LegacyChunk::new();
+        let mut chunk = Chunk::new_empty();
         for z in 0..CHUNK_SIZE_VOXELS as usize {
             for y in 0..CHUNK_SIZE_VOXELS as usize {
                 for x in 0..CHUNK_SIZE_VOXELS as usize {
@@ -1431,7 +1432,7 @@ mod tests {
             z: base.z + (CHUNK_SIZE_VOXELS / 2),
         };
 
-        let mut chunk = LegacyChunk::new();
+        let mut chunk = Chunk::new_empty();
         for z in 0..CHUNK_SIZE_VOXELS as usize {
             for y in 0..CHUNK_SIZE_VOXELS as usize {
                 for x in 0..CHUNK_SIZE_VOXELS as usize {
