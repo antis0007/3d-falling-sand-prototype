@@ -93,6 +93,16 @@ impl Camera {
         let proj = Mat4::perspective_rh(60f32.to_radians(), self.aspect.max(0.1), 0.1, 1200.0);
         proj * view
     }
+
+    fn view_proj_for_world_origin(&self, origin_voxel: VoxelCoord) -> Mat4 {
+        let origin_world = voxel_to_world(origin_voxel);
+        let world_camera = Camera {
+            pos: self.pos + origin_world,
+            dir: self.dir,
+            aspect: self.aspect,
+        };
+        world_camera.view_proj()
+    }
 }
 
 pub struct ChunkMesh {
@@ -132,6 +142,7 @@ impl ChunkOriginWorld {
 
 const DEBUG_VISIBLE_CHUNK_LOG_COUNT: usize = 8;
 const DEBUG_RENDER_CHUNK_AABBS: bool = false;
+const DEBUG_VALIDATE_CULL_SPACE: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChunkLod {
@@ -586,7 +597,8 @@ impl Renderer {
     }
 
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
-        let vp = camera.view_proj();
+        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
+        let world_camera_pos = camera_world_position(camera, self.origin_voxel);
         let mut stats = CullStats::default();
         for (&(coord, lod), mesh) in &self.store_meshes {
             if self
@@ -599,16 +611,19 @@ impl Renderer {
                 stats.lod_filtered += 1;
                 continue;
             }
-            let (aabb_min, aabb_max) = world_aabb_to_render_space(
-                mesh.world_aabb_min,
-                mesh.world_aabb_max,
-                self.origin_voxel,
-            );
-            if self.settings.frustum_culling && !aabb_in_view(vp, aabb_min, aabb_max) {
+            if self.settings.frustum_culling
+                && !aabb_in_view(vp_world, mesh.world_aabb_min, mesh.world_aabb_max)
+            {
                 stats.frustum_culled += 1;
                 continue;
             }
-            if !passes_screen_space_cull(camera, lod, aabb_min, aabb_max, self.size.height) {
+            if !passes_screen_space_cull(
+                world_camera_pos,
+                lod,
+                mesh.world_aabb_min,
+                mesh.world_aabb_max,
+                self.size.height,
+            ) {
                 stats.screen_culled += 1;
                 continue;
             }
@@ -1013,7 +1028,8 @@ impl Renderer {
         self.meshed_versions.clear();
         self.lod_selection.clear();
     }
-    pub fn mesh_draw_stats(&self, vp: glam::Mat4) -> (usize, u64) {
+    pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
+        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
         let mut chunks = 0usize;
         let mut inds = 0u64;
         for (&(coord, lod), m) in &self.store_meshes {
@@ -1026,9 +1042,7 @@ impl Renderer {
             {
                 continue;
             }
-            let (aabb_min, aabb_max) =
-                world_aabb_to_render_space(m.world_aabb_min, m.world_aabb_max, self.origin_voxel);
-            if aabb_in_view(vp, aabb_min, aabb_max) {
+            if aabb_in_view(vp_world, m.world_aabb_min, m.world_aabb_max) {
                 chunks += 1;
                 inds += m.index_count as u64;
             }
@@ -1037,13 +1051,15 @@ impl Renderer {
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
-        let vp = camera.view_proj();
+        let vp_render = camera.view_proj();
+        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
+        let world_camera_pos = camera_world_position(camera, self.origin_voxel);
 
         self.queue.write_buffer(
             &self.cam_buf,
             0,
             bytemuck::bytes_of(&CameraUniform {
-                vp: vp.to_cols_array_2d(),
+                vp: vp_render.to_cols_array_2d(),
                 origin_offset: [
                     self.origin_voxel.x as f32 * VOXEL_SIZE,
                     self.origin_voxel.y as f32 * VOXEL_SIZE,
@@ -1067,26 +1083,57 @@ impl Renderer {
             {
                 continue;
             }
-            let (aabb_min, aabb_max) = world_aabb_to_render_space(
+
+            let visible_world = chunk_visible_in_world_space(
+                self.settings.frustum_culling,
+                vp_world,
+                world_camera_pos,
+                lod,
                 mesh.world_aabb_min,
                 mesh.world_aabb_max,
-                self.origin_voxel,
+                self.size.height,
             );
-            if self.settings.frustum_culling && !aabb_in_view(vp, aabb_min, aabb_max) {
-                continue;
+            if DEBUG_VALIDATE_CULL_SPACE {
+                let visible_render = chunk_visible_in_render_space(
+                    self.settings.frustum_culling,
+                    vp_render,
+                    camera.pos,
+                    lod,
+                    mesh.world_aabb_min,
+                    mesh.world_aabb_max,
+                    self.origin_voxel,
+                    self.size.height,
+                );
+                if visible_world != visible_render {
+                    log::warn!(
+                        "cull-space mismatch chunk={:?} lod={:?} world_visible={} render_visible={} origin_voxel={:?}",
+                        coord,
+                        lod,
+                        visible_world,
+                        visible_render,
+                        self.origin_voxel,
+                    );
+                }
+                debug_assert_eq!(visible_world, visible_render);
             }
-            if !passes_screen_space_cull(camera, lod, aabb_min, aabb_max, self.size.height) {
+
+            if !visible_world {
                 continue;
             }
             if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
                 let origin_offset_world = voxel_to_world(self.origin_voxel);
+                let (render_aabb_min, render_aabb_max) = world_aabb_to_render_space(
+                    mesh.world_aabb_min,
+                    mesh.world_aabb_max,
+                    self.origin_voxel,
+                );
                 log::debug!(
                     "visible chunk {:?} world_origin={:?} origin_offset={:?} render_aabb_min={:?} render_aabb_max={:?}",
                     coord,
                     mesh.chunk_origin_world,
                     origin_offset_world,
-                    aabb_min,
-                    aabb_max,
+                    render_aabb_min,
+                    render_aabb_max,
                 );
                 debug_visible_logged += 1;
             }
@@ -1888,8 +1935,53 @@ fn world_aabb_to_render_space(
     (world_aabb_min - origin, world_aabb_max - origin)
 }
 
+fn camera_world_position(camera: &Camera, origin_voxel: VoxelCoord) -> Vec3 {
+    camera.pos + voxel_to_world(origin_voxel)
+}
+
+fn chunk_visible_in_world_space(
+    frustum_culling: bool,
+    vp_world: Mat4,
+    world_camera_pos: Vec3,
+    lod: ChunkLod,
+    world_aabb_min: Vec3,
+    world_aabb_max: Vec3,
+    screen_h: u32,
+) -> bool {
+    (!frustum_culling || aabb_in_view(vp_world, world_aabb_min, world_aabb_max))
+        && passes_screen_space_cull(
+            world_camera_pos,
+            lod,
+            world_aabb_min,
+            world_aabb_max,
+            screen_h,
+        )
+}
+
+fn chunk_visible_in_render_space(
+    frustum_culling: bool,
+    vp_render: Mat4,
+    render_camera_pos: Vec3,
+    lod: ChunkLod,
+    world_aabb_min: Vec3,
+    world_aabb_max: Vec3,
+    origin_voxel: VoxelCoord,
+    screen_h: u32,
+) -> bool {
+    let (render_aabb_min, render_aabb_max) =
+        world_aabb_to_render_space(world_aabb_min, world_aabb_max, origin_voxel);
+    (!frustum_culling || aabb_in_view(vp_render, render_aabb_min, render_aabb_max))
+        && passes_screen_space_cull(
+            render_camera_pos,
+            lod,
+            render_aabb_min,
+            render_aabb_max,
+            screen_h,
+        )
+}
+
 fn passes_screen_space_cull(
-    camera: &Camera,
+    camera_pos: Vec3,
     lod: ChunkLod,
     aabb_min: Vec3,
     aabb_max: Vec3,
@@ -1906,7 +1998,7 @@ fn passes_screen_space_cull(
     }
     let center = (aabb_min + aabb_max) * 0.5;
     let radius = (aabb_max - center).length();
-    let distance = (center - camera.pos).length().max(0.01);
+    let distance = (center - camera_pos).length().max(0.01);
     let focal = screen_h as f32 / (2.0 * (60f32.to_radians() * 0.5).tan());
     let pixel_radius = (radius / distance) * focal;
     pixel_radius * 2.0 >= min_pixels
@@ -2165,6 +2257,124 @@ mod tests {
         let beyond_far_min = Vec3::new(-1.0, -1.0, -1300.0);
         let beyond_far_max = Vec3::new(1.0, 1.0, -1250.0);
         assert!(!aabb_in_view(vp, beyond_far_min, beyond_far_max));
+    }
+
+    #[test]
+    fn culling_visibility_with_zero_origin_is_consistent() {
+        let origin = VoxelCoord { x: 0, y: 0, z: 0 };
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let world_min = Vec3::new(-1.0, -1.0, -6.0);
+        let world_max = Vec3::new(1.0, 1.0, -4.0);
+
+        let world_visible = chunk_visible_in_world_space(
+            true,
+            camera.view_proj_for_world_origin(origin),
+            camera_world_position(&camera, origin),
+            ChunkLod::Far,
+            world_min,
+            world_max,
+            1080,
+        );
+        let render_visible = chunk_visible_in_render_space(
+            true,
+            camera.view_proj(),
+            camera.pos,
+            ChunkLod::Far,
+            world_min,
+            world_max,
+            origin,
+            1080,
+        );
+
+        assert!(world_visible);
+        assert_eq!(world_visible, render_visible);
+    }
+
+    #[test]
+    fn culling_visibility_with_large_non_zero_origin_is_consistent() {
+        let origin = VoxelCoord {
+            x: 4_000_000,
+            y: 1_500,
+            z: -3_250_000,
+        };
+        let origin_world = voxel_to_world(origin);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let world_min = origin_world + Vec3::new(-1.0, -1.0, -16.0);
+        let world_max = origin_world + Vec3::new(1.0, 1.0, -8.0);
+
+        let world_visible = chunk_visible_in_world_space(
+            true,
+            camera.view_proj_for_world_origin(origin),
+            camera_world_position(&camera, origin),
+            ChunkLod::Ultra,
+            world_min,
+            world_max,
+            1080,
+        );
+        let render_visible = chunk_visible_in_render_space(
+            true,
+            camera.view_proj(),
+            camera.pos,
+            ChunkLod::Ultra,
+            world_min,
+            world_max,
+            origin,
+            1080,
+        );
+
+        assert!(world_visible);
+        assert_eq!(world_visible, render_visible);
+    }
+
+    #[test]
+    fn visibility_decisions_are_equivalent_under_origin_rebasing() {
+        let local_camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let world_camera = Camera {
+            pos: Vec3::new(1_000_000.0, 0.0, -2_000_000.0),
+            dir: local_camera.dir,
+            aspect: local_camera.aspect,
+        };
+        let origin = VoxelCoord {
+            x: (world_camera.pos.x / VOXEL_SIZE) as i32,
+            y: (world_camera.pos.y / VOXEL_SIZE) as i32,
+            z: (world_camera.pos.z / VOXEL_SIZE) as i32,
+        };
+
+        let world_min = world_camera.pos + Vec3::new(-2.0, -2.0, -20.0);
+        let world_max = world_camera.pos + Vec3::new(2.0, 2.0, -12.0);
+
+        let baseline_world = chunk_visible_in_world_space(
+            true,
+            world_camera.view_proj(),
+            world_camera.pos,
+            ChunkLod::Far,
+            world_min,
+            world_max,
+            1080,
+        );
+        let rebased_world = chunk_visible_in_world_space(
+            true,
+            local_camera.view_proj_for_world_origin(origin),
+            camera_world_position(&local_camera, origin),
+            ChunkLod::Far,
+            world_min,
+            world_max,
+            1080,
+        );
+
+        assert_eq!(baseline_world, rebased_world);
     }
 
     #[test]
