@@ -1293,7 +1293,15 @@ pub async fn run() -> anyhow::Result<()> {
                             desired_recompute_reason = reasons.join("|");
 
                             let chunk_size_meters = crate::types::CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
-                            let camera_pos_world = camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE);
+                            let camera_pos_world = camera_world_pos_from_blocks(
+                                ctrl.position
+                                    + Vec3::new(
+                                        origin_voxel.x as f32,
+                                        origin_voxel.y as f32,
+                                        origin_voxel.z as f32,
+                                    ),
+                                VOXEL_SIZE,
+                            );
                             let camera_pos_chunks = camera_pos_world / chunk_size_meters;
                             let chunk_camera = Camera {
                                 pos: camera_pos_chunks,
