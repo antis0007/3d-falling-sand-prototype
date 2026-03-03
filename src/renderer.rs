@@ -1,3 +1,17 @@
+//! Authoritative meshing pipeline for runtime rendering.
+//!
+//! - **Authoritative input:** meshing consumes a [`ChunkSnapshot`] built from
+//!   [`ChunkStore`] via `build_chunk_snapshot`, so workers never read mutable
+//!   world state directly.
+//! - **Vertex coordinate space:** all generated vertex positions and chunk AABBs
+//!   are emitted in stable world-space voxel coordinates scaled by
+//!   [`VOXEL_SIZE`].
+//! - **Chunk transform ownership:** meshing owns per-chunk world-space geometry
+//!   placement; draw-time code must not apply additional chunk-local transforms.
+//! - **Floating-origin contract:** floating-origin offsets are applied in camera
+//!   uniforms at render time, not during mesh generation, so cached chunk meshes
+//!   remain reusable across origin rebases.
+
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
     cpu_generate_material_field, rebuilt_snapshot_from_materials, GpuComputeRuntime,
@@ -2236,6 +2250,17 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk_store::{Chunk, NeighborDirtyPolicy};
+
+    fn coord() -> ChunkCoord {
+        ChunkCoord { x: 0, y: 0, z: 0 }
+    }
+
+    fn chunk_with_voxel(x: usize, y: usize, z: usize, id: MaterialId) -> Chunk {
+        let mut c = Chunk::new_empty();
+        c.set(x, y, z, id);
+        c
+    }
 
     #[test]
     fn frustum_culls_and_accepts_expected_aabbs() {
@@ -2449,5 +2474,91 @@ mod tests {
         assert_eq!(near, ChunkLod::Near);
         assert_eq!(far, ChunkLod::Far);
         assert_eq!(ultra, ChunkLod::Ultra);
+    }
+
+    #[test]
+    fn unknown_neighbor_treated_as_empty_for_boundary_faces_in_aggressive_mode() {
+        let mut store = ChunkStore::new();
+        store.insert_chunk_with_policy(
+            coord(),
+            chunk_with_voxel(CHUNK_SIZE_VOXELS as usize - 1, 2, 2, 1),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let no_neighbor =
+            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
+        let (verts_a, _, _, _) = mesh_chunk_snapshot(coord(), &no_neighbor, ChunkLod::Near, false);
+
+        store.insert_chunk_with_policy(
+            ChunkCoord { x: 1, y: 0, z: 0 },
+            Chunk::new_empty(),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+        let with_neighbor =
+            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
+        let (verts_b, _, _, _) =
+            mesh_chunk_snapshot(coord(), &with_neighbor, ChunkLod::Near, false);
+
+        assert_eq!(verts_a.len(), 24);
+        assert_eq!(verts_b.len(), 24);
+    }
+
+    #[test]
+    fn voxel_vertex_positions_are_world_space_and_ignore_origin_input() {
+        let mut store = ChunkStore::new();
+        store.insert_chunk_with_policy(
+            coord(),
+            chunk_with_voxel(2, 3, 4, 1),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let snapshot =
+            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
+        let (verts, _, min, max) = mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
+
+        let expected_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
+        let expected_max = expected_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+        assert_eq!(min, expected_min);
+        assert_eq!(max, expected_max);
+
+        let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
+        assert!(xs
+            .iter()
+            .all(|x| *x >= expected_min.x && *x <= expected_max.x));
+    }
+
+    #[test]
+    fn adjacent_chunk_bounds_are_world_space_and_contiguous() {
+        let store = ChunkStore::new();
+        let left_snapshot = build_chunk_snapshot(
+            &store,
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+        let right_snapshot = build_chunk_snapshot(
+            &store,
+            ChunkCoord { x: 1, y: 0, z: 0 },
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+
+        let (_, _, left_min, left_max) = mesh_chunk_snapshot(
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            &left_snapshot,
+            ChunkLod::Near,
+            false,
+        );
+        let (_, _, right_min, _) = mesh_chunk_snapshot(
+            ChunkCoord { x: 1, y: 0, z: 0 },
+            &right_snapshot,
+            ChunkLod::Near,
+            false,
+        );
+
+        assert_eq!(left_max.x, right_min.x);
+        assert_eq!(left_min.y, right_min.y);
+        assert_eq!(left_min.z, right_min.z);
     }
 }
