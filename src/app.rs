@@ -2192,8 +2192,7 @@ pub async fn run() -> anyhow::Result<()> {
                             aspect: renderer.config.width as f32
                                 / renderer.config.height.max(1) as f32,
                         };
-                        let vp = cam.view_proj();
-                        let (chunks_drawn, total_indices) = renderer.mesh_draw_stats(vp);
+                        let (chunks_drawn, total_indices) = renderer.mesh_draw_stats(&cam);
                         ui.set_draw_stats(chunks_drawn, total_indices);
                         let cull_stats = renderer.cull_stats(&cam);
                         ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
