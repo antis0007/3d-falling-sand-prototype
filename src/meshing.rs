@@ -40,14 +40,14 @@ impl MeshingSystem {
     }
 }
 
-pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoord) -> MeshedChunk {
+pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, _origin_voxel: VoxelCoord) -> MeshedChunk {
     let mut opaque_verts = Vec::with_capacity(CHUNK_VOLUME * 12);
     let mut opaque_inds = Vec::with_capacity(CHUNK_VOLUME * 18);
     let mut transparent_verts = Vec::new();
     let mut transparent_inds = Vec::new();
 
     let chunk_world_min = chunk_to_world_min(coord);
-    let min = relative_voxel_to_world(chunk_world_min, origin_voxel);
+    let min = voxel_to_world(chunk_world_min);
     let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
 
     let Some(mesh_input) = store.build_meshing_input(coord) else {
@@ -71,7 +71,6 @@ pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoor
         add_uniform_chunk_shell_optimized(
             &mesh_input,
             chunk_world_min,
-            origin_voxel,
             fill_id,
             &mut opaque_verts,
             &mut opaque_inds,
@@ -109,7 +108,6 @@ pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoor
                         ly_u,
                         lz_u,
                         world_voxel,
-                        origin_voxel,
                         id,
                         &mut opaque_verts,
                         &mut opaque_inds,
@@ -129,7 +127,6 @@ pub fn mesh_chunk(store: &ChunkStore, coord: ChunkCoord, origin_voxel: VoxelCoor
                     ly_u,
                     lz_u,
                     world_voxel,
-                    origin_voxel,
                     id,
                     color,
                     verts,
@@ -155,7 +152,6 @@ fn add_voxel_faces(
     ly: usize,
     lz: usize,
     world_voxel: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
@@ -206,9 +202,9 @@ fn add_voxel_faces(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (world_voxel.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                    (world_voxel.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                    (world_voxel.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
                 ],
                 color: shaded,
             });
@@ -223,7 +219,6 @@ fn add_crossed_billboard(
     ly: usize,
     lz: usize,
     world_voxel: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
@@ -283,9 +278,9 @@ fn add_crossed_billboard(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    (world_voxel.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                    (world_voxel.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                    (world_voxel.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
                 ],
                 color,
             });
@@ -415,30 +410,20 @@ fn fully_solid_fill(voxels: &[MaterialId]) -> Option<MaterialId> {
 fn add_uniform_chunk_shell_optimized(
     mesh_input: &ChunkMeshingInput<'_>,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
 ) {
     let color = material(id).color;
-    if try_add_uniform_chunk_face_quads(
-        mesh_input,
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        verts,
-        inds,
-    ) {
+    if try_add_uniform_chunk_face_quads(mesh_input, chunk_world_min, id, color, verts, inds) {
         return;
     }
-    add_uniform_chunk_shell(mesh_input, chunk_world_min, origin_voxel, id, verts, inds);
+    add_uniform_chunk_shell(mesh_input, chunk_world_min, id, verts, inds);
 }
 
 fn try_add_uniform_chunk_face_quads(
     mesh_input: &ChunkMeshingInput<'_>,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
@@ -459,60 +444,12 @@ fn try_add_uniform_chunk_face_quads(
         }
     }
 
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [1, 0, 0],
-        verts,
-        inds,
-    );
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [-1, 0, 0],
-        verts,
-        inds,
-    );
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [0, 1, 0],
-        verts,
-        inds,
-    );
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [0, -1, 0],
-        verts,
-        inds,
-    );
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [0, 0, 1],
-        verts,
-        inds,
-    );
-    add_chunk_face_quad(
-        chunk_world_min,
-        origin_voxel,
-        id,
-        color,
-        [0, 0, -1],
-        verts,
-        inds,
-    );
+    add_chunk_face_quad(chunk_world_min, id, color, [1, 0, 0], verts, inds);
+    add_chunk_face_quad(chunk_world_min, id, color, [-1, 0, 0], verts, inds);
+    add_chunk_face_quad(chunk_world_min, id, color, [0, 1, 0], verts, inds);
+    add_chunk_face_quad(chunk_world_min, id, color, [0, -1, 0], verts, inds);
+    add_chunk_face_quad(chunk_world_min, id, color, [0, 0, 1], verts, inds);
+    add_chunk_face_quad(chunk_world_min, id, color, [0, 0, -1], verts, inds);
     true
 }
 
@@ -547,7 +484,6 @@ fn uniform_face_fully_visible(
 
 fn add_chunk_face_quad(
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     color: [u8; 4],
     dir: [i32; 3],
@@ -616,9 +552,9 @@ fn add_chunk_face_quad(
     for v in quad {
         verts.push(Vertex {
             pos: [
-                (chunk_world_min.x - origin_voxel.x) as f32 * VOXEL_SIZE + v[0],
-                (chunk_world_min.y - origin_voxel.y) as f32 * VOXEL_SIZE + v[1],
-                (chunk_world_min.z - origin_voxel.z) as f32 * VOXEL_SIZE + v[2],
+                chunk_world_min.x as f32 * VOXEL_SIZE + v[0],
+                chunk_world_min.y as f32 * VOXEL_SIZE + v[1],
+                chunk_world_min.z as f32 * VOXEL_SIZE + v[2],
             ],
             color: shaded,
         });
@@ -629,7 +565,6 @@ fn add_chunk_face_quad(
 fn add_uniform_chunk_shell(
     mesh_input: &ChunkMeshingInput<'_>,
     chunk_world_min: VoxelCoord,
-    origin_voxel: VoxelCoord,
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
@@ -648,7 +583,6 @@ fn add_uniform_chunk_shell(
                 y as usize,
                 z as usize,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -666,7 +600,6 @@ fn add_uniform_chunk_shell(
                 y as usize,
                 z as usize,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -688,7 +621,6 @@ fn add_uniform_chunk_shell(
                 0,
                 z as usize,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -706,7 +638,6 @@ fn add_uniform_chunk_shell(
                 CHUNK_SIDE - 1,
                 z as usize,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -728,7 +659,6 @@ fn add_uniform_chunk_shell(
                 y as usize,
                 0,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -746,7 +676,6 @@ fn add_uniform_chunk_shell(
                 y as usize,
                 CHUNK_SIDE - 1,
                 world_voxel,
-                origin_voxel,
                 id,
                 color,
                 verts,
@@ -827,12 +756,8 @@ fn shade_color(color: [u8; 4], shade: f32) -> [u8; 4] {
     ]
 }
 
-fn relative_voxel_to_world(voxel: VoxelCoord, origin_voxel: VoxelCoord) -> Vec3 {
-    Vec3::new(
-        (voxel.x - origin_voxel.x) as f32,
-        (voxel.y - origin_voxel.y) as f32,
-        (voxel.z - origin_voxel.z) as f32,
-    ) * VOXEL_SIZE
+fn voxel_to_world(voxel: VoxelCoord) -> Vec3 {
+    Vec3::new(voxel.x as f32, voxel.y as f32, voxel.z as f32) * VOXEL_SIZE
 }
 
 #[cfg(test)]
@@ -897,7 +822,7 @@ mod tests {
 
         let mesh = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
         assert!(!mesh.opaque_verts.is_empty());
-        assert_eq!(mesh.opaque_verts.len(), 8);
+        assert_eq!(mesh.opaque_verts.len(), 12);
     }
 
     #[test]
@@ -943,5 +868,59 @@ mod tests {
         let mesh = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
         assert_eq!(mesh.opaque_verts.len(), 24);
         assert_eq!(mesh.opaque_inds.len(), 36);
+    }
+
+    #[test]
+    fn voxel_vertex_positions_are_world_space_and_ignore_origin_input() {
+        let mut store = ChunkStore::new();
+        store.insert_chunk_with_policy(
+            coord(),
+            chunk_with_voxel(2, 3, 4, 1),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let mesh_a = mesh_chunk(&store, coord(), VoxelCoord { x: 0, y: 0, z: 0 });
+        let mesh_b = mesh_chunk(
+            &store,
+            coord(),
+            VoxelCoord {
+                x: 1000,
+                y: -500,
+                z: 250,
+            },
+        );
+
+        let positions_a: Vec<[f32; 3]> = mesh_a.opaque_verts.iter().map(|v| v.pos).collect();
+        let positions_b: Vec<[f32; 3]> = mesh_b.opaque_verts.iter().map(|v| v.pos).collect();
+        assert_eq!(positions_a, positions_b);
+        assert_eq!(mesh_a.min, mesh_b.min);
+        assert_eq!(mesh_a.max, mesh_b.max);
+
+        let expected_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
+        let expected_max = expected_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+        assert_eq!(mesh_a.min, expected_min);
+        assert_eq!(mesh_a.max, expected_max);
+    }
+
+    #[test]
+    fn adjacent_chunk_bounds_are_world_space_and_contiguous() {
+        let store = ChunkStore::new();
+        let origin = VoxelCoord {
+            x: 2048,
+            y: -2048,
+            z: 1024,
+        };
+        let left = mesh_chunk(&store, ChunkCoord { x: 0, y: 0, z: 0 }, origin);
+        let right = mesh_chunk(&store, ChunkCoord { x: 1, y: 0, z: 0 }, origin);
+
+        assert_eq!(left.max.x, right.min.x);
+        assert_eq!(left.min.y, right.min.y);
+        assert_eq!(left.min.z, right.min.z);
+
+        let world_min_0 = voxel_to_world(chunk_to_world_min(ChunkCoord { x: 0, y: 0, z: 0 }));
+        let world_min_1 = voxel_to_world(chunk_to_world_min(ChunkCoord { x: 1, y: 0, z: 0 }));
+        assert_eq!(left.min, world_min_0);
+        assert_eq!(right.min, world_min_1);
     }
 }
