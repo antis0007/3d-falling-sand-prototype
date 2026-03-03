@@ -664,7 +664,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk atlas voxels"),
                 size: page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
             let page_indirect = device.create_buffer(&wgpu::BufferDescriptor {
