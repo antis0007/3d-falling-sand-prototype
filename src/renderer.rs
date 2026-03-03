@@ -611,6 +611,9 @@ impl Renderer {
     }
 
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
+        // CPU culling is evaluated in world space to match chunk AABBs.
+        // Mesh vertices are chunk-local and become world-space in the shader
+        // after applying `chunk_origin_world`.
         let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
         let world_camera_pos = camera_world_position(camera, self.origin_voxel);
         let mut stats = CullStats::default();
@@ -1043,6 +1046,8 @@ impl Renderer {
         self.lod_selection.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
+        // Keep CPU frustum checks in world space; do not pre-apply origin
+        // offsets to chunk AABBs here.
         let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
         let mut chunks = 0usize;
         let mut inds = 0u64;
@@ -1066,6 +1071,8 @@ impl Renderer {
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
         let vp_render = camera.view_proj();
+        // World-space culling uses world-space camera/AABBs. Draw still uses
+        // floating-origin subtraction in the shader via `origin_offset`.
         let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
         let world_camera_pos = camera_world_position(camera, self.origin_voxel);
 
@@ -1108,27 +1115,14 @@ impl Renderer {
                 self.size.height,
             );
             if DEBUG_VALIDATE_CULL_SPACE {
-                let visible_render = chunk_visible_in_render_space(
-                    self.settings.frustum_culling,
-                    vp_render,
-                    camera.pos,
+                let _ = vp_render;
+                let _ = camera;
+                log::trace!(
+                    "world-space culling active chunk={:?} lod={:?} visible={}",
+                    coord,
                     lod,
-                    mesh.world_aabb_min,
-                    mesh.world_aabb_max,
-                    self.origin_voxel,
-                    self.size.height,
+                    visible_world
                 );
-                if visible_world != visible_render {
-                    log::warn!(
-                        "cull-space mismatch chunk={:?} lod={:?} world_visible={} render_visible={} origin_voxel={:?}",
-                        coord,
-                        lod,
-                        visible_world,
-                        visible_render,
-                        self.origin_voxel,
-                    );
-                }
-                debug_assert_eq!(visible_world, visible_render);
             }
 
             if !visible_world {
@@ -1136,18 +1130,13 @@ impl Renderer {
             }
             if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
                 let origin_offset_world = voxel_to_world(self.origin_voxel);
-                let (render_aabb_min, render_aabb_max) = world_aabb_to_render_space(
-                    mesh.world_aabb_min,
-                    mesh.world_aabb_max,
-                    self.origin_voxel,
-                );
                 log::debug!(
-                    "visible chunk {:?} world_origin={:?} origin_offset={:?} render_aabb_min={:?} render_aabb_max={:?}",
+                    "visible chunk {:?} world_origin={:?} origin_offset={:?} world_aabb_min={:?} world_aabb_max={:?}",
                     coord,
                     mesh.chunk_origin_world,
                     origin_offset_world,
-                    render_aabb_min,
-                    render_aabb_max,
+                    mesh.world_aabb_min,
+                    mesh.world_aabb_max,
                 );
                 debug_visible_logged += 1;
             }
@@ -1940,15 +1929,6 @@ fn fallback_lod_near_threshold(
     }
 }
 
-fn world_aabb_to_render_space(
-    world_aabb_min: Vec3,
-    world_aabb_max: Vec3,
-    origin_voxel: VoxelCoord,
-) -> (Vec3, Vec3) {
-    let origin = voxel_to_world(origin_voxel);
-    (world_aabb_min - origin, world_aabb_max - origin)
-}
-
 fn camera_world_position(camera: &Camera, origin_voxel: VoxelCoord) -> Vec3 {
     camera.pos + voxel_to_world(origin_voxel)
 }
@@ -1968,28 +1948,6 @@ fn chunk_visible_in_world_space(
             lod,
             world_aabb_min,
             world_aabb_max,
-            screen_h,
-        )
-}
-
-fn chunk_visible_in_render_space(
-    frustum_culling: bool,
-    vp_render: Mat4,
-    render_camera_pos: Vec3,
-    lod: ChunkLod,
-    world_aabb_min: Vec3,
-    world_aabb_max: Vec3,
-    origin_voxel: VoxelCoord,
-    screen_h: u32,
-) -> bool {
-    let (render_aabb_min, render_aabb_max) =
-        world_aabb_to_render_space(world_aabb_min, world_aabb_max, origin_voxel);
-    (!frustum_culling || aabb_in_view(vp_render, render_aabb_min, render_aabb_max))
-        && passes_screen_space_cull(
-            render_camera_pos,
-            lod,
-            render_aabb_min,
-            render_aabb_max,
             screen_h,
         )
 }
@@ -2304,19 +2262,8 @@ mod tests {
             world_max,
             1080,
         );
-        let render_visible = chunk_visible_in_render_space(
-            true,
-            camera.view_proj(),
-            camera.pos,
-            ChunkLod::Far,
-            world_min,
-            world_max,
-            origin,
-            1080,
-        );
 
         assert!(world_visible);
-        assert_eq!(world_visible, render_visible);
     }
 
     #[test]
@@ -2344,32 +2291,21 @@ mod tests {
             world_max,
             1080,
         );
-        let render_visible = chunk_visible_in_render_space(
-            true,
-            camera.view_proj(),
-            camera.pos,
-            ChunkLod::Ultra,
-            world_min,
-            world_max,
-            origin,
-            1080,
-        );
 
         assert!(world_visible);
-        assert_eq!(world_visible, render_visible);
     }
 
     #[test]
-    fn visibility_decisions_are_equivalent_under_origin_rebasing() {
-        let local_camera = Camera {
+    fn cpu_culling_is_origin_invariant_for_same_world_relationship() {
+        let rebased_camera = Camera {
             pos: Vec3::new(0.0, 0.0, 0.0),
             dir: Vec3::new(0.0, 0.0, -1.0),
             aspect: 1.0,
         };
         let world_camera = Camera {
             pos: Vec3::new(1_000_000.0, 0.0, -2_000_000.0),
-            dir: local_camera.dir,
-            aspect: local_camera.aspect,
+            dir: rebased_camera.dir,
+            aspect: rebased_camera.aspect,
         };
         let origin = VoxelCoord {
             x: (world_camera.pos.x / VOXEL_SIZE) as i32,
@@ -2391,8 +2327,8 @@ mod tests {
         );
         let rebased_world = chunk_visible_in_world_space(
             true,
-            local_camera.view_proj_for_world_origin(origin),
-            camera_world_position(&local_camera, origin),
+            rebased_camera.view_proj_for_world_origin(origin),
+            camera_world_position(&rebased_camera, origin),
             ChunkLod::Far,
             world_min,
             world_max,
@@ -2400,6 +2336,40 @@ mod tests {
         );
 
         assert_eq!(baseline_world, rebased_world);
+    }
+
+    #[test]
+    fn screen_space_cull_uses_world_space_distances() {
+        let origin = VoxelCoord {
+            x: 4_000_000,
+            y: 0,
+            z: -2_000_000,
+        };
+        let world_origin = voxel_to_world(origin);
+        let world_camera = world_origin + Vec3::new(0.0, 0.0, 0.0);
+        let world_min = world_origin + Vec3::new(-2.0, -2.0, -24.0);
+        let world_max = world_origin + Vec3::new(2.0, 2.0, -16.0);
+
+        let consistent_world = passes_screen_space_cull(
+            world_camera,
+            ChunkLod::Ultra,
+            world_min,
+            world_max,
+            1080,
+        );
+
+        // Intentionally incorrect mixed-space input (render-relative AABB with
+        // world-space camera). This should not match correct world-space culling.
+        let mixed_space = passes_screen_space_cull(
+            world_camera,
+            ChunkLod::Ultra,
+            world_min - world_origin,
+            world_max - world_origin,
+            1080,
+        );
+
+        assert!(consistent_world);
+        assert_ne!(consistent_world, mixed_space);
     }
 
     #[test]
@@ -2488,7 +2458,8 @@ mod tests {
 
         let no_neighbor =
             build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_a, _, _, _) = mesh_chunk_snapshot(coord(), &no_neighbor, ChunkLod::Near, false);
+        let (verts_a, _, _, _, _) =
+            mesh_chunk_snapshot(coord(), &no_neighbor, ChunkLod::Near, false);
 
         store.insert_chunk_with_policy(
             ChunkCoord { x: 1, y: 0, z: 0 },
@@ -2498,7 +2469,7 @@ mod tests {
         );
         let with_neighbor =
             build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_b, _, _, _) =
+        let (verts_b, _, _, _, _) =
             mesh_chunk_snapshot(coord(), &with_neighbor, ChunkLod::Near, false);
 
         assert_eq!(verts_a.len(), 24);
@@ -2517,7 +2488,8 @@ mod tests {
 
         let snapshot =
             build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts, _, min, max) = mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
+        let (verts, _, min, max, _) =
+            mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
 
         let expected_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
         let expected_max = expected_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
@@ -2544,13 +2516,13 @@ mod tests {
             UnknownNeighborOcclusionPolicy::Aggressive,
         );
 
-        let (_, _, left_min, left_max) = mesh_chunk_snapshot(
+        let (_, _, left_min, left_max, _) = mesh_chunk_snapshot(
             ChunkCoord { x: 0, y: 0, z: 0 },
             &left_snapshot,
             ChunkLod::Near,
             false,
         );
-        let (_, _, right_min, _) = mesh_chunk_snapshot(
+        let (_, _, right_min, _, _) = mesh_chunk_snapshot(
             ChunkCoord { x: 1, y: 0, z: 0 },
             &right_snapshot,
             ChunkLod::Near,
