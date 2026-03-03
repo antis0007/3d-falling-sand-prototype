@@ -97,12 +97,41 @@ impl Camera {
 
 pub struct ChunkMesh {
     vb: wgpu::Buffer,
+    chunk_origin_buf: wgpu::Buffer,
     ib: wgpu::Buffer,
     indirect: wgpu::Buffer,
     index_count: u32,
+    debug_aabb_vb: wgpu::Buffer,
+    debug_aabb_ib: wgpu::Buffer,
+    debug_aabb_index_count: u32,
     world_aabb_min: Vec3,
     world_aabb_max: Vec3,
+    chunk_origin_world: Vec3,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ChunkOriginWorld {
+    chunk_origin_world: [f32; 3],
+    _pad: f32,
+}
+
+impl ChunkOriginWorld {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ChunkOriginWorld>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x3,
+            }],
+        }
+    }
+}
+
+const DEBUG_VISIBLE_CHUNK_LOG_COUNT: usize = 8;
+const DEBUG_RENDER_CHUNK_AABBS: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChunkLod {
@@ -290,6 +319,7 @@ struct MeshResult {
     inds: Vec<u32>,
     aabb_min: Vec3,
     aabb_max: Vec3,
+    chunk_origin_world: Vec3,
 }
 
 struct BackgroundMeshQueue {
@@ -329,7 +359,7 @@ impl BackgroundMeshQueue {
 
                     let snapshot =
                         rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
-                    let (verts, inds, aabb_min, aabb_max) =
+                    let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
                         mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
                     if worker_tx
                         .send(MeshResult {
@@ -341,6 +371,7 @@ impl BackgroundMeshQueue {
                             inds,
                             aabb_min,
                             aabb_max,
+                            chunk_origin_world,
                         })
                         .is_err()
                     {
@@ -480,7 +511,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc()],
+                buffers: &[Vertex::desc(), ChunkOriginWorld::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -875,11 +906,37 @@ impl Renderer {
                         contents: bytemuck::cast_slice(&result.inds),
                         usage: wgpu::BufferUsages::INDEX,
                     });
+                let chunk_origin_buf =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk origin instance"),
+                            contents: bytemuck::bytes_of(&ChunkOriginWorld {
+                                chunk_origin_world: result.chunk_origin_world.to_array(),
+                                _pad: 0.0,
+                            }),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
+                let debug_aabb_vb =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk debug aabb vb"),
+                            contents: bytemuck::cast_slice(&debug_aabb_verts),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let debug_aabb_ib =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk debug aabb ib"),
+                            contents: bytemuck::cast_slice(&debug_aabb_inds),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
 
                 self.store_meshes.insert(
                     (result.coord, result.lod),
                     ChunkMesh {
                         vb,
+                        chunk_origin_buf,
                         ib,
                         indirect: self.device.create_buffer_init(
                             &wgpu::util::BufferInitDescriptor {
@@ -895,8 +952,12 @@ impl Renderer {
                             },
                         ),
                         index_count: result.inds.len() as u32,
+                        debug_aabb_vb,
+                        debug_aabb_ib,
+                        debug_aabb_index_count: debug_aabb_inds.len() as u32,
                         world_aabb_min: result.aabb_min,
                         world_aabb_max: result.aabb_max,
+                        chunk_origin_world: result.chunk_origin_world,
                     },
                 );
             }
@@ -995,6 +1056,7 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
+        let mut debug_visible_logged = 0usize;
         for (&(coord, lod), mesh) in &self.store_meshes {
             if self
                 .lod_selection
@@ -1016,9 +1078,27 @@ impl Renderer {
             if !passes_screen_space_cull(camera, lod, aabb_min, aabb_max, self.size.height) {
                 continue;
             }
+            if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
+                let origin_offset_world = voxel_to_world(self.origin_voxel);
+                log::debug!(
+                    "visible chunk {:?} world_origin={:?} origin_offset={:?} render_aabb_min={:?} render_aabb_max={:?}",
+                    coord,
+                    mesh.chunk_origin_world,
+                    origin_offset_world,
+                    aabb_min,
+                    aabb_max,
+                );
+                debug_visible_logged += 1;
+            }
+            debug_assert!(mesh.chunk_origin_world.is_finite());
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
+            pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed_indirect(&mesh.indirect, 0);
+
+            if DEBUG_RENDER_CHUNK_AABBS {
+                draw_debug_aabb(pass, mesh, [255, 64, 64, 140]);
+            }
         }
     }
 }
@@ -1193,31 +1273,34 @@ fn mesh_chunk_snapshot(
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
     greedy: bool,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3, Vec3) {
     let chunk_world_min = snapshot.world_min;
-    match lod {
+    let chunk_origin_world = voxel_to_world(chunk_world_min);
+    let chunk_extent = Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+    let (verts, inds) = match lod {
         ChunkLod::Near => {
             if greedy {
-                mesh_chunk_voxel_faces_greedy(snapshot, chunk_world_min)
+                mesh_chunk_voxel_faces_greedy(snapshot)
             } else {
-                mesh_chunk_voxel_faces(snapshot, chunk_world_min, 1)
+                mesh_chunk_voxel_faces(snapshot, 1)
             }
         }
-        ChunkLod::Mid => mesh_chunk_coarse_solid(snapshot, chunk_world_min, 2),
-        ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, chunk_world_min, 4),
-        ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, chunk_world_min, 8),
-    }
+        ChunkLod::Mid => mesh_chunk_coarse_solid(snapshot, 2),
+        ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, 4),
+        ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, 8),
+    };
+    (
+        verts,
+        inds,
+        chunk_origin_world,
+        chunk_origin_world + chunk_extent,
+        chunk_origin_world,
+    )
 }
 
-fn mesh_chunk_voxel_faces(
-    snapshot: &ChunkSnapshot,
-    chunk_world_min: VoxelCoord,
-    step: i32,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+fn mesh_chunk_voxel_faces(snapshot: &ChunkSnapshot, step: i32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = voxel_to_world(chunk_world_min);
-    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
 
     let mut lz = 0;
     while lz < CHUNK_SIZE_VOXELS {
@@ -1225,11 +1308,6 @@ fn mesh_chunk_voxel_faces(
         while ly < CHUNK_SIZE_VOXELS {
             let mut lx = 0;
             while lx < CHUNK_SIZE_VOXELS {
-                let world_voxel = VoxelCoord {
-                    x: chunk_world_min.x + lx,
-                    y: chunk_world_min.y + ly,
-                    z: chunk_world_min.z + lz,
-                };
                 let id = snapshot.get_local(lx, ly, lz);
                 if id == EMPTY {
                     lx += step;
@@ -1237,23 +1315,13 @@ fn mesh_chunk_voxel_faces(
                 }
 
                 if is_billboard_material(id) {
-                    add_snapshot_billboard(world_voxel, id, &mut verts, &mut inds);
+                    add_snapshot_billboard(lx, ly, lz, id, &mut verts, &mut inds);
                     lx += step;
                     continue;
                 }
 
                 let color = material(id).color;
-                add_snapshot_voxel_faces(
-                    snapshot,
-                    lx,
-                    ly,
-                    lz,
-                    world_voxel,
-                    id,
-                    color,
-                    &mut verts,
-                    &mut inds,
-                );
+                add_snapshot_voxel_faces(snapshot, lx, ly, lz, id, color, &mut verts, &mut inds);
 
                 lx += step;
             }
@@ -1262,17 +1330,12 @@ fn mesh_chunk_voxel_faces(
         lz += step;
     }
 
-    (verts, inds, min, max)
+    (verts, inds)
 }
 
-fn mesh_chunk_voxel_faces_greedy(
-    snapshot: &ChunkSnapshot,
-    chunk_world_min: VoxelCoord,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+fn mesh_chunk_voxel_faces_greedy(snapshot: &ChunkSnapshot) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = voxel_to_world(chunk_world_min);
-    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
 
     for z in 0..side {
@@ -1280,16 +1343,7 @@ fn mesh_chunk_voxel_faces_greedy(
             for x in 0..side {
                 let id = snapshot.get_local(x, y, z);
                 if is_billboard_material(id) {
-                    add_snapshot_billboard(
-                        VoxelCoord {
-                            x: chunk_world_min.x + x,
-                            y: chunk_world_min.y + y,
-                            z: chunk_world_min.z + z,
-                        },
-                        id,
-                        &mut verts,
-                        &mut inds,
-                    );
+                    add_snapshot_billboard(x, y, z, id, &mut verts, &mut inds);
                 }
             }
         }
@@ -1316,11 +1370,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     x += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + start,
-                        y: chunk_world_min.y + y,
-                        z: chunk_world_min.z + z,
-                    },
+                    [start as f32, y as f32, z as f32],
                     (x - start) as f32,
                     1.0,
                     1.0,
@@ -1354,11 +1404,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     x += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + start,
-                        y: chunk_world_min.y + y,
-                        z: chunk_world_min.z + z,
-                    },
+                    [start as f32, y as f32, z as f32],
                     (x - start) as f32,
                     1.0,
                     1.0,
@@ -1392,11 +1438,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     z += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + x,
-                        y: chunk_world_min.y + y,
-                        z: chunk_world_min.z + start,
-                    },
+                    [x as f32, y as f32, start as f32],
                     1.0,
                     1.0,
                     (z - start) as f32,
@@ -1430,11 +1472,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     z += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + x,
-                        y: chunk_world_min.y + y,
-                        z: chunk_world_min.z + start,
-                    },
+                    [x as f32, y as f32, start as f32],
                     1.0,
                     1.0,
                     (z - start) as f32,
@@ -1468,11 +1506,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     y += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + x,
-                        y: chunk_world_min.y + start,
-                        z: chunk_world_min.z + z,
-                    },
+                    [x as f32, start as f32, z as f32],
                     1.0,
                     (y - start) as f32,
                     1.0,
@@ -1506,11 +1540,7 @@ fn mesh_chunk_voxel_faces_greedy(
                     y += 1;
                 }
                 add_box_faces(
-                    VoxelCoord {
-                        x: chunk_world_min.x + x,
-                        y: chunk_world_min.y + start,
-                        z: chunk_world_min.z + z,
-                    },
+                    [x as f32, start as f32, z as f32],
                     1.0,
                     (y - start) as f32,
                     1.0,
@@ -1523,18 +1553,12 @@ fn mesh_chunk_voxel_faces_greedy(
         }
     }
 
-    (verts, inds, min, max)
+    (verts, inds)
 }
 
-fn mesh_chunk_coarse_solid(
-    snapshot: &ChunkSnapshot,
-    chunk_world_min: VoxelCoord,
-    step: i32,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+fn mesh_chunk_coarse_solid(snapshot: &ChunkSnapshot, step: i32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = voxel_to_world(chunk_world_min);
-    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
 
     let is_solid =
@@ -1565,11 +1589,7 @@ fn mesh_chunk_coarse_solid(
                 }
                 if exposed.iter().any(|e| *e) {
                     add_box_faces(
-                        VoxelCoord {
-                            x: chunk_world_min.x + x,
-                            y: chunk_world_min.y + y,
-                            z: chunk_world_min.z + z,
-                        },
+                        [x as f32, y as f32, z as f32],
                         step as f32,
                         step as f32,
                         step as f32,
@@ -1585,18 +1605,12 @@ fn mesh_chunk_coarse_solid(
         }
         z += step;
     }
-    (verts, inds, min, max)
+    (verts, inds)
 }
 
-fn mesh_chunk_heightfield_proxy(
-    snapshot: &ChunkSnapshot,
-    chunk_world_min: VoxelCoord,
-    tile: i32,
-) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3) {
+fn mesh_chunk_heightfield_proxy(snapshot: &ChunkSnapshot, tile: i32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut inds = Vec::new();
-    let min = voxel_to_world(chunk_world_min);
-    let max = min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let side = CHUNK_SIZE_VOXELS;
     let tiles = (side / tile) as usize;
     let mut heights = vec![None; tiles * tiles];
@@ -1640,11 +1654,7 @@ fn mesh_chunk_heightfield_proxy(
                 !neighbors[5],
             ];
             add_box_faces(
-                VoxelCoord {
-                    x: chunk_world_min.x + tx * tile,
-                    y: chunk_world_min.y,
-                    z: chunk_world_min.z + tz * tile,
-                },
+                [(tx * tile) as f32, 0.0, (tz * tile) as f32],
                 tile as f32,
                 top as f32,
                 tile as f32,
@@ -1655,7 +1665,7 @@ fn mesh_chunk_heightfield_proxy(
             );
         }
     }
-    (verts, inds, min, max)
+    (verts, inds)
 }
 
 fn tile_peak(
@@ -1702,7 +1712,7 @@ fn dominant_material_in_cell(
 }
 
 fn add_box_faces(
-    world_voxel_min: VoxelCoord,
+    local_voxel_min: [f32; 3],
     sx: f32,
     sy: f32,
     sz: f32,
@@ -1758,9 +1768,9 @@ fn add_box_faces(
         ),
     ];
     let origin = [
-        world_voxel_min.x as f32 * VOXEL_SIZE,
-        world_voxel_min.y as f32 * VOXEL_SIZE,
-        world_voxel_min.z as f32 * VOXEL_SIZE,
+        local_voxel_min[0] * VOXEL_SIZE,
+        local_voxel_min[1] * VOXEL_SIZE,
+        local_voxel_min[2] * VOXEL_SIZE,
     ];
 
     for (i, (quad, shade)) in dirs.iter().enumerate() {
@@ -1781,6 +1791,41 @@ fn add_box_faces(
         }
         inds.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
+}
+
+fn build_debug_aabb_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let side = CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
+    let c = [200, 32, 32, 100];
+    let corners = [
+        [0.0, 0.0, 0.0],
+        [side, 0.0, 0.0],
+        [side, side, 0.0],
+        [0.0, side, 0.0],
+        [0.0, 0.0, side],
+        [side, 0.0, side],
+        [side, side, side],
+        [0.0, side, side],
+    ];
+    let mut verts = Vec::with_capacity(corners.len());
+    for p in corners {
+        verts.push(Vertex { pos: p, color: c });
+    }
+    let inds = vec![
+        0, 1, 2, 0, 2, 3, // near
+        4, 6, 5, 4, 7, 6, // far
+        0, 4, 5, 0, 5, 1, // bottom
+        3, 2, 6, 3, 6, 7, // top
+        1, 5, 6, 1, 6, 2, // right
+        0, 3, 7, 0, 7, 4, // left
+    ];
+    (verts, inds)
+}
+
+fn draw_debug_aabb<'a>(pass: &mut wgpu::RenderPass<'a>, mesh: &'a ChunkMesh, _color: [u8; 4]) {
+    pass.set_vertex_buffer(0, mesh.debug_aabb_vb.slice(..));
+    pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
+    pass.set_index_buffer(mesh.debug_aabb_ib.slice(..), wgpu::IndexFormat::Uint32);
+    pass.draw_indexed(0..mesh.debug_aabb_index_count, 0, 0..1);
 }
 
 fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
@@ -1872,7 +1917,6 @@ fn add_snapshot_voxel_faces(
     local_x: i32,
     local_y: i32,
     local_z: i32,
-    world_voxel: VoxelCoord,
     id: MaterialId,
     color: [u8; 4],
     verts: &mut Vec<Vertex>,
@@ -1924,9 +1968,9 @@ fn add_snapshot_voxel_faces(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                    local_x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    local_y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    local_z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
                 ],
                 color: shaded,
             });
@@ -1940,7 +1984,9 @@ fn is_billboard_material(id: MaterialId) -> bool {
 }
 
 fn add_snapshot_billboard(
-    world_voxel: VoxelCoord,
+    local_x: i32,
+    local_y: i32,
+    local_z: i32,
     id: MaterialId,
     verts: &mut Vec<Vertex>,
     inds: &mut Vec<u32>,
@@ -1983,9 +2029,9 @@ fn add_snapshot_billboard(
         for v in quad {
             verts.push(Vertex {
                 pos: [
-                    world_voxel.x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
-                    world_voxel.y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
-                    world_voxel.z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
+                    local_x as f32 * VOXEL_SIZE + v[0] * VOXEL_SIZE,
+                    local_y as f32 * VOXEL_SIZE + v[1] * VOXEL_SIZE,
+                    local_z as f32 * VOXEL_SIZE + v[2] * VOXEL_SIZE,
                 ],
                 color,
             });
