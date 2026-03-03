@@ -8,6 +8,7 @@ struct Camera {
 struct VsIn {
   @location(0) pos: vec3<f32>,
   @location(1) color: vec4<f32>,
+  @location(2) chunk_origin_world: vec3<f32>,
 };
 
 struct VsOut {
@@ -18,7 +19,8 @@ struct VsOut {
 @vertex
 fn vs_main(i: VsIn) -> VsOut {
   var o: VsOut;
-  let render_pos = i.pos - camera.origin_offset;
+  let world_pos = i.pos + i.chunk_origin_world;
+  let render_pos = world_pos - camera.origin_offset;
   o.pos = camera.vp * vec4<f32>(render_pos, 1.0);
   o.color = i.color;
   return o;
