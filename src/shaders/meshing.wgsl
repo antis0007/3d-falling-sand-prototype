@@ -25,8 +25,8 @@ struct DrawIndirectArgs {
 @group(0) @binding(5) var<storage, read_write> active_tiles: array<u32>;
 @group(0) @binding(8) var<storage, read> frame_params: array<FrameParams>;
 @group(0) @binding(9) var<storage, read_write> page_indirect: array<DrawIndirectArgs>;
-@group(0) @binding(10) var<storage, read_write> dirty_chunk_ids: array<u32>;
-@group(0) @binding(11) var<storage, read_write> dirty_chunk_counter: array<atomic<u32>>;
+@group(0) @binding(10) var<storage, read_write> dirty_page_indices: array<u32>;
+@group(0) @binding(11) var<storage, read_write> dirty_page_counter: array<atomic<u32>>;
 @group(0) @binding(12) var<storage, read_write> diagnostics: array<atomic<u32>>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
@@ -90,7 +90,7 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if (i == 0u && atomicLoad(&diagnostics[1u]) > 0u) {
-        let dirty_idx = atomicAdd(&dirty_chunk_counter[0u], 1u);
-        dirty_chunk_ids[dirty_idx] = params.page_index;
+        let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
+        dirty_page_indices[dirty_idx] = params.page_index;
     }
 }
