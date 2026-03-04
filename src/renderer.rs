@@ -83,14 +83,124 @@ struct CameraUniform {
     _pad: f32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct DrawIndexedIndirectPod {
-    index_count: u32,
-    instance_count: u32,
-    first_index: u32,
-    base_vertex: i32,
-    first_instance: u32,
+#[derive(Clone, Copy)]
+struct BufferSuballocation {
+    slab_index: usize,
+    offset: u64,
+    size: u64,
+}
+
+struct BufferSlab {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    cursor: u64,
+    free: Vec<BufferSuballocation>,
+}
+
+struct BufferArena {
+    label: &'static str,
+    usage: wgpu::BufferUsages,
+    min_slab_size: u64,
+    slabs: Vec<BufferSlab>,
+}
+
+impl BufferArena {
+    fn new(label: &'static str, usage: wgpu::BufferUsages, min_slab_size: u64) -> Self {
+        Self {
+            label,
+            usage,
+            min_slab_size,
+            slabs: Vec::new(),
+        }
+    }
+
+    fn buffer(&self, slab_index: usize) -> &wgpu::Buffer {
+        &self.slabs[slab_index].buffer
+    }
+
+    fn allocate(
+        &mut self,
+        device: &wgpu::Device,
+        size: u64,
+        telemetry: &mut MeshAllocatorTelemetry,
+    ) -> BufferSuballocation {
+        for (slab_index, slab) in self.slabs.iter_mut().enumerate() {
+            if let Some((free_idx, free_alloc)) = slab
+                .free
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, alloc)| alloc.size >= size)
+            {
+                slab.free.swap_remove(free_idx);
+                telemetry.bytes_reused += size as usize;
+                if free_alloc.size > size {
+                    slab.free.push(BufferSuballocation {
+                        slab_index,
+                        offset: free_alloc.offset + size,
+                        size: free_alloc.size - size,
+                    });
+                }
+                return BufferSuballocation {
+                    slab_index,
+                    offset: free_alloc.offset,
+                    size,
+                };
+            }
+
+            if slab.capacity - slab.cursor >= size {
+                let offset = slab.cursor;
+                slab.cursor += size;
+                return BufferSuballocation {
+                    slab_index,
+                    offset,
+                    size,
+                };
+            }
+        }
+
+        let last_capacity = self
+            .slabs
+            .last()
+            .map(|slab| slab.capacity)
+            .unwrap_or(self.min_slab_size);
+        let new_capacity = self
+            .min_slab_size
+            .max(last_capacity.saturating_mul(2))
+            .max(size);
+        let slab_index = self.slabs.len();
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(self.label),
+            size: new_capacity,
+            usage: self.usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.slabs.push(BufferSlab {
+            buffer,
+            capacity: new_capacity,
+            cursor: size,
+            free: Vec::new(),
+        });
+        telemetry.bytes_allocated += new_capacity as usize;
+        BufferSuballocation {
+            slab_index,
+            offset: 0,
+            size,
+        }
+    }
+
+    fn free(&mut self, allocation: BufferSuballocation) {
+        if let Some(slab) = self.slabs.get_mut(allocation.slab_index) {
+            slab.free.push(allocation);
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct MeshAllocatorTelemetry {
+    bytes_allocated: usize,
+    bytes_reused: usize,
+    realloc_count: usize,
 }
 
 pub struct Camera {
@@ -118,10 +228,9 @@ impl Camera {
 }
 
 pub struct ChunkMesh {
-    vb: wgpu::Buffer,
+    vertex_alloc: BufferSuballocation,
     chunk_origin_buf: wgpu::Buffer,
-    ib: wgpu::Buffer,
-    indirect: wgpu::Buffer,
+    index_alloc: BufferSuballocation,
     index_count: u32,
     debug_aabb_vb: wgpu::Buffer,
     debug_aabb_ib: wgpu::Buffer,
@@ -207,6 +316,8 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     store_meshes: HashMap<(ChunkCoord, ChunkLod), ChunkMesh>,
+    vertex_arena: BufferArena,
+    index_arena: BufferArena,
 
     dirty_queues: DirtyChunkQueues,
     dirty_near_starve_frames: u32,
@@ -223,6 +334,7 @@ pub struct Renderer {
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
     settings: RendererSettings,
+    allocator_telemetry: MeshAllocatorTelemetry,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +388,9 @@ pub struct MeshRebuildStats {
     pub gpu_mesh_jobs: usize,
     pub gpu_dispatch_ms: f32,
     pub gpu_readback_bytes: u64,
+    pub allocator_bytes_allocated: usize,
+    pub allocator_bytes_reused: usize,
+    pub allocator_realloc_count: usize,
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -746,6 +861,16 @@ impl Renderer {
             depth_texture,
             depth_view,
             store_meshes: HashMap::new(),
+            vertex_arena: BufferArena::new(
+                "chunk vertex arena",
+                wgpu::BufferUsages::VERTEX,
+                4 * 1024 * 1024,
+            ),
+            index_arena: BufferArena::new(
+                "chunk index arena",
+                wgpu::BufferUsages::INDEX,
+                4 * 1024 * 1024,
+            ),
             dirty_queues: DirtyChunkQueues::default(),
             dirty_near_starve_frames: 0,
             dirty_far_starve_frames: 0,
@@ -759,6 +884,7 @@ impl Renderer {
             day: true,
             mesh_backend,
             settings: RendererSettings::default(),
+            allocator_telemetry: MeshAllocatorTelemetry::default(),
         })
     }
 
@@ -1056,6 +1182,7 @@ impl Renderer {
             }
         }
 
+        self.allocator_telemetry = MeshAllocatorTelemetry::default();
         let mut bytes_uploaded = 0usize;
         let mut uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
@@ -1093,7 +1220,7 @@ impl Renderer {
                 stats.gpu_readback_bytes += *readback_bytes;
             }
 
-            let (verts, inds, indirect, aabb_min, aabb_max, chunk_origin_world) =
+            let (verts, inds, _indirect, aabb_min, aabb_max, chunk_origin_world) =
                 result.artifact.geometry();
             let bytes = verts.len() * std::mem::size_of::<Vertex>()
                 + inds.len() * std::mem::size_of::<u32>();
@@ -1102,72 +1229,132 @@ impl Renderer {
                 continue;
             }
 
+            let key = (result.coord, result.lod);
+            let existing = self.store_meshes.remove(&key);
             if inds.is_empty() {
-                self.store_meshes.remove(&(result.coord, result.lod));
+                if let Some(old_mesh) = existing {
+                    self.vertex_arena.free(old_mesh.vertex_alloc);
+                    self.index_arena.free(old_mesh.index_alloc);
+                }
             } else {
-                let vb = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("store chunk vb"),
-                        contents: bytemuck::cast_slice(verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                let ib = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("store chunk ib"),
-                        contents: bytemuck::cast_slice(inds),
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
-                let chunk_origin_buf =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk origin instance"),
-                            contents: bytemuck::bytes_of(&ChunkOriginInstance {
+                let vertex_bytes = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
+                let index_bytes = (inds.len() * std::mem::size_of::<u32>()) as u64;
+                let mut reallocated = false;
+
+                let mut existing = existing;
+                let mut vertex_alloc = existing.as_ref().map(|mesh| mesh.vertex_alloc);
+                let mut index_alloc = existing.as_ref().map(|mesh| mesh.index_alloc);
+
+                if let Some(alloc) = vertex_alloc {
+                    if alloc.size >= vertex_bytes {
+                        self.allocator_telemetry.bytes_reused += vertex_bytes as usize;
+                    } else {
+                        self.vertex_arena.free(alloc);
+                        vertex_alloc = None;
+                        reallocated = true;
+                    }
+                }
+                if let Some(alloc) = index_alloc {
+                    if alloc.size >= index_bytes {
+                        self.allocator_telemetry.bytes_reused += index_bytes as usize;
+                    } else {
+                        self.index_arena.free(alloc);
+                        index_alloc = None;
+                        reallocated = true;
+                    }
+                }
+
+                let vertex_alloc = vertex_alloc.unwrap_or_else(|| {
+                    self.vertex_arena.allocate(
+                        &self.device,
+                        vertex_bytes,
+                        &mut self.allocator_telemetry,
+                    )
+                });
+                let index_alloc = index_alloc.unwrap_or_else(|| {
+                    self.index_arena.allocate(
+                        &self.device,
+                        index_bytes,
+                        &mut self.allocator_telemetry,
+                    )
+                });
+
+                if reallocated {
+                    self.allocator_telemetry.realloc_count += 1;
+                }
+
+                self.queue.write_buffer(
+                    self.vertex_arena.buffer(vertex_alloc.slab_index),
+                    vertex_alloc.offset,
+                    bytemuck::cast_slice(verts),
+                );
+                self.queue.write_buffer(
+                    self.index_arena.buffer(index_alloc.slab_index),
+                    index_alloc.offset,
+                    bytemuck::cast_slice(inds),
+                );
+
+                let (chunk_origin_buf, debug_aabb_vb, debug_aabb_ib, debug_aabb_index_count) =
+                    if let Some(old_mesh) = existing.take() {
+                        self.queue.write_buffer(
+                            &old_mesh.chunk_origin_buf,
+                            0,
+                            bytemuck::bytes_of(&ChunkOriginInstance {
                                 chunk_origin_world: chunk_origin_world.to_array(),
                                 _pad: 0.0,
                             }),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
-                let debug_aabb_vb =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk debug aabb vb"),
-                            contents: bytemuck::cast_slice(&debug_aabb_verts),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let debug_aabb_ib =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk debug aabb ib"),
-                            contents: bytemuck::cast_slice(&debug_aabb_inds),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
+                        );
+                        (
+                            old_mesh.chunk_origin_buf,
+                            old_mesh.debug_aabb_vb,
+                            old_mesh.debug_aabb_ib,
+                            old_mesh.debug_aabb_index_count,
+                        )
+                    } else {
+                        let chunk_origin_buf =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("store chunk origin instance"),
+                                    contents: bytemuck::bytes_of(&ChunkOriginInstance {
+                                        chunk_origin_world: chunk_origin_world.to_array(),
+                                        _pad: 0.0,
+                                    }),
+                                    usage: wgpu::BufferUsages::VERTEX
+                                        | wgpu::BufferUsages::COPY_DST,
+                                });
+                        let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
+                        let debug_aabb_vb =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("store chunk debug aabb vb"),
+                                    contents: bytemuck::cast_slice(&debug_aabb_verts),
+                                    usage: wgpu::BufferUsages::VERTEX,
+                                });
+                        let debug_aabb_ib =
+                            self.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("store chunk debug aabb ib"),
+                                    contents: bytemuck::cast_slice(&debug_aabb_inds),
+                                    usage: wgpu::BufferUsages::INDEX,
+                                });
+                        (
+                            chunk_origin_buf,
+                            debug_aabb_vb,
+                            debug_aabb_ib,
+                            debug_aabb_inds.len() as u32,
+                        )
+                    };
 
                 self.store_meshes.insert(
-                    (result.coord, result.lod),
+                    key,
                     ChunkMesh {
-                        vb,
+                        vertex_alloc,
                         chunk_origin_buf,
-                        ib,
-                        indirect: self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("store chunk indirect"),
-                                contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
-                                    index_count: indirect.vertex_count,
-                                    instance_count: 1,
-                                    first_index: 0,
-                                    base_vertex: 0,
-                                    first_instance: 0,
-                                }),
-                                usage: wgpu::BufferUsages::INDIRECT,
-                            },
-                        ),
+                        index_alloc,
                         index_count: inds.len() as u32,
                         debug_aabb_vb,
                         debug_aabb_ib,
-                        debug_aabb_index_count: debug_aabb_inds.len() as u32,
+                        debug_aabb_index_count,
                         world_aabb_min: aabb_min,
                         world_aabb_max: aabb_max,
                         chunk_origin_world,
@@ -1188,6 +1375,9 @@ impl Renderer {
         } else {
             0.0
         };
+        stats.allocator_bytes_allocated = self.allocator_telemetry.bytes_allocated;
+        stats.allocator_bytes_reused = self.allocator_telemetry.bytes_reused;
+        stats.allocator_realloc_count = self.allocator_telemetry.realloc_count;
         stats.dirty_backlog = self.dirty_queues.total_len();
         stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
         stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
@@ -1203,10 +1393,17 @@ impl Renderer {
             }
         }
         for coord in drop_keys {
-            self.store_meshes.remove(&(coord, ChunkLod::Near));
-            self.store_meshes.remove(&(coord, ChunkLod::Mid));
-            self.store_meshes.remove(&(coord, ChunkLod::Far));
-            self.store_meshes.remove(&(coord, ChunkLod::Ultra));
+            for lod in [
+                ChunkLod::Near,
+                ChunkLod::Mid,
+                ChunkLod::Far,
+                ChunkLod::Ultra,
+            ] {
+                if let Some(mesh) = self.store_meshes.remove(&(coord, lod)) {
+                    self.vertex_arena.free(mesh.vertex_alloc);
+                    self.index_arena.free(mesh.index_alloc);
+                }
+            }
             self.lod_selection.remove(&coord);
         }
 
@@ -1222,7 +1419,10 @@ impl Renderer {
         stats
     }
     pub fn clear_mesh_cache(&mut self) {
-        self.store_meshes.clear();
+        for (_, mesh) in self.store_meshes.drain() {
+            self.vertex_arena.free(mesh.vertex_alloc);
+            self.index_arena.free(mesh.index_alloc);
+        }
         self.dirty_queues.clear();
         self.dirty_near_starve_frames = 0;
         self.dirty_far_starve_frames = 0;
@@ -1336,10 +1536,22 @@ impl Renderer {
                 mesh.chunk_origin_world,
                 voxel_to_world(chunk_to_world_min(coord))
             );
-            pass.set_vertex_buffer(0, mesh.vb.slice(..));
+            pass.set_vertex_buffer(
+                0,
+                self.vertex_arena
+                    .buffer(mesh.vertex_alloc.slab_index)
+                    .slice(
+                        mesh.vertex_alloc.offset..mesh.vertex_alloc.offset + mesh.vertex_alloc.size,
+                    ),
+            );
             pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
-            pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed_indirect(&mesh.indirect, 0);
+            pass.set_index_buffer(
+                self.index_arena.buffer(mesh.index_alloc.slab_index).slice(
+                    mesh.index_alloc.offset..mesh.index_alloc.offset + mesh.index_alloc.size,
+                ),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
 
             if DEBUG_RENDER_CHUNK_AABBS {
                 draw_debug_aabb(pass, mesh, [255, 64, 64, 140]);
