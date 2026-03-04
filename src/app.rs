@@ -2197,8 +2197,14 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                         }
 
+                        let camera_pos_blocks_world = ctrl.position
+                            + Vec3::new(
+                                origin_voxel.x as f32,
+                                origin_voxel.y as f32,
+                                origin_voxel.z as f32,
+                            );
                         let cam = Camera {
-                            pos: camera_world_pos_from_blocks(ctrl.position, VOXEL_SIZE),
+                            pos: camera_world_pos_from_blocks(camera_pos_blocks_world, VOXEL_SIZE),
                             dir: ctrl.look_dir(),
                             aspect: renderer.config.width as f32
                                 / renderer.config.height.max(1) as f32,
@@ -2223,17 +2229,6 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.generating_chunks = streaming.dispatched_generate.len();
                         ui.profiler.sim_region_chunks = cached_sim_region.len().max(cached_gas_sim_region.len());
 
-                        let preview_local: Vec<[i32; 3]> = preview_block_list
-                            .iter()
-                            .map(|p| {
-                                [
-                                    p[0] - origin_voxel.x,
-                                    p[1] - origin_voxel.y,
-                                    p[2] - origin_voxel.z,
-                                ]
-                            })
-                            .collect();
-
                         let chunk_overlay_entries = if ui.show_chunk_overlay {
                             let mut entries = Vec::new();
                             let overlay_radius = 3;
@@ -2257,13 +2252,8 @@ pub async fn run() -> anyhow::Result<()> {
                                             [130, 130, 130, 110]
                                         };
                                         let world_min = crate::types::chunk_to_world_min(coord);
-                                        let local_min = crate::types::VoxelCoord {
-                                            x: world_min.x - origin_voxel.x,
-                                            y: world_min.y - origin_voxel.y,
-                                            z: world_min.z - origin_voxel.z,
-                                        };
                                         entries.push(ChunkDebugOverlayEntry {
-                                            chunk_min: [local_min.x, local_min.y, local_min.z],
+                                            chunk_min: [world_min.x, world_min.y, world_min.z],
                                             color,
                                         });
                                     }
@@ -2272,6 +2262,11 @@ pub async fn run() -> anyhow::Result<()> {
                             Some(entries)
                         } else {
                             None
+                        };
+
+                        let held_tool = {
+                            let tool_texture = tool_textures.for_tool(ui.active_tool);
+                            Some((tool_texture.texture.id(), tool_texture.size))
                         };
 
                         let spawn_debug = if spawn_pending {
@@ -2290,16 +2285,16 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.sim_speed,
                             cam.view_proj(),
                             [renderer.config.width, renderer.config.height],
-                            &preview_local,
+                            &preview_block_list,
                             [0, 0, 0],
                             &brush,
                             preview_mode,
                             ui.show_radial_menu,
                             RADIAL_MENU_TOGGLE_LABEL,
                             VOXEL_SIZE,
-                            None,
+                            held_tool,
                             start.elapsed().as_secs_f32(),
-                            !gameplay_blocked && !egui_c,
+                            !gameplay_blocked && !egui_c && (input.lmb || input.rmb),
                             Some(&spawn_debug),
                             chunk_overlay_entries.as_deref(),
                         );

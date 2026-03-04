@@ -1347,24 +1347,41 @@ fn draw_held_tool_sprite(
     now_s: f32,
     using_tool: bool,
 ) {
-    let base_w = (size[0] as f32 * 5.0).clamp(96.0, 260.0);
+    let base_w = (size[0] as f32 * 10.0).clamp(192.0, 520.0);
     let aspect = (size[1] as f32 / size[0].max(1) as f32).clamp(0.35, 1.8);
     let height = base_w * aspect;
     let bob = (now_s * 4.0).sin() * 5.0;
-    let swing = if using_tool {
-        (now_s * 18.0).sin().abs() * 22.0
+    let swing_phase = if using_tool {
+        (now_s * 11.5).sin()
     } else {
         0.0
     };
+    let arc_angle = if using_tool {
+        -1.1 + (swing_phase * 0.5 + 0.5) * 1.3
+    } else {
+        -0.15
+    };
+    let arc_radius = if using_tool { 52.0 } else { 14.0 };
+    let arc_offset = egui::vec2(arc_angle.cos() * arc_radius, arc_angle.sin() * arc_radius);
+    let rotation = if using_tool {
+        -0.52 + swing_phase * 0.45
+    } else {
+        -0.26
+    };
 
     let pivot = egui::pos2(
-        rect.max.x - 84.0 - swing,
-        rect.max.y - 64.0 + bob + swing * 0.2,
+        rect.max.x - 120.0 + arc_offset.x,
+        rect.max.y - 90.0 + bob + arc_offset.y,
     );
-    let top_left = egui::pos2(pivot.x - base_w * 0.66, pivot.y - height - 10.0);
-    let top_right = egui::pos2(pivot.x - base_w * 0.08, pivot.y - height * 1.02);
-    let bottom_right = egui::pos2(pivot.x + base_w * 0.10, pivot.y + 7.0);
-    let bottom_left = egui::pos2(pivot.x - base_w * 0.46, pivot.y + 20.0);
+
+    let rotate = |v: egui::Vec2| {
+        let (sin_r, cos_r) = rotation.sin_cos();
+        egui::vec2(v.x * cos_r - v.y * sin_r, v.x * sin_r + v.y * cos_r)
+    };
+    let top_left = pivot + rotate(egui::vec2(-base_w * 0.52, -height * 0.92));
+    let top_right = pivot + rotate(egui::vec2(base_w * 0.18, -height * 0.82));
+    let bottom_right = pivot + rotate(egui::vec2(base_w * 0.30, height * 0.24));
+    let bottom_left = pivot + rotate(egui::vec2(-base_w * 0.42, height * 0.34));
 
     let mut mesh = egui::Mesh::with_texture(texture);
     let tint = if using_tool {
