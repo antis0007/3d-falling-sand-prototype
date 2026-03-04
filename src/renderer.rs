@@ -247,6 +247,64 @@ pub struct ChunkMesh {
     chunk_origin_world: Vec3,
 }
 
+#[derive(Default)]
+struct ChunkMeshCache {
+    near: Option<ChunkMesh>,
+    mid: Option<ChunkMesh>,
+    far: Option<ChunkMesh>,
+    ultra: Option<ChunkMesh>,
+}
+
+impl ChunkMeshCache {
+    fn get(&self, lod: ChunkLod) -> Option<&ChunkMesh> {
+        match lod {
+            ChunkLod::Near => self.near.as_ref(),
+            ChunkLod::Mid => self.mid.as_ref(),
+            ChunkLod::Far => self.far.as_ref(),
+            ChunkLod::Ultra => self.ultra.as_ref(),
+        }
+    }
+
+    fn slot_mut(&mut self, lod: ChunkLod) -> &mut Option<ChunkMesh> {
+        match lod {
+            ChunkLod::Near => &mut self.near,
+            ChunkLod::Mid => &mut self.mid,
+            ChunkLod::Far => &mut self.far,
+            ChunkLod::Ultra => &mut self.ultra,
+        }
+    }
+
+    fn best_available(&self, selected: ChunkLod) -> Option<(ChunkLod, &ChunkMesh)> {
+        if let Some(mesh) = self.get(selected) {
+            return Some((selected, mesh));
+        }
+
+        let selected_rank = lod_rank(selected) as i32;
+        [
+            ChunkLod::Near,
+            ChunkLod::Mid,
+            ChunkLod::Far,
+            ChunkLod::Ultra,
+        ]
+        .into_iter()
+        .filter_map(|lod| self.get(lod).map(|mesh| (lod, mesh)))
+        .min_by_key(|(lod, _)| {
+            let rank = lod_rank(*lod) as i32;
+            ((rank - selected_rank).abs(), lod_rank(*lod))
+        })
+    }
+
+    fn drain(self) -> impl Iterator<Item = ChunkMesh> {
+        [self.near, self.mid, self.far, self.ultra]
+            .into_iter()
+            .flatten()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.near.is_none() && self.mid.is_none() && self.far.is_none() && self.ultra.is_none()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ChunkOriginInstance {
@@ -278,6 +336,15 @@ pub enum ChunkLod {
     Mid,
     Far,
     Ultra,
+}
+
+fn lod_rank(lod: ChunkLod) -> usize {
+    match lod {
+        ChunkLod::Near => 0,
+        ChunkLod::Mid => 1,
+        ChunkLod::Far => 2,
+        ChunkLod::Ultra => 3,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -322,7 +389,7 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
 
-    store_meshes: HashMap<(ChunkCoord, ChunkLod), ChunkMesh>,
+    store_meshes: HashMap<ChunkCoord, ChunkMeshCache>,
     vertex_arena: BufferArena,
     index_arena: BufferArena,
 
@@ -334,6 +401,7 @@ pub struct Renderer {
     dirty_fair_cursor: u8,
     mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
+    pending_lod_remesh: HashSet<ChunkCoord>,
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
@@ -405,6 +473,7 @@ const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
 const DIRTY_NEAR_STARVE_LIMIT_FRAMES: u32 = 8;
 const DIRTY_FAR_STARVE_LIMIT_FRAMES: u32 = 20;
 const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
+const FAR_CACHE_EVICT_BAND_CHUNKS: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -921,6 +990,7 @@ impl Renderer {
             dirty_fair_cursor: 0,
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
+            pending_lod_remesh: HashSet::new(),
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
@@ -958,16 +1028,17 @@ impl Renderer {
         let vp_world = camera.view_proj();
         let world_camera_pos = camera_world_position(camera);
         let mut stats = CullStats::default();
-        for (&(coord, lod), mesh) in &self.store_meshes {
-            if self
+        for (&coord, cache) in &self.store_meshes {
+            let selected_lod = self
                 .lod_selection
                 .get(&coord)
                 .copied()
-                .unwrap_or(ChunkLod::Near)
-                != lod
-            {
-                stats.lod_filtered += 1;
+                .unwrap_or(ChunkLod::Near);
+            let Some((lod, mesh)) = cache.best_available(selected_lod) else {
                 continue;
+            };
+            if lod != selected_lod {
+                stats.lod_filtered += 1;
             }
             if self.settings.frustum_culling
                 && !aabb_in_view(vp_world, mesh.world_aabb_min, mesh.world_aabb_max)
@@ -1288,59 +1359,26 @@ impl Renderer {
                 continue;
             }
 
-            let key = (result.coord, result.lod);
-            let existing = self.store_meshes.remove(&key);
+            let cache = self.store_meshes.entry(result.coord).or_default();
             if inds.is_empty() {
-                if let Some(old_mesh) = existing {
+                if let Some(old_mesh) = cache.slot_mut(result.lod).take() {
                     self.vertex_arena.free(old_mesh.vertex_alloc);
                     self.index_arena.free(old_mesh.index_alloc);
                 }
             } else {
                 let vertex_bytes = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
                 let index_bytes = (inds.len() * std::mem::size_of::<u32>()) as u64;
-                let mut reallocated = false;
 
-                let mut existing = existing;
-                let mut vertex_alloc = existing.as_ref().map(|mesh| mesh.vertex_alloc);
-                let mut index_alloc = existing.as_ref().map(|mesh| mesh.index_alloc);
-
-                if let Some(alloc) = vertex_alloc {
-                    if alloc.size >= vertex_bytes {
-                        self.allocator_telemetry.bytes_reused += vertex_bytes as usize;
-                    } else {
-                        self.vertex_arena.free(alloc);
-                        vertex_alloc = None;
-                        reallocated = true;
-                    }
-                }
-                if let Some(alloc) = index_alloc {
-                    if alloc.size >= index_bytes {
-                        self.allocator_telemetry.bytes_reused += index_bytes as usize;
-                    } else {
-                        self.index_arena.free(alloc);
-                        index_alloc = None;
-                        reallocated = true;
-                    }
-                }
-
-                let vertex_alloc = vertex_alloc.unwrap_or_else(|| {
-                    self.vertex_arena.allocate(
-                        &self.device,
-                        vertex_bytes,
-                        &mut self.allocator_telemetry,
-                    )
-                });
-                let index_alloc = index_alloc.unwrap_or_else(|| {
-                    self.index_arena.allocate(
-                        &self.device,
-                        index_bytes,
-                        &mut self.allocator_telemetry,
-                    )
-                });
-
-                if reallocated {
-                    self.allocator_telemetry.realloc_count += 1;
-                }
+                let vertex_alloc = self.vertex_arena.allocate(
+                    &self.device,
+                    vertex_bytes,
+                    &mut self.allocator_telemetry,
+                );
+                let index_alloc = self.index_arena.allocate(
+                    &self.device,
+                    index_bytes,
+                    &mut self.allocator_telemetry,
+                );
 
                 self.queue.write_buffer(
                     self.vertex_arena.buffer(vertex_alloc.slab_index),
@@ -1353,72 +1391,54 @@ impl Renderer {
                     bytemuck::cast_slice(inds),
                 );
 
-                let (chunk_origin_buf, debug_aabb_vb, debug_aabb_ib, debug_aabb_index_count) =
-                    if let Some(old_mesh) = existing.take() {
-                        self.queue.write_buffer(
-                            &old_mesh.chunk_origin_buf,
-                            0,
-                            bytemuck::bytes_of(&ChunkOriginInstance {
+                let chunk_origin_buf =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk origin instance"),
+                            contents: bytemuck::bytes_of(&ChunkOriginInstance {
                                 chunk_origin_world: chunk_origin_world.to_array(),
                                 _pad: 0.0,
                             }),
-                        );
-                        (
-                            old_mesh.chunk_origin_buf,
-                            old_mesh.debug_aabb_vb,
-                            old_mesh.debug_aabb_ib,
-                            old_mesh.debug_aabb_index_count,
-                        )
-                    } else {
-                        let chunk_origin_buf =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("store chunk origin instance"),
-                                    contents: bytemuck::bytes_of(&ChunkOriginInstance {
-                                        chunk_origin_world: chunk_origin_world.to_array(),
-                                        _pad: 0.0,
-                                    }),
-                                    usage: wgpu::BufferUsages::VERTEX
-                                        | wgpu::BufferUsages::COPY_DST,
-                                });
-                        let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
-                        let debug_aabb_vb =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("store chunk debug aabb vb"),
-                                    contents: bytemuck::cast_slice(&debug_aabb_verts),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
-                        let debug_aabb_ib =
-                            self.device
-                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("store chunk debug aabb ib"),
-                                    contents: bytemuck::cast_slice(&debug_aabb_inds),
-                                    usage: wgpu::BufferUsages::INDEX,
-                                });
-                        (
-                            chunk_origin_buf,
-                            debug_aabb_vb,
-                            debug_aabb_ib,
-                            debug_aabb_inds.len() as u32,
-                        )
-                    };
+                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        });
+                let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
+                let debug_aabb_vb =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk debug aabb vb"),
+                            contents: bytemuck::cast_slice(&debug_aabb_verts),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                let debug_aabb_ib =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("store chunk debug aabb ib"),
+                            contents: bytemuck::cast_slice(&debug_aabb_inds),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
 
-                self.store_meshes.insert(
-                    key,
-                    ChunkMesh {
-                        vertex_alloc,
-                        chunk_origin_buf,
-                        index_alloc,
-                        index_count: inds.len() as u32,
-                        debug_aabb_vb,
-                        debug_aabb_ib,
-                        debug_aabb_index_count,
-                        world_aabb_min: aabb_min,
-                        world_aabb_max: aabb_max,
-                        chunk_origin_world,
-                    },
-                );
+                let new_mesh = ChunkMesh {
+                    vertex_alloc,
+                    chunk_origin_buf,
+                    index_alloc,
+                    index_count: inds.len() as u32,
+                    debug_aabb_vb,
+                    debug_aabb_ib,
+                    debug_aabb_index_count: debug_aabb_inds.len() as u32,
+                    world_aabb_min: aabb_min,
+                    world_aabb_max: aabb_max,
+                    chunk_origin_world,
+                };
+
+                if let Some(old_mesh) = cache.slot_mut(result.lod).replace(new_mesh) {
+                    self.vertex_arena.free(old_mesh.vertex_alloc);
+                    self.index_arena.free(old_mesh.index_alloc);
+                }
+            }
+
+            if cache.is_empty() {
+                self.store_meshes.remove(&result.coord);
+                self.pending_lod_remesh.remove(&result.coord);
             }
 
             self.mesh_versions.insert(result.coord, result.version);
@@ -1457,42 +1477,62 @@ impl Renderer {
         stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = self.completed_meshes.len();
 
+        let ultra_mesh_evict_distance = lod_radii.ultra.saturating_sub(lod_radii.hysteresis.max(1));
+        let far_mesh_evict_distance =
+            ultra_mesh_evict_distance.saturating_sub(FAR_CACHE_EVICT_BAND_CHUNKS);
+        let mut evict_lod_slots = Vec::new();
+        for &coord in self.store_meshes.keys() {
+            let d = chunk_chebyshev_dist(player_chunk, coord);
+            if d > ultra_mesh_evict_distance {
+                evict_lod_slots.push((coord, ChunkLod::Ultra));
+            }
+            if d > far_mesh_evict_distance {
+                evict_lod_slots.push((coord, ChunkLod::Far));
+            }
+        }
+        for (coord, lod) in evict_lod_slots {
+            if let Some(cache) = self.store_meshes.get_mut(&coord) {
+                if let Some(mesh) = cache.slot_mut(lod).take() {
+                    self.vertex_arena.free(mesh.vertex_alloc);
+                    self.index_arena.free(mesh.index_alloc);
+                }
+            }
+        }
+
         let mut drop_keys = Vec::new();
-        for &(coord, _) in self.store_meshes.keys() {
+        for &coord in self.store_meshes.keys() {
             if chunk_chebyshev_dist(player_chunk, coord) > lod_radii.ultra {
                 drop_keys.push(coord);
             }
         }
         for coord in drop_keys {
-            for lod in [
-                ChunkLod::Near,
-                ChunkLod::Mid,
-                ChunkLod::Far,
-                ChunkLod::Ultra,
-            ] {
-                if let Some(mesh) = self.store_meshes.remove(&(coord, lod)) {
+            if let Some(cache) = self.store_meshes.remove(&coord) {
+                for mesh in cache.drain() {
                     self.vertex_arena.free(mesh.vertex_alloc);
                     self.index_arena.free(mesh.index_alloc);
                 }
             }
             self.lod_selection.remove(&coord);
+            self.pending_lod_remesh.remove(&coord);
         }
 
-        let mut coords = HashSet::new();
-        for &(coord, _) in self.store_meshes.keys() {
-            coords.insert(coord);
-        }
-        for coord in coords {
+        let cached_coords: Vec<ChunkCoord> = self.store_meshes.keys().copied().collect();
+        for coord in cached_coords {
             let prev = self.lod_selection.get(&coord).copied();
             let lod = select_lod(coord, player_chunk, lod_radii, prev);
+            if prev != Some(lod) {
+                self.enqueue_lod_remesh(coord, player_chunk, chunk_priority_scores);
+            }
             self.lod_selection.insert(coord, lod);
         }
         stats
     }
     pub fn clear_mesh_cache(&mut self) {
-        for (_, mesh) in self.store_meshes.drain() {
-            self.vertex_arena.free(mesh.vertex_alloc);
-            self.index_arena.free(mesh.index_alloc);
+        for (_, cache) in self.store_meshes.drain() {
+            for mesh in cache.drain() {
+                self.vertex_arena.free(mesh.vertex_alloc);
+                self.index_arena.free(mesh.index_alloc);
+            }
         }
         self.dirty_queues.clear();
         self.urgent_mesh_queue.clear();
@@ -1503,6 +1543,7 @@ impl Renderer {
         self.completed_meshes.clear();
         self.mesh_versions.clear();
         self.lod_selection.clear();
+        self.pending_lod_remesh.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
         // Keep CPU frustum checks in world space; do not pre-apply origin
@@ -1510,16 +1551,15 @@ impl Renderer {
         let vp_world = camera.view_proj();
         let mut chunks = 0usize;
         let mut inds = 0u64;
-        for (&(coord, lod), m) in &self.store_meshes {
-            if self
+        for (&coord, cache) in &self.store_meshes {
+            let selected_lod = self
                 .lod_selection
                 .get(&coord)
                 .copied()
-                .unwrap_or(ChunkLod::Near)
-                != lod
-            {
+                .unwrap_or(ChunkLod::Near);
+            let Some((_, m)) = cache.best_available(selected_lod) else {
                 continue;
-            }
+            };
             if aabb_in_view(vp_world, m.world_aabb_min, m.world_aabb_max) {
                 chunks += 1;
                 inds += m.index_count as u64;
@@ -1553,16 +1593,15 @@ impl Renderer {
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
         let mut debug_visible_logged = 0usize;
-        for (&(coord, lod), mesh) in &self.store_meshes {
-            if self
+        for (&coord, cache) in &self.store_meshes {
+            let selected_lod = self
                 .lod_selection
                 .get(&coord)
                 .copied()
-                .unwrap_or(ChunkLod::Near)
-                != lod
-            {
+                .unwrap_or(ChunkLod::Near);
+            let Some((lod, mesh)) = cache.best_available(selected_lod) else {
                 continue;
-            }
+            };
 
             let visible_world = chunk_visible_in_world_space(
                 self.settings.frustum_culling,
@@ -1636,6 +1675,7 @@ impl Renderer {
         if self.urgent_mesh_set.insert(coord) {
             self.urgent_mesh_queue.push_back(coord);
         }
+        self.pending_lod_remesh.remove(&coord);
         self.dirty_queues.remove_coord(coord);
     }
 
@@ -1649,6 +1689,7 @@ impl Renderer {
         let mut jobs = Vec::new();
         while let Some(coord) = self.urgent_mesh_queue.pop_front() {
             self.urgent_mesh_set.remove(&coord);
+            self.pending_lod_remesh.remove(&coord);
 
             let t0 = Instant::now();
             let snapshot =
@@ -1720,6 +1761,17 @@ impl Renderer {
         }
         let tier = Self::classify_dirty_tier(coord, player_chunk, chunk_priority_scores);
         self.dirty_queues.queue_coord(coord, tier);
+    }
+
+    fn enqueue_lod_remesh(
+        &mut self,
+        coord: ChunkCoord,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) {
+        if self.pending_lod_remesh.insert(coord) {
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
     }
 
     fn pop_priority_dirty_chunks(
@@ -1811,6 +1863,7 @@ impl Renderer {
             let Some(coord) = picked else {
                 break;
             };
+            self.pending_lod_remesh.remove(&coord);
             snapshots.push(coord);
         }
 
@@ -1841,10 +1894,12 @@ impl Renderer {
                 .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Normal))
                 .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Near))
                 .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Urgent));
-            if removed.is_none() {
+            if let Some(coord) = removed {
+                self.pending_lod_remesh.remove(&coord);
+                dropped += 1;
+            } else {
                 break;
             }
-            dropped += 1;
         }
         dropped
     }
@@ -2538,16 +2593,61 @@ fn select_lod(
     prev: Option<ChunkLod>,
 ) -> ChunkLod {
     let d = chunk_chebyshev_dist(coord, player_chunk);
-    let h = radii.hysteresis;
-    match prev.unwrap_or(ChunkLod::Ultra) {
-        ChunkLod::Near if d <= radii.near + h => ChunkLod::Near,
-        ChunkLod::Mid if d >= radii.near.saturating_sub(h) && d <= radii.mid + h => ChunkLod::Mid,
-        ChunkLod::Far if d >= radii.mid.saturating_sub(h) && d <= radii.far + h => ChunkLod::Far,
-        ChunkLod::Ultra if d >= radii.far.saturating_sub(h) => ChunkLod::Ultra,
-        _ if d <= radii.near.saturating_sub(h) => ChunkLod::Near,
-        _ if d <= radii.mid.saturating_sub(h) => ChunkLod::Mid,
-        _ if d <= radii.far.saturating_sub(h) => ChunkLod::Far,
-        _ => ChunkLod::Ultra,
+    let h = radii.hysteresis.max(1);
+    let near_down = radii.near.saturating_sub(h);
+    let mid_down = radii.mid.saturating_sub(h * 2);
+    let far_down = radii.far.saturating_sub(h * 3);
+
+    match prev {
+        Some(ChunkLod::Near) => {
+            if d <= radii.near {
+                ChunkLod::Near
+            } else if d <= radii.mid {
+                ChunkLod::Mid
+            } else if d <= radii.far {
+                ChunkLod::Far
+            } else {
+                ChunkLod::Ultra
+            }
+        }
+        Some(ChunkLod::Mid) => {
+            if d <= near_down {
+                ChunkLod::Near
+            } else if d <= radii.mid {
+                ChunkLod::Mid
+            } else if d <= radii.far {
+                ChunkLod::Far
+            } else {
+                ChunkLod::Ultra
+            }
+        }
+        Some(ChunkLod::Far) => {
+            if d <= mid_down {
+                ChunkLod::Mid
+            } else if d <= radii.far {
+                ChunkLod::Far
+            } else {
+                ChunkLod::Ultra
+            }
+        }
+        Some(ChunkLod::Ultra) => {
+            if d <= far_down {
+                ChunkLod::Far
+            } else {
+                ChunkLod::Ultra
+            }
+        }
+        None => {
+            if d <= radii.near {
+                ChunkLod::Near
+            } else if d <= radii.mid {
+                ChunkLod::Mid
+            } else if d <= radii.far {
+                ChunkLod::Far
+            } else {
+                ChunkLod::Ultra
+            }
+        }
     }
 }
 
