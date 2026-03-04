@@ -1,4 +1,6 @@
-use crate::renderer::{mesh_chunk_snapshot, ChunkMeshArtifact, MeshJob};
+#[cfg(feature = "cpu_meshing_debug")]
+use crate::renderer::mesh_chunk_snapshot;
+use crate::renderer::{ChunkMeshArtifact, MeshJob};
 use crate::types::{ChunkCoord, GpuPageIndex};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
@@ -327,6 +329,41 @@ fn clear_meshing_outputs_for_page(state: &WorkerGpuState, page_index: GpuPageInd
         indirect_offset,
         bytemuck::bytes_of(&zero_indirect),
     );
+
+    let zero_draw_indirect = DrawIndexedIndirectArgs::default();
+    let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+    let draw_offset = page_index.0 as u64 * draw_stride;
+    state.queue.write_buffer(
+        &state.draw_indirect_buffer,
+        draw_offset,
+        bytemuck::bytes_of(&zero_draw_indirect),
+    );
+
+    let zero_meta = ChunkMeshMeta {
+        page_index: page_index.0,
+        ..ChunkMeshMeta::default()
+    };
+    let meta_stride = std::mem::size_of::<ChunkMeshMeta>() as u64;
+    let meta_offset = page_index.0 as u64 * meta_stride;
+    state.queue.write_buffer(
+        &state.mesh_meta_buffer,
+        meta_offset,
+        bytemuck::bytes_of(&zero_meta),
+    );
+
+    let zero_counter = [0u32; 1];
+    let counter_stride = std::mem::size_of::<u32>() as u64;
+    let counter_offset = page_index.0 as u64 * counter_stride;
+    state.queue.write_buffer(
+        &state.vertex_counter,
+        counter_offset,
+        bytemuck::cast_slice(&zero_counter),
+    );
+    state.queue.write_buffer(
+        &state.index_counter,
+        counter_offset,
+        bytemuck::cast_slice(&zero_counter),
+    );
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -411,6 +448,14 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+pub struct MeshArtifactGPU {
+    pub page_index: GpuPageIndex,
+    pub lod: u8,
+    pub draw_indirect_index: u32,
 }
 
 impl GpuComputeRuntime {
@@ -713,7 +758,8 @@ impl GpuComputeRuntime {
         sim_job: &SimulationJob,
         page_index: GpuPageIndex,
         current_state: u32,
-    ) -> anyhow::Result<DrawIndirectArgs> {
+        lod: u8,
+    ) -> anyhow::Result<MeshArtifactGPU> {
         clear_meshing_outputs_for_page(state, page_index);
 
         let page_params = device_page_params(
@@ -743,81 +789,12 @@ impl GpuComputeRuntime {
         }
 
         state.queue.submit(Some(encoder.finish()));
-        Ok(DrawIndirectArgs::default())
+        Ok(MeshArtifactGPU {
+            page_index,
+            lod,
+            draw_indirect_index: page_index.0,
+        })
     }
-}
-
-#[cfg(feature = "gpu-compute")]
-struct PendingReadback {
-    readback: wgpu::Buffer,
-    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-}
-
-#[cfg(feature = "gpu-compute")]
-fn readback_page_materials(
-    state: &WorkerGpuState,
-    page_index: GpuPageIndex,
-    state_index: u32,
-    voxel_count: usize,
-) -> anyhow::Result<Vec<MaterialId>> {
-    let pending = begin_material_readback(state, page_index, state_index, voxel_count)?;
-    finish_material_readback(state, pending)
-}
-
-#[cfg(feature = "gpu-compute")]
-fn begin_material_readback(
-    state: &WorkerGpuState,
-    page_index: GpuPageIndex,
-    state_index: u32,
-    voxel_count: usize,
-) -> anyhow::Result<PendingReadback> {
-    let atlas_offset_voxels = (page_index.0 as u64 * CHUNK_VOLUME as u64 * 2)
-        + (state_index as u64 * CHUNK_VOLUME as u64);
-    let byte_offset = atlas_offset_voxels * std::mem::size_of::<u32>() as u64;
-    let byte_len = voxel_count as u64 * std::mem::size_of::<u32>() as u64;
-    let readback = state.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("chunk materials readback"),
-        size: byte_len,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = state
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(&state.atlas_voxels, byte_offset, &readback, 0, byte_len);
-    state.queue.submit(Some(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-
-    Ok(PendingReadback { readback, rx })
-}
-
-#[cfg(feature = "gpu-compute")]
-fn finish_material_readback(
-    state: &WorkerGpuState,
-    pending: PendingReadback,
-) -> anyhow::Result<Vec<MaterialId>> {
-    loop {
-        if let Ok(done) = pending.rx.try_recv() {
-            done.context("gpu readback completion")?;
-            break;
-        }
-        state.device.poll(wgpu::Maintain::Poll);
-        std::thread::yield_now();
-    }
-
-    let slice = pending.readback.slice(..);
-    let bytes = slice.get_mapped_range();
-    let words: &[u32] = bytemuck::cast_slice(&bytes);
-    let materials = words.iter().map(|m| *m as MaterialId).collect();
-    drop(bytes);
-    pending.readback.unmap();
-    Ok(materials)
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1344,8 +1321,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
                 atlas.assert_page_for_chunk(job.coord, page_index);
             }
-            let (indirect, generated_materials) = {
-                // Shared worker buffers are global; serialize command encoding/submission/readback.
+            let gpu_artifact = {
+                // Shared worker buffers are global; serialize command encoding/submission.
                 let _dispatch_guard = GPU_DISPATCH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
                 if page_was_reassigned {
@@ -1368,55 +1345,50 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     )?
                 }
                 #[cfg(feature = "gpu_meshing_experimental")]
-                let indirect = if !edit_commands.is_empty() || _last_version != job.version {
+                let gpu_artifact = if !edit_commands.is_empty() || _last_version != job.version {
                     state.runtime.run_meshing_dispatch(
                         state,
                         &sim_job,
                         page_index,
                         current_state,
+                        job.lod as u8,
                     )?
                 } else {
-                    DrawIndirectArgs::default()
+                    MeshArtifactGPU {
+                        page_index,
+                        lod: job.lod as u8,
+                        draw_indirect_index: page_index.0,
+                    }
                 };
 
                 #[cfg(not(feature = "gpu_meshing_experimental"))]
-                let indirect = DrawIndirectArgs::default();
-
-                let generated_materials = readback_page_materials(
-                    state,
+                let gpu_artifact = MeshArtifactGPU {
                     page_index,
-                    next_state,
-                    job.snapshot.center_voxels.len(),
-                )
-                .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
-                (indirect, generated_materials)
+                    lod: job.lod as u8,
+                    draw_indirect_index: page_index.0,
+                };
+
+                gpu_artifact
             };
 
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
-            let snapshot = job
-                .snapshot
-                .with_center_materials(generated_materials.clone());
-            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
-                mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
-            let mesh_indirect = DrawIndirectArgs {
-                index_count: inds.len() as u32,
-                instance_count: indirect.instance_count.max(1),
-                first_vertex: 0,
-                first_instance: 0,
-            };
+            let _ = gpu_artifact;
 
             Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: diagnostics,
                 mesh_artifact: ChunkMeshArtifact::Gpu {
-                    verts,
-                    inds,
-                    indirect: mesh_indirect,
-                    aabb_min,
-                    aabb_max,
-                    chunk_origin_world,
+                    verts: Vec::new(),
+                    inds: Vec::new(),
+                    indirect: DrawIndirectArgs::default(),
+                    aabb_min: glam::Vec3::ZERO,
+                    aabb_max: glam::Vec3::ZERO,
+                    chunk_origin_world: glam::Vec3::new(
+                        job.coord.x as f32 * 32.0,
+                        job.coord.y as f32 * 32.0,
+                        job.coord.z as f32 * 32.0,
+                    ),
                     dispatch_ms,
-                    readback_bytes: generated_materials.len() as u64
-                        * std::mem::size_of::<MaterialId>() as u64,
+                    readback_bytes: 0,
                 },
             })
         })();
@@ -1431,9 +1403,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 .frontier_len_for_chunk
                 .insert(job.coord, active_frontier_count);
             atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
-            atlas
-                .cached_materials
-                .insert(job.coord, job.snapshot.center_voxels.as_ref().to_vec());
+            atlas.cached_materials.insert(job.coord, Vec::new());
         }
 
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
@@ -1580,10 +1550,9 @@ pub struct ChunkMeshMeta {
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndexedIndirectArgs {
-    pub index_count: u32,
+    pub vertex_count: u32,
     pub instance_count: u32,
-    pub first_index: u32,
-    pub base_vertex: i32,
+    pub first_vertex: u32,
     pub first_instance: u32,
 }
 
