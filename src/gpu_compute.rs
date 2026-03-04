@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
@@ -334,8 +334,8 @@ fn create_job_scratch_buffers(state: &WorkerGpuState) -> JobScratchBuffers {
 fn clear_job_scratch_buffers(
     state: &WorkerGpuState,
     scratch: &JobScratchBuffers,
-    active_tile_len: usize,
-    dirty_page_len: usize,
+    _active_tile_len: usize,
+    _dirty_page_len: usize,
 ) {
     let zero_u32x4 = [0u32; 4];
 
@@ -353,23 +353,7 @@ fn clear_job_scratch_buffers(
         .queue
         .write_buffer(&scratch.diagnostics, 0, bytemuck::cast_slice(&zero_u32x4));
 
-    if active_tile_len > 0 {
-        let active_tile_zeros = vec![0u32; active_tile_len.min(CHUNK_VOLUME)];
-        state.queue.write_buffer(
-            &scratch.active_tiles,
-            0,
-            bytemuck::cast_slice(&active_tile_zeros),
-        );
-    }
-
-    if dirty_page_len > 0 {
-        let dirty_page_zeros = vec![0u32; dirty_page_len.min(GPU_PAGE_CAPACITY as usize)];
-        state.queue.write_buffer(
-            &scratch.dirty_page_indices,
-            0,
-            bytemuck::cast_slice(&dirty_page_zeros),
-        );
-    }
+    // FIX 7: avoid uploading large zero arrays every job; counters are authoritative.
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -479,6 +463,8 @@ static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+#[cfg(feature = "gpu-compute")]
+static GPU_JOB_MUTEX: Mutex<()> = Mutex::new(());
 
 pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfilerSnapshot {
     #[cfg(not(feature = "gpu-compute"))]
@@ -1056,7 +1042,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
     {
         use std::sync::OnceLock;
 
-        static STATE: OnceLock<anyhow::Result<WorkerGpuState>> = OnceLock::new();
+        static STATE: OnceLock<anyhow::Result<Arc<WorkerGpuState>>> = OnceLock::new();
         let state = STATE.get_or_init(|| {
             let instance = wgpu::Instance::default();
             let adapter =
@@ -1198,7 +1184,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 mapped_at_creation: false,
             });
 
-            Ok(WorkerGpuState {
+            Ok(Arc::new(WorkerGpuState {
                 device,
                 queue,
                 runtime,
@@ -1216,9 +1202,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 vertex_counter,
                 index_counter,
                 runtime_config: GpuSimulationRuntimeConfig::default(),
-            })
+            }))
         });
-        let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let state = state
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            .clone();
         {
             let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
             if !active_jobs.insert(job.coord) {
@@ -1242,6 +1231,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             }
         };
         atlas.assert_page_for_chunk(job.coord, page_index);
+        // FIX 6: pin the primary page until dispatch/readback completion.
         atlas.acquire_page_for_job(job.coord, page_index);
         let _last_version = atlas
             .version_for_chunk
@@ -1263,6 +1253,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         if cached_before.len() != incoming.len() {
             cached_before.resize(incoming.len(), EMPTY);
         }
+        // FIX 4: freeze neighbor page indices while atlas lock is held.
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
         let mut pinned_pages = vec![page_index];
         for neighbor_page in neighbor_pages {
@@ -1271,6 +1262,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             }
             let neighbor_index = GpuPageIndex(neighbor_page);
             if !pinned_pages.contains(&neighbor_index) {
+                // FIX 6: pin neighbor pages for the full job to prevent eviction races.
                 atlas.acquire_existing_page_for_job(neighbor_index);
                 pinned_pages.push(neighbor_index);
             }
@@ -1311,17 +1303,19 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let dispatch_t0 = Instant::now();
         let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
+            // FIX 3: current worker scratch/resources are shared; serialize dispatch for safety.
+            let _job_guard = GPU_JOB_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             {
                 let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
                 atlas.assert_page_for_chunk(job.coord, page_index);
             }
-            let scratch = create_job_scratch_buffers(state);
+            let scratch = create_job_scratch_buffers(&state);
             let gpu_artifact = {
                 if page_was_reassigned {
-                    clear_page_buffers(state, page_index);
+                    clear_page_buffers(&state, page_index);
                 }
                 clear_job_scratch_buffers(
-                    state,
+                    &state,
                     &scratch,
                     active_frontier_count.max(previous_frontier) as usize,
                     1,
@@ -1329,7 +1323,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
                 if active_frontier_count > 0 {
                     state.runtime.run_active_frontier(
-                        state,
+                        &state,
                         &scratch,
                         &sim_job,
                         page_index,
@@ -1341,7 +1335,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 #[cfg(feature = "gpu_meshing_experimental")]
                 let gpu_artifact = if !edit_commands.is_empty() || _last_version != job.version {
                     state.runtime.run_meshing_dispatch(
-                        state,
+                        &state,
                         &scratch,
                         &sim_job,
                         page_index,

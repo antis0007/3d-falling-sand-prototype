@@ -1495,20 +1495,18 @@ impl Renderer {
         let mut total_latency_ms = 0.0f32;
         let mut deferred = Vec::new();
         let mut remesh_coords = Vec::new();
-        let mut stale_result_coords = Vec::new();
+        let stale_result_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             let voxel_version = store.chunk_voxel_version(result.coord);
-            if result.version < voxel_version
-                && matches!(result.artifact, ChunkMeshArtifact::Skipped)
-            {
-                stats.age_drop_count += 1;
-                stale_result_coords.push(result.coord);
-                continue;
-            }
-
+            // FIX 5: never upload stale geometry; requeue and skip this artifact.
             if result.version < voxel_version {
                 stats.stale_drop_count += 1;
                 remesh_coords.push(result.coord);
+                continue;
+            }
+
+            // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
+            if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
                 continue;
             }
 
@@ -1536,6 +1534,14 @@ impl Renderer {
 
             let cache = self.store_meshes.entry(result.coord).or_default();
             if inds.is_empty() {
+                // FIX 2: ignore transient empty GPU geometry unless the chunk is truly empty.
+                let chunk_is_empty = store
+                    .get_chunk(result.coord)
+                    .map(|chunk| chunk.iter_raw().iter().all(|&id| id == EMPTY))
+                    .unwrap_or(true);
+                if !chunk_is_empty {
+                    continue;
+                }
                 if let Some(old_mesh) = cache.slot_mut(result.lod).take() {
                     self.mesh_allocator.free(old_mesh.allocation);
                 }
