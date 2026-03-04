@@ -85,12 +85,16 @@ struct CameraUniform {
     _pad: f32,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 #[derive(Clone, Copy)]
 struct MeshBufferRange {
     offset: u64,
     size: u64,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 #[derive(Clone, Copy)]
 struct MeshAllocation {
     page_index: usize,
@@ -98,12 +102,16 @@ struct MeshAllocation {
     index: MeshBufferRange,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 #[derive(Clone, Copy)]
 struct MeshPageRange {
     vertex: MeshBufferRange,
     index: MeshBufferRange,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 struct MeshPage {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -114,6 +122,8 @@ struct MeshPage {
     live_allocations: usize,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 struct MeshPageAllocator {
     label: &'static str,
     page_size: u64,
@@ -300,6 +310,8 @@ impl Camera {
     }
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 pub struct ChunkMesh {
     allocation: MeshAllocation,
     index_count: u32,
@@ -311,6 +323,8 @@ pub struct ChunkMesh {
     chunk_origin_world: Vec3,
 }
 
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
 #[derive(Default)]
 struct ChunkMeshCache {
     near: Option<ChunkMesh>,
@@ -391,6 +405,14 @@ struct DrawIndexedIndirectCommand {
     first_instance: u32,
 }
 
+
+// Deprecated: CPU mesh pipeline removed. Structures retained temporarily
+// to avoid breaking references during GPU renderer migration.
+#[derive(Clone, Copy, Debug)]
+struct ChunkOriginInstance {
+    chunk_origin_world: Vec3,
+}
+
 const DEBUG_VISIBLE_CHUNK_LOG_COUNT: usize = 8;
 const DEBUG_RENDER_CHUNK_AABBS: bool = false;
 const DEBUG_VALIDATE_CULL_SPACE: bool = false;
@@ -454,9 +476,7 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
 
-    store_meshes: HashMap<ChunkCoord, ChunkMeshCache>,
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
-    mesh_allocator: MeshPageAllocator,
     global_gpu_vertex_buffer: wgpu::Buffer,
     global_gpu_index_buffer: wgpu::Buffer,
     global_gpu_draw_indirect_buffer: wgpu::Buffer,
@@ -479,7 +499,6 @@ pub struct Renderer {
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
     settings: RendererSettings,
-    allocator_telemetry: MeshAllocatorTelemetry,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -814,6 +833,9 @@ struct GpuChunkDraw {
     draw_indirect_index: u32,
     lod: u8,
     origin: Vec3,
+    world_aabb_min: Vec3,
+    world_aabb_max: Vec3,
+    index_count: u32,
 }
 
 pub(crate) enum ChunkMeshArtifact {
@@ -1145,9 +1167,7 @@ impl Renderer {
             cam_bg,
             depth_texture,
             depth_view,
-            store_meshes: HashMap::new(),
             visible_gpu_chunks: HashMap::new(),
-            mesh_allocator: MeshPageAllocator::new("chunk mesh", 12 * 1024 * 1024),
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
             global_gpu_draw_indirect_buffer,
@@ -1167,7 +1187,6 @@ impl Renderer {
             day: true,
             mesh_backend,
             settings: RendererSettings::default(),
-            allocator_telemetry: MeshAllocatorTelemetry::default(),
         })
     }
 
@@ -1192,38 +1211,36 @@ impl Renderer {
     }
 
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
-        // CPU culling is evaluated in world space to match chunk AABBs.
-        // Mesh vertices are chunk-local and become world-space in the shader
-        // after applying `chunk_origin_world`.
+        // GPU culling stats are evaluated in world space from GPU mesh metadata.
         let vp_world = camera.view_proj();
         let world_camera_pos = camera_world_position(camera);
         let mut stats = CullStats::default();
-        for (&coord, cache) in &self.store_meshes {
+        for (&coord, draw) in &self.visible_gpu_chunks {
             let selected_lod = self
                 .lod_selection
                 .get(&coord)
                 .copied()
                 .unwrap_or(ChunkLod::Near);
-            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
-            let Some((lod, mesh)) =
-                cache.best_available(selected_lod, distance, self.near_lod_distance)
-            else {
-                continue;
+            let draw_lod = match draw.lod {
+                0 => ChunkLod::Near,
+                1 => ChunkLod::Mid,
+                2 => ChunkLod::Far,
+                _ => ChunkLod::Ultra,
             };
-            if lod != selected_lod {
+            if draw_lod != selected_lod {
                 stats.lod_filtered += 1;
             }
             if self.settings.frustum_culling
-                && !aabb_in_view(vp_world, mesh.world_aabb_min, mesh.world_aabb_max)
+                && !aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max)
             {
                 stats.frustum_culled += 1;
                 continue;
             }
             if !passes_screen_space_cull(
                 world_camera_pos,
-                lod,
-                mesh.world_aabb_min,
-                mesh.world_aabb_max,
+                draw_lod,
+                draw.world_aabb_min,
+                draw.world_aabb_max,
                 self.size.height,
             ) {
                 stats.screen_culled += 1;
@@ -1244,7 +1261,7 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
         mesh_budget: usize,
-        upload_byte_budget: usize,
+        _upload_byte_budget: usize,
         lod_radii: LodRadii,
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
@@ -1520,13 +1537,10 @@ impl Renderer {
             }
         }
 
-        self.allocator_telemetry = MeshAllocatorTelemetry::default();
-        let mut bytes_uploaded = 0usize;
-        let mut uploaded = 0usize;
-        let mut total_latency_ms = 0.0f32;
-        let mut deferred = Vec::new();
+        let bytes_uploaded = 0usize;
+        let uploaded = 0usize;
+        let total_latency_ms = 0.0f32;
         let mut remesh_coords = Vec::new();
-        let stale_result_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
@@ -1550,6 +1564,9 @@ impl Renderer {
                 lod,
                 dispatch_ms,
                 readback_bytes,
+                aabb_min,
+                aabb_max,
+                indirect,
                 chunk_origin_world,
                 ..
             } = &result.artifact
@@ -1564,6 +1581,9 @@ impl Renderer {
                         draw_indirect_index: *draw_indirect_index,
                         lod: *lod,
                         origin: *chunk_origin_world,
+                        world_aabb_min: *aabb_min,
+                        world_aabb_max: *aabb_max,
+                        index_count: indirect.index_count,
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
@@ -1608,107 +1628,13 @@ impl Renderer {
                 continue;
             }
 
-            let (verts, inds, _mesh_indirect, aabb_min, aabb_max, chunk_origin_world) =
-                result.artifact.geometry();
+            // Deprecated CPU meshing path: keep artifact handling non-breaking, but
+            // do not allocate pages or upload CPU mesh geometry.
+            stats.mesh_artifacts_rejected += 1;
+            self.visible_gpu_chunks.remove(&result.coord);
+            self.pending_lod_remesh.remove(&result.coord);
+            continue;
 
-            let bytes = verts.len() * std::mem::size_of::<Vertex>()
-                + inds.len() * std::mem::size_of::<u32>();
-            if !result.urgent && bytes_uploaded + bytes > upload_byte_budget {
-                deferred.push(result);
-                continue;
-            }
-
-            let chunk_is_empty = store
-                .get_chunk(result.coord)
-                .map(|chunk| chunk.iter_raw().iter().all(|&id| id == EMPTY))
-                .unwrap_or(true);
-
-            let cache = self.store_meshes.entry(result.coord).or_default();
-            if inds.is_empty() {
-                // Preserve last valid mesh for transient empty meshing artifacts.
-                if !chunk_is_empty {
-                    stats.mesh_artifacts_rejected += 1;
-                    continue;
-                }
-                if let Some(old_mesh) = cache.slot_mut(result.lod).take() {
-                    self.mesh_allocator.free(old_mesh.allocation);
-                }
-            } else {
-                let vertex_bytes = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
-                let index_bytes = (inds.len() * std::mem::size_of::<u32>()) as u64;
-
-                let allocation = self.mesh_allocator.allocate(
-                    &self.device,
-                    vertex_bytes,
-                    index_bytes,
-                    &mut self.allocator_telemetry,
-                );
-                if let Some(page) = self.mesh_allocator.page(allocation.page_index) {
-                    self.queue.write_buffer(
-                        &page.vertex_buffer,
-                        allocation.vertex.offset,
-                        bytemuck::cast_slice(verts),
-                    );
-                    self.queue.write_buffer(
-                        &page.index_buffer,
-                        allocation.index.offset,
-                        bytemuck::cast_slice(inds),
-                    );
-                }
-
-                let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
-                let debug_aabb_vb =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk debug aabb vb"),
-                            contents: bytemuck::cast_slice(&debug_aabb_verts),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let debug_aabb_ib =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk debug aabb ib"),
-                            contents: bytemuck::cast_slice(&debug_aabb_inds),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-
-                let new_mesh = ChunkMesh {
-                    allocation,
-                    index_count: inds.len() as u32,
-                    debug_aabb_vb,
-                    debug_aabb_ib,
-                    debug_aabb_index_count: debug_aabb_inds.len() as u32,
-                    world_aabb_min: aabb_min,
-                    world_aabb_max: aabb_max,
-                    chunk_origin_world,
-                };
-
-                if let Some(old_mesh) = cache.slot_mut(result.lod).replace(new_mesh) {
-                    self.mesh_allocator.free(old_mesh.allocation);
-                }
-            }
-
-            if cache.is_empty() && chunk_is_empty {
-                self.store_meshes.remove(&result.coord);
-                self.pending_lod_remesh.remove(&result.coord);
-            }
-
-            self.mesh_versions.insert(result.coord, result.version);
-            store.mark_chunk_meshed(result.coord);
-
-            bytes_uploaded += bytes;
-            uploaded += 1;
-            total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
-
-            let mesh_version = *self.mesh_versions.get(&result.coord).unwrap_or(&0);
-            if mesh_version < voxel_version {
-                remesh_coords.push(result.coord);
-            }
-        }
-        self.completed_meshes.extend(deferred);
-        for coord in stale_result_coords {
-            self.pending_lod_remesh.remove(&coord);
-            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
@@ -1721,10 +1647,10 @@ impl Renderer {
         } else {
             0.0
         };
-        stats.allocator_bytes_allocated = self.allocator_telemetry.bytes_allocated;
-        stats.allocator_bytes_reused = self.allocator_telemetry.bytes_reused;
-        stats.allocator_realloc_count = self.allocator_telemetry.realloc_count;
-        stats.mesh_cache_entries = self.store_meshes.len();
+        stats.allocator_bytes_allocated = 0;
+        stats.allocator_bytes_reused = 0;
+        stats.allocator_realloc_count = 0;
+        stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.dirty_backlog = self.dirty_queues.total_len();
         stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
         stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
@@ -1733,53 +1659,21 @@ impl Renderer {
         stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = self.completed_meshes.len();
 
-        let ultra_mesh_evict_distance =
-            lod_radii.ultra.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
-        let far_mesh_evict_distance =
-            lod_radii.far.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
-        let mid_mesh_evict_distance =
-            lod_radii.mid.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
-        let mut evict_lod_slots = Vec::new();
-        for &coord in self.store_meshes.keys() {
-            let d = chunk_distance(player_chunk, coord);
-            if d > ultra_mesh_evict_distance {
-                evict_lod_slots.push((coord, ChunkLod::Ultra));
-            }
-            if d > far_mesh_evict_distance {
-                evict_lod_slots.push((coord, ChunkLod::Far));
-            }
-            if d > mid_mesh_evict_distance {
-                evict_lod_slots.push((coord, ChunkLod::Mid));
-            }
-        }
-        for (coord, lod) in evict_lod_slots {
-            if let Some(cache) = self.store_meshes.get_mut(&coord) {
-                if let Some(mesh) = cache.slot_mut(lod).take() {
-                    self.mesh_allocator.free(mesh.allocation);
-                }
-            }
-        }
-
         let mut drop_keys = Vec::new();
-        for &coord in self.store_meshes.keys() {
+        for &coord in self.visible_gpu_chunks.keys() {
             if chunk_distance(player_chunk, coord) > lod_radii.ultra as f32 {
                 drop_keys.push(coord);
             }
         }
         for coord in drop_keys {
-            if let Some(cache) = self.store_meshes.remove(&coord) {
-                for mesh in cache.drain() {
-                    self.mesh_allocator.free(mesh.allocation);
-                }
-            }
             self.visible_gpu_chunks.remove(&coord);
             self.lod_selection.remove(&coord);
             self.pending_lod_remesh.remove(&coord);
         }
 
-        let cached_coords: Vec<ChunkCoord> = self.store_meshes.keys().copied().collect();
+        let tracked_coords: Vec<ChunkCoord> = self.visible_gpu_chunks.keys().copied().collect();
         let mut lod_changes = Vec::new();
-        for coord in cached_coords {
+        for coord in tracked_coords {
             let prev = self.lod_selection.get(&coord).copied();
             let lod = select_lod(coord, player_chunk, lod_radii, prev);
             if prev != Some(lod) {
@@ -1798,11 +1692,6 @@ impl Renderer {
         stats
     }
     pub fn clear_mesh_cache(&mut self) {
-        for (_, cache) in self.store_meshes.drain() {
-            for mesh in cache.drain() {
-                self.mesh_allocator.free(mesh.allocation);
-            }
-        }
         self.visible_gpu_chunks.clear();
         self.dirty_queues.clear();
         self.urgent_mesh_queue.clear();
@@ -1816,26 +1705,14 @@ impl Renderer {
         self.pending_lod_remesh.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
-        // Keep CPU frustum checks in world space; do not pre-apply origin
-        // offsets to chunk AABBs here.
+        // Keep frustum checks in world space; use GPU mesh metadata.
         let vp_world = camera.view_proj();
         let mut chunks = 0usize;
         let mut inds = 0u64;
-        for (&coord, cache) in &self.store_meshes {
-            let selected_lod = self
-                .lod_selection
-                .get(&coord)
-                .copied()
-                .unwrap_or(ChunkLod::Near);
-            let world_camera_pos = camera_world_position(camera);
-            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
-            let Some((_, m)) = cache.best_available(selected_lod, distance, self.near_lod_distance)
-            else {
-                continue;
-            };
-            if aabb_in_view(vp_world, m.world_aabb_min, m.world_aabb_max) {
+        for draw in self.visible_gpu_chunks.values() {
+            if aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max) {
                 chunks += 1;
-                inds += m.index_count as u64;
+                inds += draw.index_count as u64;
             }
         }
         (chunks, inds)
