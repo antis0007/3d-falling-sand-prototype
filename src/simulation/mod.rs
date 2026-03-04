@@ -19,6 +19,7 @@ pub struct SimulationStepMetadata {
     pub phase_class: Option<SimulationPhaseClass>,
     pub boundary_dissipation_strength: f32,
     pub core_radius_chunks: i32,
+    pub max_voxels_to_process: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,7 +36,7 @@ pub trait SimulationBackend {
     fn step(
         &mut self,
         store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
+        active_chunks: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
         metadata: SimulationStepMetadata,
@@ -53,13 +54,12 @@ impl SimulationBackend for CpuCellularBackend {
     fn step(
         &mut self,
         store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
+        _active_chunks: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
         metadata: SimulationStepMetadata,
     ) -> SimulationStepStats {
-        self.sim_world
-            .step_region(store, region, center, rng, metadata)
+        self.sim_world.step_active(store, center, rng, metadata)
     }
 
     fn queue_place_edit(&mut self, coord: VoxelCoord, _material_id: u16) {
@@ -78,12 +78,14 @@ pub struct SimulationRuntime {
     cpu: CpuCellularBackend,
     gpu: GpuFluidBackend,
     active_emitter_chunks: HashSet<ChunkCoord>,
+    active_chunk_set: HashSet<ChunkCoord>,
 }
 
 impl SimulationRuntime {
     pub fn queue_place_edit(&mut self, mode: SimulationMode, coord: VoxelCoord, material_id: u16) {
-        self.active_emitter_chunks
-            .insert(crate::types::voxel_to_chunk(coord).0);
+        let edited_chunk = crate::types::voxel_to_chunk(coord).0;
+        self.active_emitter_chunks.insert(edited_chunk);
+        self.active_chunk_set.insert(edited_chunk);
         // Keep all backends aware of user edits so mode switches do not strand queued writes
         // in a single backend and appear as frozen particles.
         self.cpu.queue_place_edit(coord, material_id);
@@ -103,15 +105,25 @@ impl SimulationRuntime {
         &mut self,
         mode: SimulationMode,
         store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
-        metadata: SimulationStepMetadata,
+        mut metadata: SimulationStepMetadata,
     ) -> SimulationStepStats {
-        match mode {
-            SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng, metadata),
-            SimulationMode::GpuFluid => self.gpu.step(store, region, center, rng, metadata),
+        if metadata.max_voxels_to_process == 0 {
+            metadata.max_voxels_to_process = 8_192;
         }
+        let stats = match mode {
+            SimulationMode::CpuCellular => {
+                self.cpu
+                    .step(store, &self.active_chunk_set, center, rng, metadata)
+            }
+            SimulationMode::GpuFluid => {
+                self.gpu
+                    .step(store, &self.active_chunk_set, center, rng, metadata)
+            }
+        };
+        self.active_chunk_set = self.cpu.sim_world.active_chunks_snapshot();
+        stats
     }
 }
 
@@ -122,26 +134,23 @@ mod tests {
     use crate::sim::XorShift32;
     use crate::types::{ChunkCoord, VoxelCoord};
     use crate::world::EMPTY;
-    use std::collections::HashSet;
-
     #[test]
     fn gpu_mode_consumes_queued_edits_and_moves_material() {
         let mut runtime = SimulationRuntime::default();
         let mut store = ChunkStore::new();
         let mut rng = XorShift32::new(7);
         let center = ChunkCoord { x: 0, y: 0, z: 0 };
-        let mut region = HashSet::new();
-        region.insert(center);
-
         runtime.queue_place_edit(SimulationMode::GpuFluid, VoxelCoord { x: 4, y: 4, z: 4 }, 3);
 
         let _stats = runtime.step(
             SimulationMode::GpuFluid,
             &mut store,
-            &region,
             center,
             &mut rng,
-            SimulationStepMetadata::default(),
+            SimulationStepMetadata {
+                max_voxels_to_process: 8192,
+                ..SimulationStepMetadata::default()
+            },
         );
 
         assert_eq!(store.get_voxel(VoxelCoord { x: 4, y: 4, z: 4 }), EMPTY);

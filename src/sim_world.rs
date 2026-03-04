@@ -36,6 +36,7 @@ const BASE_MAX_CHUNKS_PER_STEP: usize = 96;
 const MIN_CHUNKS_PER_STEP: usize = 24;
 const MAX_DYNAMIC_CHUNKS_PER_STEP: usize = 192;
 const CHUNK_STARVATION_WAIT_TICKS: u16 = 10;
+const MAX_STARVATION_BONUS: i64 = 512;
 const CHUNK_VOLUME: usize = (CHUNK_SIZE_VOXELS as usize).pow(3);
 const CHUNK_WORDS: usize = CHUNK_VOLUME.div_ceil(64);
 const MAX_FRONTIER_PROCESSED_PER_SUBSTEP: usize = 768;
@@ -77,6 +78,7 @@ struct ChunkFrontierState {
     moving_avg_processed: f32,
     dormant_water_bits: Vec<u64>,
     wait_ticks: u16,
+    starvation_counter: u16,
 }
 
 impl ChunkFrontierState {
@@ -97,6 +99,7 @@ impl ChunkFrontierState {
             moving_avg_processed: 0.0,
             dormant_water_bits: vec![0; CHUNK_WORDS],
             wait_ticks: 0,
+            starvation_counter: 0,
         }
     }
 
@@ -186,6 +189,9 @@ pub struct SimSoAChunkBuffer {
 #[derive(Default)]
 pub struct SimWorld {
     chunks: HashMap<ChunkCoord, ChunkFrontierState>,
+    active_chunk_set: HashSet<ChunkCoord>,
+    cross_chunk_wake_bus: Vec<ChunkCoord>,
+    cross_chunk_wake_dedup: HashSet<ChunkCoord>,
 }
 
 impl SimWorld {
@@ -193,25 +199,47 @@ impl SimWorld {
         self.enqueue_with_neighbors(coord);
     }
 
+
     pub fn step_region(
         &mut self,
         store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
+        _region: &HashSet<ChunkCoord>,
         center: ChunkCoord,
         rng: &mut Rng,
         metadata: SimulationStepMetadata,
     ) -> SimulationStepStats {
-        self.seed_region_frontier_if_needed(store, region);
-        self.enqueue_dirty_voxels(store, region);
+        self.step_active(store, center, rng, metadata)
+    }
+
+    pub fn step_active(
+        &mut self,
+        store: &mut ChunkStore,
+        center: ChunkCoord,
+        rng: &mut Rng,
+        metadata: SimulationStepMetadata,
+    ) -> SimulationStepStats {
+        self.seed_frontier_if_needed(store);
+        self.enqueue_dirty_voxels(store);
+        self.drain_cross_chunk_wakes();
         let step_start = Instant::now();
 
-        let mut candidates = self.prioritized_chunks(center, region);
+        let mut candidates = self.prioritized_chunks(center);
         let mut stats = SimulationStepStats::default();
+        let mut voxel_budget = if metadata.max_voxels_to_process == 0 {
+            usize::MAX
+        } else {
+            metadata.max_voxels_to_process
+        };
         let max_chunks_this_step = dynamic_chunk_budget(
             candidates.len(),
             step_start.elapsed().as_secs_f32() * 1000.0,
         );
         if candidates.len() > max_chunks_this_step {
+            for coord in candidates.iter().skip(max_chunks_this_step) {
+                if let Some(state) = self.chunks.get_mut(coord) {
+                    state.starvation_counter = state.starvation_counter.saturating_add(1);
+                }
+            }
             stats.skipped_active_chunks += candidates.len() - max_chunks_this_step;
             candidates.truncate(max_chunks_this_step);
         }
@@ -220,6 +248,7 @@ impl SimWorld {
         for chunk_coord in candidates {
             if !store.is_chunk_loaded(chunk_coord) {
                 self.chunks.remove(&chunk_coord);
+                self.active_chunk_set.remove(&chunk_coord);
                 continue;
             }
 
@@ -229,6 +258,7 @@ impl SimWorld {
                     continue;
                 };
                 if state.is_empty() {
+                    self.active_chunk_set.remove(&chunk_coord);
                     continue;
                 }
 
@@ -251,6 +281,7 @@ impl SimWorld {
                     process_cap = process_cap.min(ema_cap.saturating_add(128));
                 }
                 process_cap = process_cap.min(frontier_len).max(frontier_len.min(1));
+                process_cap = process_cap.min(voxel_budget.max(1));
                 let start = if frontier_len > 0 {
                     state.rotate_offset % frontier_len
                 } else {
@@ -417,12 +448,18 @@ impl SimWorld {
 
                 if moved_any {
                     state.cooldown_ticks = 0;
+                    self.active_chunk_set.insert(chunk_coord);
+
                     state.wait_ticks = 0;
+                    state.starvation_counter = 0;
+                    state.starvation_counter = 0;
                     state.recent_activity = state.recent_activity.saturating_add(4);
                 } else if deferred_for_other_phase {
                     // Keep chunks immediately schedulable when this split pass skipped them,
                     // so the complementary phase pass can run without perceptible stalls.
                     state.cooldown_ticks = 0;
+                    self.active_chunk_set.insert(chunk_coord);
+
                     state.wait_ticks = 0;
                 } else {
                     state.cooldown_ticks =
@@ -436,7 +473,7 @@ impl SimWorld {
             }
 
             for center in activation_centers {
-                enqueue_world_neighbors_to_chunks(&mut self.chunks, center, region);
+                self.enqueue_with_neighbors(center);
             }
         }
 
@@ -482,15 +519,16 @@ impl SimWorld {
         })
     }
 
-    fn enqueue_dirty_voxels(&mut self, store: &mut ChunkStore, region: &HashSet<ChunkCoord>) {
+    fn enqueue_dirty_voxels(&mut self, store: &mut ChunkStore) {
         for coord in store.take_sim_dirty_voxels() {
-            self.enqueue_with_neighbors_if_in_region(coord, region);
+            self.enqueue_with_neighbors(coord);
         }
     }
 
-    fn seed_region_frontier_if_needed(&mut self, store: &ChunkStore, region: &HashSet<ChunkCoord>) {
+    fn seed_frontier_if_needed(&mut self, store: &ChunkStore) {
         const SEED_SCAN_BATCH: usize = 1024;
-        for &chunk_coord in region {
+        let loaded: Vec<ChunkCoord> = store.iter_loaded_chunks().copied().collect();
+        for chunk_coord in loaded {
             if !store.is_chunk_loaded(chunk_coord) {
                 continue;
             }
@@ -534,20 +572,13 @@ impl SimWorld {
                 state.seed_scan_complete = true;
             }
             for world in seed_worlds {
-                self.enqueue_with_neighbors_if_in_region(world, region);
+                self.enqueue_with_neighbors(world);
             }
         }
     }
 
-    fn enqueue_with_neighbors_if_in_region(
-        &mut self,
-        center: VoxelCoord,
-        region: &HashSet<ChunkCoord>,
-    ) {
-        enqueue_world_neighbors_to_chunks(&mut self.chunks, center, region);
-    }
-
     fn enqueue_with_neighbors(&mut self, center: VoxelCoord) {
+        let origin_chunk = voxel_to_chunk(center).0;
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
@@ -567,22 +598,44 @@ impl SimWorld {
                     state.clear_water_dormant(local_idx);
                     state.enqueue_local(local_idx);
                     state.cooldown_ticks = 0;
+                    self.active_chunk_set.insert(chunk_coord);
+                    if chunk_coord != origin_chunk {
+                        self.emit_cross_chunk_wake(chunk_coord);
+                    }
                 }
             }
         }
     }
 
-    fn prioritized_chunks(
-        &mut self,
-        center: ChunkCoord,
-        region: &HashSet<ChunkCoord>,
-    ) -> Vec<ChunkCoord> {
+    fn emit_cross_chunk_wake(&mut self, chunk: ChunkCoord) {
+        if self.cross_chunk_wake_dedup.insert(chunk) {
+            self.cross_chunk_wake_bus.push(chunk);
+        }
+    }
+
+    fn drain_cross_chunk_wakes(&mut self) {
+        for chunk in self.cross_chunk_wake_bus.drain(..) {
+            self.active_chunk_set.insert(chunk);
+            self.chunks
+                .entry(chunk)
+                .or_insert_with(ChunkFrontierState::new);
+        }
+        self.cross_chunk_wake_dedup.clear();
+    }
+
+    pub fn active_chunks_snapshot(&self) -> HashSet<ChunkCoord> {
+        self.active_chunk_set.clone()
+    }
+
+    fn prioritized_chunks(&mut self, center: ChunkCoord) -> Vec<ChunkCoord> {
         let mut out = Vec::new();
-        for (&coord, state) in &mut self.chunks {
-            if !region.contains(&coord) {
+        let active_coords: Vec<ChunkCoord> = self.active_chunk_set.iter().copied().collect();
+        for coord in active_coords {
+            let Some(state) = self.chunks.get_mut(&coord) else {
                 continue;
-            }
+            };
             if state.is_empty() {
+                self.active_chunk_set.remove(&coord);
                 if state.cooldown_ticks > 0 {
                     state.cooldown_ticks -= 1;
                 }
@@ -592,28 +645,37 @@ impl SimWorld {
             if state.cooldown_ticks > 0 {
                 state.cooldown_ticks -= 1;
                 state.wait_ticks = state.wait_ticks.saturating_add(1);
+                state.starvation_counter = state.starvation_counter.saturating_add(1);
                 continue;
             }
-            out.push((coord, state.recent_activity, state.wait_ticks));
+            out.push((
+                coord,
+                state.recent_activity,
+                state.wait_ticks,
+                state.starvation_counter,
+            ));
         }
 
-        out.sort_by_key(|(coord, activity, wait_ticks)| {
+        out.sort_by_key(|(coord, activity, wait_ticks, starvation)| {
             let dx = i64::from(coord.x - center.x);
             let dy = i64::from(coord.y - center.y);
             let dz = i64::from(coord.z - center.z);
             let dist2 = dx * dx + dy * dy + dz * dz;
+            let starvation_bonus = (i64::from(*starvation) * 8).min(MAX_STARVATION_BONUS);
+            let priority_distance = dist2.saturating_sub(starvation_bonus);
             let starved = *wait_ticks >= CHUNK_STARVATION_WAIT_TICKS;
             (
                 !starved,
-                dist2,
+                priority_distance,
                 std::cmp::Reverse(*activity),
                 std::cmp::Reverse(*wait_ticks),
+                std::cmp::Reverse(*starvation),
                 coord.x,
                 coord.y,
                 coord.z,
             )
         });
-        out.into_iter().map(|(coord, _, _)| coord).collect()
+        out.into_iter().map(|(coord, _, _, _)| coord).collect()
     }
 }
 
@@ -1024,60 +1086,23 @@ fn offset_voxel(p: VoxelCoord, dx: i32, dy: i32, dz: i32) -> VoxelCoord {
 
 pub fn step_region_profiled(
     store: &mut ChunkStore,
-    region: &HashSet<ChunkCoord>,
+    _region: &HashSet<ChunkCoord>,
     center: ChunkCoord,
     rng: &mut Rng,
 ) -> usize {
     let mut sim = SimWorld::default();
-    sim.step_region(
-        store,
-        region,
-        center,
-        rng,
-        SimulationStepMetadata::default(),
-    )
-    .stepped_chunks
+    sim.step_active(store, center, rng, SimulationStepMetadata::default())
+        .stepped_chunks
 }
 
-pub fn step_region(store: &mut ChunkStore, region: &HashSet<ChunkCoord>, rng: &mut Rng) {
+pub fn step_region(store: &mut ChunkStore, _region: &HashSet<ChunkCoord>, rng: &mut Rng) {
     let mut sim = SimWorld::default();
-    let _ = sim.step_region(
+    let _ = sim.step_active(
         store,
-        region,
         ChunkCoord { x: 0, y: 0, z: 0 },
         rng,
         SimulationStepMetadata::default(),
     );
-}
-
-fn enqueue_world_neighbors_to_chunks(
-    chunks: &mut HashMap<ChunkCoord, ChunkFrontierState>,
-    center: VoxelCoord,
-    region: &HashSet<ChunkCoord>,
-) {
-    for dx in -1..=1 {
-        for dy in -1..=1 {
-            for dz in -1..=1 {
-                let world = VoxelCoord {
-                    x: center.x + dx,
-                    y: center.y + dy,
-                    z: center.z + dz,
-                };
-                let (chunk_coord, local) = voxel_to_chunk(world);
-                if !region.contains(&chunk_coord) {
-                    continue;
-                }
-                let idx = local_to_index(local[0] as usize, local[1] as usize, local[2] as usize);
-                let state = chunks
-                    .entry(chunk_coord)
-                    .or_insert_with(ChunkFrontierState::new);
-                let local_idx = idx as u16;
-                state.clear_water_dormant(local_idx);
-                state.enqueue_local(local_idx);
-                state.cooldown_ticks = 0;
-            }
-        }
-    }
 }
 
 fn local_to_index(x: usize, y: usize, z: usize) -> usize {
@@ -1328,9 +1353,8 @@ mod tests {
         let mut rng = XorShift32::new(1);
         let mut sim = SimWorld::default();
 
-        sim.step_region(
+        sim.step_active(
             &mut store,
-            &region,
             source_chunk,
             &mut rng,
             SimulationStepMetadata::default(),
@@ -1370,13 +1394,7 @@ mod tests {
         sim_ref.notify_voxel_edit(top);
 
         for _ in 0..4 {
-            sim.step_region(
-                &mut store,
-                &region,
-                c,
-                &mut rng_a,
-                SimulationStepMetadata::default(),
-            );
+            sim.step_active(&mut store, c, &mut rng_a, SimulationStepMetadata::default());
             sim_ref.step_region(
                 &mut store_ref,
                 &region,
@@ -1416,9 +1434,8 @@ mod tests {
         sim.notify_voxel_edit(p);
         let mut rng = XorShift32::new(99);
 
-        let non_gas = sim.step_region(
+        let non_gas = sim.step_active(
             &mut store,
-            &region,
             c,
             &mut rng,
             SimulationStepMetadata {
@@ -1428,9 +1445,8 @@ mod tests {
         );
         assert!(non_gas.processed_frontier_voxels > 0);
 
-        let gas = sim.step_region(
+        let gas = sim.step_active(
             &mut store,
-            &region,
             c,
             &mut rng,
             SimulationStepMetadata {
@@ -1457,13 +1473,7 @@ mod tests {
         sim.notify_voxel_edit(v);
         let region = HashSet::from([c]);
         let mut rng = XorShift32::new(7);
-        sim.step_region(
-            &mut store,
-            &region,
-            c,
-            &mut rng,
-            SimulationStepMetadata::default(),
-        );
+        sim.step_active(&mut store, c, &mut rng, SimulationStepMetadata::default());
 
         let soa = sim
             .build_soa_for_chunk(&store, c)
@@ -1527,9 +1537,8 @@ mod tests {
         sim.notify_voxel_edit(top_center);
 
         for _ in 0..64 {
-            sim.step_region(
+            sim.step_active(
                 &mut store,
-                &region,
                 source_chunk,
                 &mut rng,
                 SimulationStepMetadata::default(),
@@ -1582,21 +1591,9 @@ mod tests {
         });
         let mut rng = XorShift32::new(99);
 
-        let _ = sim.step_region(
-            &mut store,
-            &region,
-            c,
-            &mut rng,
-            SimulationStepMetadata::default(),
-        );
+        let _ = sim.step_active(&mut store, c, &mut rng, SimulationStepMetadata::default());
         for _ in 0..4 {
-            let _ = sim.step_region(
-                &mut store,
-                &region,
-                c,
-                &mut rng,
-                SimulationStepMetadata::default(),
-            );
+            let _ = sim.step_active(&mut store, c, &mut rng, SimulationStepMetadata::default());
         }
 
         let mut quiet_before = Vec::new();
@@ -1609,13 +1606,8 @@ mod tests {
                 }));
             }
         }
-        let quiet_stats = sim.step_region(
-            &mut store,
-            &region,
-            c,
-            &mut rng,
-            SimulationStepMetadata::default(),
-        );
+        let quiet_stats =
+            sim.step_active(&mut store, c, &mut rng, SimulationStepMetadata::default());
         let mut quiet_after = Vec::new();
         for z in 3..8 {
             for x in 3..8 {
@@ -1634,13 +1626,8 @@ mod tests {
         };
         store.set_voxel(disturb, WATER);
         sim.notify_voxel_edit(disturb);
-        let wake_stats = sim.step_region(
-            &mut store,
-            &region,
-            c,
-            &mut rng,
-            SimulationStepMetadata::default(),
-        );
+        let wake_stats =
+            sim.step_active(&mut store, c, &mut rng, SimulationStepMetadata::default());
         assert!(wake_stats.processed_frontier_voxels > 0);
         assert!(quiet_stats.processed_frontier_voxels <= wake_stats.processed_frontier_voxels);
     }
