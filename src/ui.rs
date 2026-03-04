@@ -39,6 +39,11 @@ pub struct ProfilerStats {
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
+    pub dirty_queue_drop_count: usize,
+    pub dirty_urgent_depth: usize,
+    pub dirty_near_depth: usize,
+    pub dirty_normal_depth: usize,
+    pub dirty_far_depth: usize,
     pub gen_paused_by_worker_queue: bool,
     pub desired_budget_drop_count: usize,
     pub near_radius: i32,
@@ -595,12 +600,20 @@ pub fn draw(
                     ui_state.profiler.dirty_backlog
                 ));
                 ui.monospace(format!(
-                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {}",
+                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {} | dirty queue drops: {}",
                     ui_state.profiler.mesh_queue_depth,
                     ui_state.profiler.mesh_completed_depth,
                     ui_state.profiler.mesh_stale_drop_count,
                     ui_state.profiler.mesh_age_drop_count,
                     ui_state.profiler.mesh_pressure_drop_count,
+                    ui_state.profiler.dirty_queue_drop_count,
+                ));
+                ui.monospace(format!(
+                    "dirty tier depth urgent/near/normal/far: {}/{}/{}/{}",
+                    ui_state.profiler.dirty_urgent_depth,
+                    ui_state.profiler.dirty_near_depth,
+                    ui_state.profiler.dirty_normal_depth,
+                    ui_state.profiler.dirty_far_depth,
                 ));
                 ui.monospace(format!(
                     "lod radii n/m/f/u: {}/{}/{}/{} | hysteresis: {}",
