@@ -339,20 +339,37 @@ impl ChunkMeshCache {
         }
     }
 
-    fn best_available(&self, selected: ChunkLod) -> Option<(ChunkLod, &ChunkMesh)> {
+    fn best_available(
+        &self,
+        selected: ChunkLod,
+        chunk_distance: f32,
+        near_lod_distance: f32,
+    ) -> Option<(ChunkLod, &ChunkMesh)> {
         let ordered = [
             ChunkLod::Near,
             ChunkLod::Mid,
             ChunkLod::Far,
             ChunkLod::Ultra,
         ];
+        let allowed_lods: &[ChunkLod] = if chunk_distance < near_lod_distance {
+            &[ChunkLod::Near, ChunkLod::Mid]
+        } else {
+            &ordered
+        };
+
         let start = lod_rank(selected);
         for lod in ordered.iter().skip(start).copied() {
+            if !allowed_lods.contains(&lod) {
+                continue;
+            }
             if let Some(mesh) = self.get(lod) {
                 return Some((lod, mesh));
             }
         }
         for lod in ordered.iter().take(start).copied() {
+            if !allowed_lods.contains(&lod) {
+                continue;
+            }
             if let Some(mesh) = self.get(lod) {
                 return Some((lod, mesh));
             }
@@ -467,6 +484,7 @@ pub struct Renderer {
     mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
+    near_lod_distance: f32,
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
@@ -712,11 +730,72 @@ impl ChunkSnapshot {
     }
 
     pub(crate) fn with_center_materials(&self, materials: Vec<MaterialId>) -> Self {
+        let center_voxels: Arc<[MaterialId]> = Arc::from(materials);
+        let border_strips = Arc::new(self.rebuild_border_strips_from_center(&center_voxels));
         Self {
             world_min: self.world_min,
-            center_voxels: Arc::from(materials),
-            border_strips: Arc::clone(&self.border_strips),
+            center_voxels,
+            border_strips,
         }
+    }
+
+    fn rebuild_border_strips_from_center(&self, new_center: &[MaterialId]) -> ChunkBorderStrips {
+        let side = CHUNK_SIZE_VOXELS as usize;
+        let mut strips = self.border_strips.as_ref().clone();
+        let old_center = self.center_voxels.as_ref();
+        if old_center.len() != new_center.len() || old_center.len() != side * side * side {
+            return strips;
+        }
+
+        let center_idx = |x: usize, y: usize, z: usize| -> usize { (z * side + y) * side + x };
+        let strip_idx = |u: usize, v: usize| -> usize { u * side + v };
+
+        for y in 0..side {
+            for z in 0..side {
+                let edge_old = old_center[center_idx(0, y, z)];
+                let i = strip_idx(y, z);
+                if strips.neg_x[i] == edge_old {
+                    strips.neg_x[i] = new_center[center_idx(0, y, z)];
+                }
+
+                let edge_old = old_center[center_idx(side - 1, y, z)];
+                if strips.pos_x[i] == edge_old {
+                    strips.pos_x[i] = new_center[center_idx(side - 1, y, z)];
+                }
+            }
+        }
+
+        for x in 0..side {
+            for z in 0..side {
+                let i = strip_idx(x, z);
+                let edge_old = old_center[center_idx(x, 0, z)];
+                if strips.neg_y[i] == edge_old {
+                    strips.neg_y[i] = new_center[center_idx(x, 0, z)];
+                }
+
+                let edge_old = old_center[center_idx(x, side - 1, z)];
+                if strips.pos_y[i] == edge_old {
+                    strips.pos_y[i] = new_center[center_idx(x, side - 1, z)];
+                }
+            }
+        }
+
+        for x in 0..side {
+            for y in 0..side {
+                let i = strip_idx(x, y);
+                let edge_old = old_center[center_idx(x, y, 0)];
+                if strips.neg_z[i] == edge_old {
+                    strips.neg_z[i] = new_center[center_idx(x, y, 0)];
+                }
+
+                let edge_old = old_center[center_idx(x, y, side - 1)];
+                if strips.pos_z[i] == edge_old {
+                    strips.pos_z[i] = new_center[center_idx(x, y, side - 1)];
+                }
+            }
+        }
+
+        strips
     }
 }
 
@@ -760,6 +839,7 @@ pub(crate) enum ChunkMeshArtifact {
         dispatch_ms: f32,
         readback_bytes: u64,
     },
+    Skipped,
 }
 
 impl ChunkMeshArtifact {
@@ -796,6 +876,14 @@ impl ChunkMeshArtifact {
                 *aabb_min,
                 *aabb_max,
                 *chunk_origin_world,
+            ),
+            Self::Skipped => (
+                &[],
+                &[],
+                DrawIndirectArgs::default(),
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Vec3::ZERO,
             ),
         }
     }
@@ -1047,6 +1135,7 @@ impl Renderer {
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
+            near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
@@ -1090,7 +1179,10 @@ impl Renderer {
                 .get(&coord)
                 .copied()
                 .unwrap_or(ChunkLod::Near);
-            let Some((lod, mesh)) = cache.best_available(selected_lod) else {
+            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
+            let Some((lod, mesh)) =
+                cache.best_available(selected_lod, distance, self.near_lod_distance)
+            else {
                 continue;
             };
             if lod != selected_lod {
@@ -1132,6 +1224,7 @@ impl Renderer {
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
         let lod_radii = lod_radii.normalized();
+        self.near_lod_distance = lod_radii.near as f32 + 0.5;
         for coord in store.take_urgent_dirty_chunks() {
             self.enqueue_urgent_mesh_chunk(coord);
         }
@@ -1393,6 +1486,10 @@ impl Renderer {
         let mut deferred = Vec::new();
         let mut remesh_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
+            if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
+                continue;
+            }
+
             #[allow(irrefutable_let_patterns)]
             if let ChunkMeshArtifact::Gpu {
                 dispatch_ms,
@@ -1403,6 +1500,12 @@ impl Renderer {
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 stats.gpu_readback_bytes += *readback_bytes;
+            }
+
+            let voxel_version = store.chunk_voxel_version(result.coord);
+            if result.version < voxel_version {
+                remesh_coords.push(result.coord);
+                continue;
             }
 
             let (verts, inds, _mesh_indirect, aabb_min, aabb_max, chunk_origin_world) =
@@ -1497,12 +1600,6 @@ impl Renderer {
             bytes_uploaded += bytes;
             uploaded += 1;
             total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
-
-            let mesh_version = *self.mesh_versions.get(&result.coord).unwrap_or(&0);
-            let voxel_version = store.chunk_voxel_version(result.coord);
-            if mesh_version < voxel_version {
-                remesh_coords.push(result.coord);
-            }
         }
         self.completed_meshes.extend(deferred);
         for coord in remesh_coords {
@@ -1619,7 +1716,10 @@ impl Renderer {
                 .get(&coord)
                 .copied()
                 .unwrap_or(ChunkLod::Near);
-            let Some((_, m)) = cache.best_available(selected_lod) else {
+            let world_camera_pos = camera_world_position(camera);
+            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
+            let Some((_, m)) = cache.best_available(selected_lod, distance, self.near_lod_distance)
+            else {
                 continue;
             };
             if aabb_in_view(vp_world, m.world_aabb_min, m.world_aabb_max) {
@@ -1661,7 +1761,10 @@ impl Renderer {
                 .get(&coord)
                 .copied()
                 .unwrap_or(ChunkLod::Near);
-            let Some((lod, mesh)) = cache.best_available(selected_lod) else {
+            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
+            let Some((lod, mesh)) =
+                cache.best_available(selected_lod, distance, self.near_lod_distance)
+            else {
                 continue;
             };
 
@@ -2655,6 +2758,13 @@ fn chunk_horizontal_distance(a: ChunkCoord, b: ChunkCoord) -> f32 {
     let dx = (a.x - b.x) as f32;
     let dz = (a.z - b.z) as f32;
     (dx * dx + dz * dz).sqrt()
+}
+
+fn chunk_horizontal_distance_to_camera(coord: ChunkCoord, world_camera_pos: Vec3) -> f32 {
+    let chunk_world_min = voxel_to_world(chunk_to_world_min(coord));
+    let center = chunk_world_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE * 0.5);
+    let delta = center - world_camera_pos;
+    (delta.x.hypot(delta.z)) / (CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE)
 }
 
 fn select_lod(

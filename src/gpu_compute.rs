@@ -4,7 +4,7 @@ use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "gpu-compute")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
@@ -155,6 +155,12 @@ impl ChunkPageAtlas {
     fn acquire_page_for_job(&mut self, chunk: ChunkCoord, page_index: GpuPageIndex) {
         self.assert_page_for_chunk(chunk, page_index);
         *self.in_flight_jobs_for_page.entry(page_index).or_insert(0) += 1;
+    }
+
+    fn acquire_existing_page_for_job(&mut self, page_index: GpuPageIndex) {
+        if self.resolve_chunk(page_index).is_some() {
+            *self.in_flight_jobs_for_page.entry(page_index).or_insert(0) += 1;
+        }
     }
 
     fn release_page_from_job(&mut self, page_index: GpuPageIndex) {
@@ -379,6 +385,11 @@ static GPU_DISPATCH_NS: AtomicU64 = AtomicU64::new(0);
 static GPU_TRANSFER_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_DISPATCH_MUTEX: Mutex<()> = Mutex::new(());
+#[cfg(feature = "gpu-compute")]
+static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfilerSnapshot {
     #[cfg(not(feature = "gpu-compute"))]
@@ -1232,9 +1243,28 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+        {
+            let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if !active_jobs.insert(job.coord) {
+                // Prevent concurrent jobs for the same chunk from racing GPU artifacts.
+                return Ok(ComputedChunkArtifacts {
+                    simulation_diagnostics: ChunkSimulationDiagnostics::default(),
+                    mesh_artifact: ChunkMeshArtifact::Skipped,
+                });
+            }
+        }
+
         let incoming = job.snapshot.center_voxels.as_ref();
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
+        let (page_index, page_was_reassigned) = match atlas.page_for_chunk_or_allocate(job.coord) {
+            Ok(value) => value,
+            Err(err) => {
+                drop(atlas);
+                let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+                active_jobs.remove(&job.coord);
+                return Err(err);
+            }
+        };
         atlas.assert_page_for_chunk(job.coord, page_index);
         atlas.acquire_page_for_job(job.coord, page_index);
         let _last_version = atlas
@@ -1258,6 +1288,17 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             cached_before.resize(incoming.len(), EMPTY);
         }
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
+        let mut pinned_pages = vec![page_index];
+        for neighbor_page in neighbor_pages {
+            if neighbor_page == u32::MAX {
+                continue;
+            }
+            let neighbor_index = GpuPageIndex(neighbor_page);
+            if !pinned_pages.contains(&neighbor_index) {
+                atlas.acquire_existing_page_for_job(neighbor_index);
+                pinned_pages.push(neighbor_index);
+            }
+        }
         drop(atlas);
 
         let mut edit_commands = Vec::new();
@@ -1298,44 +1339,54 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
                 atlas.assert_page_for_chunk(job.coord, page_index);
             }
-            if page_was_reassigned {
-                clear_page_buffers(state, page_index);
-            }
-            clear_job_scratch_buffers(
-                state,
-                active_frontier_count.max(previous_frontier) as usize,
-                1,
-            );
+            let (indirect, generated_materials) = {
+                // Shared worker buffers are global; serialize command encoding/submission/readback.
+                let _dispatch_guard = GPU_DISPATCH_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-            if active_frontier_count > 0 {
-                state.runtime.run_active_frontier(
+                if page_was_reassigned {
+                    clear_page_buffers(state, page_index);
+                }
+                clear_job_scratch_buffers(
                     state,
-                    &sim_job,
+                    active_frontier_count.max(previous_frontier) as usize,
+                    1,
+                );
+
+                if active_frontier_count > 0 {
+                    state.runtime.run_active_frontier(
+                        state,
+                        &sim_job,
+                        page_index,
+                        current_state,
+                        &edit_commands,
+                        neighbor_pages,
+                    )?
+                }
+                #[cfg(feature = "gpu_meshing_experimental")]
+                let indirect = if !edit_commands.is_empty() || _last_version != job.version {
+                    state.runtime.run_meshing_dispatch(
+                        state,
+                        &sim_job,
+                        page_index,
+                        current_state,
+                    )?
+                } else {
+                    DrawIndirectArgs::default()
+                };
+
+                #[cfg(not(feature = "gpu_meshing_experimental"))]
+                let indirect = DrawIndirectArgs::default();
+
+                let generated_materials = readback_page_materials(
+                    state,
                     page_index,
-                    current_state,
-                    &edit_commands,
-                    neighbor_pages,
-                )?
-            }
-            #[cfg(feature = "gpu_meshing_experimental")]
-            let indirect = if !edit_commands.is_empty() || _last_version != job.version {
-                state
-                    .runtime
-                    .run_meshing_dispatch(state, &sim_job, page_index, current_state)?
-            } else {
-                DrawIndirectArgs::default()
+                    next_state,
+                    job.snapshot.center_voxels.len(),
+                )
+                .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
+                (indirect, generated_materials)
             };
 
-            #[cfg(not(feature = "gpu_meshing_experimental"))]
-            let indirect = DrawIndirectArgs::default();
-
-            let generated_materials = readback_page_materials(
-                state,
-                page_index,
-                next_state,
-                job.snapshot.center_voxels.len(),
-            )
-            .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
             let snapshot = job
                 .snapshot
@@ -1381,8 +1432,13 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         }
 
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        atlas.release_page_from_job(page_index);
+        for pinned_page in pinned_pages {
+            atlas.release_page_from_job(pinned_page);
+        }
         drop(atlas);
+
+        let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        active_jobs.remove(&job.coord);
 
         job_result
     }
