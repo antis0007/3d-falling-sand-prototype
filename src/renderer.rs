@@ -329,8 +329,7 @@ pub struct Renderer {
     dirty_near_starve_frames: u32,
     dirty_far_starve_frames: u32,
     dirty_fair_cursor: u8,
-    mesh_versions: HashMap<(ChunkCoord, ChunkLod), u64>,
-    meshed_versions: HashMap<ChunkCoord, u64>,
+    mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
 
     mesh_queue: BackgroundMeshQueue,
@@ -882,7 +881,6 @@ impl Renderer {
             dirty_far_starve_frames: 0,
             dirty_fair_cursor: 0,
             mesh_versions: HashMap::new(),
-            meshed_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
@@ -970,27 +968,9 @@ impl Renderer {
         let lod_radii = lod_radii.normalized();
         for coord in store.take_urgent_dirty_chunks() {
             self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
-            for lod in [
-                ChunkLod::Near,
-                ChunkLod::Mid,
-                ChunkLod::Far,
-                ChunkLod::Ultra,
-            ] {
-                let version = self.mesh_versions.entry((coord, lod)).or_insert(0);
-                *version = version.saturating_add(1);
-            }
         }
         for coord in store.take_dirty_chunks() {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
-            for lod in [
-                ChunkLod::Near,
-                ChunkLod::Mid,
-                ChunkLod::Far,
-                ChunkLod::Ultra,
-            ] {
-                let version = self.mesh_versions.entry((coord, lod)).or_insert(0);
-                *version = version.saturating_add(1);
-            }
         }
         let mut stats = MeshRebuildStats::default();
         stats.dirty_queue_drop_count +=
@@ -1031,7 +1011,7 @@ impl Renderer {
                 fallback_lod_near_threshold(coord, player_chunk, lod_radii, primary_lod);
 
             let push_job = |lod: ChunkLod, jobs: &mut Vec<MeshJob>| {
-                let version = *self.mesh_versions.get(&(coord, lod)).unwrap_or(&0);
+                let version = store.chunk_voxel_version(coord);
                 jobs.push(MeshJob {
                     coord,
                     lod,
@@ -1205,28 +1185,8 @@ impl Renderer {
         let mut uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
         let mut deferred = Vec::new();
+        let mut remesh_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
-            let current_version = self
-                .mesh_versions
-                .get(&(result.coord, result.lod))
-                .copied()
-                .unwrap_or(0);
-            if current_version != result.version || store.is_dirty(result.coord) {
-                stats.stale_drop_count += 1;
-                continue;
-            }
-
-            if self
-                .meshed_versions
-                .get(&result.coord)
-                .copied()
-                .unwrap_or(0)
-                != result.version
-            {
-                store.mark_chunk_meshed(result.coord);
-                self.meshed_versions.insert(result.coord, result.version);
-            }
-
             if let ChunkMeshArtifact::Gpu {
                 dispatch_ms,
                 readback_bytes,
@@ -1381,11 +1341,23 @@ impl Renderer {
                 );
             }
 
+            self.mesh_versions.insert(result.coord, result.version);
+            store.mark_chunk_meshed(result.coord);
+
             bytes_uploaded += bytes;
             uploaded += 1;
             total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
+
+            let mesh_version = *self.mesh_versions.get(&result.coord).unwrap_or(&0);
+            let voxel_version = store.chunk_voxel_version(result.coord);
+            if mesh_version < voxel_version {
+                remesh_coords.push(result.coord);
+            }
         }
         self.completed_meshes.extend(deferred);
+        for coord in remesh_coords {
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
 
         stats.upload_count = uploaded;
         stats.upload_bytes = bytes_uploaded;
@@ -1448,7 +1420,6 @@ impl Renderer {
         self.dirty_fair_cursor = 0;
         self.completed_meshes.clear();
         self.mesh_versions.clear();
-        self.meshed_versions.clear();
         self.lod_selection.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
