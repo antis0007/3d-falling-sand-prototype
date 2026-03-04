@@ -435,6 +435,40 @@ impl ChunkStore {
         }
     }
 
+    pub fn set_generated_voxel_if_loaded(
+        &mut self,
+        coord: VoxelCoord,
+        material: MaterialId,
+    ) -> bool {
+        let (chunk_coord, local) = voxel_to_chunk(coord);
+        let Some(chunk) = self.chunks.get_mut(&chunk_coord) else {
+            return false;
+        };
+
+        let (x, y, z) = (local[0] as usize, local[1] as usize, local[2] as usize);
+        let existing = chunk.get(x, y, z);
+        if existing != EMPTY {
+            return false;
+        }
+
+        let old_face_mask = chunk.face_non_empty_mask();
+        chunk.set(x, y, z, material);
+        let new_face_mask = chunk.face_non_empty_mask();
+
+        let version = self.chunk_voxel_versions.entry(chunk_coord).or_insert(0);
+        *version = version.saturating_add(1);
+        self.dirty_chunks.insert(chunk_coord);
+        self.unmeshed_chunks.insert(chunk_coord);
+
+        self.apply_neighbor_dirty_policy(
+            chunk_coord,
+            NeighborDirtyPolicy::GeneratedConditional,
+            new_face_mask,
+            Some(old_face_mask),
+        );
+        true
+    }
+
     pub fn ensure_chunk(&mut self, coord: ChunkCoord) -> &mut Chunk {
         self.chunks.entry(coord).or_insert_with(Chunk::new_empty)
     }
