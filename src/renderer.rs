@@ -544,6 +544,9 @@ pub struct MeshRebuildStats {
     pub allocator_bytes_allocated: usize,
     pub allocator_bytes_reused: usize,
     pub allocator_realloc_count: usize,
+    pub mesh_artifacts_received: usize,
+    pub mesh_artifacts_rejected: usize,
+    pub mesh_cache_entries: usize,
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -1497,10 +1500,12 @@ impl Renderer {
         let mut remesh_coords = Vec::new();
         let stale_result_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
+            stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
             // FIX 5: never upload stale geometry; requeue and skip this artifact.
-            if result.version < voxel_version {
+            if result.version.saturating_add(1) < voxel_version {
                 stats.stale_drop_count += 1;
+                stats.mesh_artifacts_rejected += 1;
                 remesh_coords.push(result.coord);
                 continue;
             }
@@ -1532,14 +1537,16 @@ impl Renderer {
                 continue;
             }
 
+            let chunk_is_empty = store
+                .get_chunk(result.coord)
+                .map(|chunk| chunk.iter_raw().iter().all(|&id| id == EMPTY))
+                .unwrap_or(true);
+
             let cache = self.store_meshes.entry(result.coord).or_default();
             if inds.is_empty() {
-                // FIX 2: ignore transient empty GPU geometry unless the chunk is truly empty.
-                let chunk_is_empty = store
-                    .get_chunk(result.coord)
-                    .map(|chunk| chunk.iter_raw().iter().all(|&id| id == EMPTY))
-                    .unwrap_or(true);
+                // Preserve last valid mesh for transient empty meshing artifacts.
                 if !chunk_is_empty {
+                    stats.mesh_artifacts_rejected += 1;
                     continue;
                 }
                 if let Some(old_mesh) = cache.slot_mut(result.lod).take() {
@@ -1611,7 +1618,7 @@ impl Renderer {
                 }
             }
 
-            if cache.is_empty() && !self.pending_lod_remesh.contains(&result.coord) {
+            if cache.is_empty() && chunk_is_empty {
                 self.store_meshes.remove(&result.coord);
                 self.pending_lod_remesh.remove(&result.coord);
             }
@@ -1647,6 +1654,7 @@ impl Renderer {
         stats.allocator_bytes_allocated = self.allocator_telemetry.bytes_allocated;
         stats.allocator_bytes_reused = self.allocator_telemetry.bytes_reused;
         stats.allocator_realloc_count = self.allocator_telemetry.realloc_count;
+        stats.mesh_cache_entries = self.store_meshes.len();
         stats.dirty_backlog = self.dirty_queues.total_len();
         stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
         stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
