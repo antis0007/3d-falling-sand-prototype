@@ -3,14 +3,12 @@
 //! - **Authoritative input:** meshing consumes a [`ChunkSnapshot`] built from
 //!   [`ChunkStore`] via `build_chunk_snapshot`, so workers never read mutable
 //!   world state directly.
-//! - **Vertex coordinate space:** all generated vertex positions and chunk AABBs
-//!   are emitted in stable world-space voxel coordinates scaled by
-//!   [`VOXEL_SIZE`].
-//! - **Chunk transform ownership:** meshing owns per-chunk world-space geometry
-//!   placement; draw-time code must not apply additional chunk-local transforms.
-//! - **Floating-origin contract:** floating-origin offsets are applied in camera
-//!   uniforms at render time, not during mesh generation, so cached chunk meshes
-//!   remain reusable across origin rebases.
+//! - **Vertex coordinate space:** all meshing emits chunk-local positions
+//!   (scaled by [`VOXEL_SIZE`]), independent of world placement.
+//! - **Chunk transform ownership:** draw-time code applies world placement via a
+//!   per-instance chunk origin buffer.
+//! - **Floating-origin contract:** `origin_offset` is only for world-to-camera
+//!   conversion and must never be coupled to chunk placement.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
@@ -135,15 +133,15 @@ pub struct ChunkMesh {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ChunkOriginWorld {
+struct ChunkOriginInstance {
     chunk_origin_world: [f32; 3],
     _pad: f32,
 }
 
-impl ChunkOriginWorld {
+impl ChunkOriginInstance {
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ChunkOriginWorld>() as u64,
+            array_stride: std::mem::size_of::<ChunkOriginInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &[wgpu::VertexAttribute {
                 offset: 0,
@@ -536,7 +534,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc(), ChunkOriginWorld::desc()],
+                buffers: &[Vertex::desc(), ChunkOriginInstance::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -942,7 +940,7 @@ impl Renderer {
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("store chunk origin instance"),
-                            contents: bytemuck::bytes_of(&ChunkOriginWorld {
+                            contents: bytemuck::bytes_of(&ChunkOriginInstance {
                                 chunk_origin_world: result.chunk_origin_world.to_array(),
                                 _pad: 0.0,
                             }),
@@ -1130,17 +1128,25 @@ impl Renderer {
             }
             if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
                 let origin_offset_world = voxel_to_world(self.origin_voxel);
+                let computed_world_origin = voxel_to_world(chunk_to_world_min(coord));
+                let render_translation = mesh.chunk_origin_world - origin_offset_world;
                 log::debug!(
-                    "visible chunk {:?} world_origin={:?} origin_offset={:?} world_aabb_min={:?} world_aabb_max={:?}",
+                    "visible chunk {:?} computed_world_origin={:?} instance_world_origin={:?} origin_offset={:?} render_translation={:?} world_aabb_min={:?} world_aabb_max={:?}",
                     coord,
+                    computed_world_origin,
                     mesh.chunk_origin_world,
                     origin_offset_world,
+                    render_translation,
                     mesh.world_aabb_min,
                     mesh.world_aabb_max,
                 );
                 debug_visible_logged += 1;
             }
             debug_assert!(mesh.chunk_origin_world.is_finite());
+            debug_assert_eq!(
+                mesh.chunk_origin_world,
+                voxel_to_world(chunk_to_world_min(coord))
+            );
             pass.set_vertex_buffer(0, mesh.vb.slice(..));
             pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
             pass.set_index_buffer(mesh.ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -1319,12 +1325,13 @@ fn synthesize_missing_neighbor_borders(
 }
 
 fn mesh_chunk_snapshot(
-    _coord: ChunkCoord,
+    coord: ChunkCoord,
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
     greedy: bool,
 ) -> (Vec<Vertex>, Vec<u32>, Vec3, Vec3, Vec3) {
     let chunk_world_min = snapshot.world_min;
+    debug_assert_eq!(chunk_world_min, chunk_to_world_min(coord));
     let chunk_origin_world = voxel_to_world(chunk_world_min);
     let chunk_extent = Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let (verts, inds) = match lod {
@@ -2350,13 +2357,8 @@ mod tests {
         let world_min = world_origin + Vec3::new(-2.0, -2.0, -24.0);
         let world_max = world_origin + Vec3::new(2.0, 2.0, -16.0);
 
-        let consistent_world = passes_screen_space_cull(
-            world_camera,
-            ChunkLod::Ultra,
-            world_min,
-            world_max,
-            1080,
-        );
+        let consistent_world =
+            passes_screen_space_cull(world_camera, ChunkLod::Ultra, world_min, world_max, 1080);
 
         // Intentionally incorrect mixed-space input (render-relative AABB with
         // world-space camera). This should not match correct world-space culling.
@@ -2477,7 +2479,7 @@ mod tests {
     }
 
     #[test]
-    fn voxel_vertex_positions_are_world_space_and_ignore_origin_input() {
+    fn voxel_vertex_positions_are_chunk_local_and_world_origin_is_metadata() {
         let mut store = ChunkStore::new();
         store.insert_chunk_with_policy(
             coord(),
@@ -2491,15 +2493,16 @@ mod tests {
         let (verts, _, min, max, _) =
             mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
 
-        let expected_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
-        let expected_max = expected_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
-        assert_eq!(min, expected_min);
-        assert_eq!(max, expected_max);
+        let expected_world_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
+        let expected_world_max =
+            expected_world_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+        assert_eq!(min, expected_world_min);
+        assert_eq!(max, expected_world_max);
 
         let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
         assert!(xs
             .iter()
-            .all(|x| *x >= expected_min.x && *x <= expected_max.x));
+            .all(|x| *x >= 0.0 && *x <= CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE));
     }
 
     #[test]

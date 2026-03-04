@@ -19,8 +19,8 @@ struct VsOut {
 @vertex
 fn vs_main(i: VsIn) -> VsOut {
   var o: VsOut;
-  // CPU culling operates on world-space chunk AABBs. Keep draw-time floating
-  // origin isolated to this transform so culling and rendering stay consistent.
+  // Transform path: chunk-local vertex + chunk world origin - floating origin
+  // offset, then project with camera VP.
   let world_pos = i.pos + i.chunk_origin_world;
   let render_pos = world_pos - camera.origin_offset;
   o.pos = camera.vp * vec4<f32>(render_pos, 1.0);
