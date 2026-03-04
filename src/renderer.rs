@@ -5,8 +5,8 @@
 //!   world state directly.
 //! - **Vertex coordinate space:** all meshing emits chunk-local positions
 //!   (scaled by [`VOXEL_SIZE`]), independent of world placement.
-//! - **Chunk transform ownership:** draw-time code applies world placement via a
-//!   per-instance chunk origin buffer.
+//! - **Chunk transform ownership:** chunk mesh vertices are authored in world
+//!   space and submitted from shared GPU mesh buffers.
 //! - **Floating-origin contract:** renderer APIs accept **world-space camera
 //!   coordinates**. The renderer then derives both world-space culling and
 //!   render-space projection from that one source of truth.
@@ -302,7 +302,6 @@ impl Camera {
 
 pub struct ChunkMesh {
     allocation: MeshAllocation,
-    chunk_origin_buf: wgpu::Buffer,
     index_count: u32,
     debug_aabb_vb: wgpu::Buffer,
     debug_aabb_ib: wgpu::Buffer,
@@ -383,24 +382,13 @@ impl ChunkMeshCache {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ChunkOriginInstance {
-    chunk_origin_world: [f32; 3],
-    _pad: f32,
-}
-
-impl ChunkOriginInstance {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ChunkOriginInstance>() as u64,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 2,
-                format: wgpu::VertexFormat::Float32x3,
-            }],
-        }
-    }
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+struct DrawIndexedIndirectCommand {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
 }
 
 const DEBUG_VISIBLE_CHUNK_LOG_COUNT: usize = 8;
@@ -469,6 +457,9 @@ pub struct Renderer {
     store_meshes: HashMap<ChunkCoord, ChunkMeshCache>,
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
     mesh_allocator: MeshPageAllocator,
+    global_gpu_vertex_buffer: wgpu::Buffer,
+    global_gpu_index_buffer: wgpu::Buffer,
+    global_gpu_draw_indirect_buffer: wgpu::Buffer,
 
     dirty_queues: DirtyChunkQueues,
     urgent_mesh_queue: VecDeque<ChunkCoord>,
@@ -1094,7 +1085,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[Vertex::desc(), ChunkOriginInstance::desc()],
+                buffers: &[Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -1121,6 +1112,27 @@ impl Renderer {
         });
 
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
+        let page_capacity = gpu_page_capacity() as u64;
+        let verts_per_page = (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+        let indices_per_page = verts_per_page * 6;
+        let global_gpu_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("global gpu mesh vertex buffer"),
+            size: page_capacity * verts_per_page * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let global_gpu_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("global gpu mesh index buffer"),
+            size: page_capacity * indices_per_page * std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let global_gpu_draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("global gpu draw indirect buffer"),
+            size: page_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Ok(Self {
             surface,
@@ -1136,6 +1148,9 @@ impl Renderer {
             store_meshes: HashMap::new(),
             visible_gpu_chunks: HashMap::new(),
             mesh_allocator: MeshPageAllocator::new("chunk mesh", 12 * 1024 * 1024),
+            global_gpu_vertex_buffer,
+            global_gpu_index_buffer,
+            global_gpu_draw_indirect_buffer,
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
             urgent_mesh_set: HashSet::new(),
@@ -1553,6 +1568,43 @@ impl Renderer {
                 );
                 self.mesh_versions.insert(result.coord, result.version);
                 store.mark_chunk_meshed(result.coord);
+
+                let verts_per_page =
+                    (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+                let indices_per_page = verts_per_page * 6;
+                let vertex_offset =
+                    page_index.0 as u64 * verts_per_page * std::mem::size_of::<Vertex>() as u64;
+                let index_offset =
+                    page_index.0 as u64 * indices_per_page * std::mem::size_of::<u32>() as u64;
+                let draw_offset = *draw_indirect_index as u64
+                    * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+                let (verts, inds, indirect, ..) = result.artifact.geometry();
+                if !verts.is_empty() {
+                    self.queue.write_buffer(
+                        &self.global_gpu_vertex_buffer,
+                        vertex_offset,
+                        bytemuck::cast_slice(verts),
+                    );
+                }
+                if !inds.is_empty() {
+                    self.queue.write_buffer(
+                        &self.global_gpu_index_buffer,
+                        index_offset,
+                        bytemuck::cast_slice(inds),
+                    );
+                }
+                let indexed_indirect = DrawIndexedIndirectCommand {
+                    index_count: indirect.index_count,
+                    instance_count: indirect.instance_count,
+                    first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
+                    base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
+                    first_instance: 0,
+                };
+                self.queue.write_buffer(
+                    &self.global_gpu_draw_indirect_buffer,
+                    draw_offset,
+                    bytemuck::bytes_of(&indexed_indirect),
+                );
                 continue;
             }
 
@@ -1604,16 +1656,6 @@ impl Renderer {
                     );
                 }
 
-                let chunk_origin_buf =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("store chunk origin instance"),
-                            contents: bytemuck::bytes_of(&ChunkOriginInstance {
-                                chunk_origin_world: chunk_origin_world.to_array(),
-                                _pad: 0.0,
-                            }),
-                            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        });
                 let (debug_aabb_verts, debug_aabb_inds) = build_debug_aabb_mesh();
                 let debug_aabb_vb =
                     self.device
@@ -1632,7 +1674,6 @@ impl Renderer {
 
                 let new_mesh = ChunkMesh {
                     allocation,
-                    chunk_origin_buf,
                     index_count: inds.len() as u32,
                     debug_aabb_vb,
                     debug_aabb_ib,
@@ -1824,86 +1865,17 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
-        let mut debug_visible_logged = 0usize;
-        for (&coord, cache) in &self.store_meshes {
-            let selected_lod = self
-                .lod_selection
-                .get(&coord)
-                .copied()
-                .unwrap_or(ChunkLod::Near);
-            let distance = chunk_horizontal_distance_to_camera(coord, world_camera_pos);
-            let Some((lod, mesh)) =
-                cache.best_available(selected_lod, distance, self.near_lod_distance)
-            else {
-                continue;
-            };
+        let _ = vp_world;
+        let _ = world_camera_pos;
 
-            let visible_world = chunk_visible_in_world_space(
-                self.settings.frustum_culling,
-                vp_world,
-                world_camera_pos,
-                lod,
-                mesh.world_aabb_min,
-                mesh.world_aabb_max,
-                self.size.height,
-            );
-            if DEBUG_VALIDATE_CULL_SPACE {
-                let _ = vp_render;
-                let _ = camera;
-                log::trace!(
-                    "world-space culling active chunk={:?} lod={:?} visible={}",
-                    coord,
-                    lod,
-                    visible_world
-                );
-            }
-
-            if !visible_world {
-                continue;
-            }
-            if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
-                let computed_world_origin = voxel_to_world(chunk_to_world_min(coord));
-                let render_translation = mesh.chunk_origin_world - origin_offset_world;
-                log::debug!(
-                    "visible chunk {:?} computed_world_origin={:?} instance_world_origin={:?} origin_offset={:?} render_translation={:?} world_aabb_min={:?} world_aabb_max={:?}",
-                    coord,
-                    computed_world_origin,
-                    mesh.chunk_origin_world,
-                    origin_offset_world,
-                    render_translation,
-                    mesh.world_aabb_min,
-                    mesh.world_aabb_max,
-                );
-                debug_visible_logged += 1;
-            }
-            debug_assert!(mesh.chunk_origin_world.is_finite());
-            debug_assert_eq!(
-                mesh.chunk_origin_world,
-                voxel_to_world(chunk_to_world_min(coord))
-            );
-            let Some(page) = self.mesh_allocator.page(mesh.allocation.page_index) else {
-                continue;
-            };
-            pass.set_vertex_buffer(
-                0,
-                page.vertex_buffer.slice(
-                    mesh.allocation.vertex.offset
-                        ..mesh.allocation.vertex.offset + mesh.allocation.vertex.size,
-                ),
-            );
-            pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
+        let draw_count = gpu_page_capacity();
+        if draw_count > 0 {
+            pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
             pass.set_index_buffer(
-                page.index_buffer.slice(
-                    mesh.allocation.index.offset
-                        ..mesh.allocation.index.offset + mesh.allocation.index.size,
-                ),
+                self.global_gpu_index_buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-
-            if DEBUG_RENDER_CHUNK_AABBS {
-                draw_debug_aabb(pass, mesh, [255, 64, 64, 140]);
-            }
+            pass.multi_draw_indexed_indirect(&self.global_gpu_draw_indirect_buffer, 0, draw_count);
         }
     }
 }
@@ -2806,7 +2778,6 @@ fn build_debug_aabb_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
 fn draw_debug_aabb<'a>(pass: &mut wgpu::RenderPass<'a>, mesh: &'a ChunkMesh, _color: [u8; 4]) {
     pass.set_vertex_buffer(0, mesh.debug_aabb_vb.slice(..));
-    pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
     pass.set_index_buffer(mesh.debug_aabb_ib.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..mesh.debug_aabb_index_count, 0, 0..1);
 }
