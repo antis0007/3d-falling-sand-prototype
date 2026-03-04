@@ -850,10 +850,15 @@ impl GpuComputeRuntime {
         let meshing_bg = self.create_meshing_bind_group(&state.device, meshing_resources);
         let mut encoder = state
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("meshing_dispatch"),
+            });
 
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("meshing_pass"),
+                timestamp_writes: None,
+            });
             pass.set_bind_group(0, &meshing_bg, &[]);
             pass.set_pipeline(&self.meshing_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
