@@ -153,10 +153,24 @@ impl ChunkStreaming {
 
         let mut coords: Vec<_> = self.pending_generate.drain(..).collect();
         coords.sort_by(|a, b| {
+            let meta_a = self.generate_meta.get(a).copied().unwrap_or_default();
+            let meta_b = self.generate_meta.get(b).copied().unwrap_or_default();
             let urgent_a = is_urgent_chunk(player_chunk, *a);
             let urgent_b = is_urgent_chunk(player_chunk, *b);
             urgent_b
                 .cmp(&urgent_a)
+                .then_with(|| {
+                    meta_b
+                        .class
+                        .map(GenerateJobClass::priority_rank)
+                        .unwrap_or(0)
+                        .cmp(
+                            &meta_a
+                                .class
+                                .map(GenerateJobClass::priority_rank)
+                                .unwrap_or(0),
+                        )
+                })
                 .then_with(|| {
                     generation_scores
                         .get(b)
@@ -164,6 +178,7 @@ impl ChunkStreaming {
                         .unwrap_or(0.0)
                         .total_cmp(&generation_scores.get(a).copied().unwrap_or(0.0))
                 })
+                .then_with(|| meta_a.enqueue_seq.cmp(&meta_b.enqueue_seq))
                 .then_with(|| {
                     Self::sort_key(player_chunk, *a).cmp(&Self::sort_key(player_chunk, *b))
                 })
@@ -918,8 +933,8 @@ impl ChunkStreaming {
                             .map(GenerateJobClass::priority_rank)
                             .unwrap_or(0),
                     )
+                    .then_with(|| meta_a.enqueue_seq.cmp(&meta_b.enqueue_seq))
                     .then_with(|| meta_a.score.total_cmp(&meta_b.score))
-                    .then_with(|| meta_b.enqueue_seq.cmp(&meta_a.enqueue_seq))
             })
             .map(|(idx, _)| idx)
     }

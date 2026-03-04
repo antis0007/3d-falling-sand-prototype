@@ -50,11 +50,6 @@ const SIM_REGION_RECOMPUTE_CHUNK_DELTA: i32 = 2;
 const APPLY_BUDGET_MS: f32 = 1.5;
 const APPLY_NEAR_PROTECTED_BUDGET_MS: f32 = 1.0;
 const EVICT_BUDGET_MS: f32 = 1.0;
-const DESIRED_NEAR_PER_FRAME_CAP: usize = 224;
-const DESIRED_MID_PER_FRAME_CAP: usize = 320;
-const DESIRED_FAR_PER_FRAME_CAP: usize = 448;
-const DESIRED_MAX_TOTAL_BUDGET: usize = 2600;
-const DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV: i32 = 1;
 const RESIDENT_KEEP_MID_CAP: usize = 512;
 const RESIDENT_KEEP_FAR_CAP: usize = 640;
 const MESH_BACKPRESSURE_START: usize = 80;
@@ -424,65 +419,27 @@ fn extract_frustum_planes(vp: Mat4) -> [Vec4; 6] {
 fn cap_desired_generation_order(
     desired: &DesiredChunks,
     player_chunk: ChunkCoord,
-    max_total_budget: usize,
 ) -> (Vec<ChunkCoord>, DesiredCapStats) {
-    let near_set: HashSet<_> = desired.near.iter().copied().collect();
-    let mid_set: HashSet<_> = desired.mid.iter().copied().collect();
-    let far_set: HashSet<_> = desired.far.iter().copied().collect();
-    let mut near_left = DESIRED_NEAR_PER_FRAME_CAP;
-    let mut mid_left = DESIRED_MID_PER_FRAME_CAP;
-    let mut far_left = DESIRED_FAR_PER_FRAME_CAP;
-
-    let mut capped = Vec::with_capacity(desired.generation_order.len().min(max_total_budget));
+    let mut prioritized = Vec::with_capacity(desired.generation_order.len());
     let mut stats = DesiredCapStats::default();
 
-    for &coord in &desired.generation_order {
-        let cheb = chebyshev_from_player(player_chunk, coord);
-        let uncapped_immediate = cheb <= DESIRED_IMMEDIATE_UNCAPPED_CHEBYSHEV;
-        let keep = if uncapped_immediate {
+    for &coord in &desired.near {
+        if chebyshev_from_player(player_chunk, coord) <= 1 {
             stats.uncapped_kept += 1;
-            true
-        } else if near_set.contains(&coord) {
-            if near_left > 0 {
-                near_left -= 1;
-                stats.near_kept += 1;
-                true
-            } else {
-                stats.near_dropped += 1;
-                false
-            }
-        } else if mid_set.contains(&coord) {
-            if mid_left > 0 {
-                mid_left -= 1;
-                stats.mid_kept += 1;
-                true
-            } else {
-                stats.mid_dropped += 1;
-                false
-            }
-        } else if far_set.contains(&coord) {
-            if far_left > 0 {
-                far_left -= 1;
-                stats.far_kept += 1;
-                true
-            } else {
-                stats.far_dropped += 1;
-                false
-            }
-        } else {
-            false
-        };
-
-        if keep {
-            if capped.len() >= max_total_budget {
-                stats.budget_dropped += 1;
-                continue;
-            }
-            capped.push(coord);
         }
+        stats.near_kept += 1;
+        prioritized.push(coord);
+    }
+    for &coord in &desired.mid {
+        stats.mid_kept += 1;
+        prioritized.push(coord);
+    }
+    for &coord in &desired.far {
+        stats.far_kept += 1;
+        prioritized.push(coord);
     }
 
-    (capped, stats)
+    (prioritized, stats)
 }
 
 fn blend_i32(max: i32, min: i32, t: f32) -> i32 {
@@ -1388,11 +1345,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
                                 .clamp(0.0, 1.0)
                         };
-                        let (mut generation_priority, desired_cap_stats) = cap_desired_generation_order(
-                            &cached_desired,
-                            player_chunk,
-                            DESIRED_MAX_TOTAL_BUDGET,
-                        );
+                        let (mut generation_priority, desired_cap_stats) =
+                            cap_desired_generation_order(&cached_desired, player_chunk);
                         last_desired_cap_stats = desired_cap_stats;
                         if backpressure > 0.0 {
                             let far_radius_cutoff = (effective_stream_tuning.mid_radius_xz as f32
@@ -1428,20 +1382,14 @@ pub async fn run() -> anyhow::Result<()> {
                             });
                         }
 
-                        let gen_dispatched_inflight_before_dispatch =
-                            streaming.dispatched_generate.len();
+                        let gen_worker_inflight_before_dispatch = gen_worker_inflight;
                         if gen_dispatch_paused {
-                            if gen_dispatched_inflight_before_dispatch <= generator_config.dispatch_low {
+                            if gen_worker_inflight_before_dispatch <= generator_config.dispatch_low {
                                 gen_dispatch_paused = false;
                             }
-                        } else if gen_dispatched_inflight_before_dispatch >= generator_config.dispatch_high {
+                        } else if gen_worker_inflight_before_dispatch >= generator_config.dispatch_high {
                             gen_dispatch_paused = true;
                         }
-                        let gen_pause_reason = if gen_dispatch_paused {
-                            "worker_queue_high_watermark"
-                        } else {
-                            "none"
-                        };
 
                         let mut gen_request_count = 0usize;
                         let mut dispatch_urgent = Vec::new();
@@ -1452,7 +1400,6 @@ pub async fn run() -> anyhow::Result<()> {
                         for &coord in &generation_priority {
                             if streaming.resident.contains(&coord)
                                 || streaming.dispatched_generate.contains(&coord)
-                                || streaming.scheduled_generate.contains(&coord)
                             {
                                 continue;
                             }
@@ -1466,6 +1413,25 @@ pub async fn run() -> anyhow::Result<()> {
                                 dispatch_far.push(coord);
                             }
                         }
+
+                        let has_near_backlog = dispatch_near.iter().any(|coord| {
+                            !streaming.resident.contains(coord)
+                                && !streaming.dispatched_generate.contains(coord)
+                        });
+                        let has_mid_backlog = !has_near_backlog
+                            && dispatch_mid.iter().any(|coord| {
+                                !streaming.resident.contains(coord)
+                                    && !streaming.dispatched_generate.contains(coord)
+                            });
+                        let gen_pause_reason = if has_near_backlog {
+                            "near_ring_active"
+                        } else if has_mid_backlog {
+                            "mid_ring_active"
+                        } else if gen_dispatch_paused {
+                            "worker_queue_high_watermark"
+                        } else {
+                            "none"
+                        };
 
                         let dispatch_coord = |coord: ChunkCoord,
                                               class: GenerateJobClass,
@@ -1503,19 +1469,17 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let urgent_dispatch_budget =
                             URGENT_GENERATION_BUDGET + collision_local_urgent_boost;
-                        if !gen_dispatch_paused || collision_local_urgent_boost > 0 {
-                            for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
-                                if !dispatch_coord(
-                                    coord,
-                                    GenerateJobClass::Urgent,
-                                    &mut gen_request_count,
-                                    &mut gen_worker_inflight,
-                                    &mut store,
-                                    &mut streaming,
-                                    &mut cached_modified_chunks,
-                                ) {
-                                    break;
-                                }
+                        for coord in dispatch_urgent.into_iter().take(urgent_dispatch_budget) {
+                            if !dispatch_coord(
+                                coord,
+                                GenerateJobClass::Urgent,
+                                &mut gen_request_count,
+                                &mut gen_worker_inflight,
+                                &mut store,
+                                &mut streaming,
+                                &mut cached_modified_chunks,
+                            ) {
+                                break;
                             }
                         }
 
@@ -1525,13 +1489,7 @@ pub async fn run() -> anyhow::Result<()> {
                             streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
-                        let generate_drain_budget = if gen_dispatch_paused {
-                            0
-                        } else {
-                            base_generate_drain_budget
-                        };
-
-                        let near_budget = generate_drain_budget
+                        let near_budget = base_generate_drain_budget
                             .min(NEAR_GENERATION_BUDGET)
                             .max(PROTECTED_HIGH_PRIORITY_SLOTS);
                         let mut near_sent = 0usize;
@@ -1550,60 +1508,69 @@ pub async fn run() -> anyhow::Result<()> {
                             near_sent += 1;
                         }
 
-                        let mut far_budget = generate_drain_budget.saturating_sub(near_sent);
-                        let mut mid_budget = far_budget.min(MID_GENERATION_BUDGET);
-                        for coord in dispatch_mid {
-                            if mid_budget == 0 {
-                                break;
-                            }
-                            if !dispatch_coord(
-                                coord,
-                                GenerateJobClass::Mid,
-                                &mut gen_request_count,
-                                &mut gen_worker_inflight,
-                                &mut store,
-                                &mut streaming,
-                                &mut cached_modified_chunks,
-                            ) {
-                                break;
-                            }
-                            mid_budget = mid_budget.saturating_sub(1);
-                            far_budget = far_budget.saturating_sub(1);
-                        }
-                        for coord in dispatch_far {
-                            if far_budget == 0 {
-                                break;
-                            }
-                            if !dispatch_coord(
-                                coord,
-                                GenerateJobClass::Far,
-                                &mut gen_request_count,
-                                &mut gen_worker_inflight,
-                                &mut store,
-                                &mut streaming,
-                                &mut cached_modified_chunks,
-                            ) {
-                                break;
-                            }
-                            far_budget = far_budget.saturating_sub(1);
-                        }
+                        let generate_drain_budget = if gen_dispatch_paused {
+                            0
+                        } else {
+                            base_generate_drain_budget.saturating_sub(near_sent)
+                        };
 
-                        while far_budget > 0 {
-                            let Some(coord) = streaming.next_generation_job() else {
-                                break;
-                            };
-                            if !dispatch_coord(
-                                coord,
-                                GenerateJobClass::Far,
-                                &mut gen_request_count,
-                                &mut gen_worker_inflight,
-                                &mut store,
-                                &mut streaming,
-                                &mut cached_modified_chunks,
-                            ) {
-                                break;
+                        if !has_near_backlog {
+                            if has_mid_backlog {
+                                let mut mid_budget = generate_drain_budget.min(MID_GENERATION_BUDGET);
+                                for coord in dispatch_mid {
+                                    if mid_budget == 0 {
+                                        break;
+                                    }
+                                    if !dispatch_coord(
+                                        coord,
+                                        GenerateJobClass::Mid,
+                                        &mut gen_request_count,
+                                        &mut gen_worker_inflight,
+                                        &mut store,
+                                        &mut streaming,
+                                        &mut cached_modified_chunks,
+                                    ) {
+                                        break;
+                                    }
+                                    mid_budget = mid_budget.saturating_sub(1);
+                                }
+                            } else {
+                                let mut far_budget = generate_drain_budget;
+                                for coord in dispatch_mid {
+                                    if far_budget == 0 {
+                                        break;
+                                    }
+                                    if !dispatch_coord(
+                                        coord,
+                                        GenerateJobClass::Mid,
+                                        &mut gen_request_count,
+                                        &mut gen_worker_inflight,
+                                        &mut store,
+                                        &mut streaming,
+                                        &mut cached_modified_chunks,
+                                    ) {
+                                        break;
+                                    }
+                                    far_budget = far_budget.saturating_sub(1);
+                                }
+                                for coord in dispatch_far {
+                                    if far_budget == 0 {
+                                        break;
+                                    }
+                                    if !dispatch_coord(
+                                        coord,
+                                        GenerateJobClass::Far,
+                                        &mut gen_request_count,
+                                        &mut gen_worker_inflight,
+                                        &mut store,
+                                        &mut streaming,
+                                        &mut cached_modified_chunks,
+                                    ) {
+                                        break;
+                                    }
+                                    far_budget = far_budget.saturating_sub(1);
+                                }
                             }
-                            far_budget = far_budget.saturating_sub(1);
                         }
                         let gen_recv_t0 = Instant::now();
                         let mut gen_completed_count = 0usize;
@@ -3415,28 +3382,26 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     #[test]
-    fn desired_caps_preserve_immediate_neighbors() {
+    fn ring_priority_orders_near_then_mid_then_far_without_capping() {
         let player = ChunkCoord { x: 0, y: 0, z: 0 };
-        let immediate = ChunkCoord { x: 1, y: 0, z: 0 };
-        let mut near = vec![immediate];
-        near.extend((0..600).map(|i| ChunkCoord {
-            x: 2 + i,
-            y: 0,
-            z: 0,
-        }));
+        let near = vec![ChunkCoord { x: 1, y: 0, z: 0 }];
+        let mid = vec![ChunkCoord { x: 3, y: 0, z: 0 }];
+        let far = vec![ChunkCoord { x: 6, y: 0, z: 0 }];
 
         let desired = DesiredChunks {
             near: near.clone(),
-            mid: Vec::new(),
-            far: Vec::new(),
-            generation_order: near,
+            mid: mid.clone(),
+            far: far.clone(),
+            generation_order: Vec::new(),
             generation_scores: HashMap::new(),
             resident_keep: HashSet::new(),
         };
 
-        let (capped, stats) = cap_desired_generation_order(&desired, player, 64);
-        assert!(capped.contains(&immediate));
-        assert_eq!(capped.len(), 64);
-        assert!(stats.budget_dropped > 0);
+        let (prioritized, stats) = cap_desired_generation_order(&desired, player);
+        assert_eq!(prioritized, vec![near[0], mid[0], far[0]]);
+        assert_eq!(stats.near_kept, 1);
+        assert_eq!(stats.mid_kept, 1);
+        assert_eq!(stats.far_kept, 1);
+        assert_eq!(stats.budget_dropped, 0);
     }
 }
