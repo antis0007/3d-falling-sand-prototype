@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "procgen-profile")]
 use std::time::{Duration, Instant};
@@ -167,7 +168,65 @@ impl ProcGenVolume {
 }
 
 pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk) {
+    let mut chunk = chunk;
+    apply_deferred_structure_placements(c, &mut chunk);
     store.insert_chunk_with_policy(c, chunk, true, NeighborDirtyPolicy::GeneratedConditional);
+}
+
+#[derive(Clone, Copy)]
+struct DeferredStructurePlacement {
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    material: MaterialId,
+}
+
+type DeferredPlacementMap = HashMap<ChunkCoord, Vec<DeferredStructurePlacement>>;
+
+fn deferred_structure_placements() -> &'static Mutex<DeferredPlacementMap> {
+    static DEFERRED: OnceLock<Mutex<DeferredPlacementMap>> = OnceLock::new();
+    DEFERRED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn chunk_for_world_voxel(wx: i32, wy: i32, wz: i32) -> ChunkCoord {
+    ChunkCoord {
+        x: wx.div_euclid(CHUNK_SIZE_VOXELS),
+        y: wy.div_euclid(CHUNK_SIZE_VOXELS),
+        z: wz.div_euclid(CHUNK_SIZE_VOXELS),
+    }
+}
+
+fn local_for_world_voxel(wx: i32, wy: i32, wz: i32) -> [usize; 3] {
+    [
+        wx.rem_euclid(CHUNK_SIZE_VOXELS) as usize,
+        wy.rem_euclid(CHUNK_SIZE_VOXELS) as usize,
+        wz.rem_euclid(CHUNK_SIZE_VOXELS) as usize,
+    ]
+}
+
+fn queue_deferred_structure_placement(
+    target_chunk: ChunkCoord,
+    placement: DeferredStructurePlacement,
+) {
+    let mut deferred = deferred_structure_placements()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    deferred.entry(target_chunk).or_default().push(placement);
+}
+
+fn apply_deferred_structure_placements(chunk_coord: ChunkCoord, chunk: &mut Chunk) {
+    let placements = {
+        let mut deferred = deferred_structure_placements()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        deferred.remove(&chunk_coord).unwrap_or_default()
+    };
+    for placement in placements {
+        let [lx, ly, lz] = local_for_world_voxel(placement.wx, placement.wy, placement.wz);
+        if chunk.get(lx, ly, lz) == EMPTY {
+            chunk.set(lx, ly, lz, placement.material);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2600,6 +2659,11 @@ fn apply_vegetation_intents(
     intents: &[VegetationIntent],
     cache: Option<&ProcGenFieldCache>,
 ) {
+    let current_chunk = chunk_for_world_voxel(
+        config.world_origin[0],
+        config.world_origin[1],
+        config.world_origin[2],
+    );
     let mut anchors = HashMap::<(i32, i32), i32>::new();
     for intent in intents {
         if intent.material == WOOD {
@@ -2611,18 +2675,10 @@ fn apply_vegetation_intents(
     }
 
     for intent in intents {
+        let target_chunk = chunk_for_world_voxel(intent.wx, intent.wy, intent.wz);
         let lx = intent.wx - config.world_origin[0];
         let ly = intent.wy - config.world_origin[1];
         let lz = intent.wz - config.world_origin[2];
-        if lx < 0
-            || ly < 0
-            || lz < 0
-            || lx >= world.dims[0] as i32
-            || ly >= world.dims[1] as i32
-            || lz >= world.dims[2] as i32
-        {
-            continue;
-        }
         if matches!(intent.material, WOOD | LEAVES) {
             let mut supported = false;
             for dz in -2..=2 {
@@ -2683,8 +2739,29 @@ fn apply_vegetation_intents(
                 continue;
             }
         }
-        if world.get(lx, ly, lz) == EMPTY {
-            let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
+        if target_chunk == current_chunk {
+            if lx < 0
+                || ly < 0
+                || lz < 0
+                || lx >= world.dims[0] as i32
+                || ly >= world.dims[1] as i32
+                || lz >= world.dims[2] as i32
+            {
+                continue;
+            }
+            if world.get(lx, ly, lz) == EMPTY {
+                let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
+            }
+        } else if cache.is_some() && matches!(intent.material, WOOD | LEAVES) {
+            queue_deferred_structure_placement(
+                target_chunk,
+                DeferredStructurePlacement {
+                    wx: intent.wx,
+                    wy: intent.wy,
+                    wz: intent.wz,
+                    material: intent.material,
+                },
+            );
         }
     }
 }
@@ -3268,6 +3345,13 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::time::Instant;
+
+    fn clear_deferred_structure_placements_for_tests() {
+        deferred_structure_placements()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 
     fn river_width_bucket(weight: f32) -> u8 {
         if weight > 0.82 {
@@ -4318,6 +4402,37 @@ mod tests {
                 assert_eq!(upper_a.get(x, 0, z), upper_b.get(x, 0, z));
             }
         }
+    }
+
+    #[test]
+    fn apply_generated_chunk_applies_deferred_cross_chunk_structure_writes() {
+        clear_deferred_structure_placements_for_tests();
+        let target_chunk = ChunkCoord { x: 2, y: -1, z: 3 };
+        let world_x = target_chunk.x * CHUNK_SIZE_VOXELS + 5;
+        let world_y = target_chunk.y * CHUNK_SIZE_VOXELS + 7;
+        let world_z = target_chunk.z * CHUNK_SIZE_VOXELS + 9;
+
+        queue_deferred_structure_placement(
+            target_chunk,
+            DeferredStructurePlacement {
+                wx: world_x,
+                wy: world_y,
+                wz: world_z,
+                material: WOOD,
+            },
+        );
+
+        let mut store = ChunkStore::new();
+        apply_generated_chunk(&mut store, target_chunk, Chunk::new_empty());
+
+        assert_eq!(
+            store.get_voxel(crate::types::VoxelCoord {
+                x: world_x,
+                y: world_y,
+                z: world_z,
+            }),
+            WOOD
+        );
     }
 
     #[test]
