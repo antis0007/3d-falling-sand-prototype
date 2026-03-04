@@ -91,9 +91,12 @@ struct ChunkPageAtlas {
 
 #[cfg(feature = "gpu-compute")]
 impl ChunkPageAtlas {
-    fn page_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> anyhow::Result<GpuPageIndex> {
+    fn page_for_chunk_or_allocate(
+        &mut self,
+        chunk: ChunkCoord,
+    ) -> anyhow::Result<(GpuPageIndex, bool)> {
         if let Some(existing) = self.page_for_chunk.get(&chunk).copied() {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         if self.next_page.0 < GPU_PAGE_CAPACITY {
@@ -101,7 +104,7 @@ impl ChunkPageAtlas {
             self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
             self.page_for_chunk.insert(chunk, page);
             self.chunk_for_page.insert(page, chunk);
-            return Ok(page);
+            return Ok((page, true));
         }
 
         let page = self.evictable_page().with_context(|| {
@@ -110,7 +113,7 @@ impl ChunkPageAtlas {
         self.evict_page(page);
         self.page_for_chunk.insert(chunk, page);
         self.chunk_for_page.insert(page, chunk);
-        Ok(page)
+        Ok((page, true))
     }
 
     fn resolve_chunk(&self, page_index: GpuPageIndex) -> Option<ChunkCoord> {
@@ -146,6 +149,14 @@ impl ChunkPageAtlas {
     }
 
     fn evict_page(&mut self, page_index: GpuPageIndex) {
+        debug_assert_eq!(
+            self.in_flight_jobs_for_page
+                .get(&page_index)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "attempted to evict an in-flight gpu page"
+        );
         if let Some(chunk) = self.chunk_for_page.remove(&page_index) {
             self.page_for_chunk.remove(&chunk);
             self.version_for_chunk.remove(&chunk);
@@ -163,6 +174,7 @@ struct WorkerGpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     runtime: GpuComputeRuntime,
+    gpu_job_lock: Mutex<()>,
     atlas: Mutex<ChunkPageAtlas>,
     atlas_voxels: wgpu::Buffer,
     velocity_mac: wgpu::Buffer,
@@ -178,6 +190,79 @@ struct WorkerGpuState {
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
     runtime_config: GpuSimulationRuntimeConfig,
+}
+
+#[cfg(feature = "gpu-compute")]
+fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
+    let voxel_words = CHUNK_VOLUME * 2;
+    let atlas_byte_offset =
+        page_index.0 as u64 * voxel_words as u64 * std::mem::size_of::<u32>() as u64;
+    let atlas_zeros = vec![0u32; voxel_words];
+    state.queue.write_buffer(
+        &state.atlas_voxels,
+        atlas_byte_offset,
+        bytemuck::cast_slice(&atlas_zeros),
+    );
+
+    let velocity_offset =
+        page_index.0 as u64 * CHUNK_VOLUME as u64 * std::mem::size_of::<[f32; 4]>() as u64;
+    let velocity_zeros = vec![[0.0f32; 4]; CHUNK_VOLUME];
+    state.queue.write_buffer(
+        &state.velocity_mac,
+        velocity_offset,
+        bytemuck::cast_slice(&velocity_zeros),
+    );
+
+    let scalar_offset =
+        page_index.0 as u64 * CHUNK_VOLUME as u64 * std::mem::size_of::<f32>() as u64;
+    let scalar_zeros = vec![0.0f32; CHUNK_VOLUME];
+    state.queue.write_buffer(
+        &state.pressure,
+        scalar_offset,
+        bytemuck::cast_slice(&scalar_zeros),
+    );
+    state.queue.write_buffer(
+        &state.divergence,
+        scalar_offset,
+        bytemuck::cast_slice(&scalar_zeros),
+    );
+
+    let density_offset =
+        page_index.0 as u64 * CHUNK_VOLUME as u64 * 2 * std::mem::size_of::<f32>() as u64;
+    let density_zeros = vec![0.0f32; CHUNK_VOLUME * 2];
+    state.queue.write_buffer(
+        &state.material_density,
+        density_offset,
+        bytemuck::cast_slice(&density_zeros),
+    );
+}
+
+#[cfg(feature = "gpu-compute")]
+fn clear_job_scratch_buffers(state: &WorkerGpuState) {
+    let zero_u32 = [0u32; 4];
+    state.queue.write_buffer(
+        &state.active_tile_counter,
+        0,
+        bytemuck::cast_slice(&zero_u32),
+    );
+    state.queue.write_buffer(
+        &state.dirty_page_counter,
+        0,
+        bytemuck::cast_slice(&zero_u32),
+    );
+
+    let active_tile_zeros = vec![0u32; CHUNK_VOLUME];
+    state.queue.write_buffer(
+        &state.active_tiles,
+        0,
+        bytemuck::cast_slice(&active_tile_zeros),
+    );
+    let dirty_page_zeros = vec![0u32; GPU_PAGE_CAPACITY as usize];
+    state.queue.write_buffer(
+        &state.dirty_page_indices,
+        0,
+        bytemuck::cast_slice(&dirty_page_zeros),
+    );
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -439,10 +524,6 @@ impl GpuComputeRuntime {
         current_state: u32,
         edit_commands: &[EditCommand],
     ) -> anyhow::Result<()> {
-        {
-            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
-        }
         let t0 = Instant::now();
         let frontier_len = sim_job
             .active_frontier_count
@@ -521,10 +602,6 @@ impl GpuComputeRuntime {
         page_index: GpuPageIndex,
         current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
-        {
-            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
-        }
         let page_params = device_page_params(
             sim_job,
             page_index,
@@ -848,6 +925,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 device,
                 queue,
                 runtime,
+                gpu_job_lock: Mutex::new(()),
                 atlas: Mutex::new(ChunkPageAtlas::default()),
                 atlas_voxels,
                 velocity_mac,
@@ -867,8 +945,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+        let incoming = job.snapshot.center_voxels.as_ref();
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        let page_index = atlas.page_for_chunk_or_allocate(job.coord)?;
+        let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
         atlas.acquire_page_for_job(job.coord, page_index);
         let last_version = atlas
@@ -883,16 +962,18 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .copied()
             .unwrap_or(0);
         let tick = atlas.tick_for_chunk.get(&job.coord).copied().unwrap_or(0);
-        let mut edit_commands = Vec::new();
-        let incoming = job.snapshot.center_voxels.as_ref();
-        let cached = atlas
+        let mut cached_before = atlas
             .cached_materials
-            .entry(job.coord)
-            .or_insert_with(|| vec![EMPTY; incoming.len()]);
-        if cached.len() != incoming.len() {
-            cached.resize(incoming.len(), EMPTY);
+            .get(&job.coord)
+            .cloned()
+            .unwrap_or_else(|| vec![EMPTY; incoming.len()]);
+        if cached_before.len() != incoming.len() {
+            cached_before.resize(incoming.len(), EMPTY);
         }
-        for (idx, (&next, prev)) in incoming.iter().zip(cached.iter_mut()).enumerate() {
+        drop(atlas);
+
+        let mut edit_commands = Vec::new();
+        for (idx, (&next, prev)) in incoming.iter().zip(cached_before.iter()).enumerate() {
             if next != *prev {
                 edit_commands.push(EditCommand {
                     voxel_index: idx as u32,
@@ -900,9 +981,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     flags: 0,
                     _pad: 0,
                 });
-                *prev = next;
             }
         }
+
         let seeded_active = incoming.iter().filter(|m| **m != EMPTY).count() as u32;
         let active_frontier_count = seeded_active
             .max(previous_frontier)
@@ -913,29 +994,32 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             active_frontier_count,
             simulation_tick: tick,
         };
-        atlas.version_for_chunk.insert(job.coord, job.version);
-        atlas
-            .state_for_chunk
-            .insert(job.coord, (current_state + 1) & 1);
-        atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
-        atlas
-            .frontier_len_for_chunk
-            .insert(job.coord, active_frontier_count);
-        atlas.diagnostics_for_chunk.insert(
-            job.coord,
-            ChunkSimulationDiagnostics {
-                changed_voxels: edit_commands.len() as u32,
-                dropped_frontier_writes: edit_commands
-                    .len()
-                    .saturating_sub(active_frontier_count as usize)
-                    as u32,
-                cross_border_attempts: 0,
-            },
-        );
-        drop(atlas);
+        let next_state = (current_state + 1) & 1;
+        let diagnostics = ChunkSimulationDiagnostics {
+            changed_voxels: edit_commands.len() as u32,
+            dropped_frontier_writes: edit_commands
+                .len()
+                .saturating_sub(active_frontier_count as usize)
+                as u32,
+            cross_border_attempts: 0,
+        };
 
         let dispatch_t0 = Instant::now();
         let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
+            // The worker uses a shared set of writable scratch buffers/bind groups.
+            // Serialize dispatch and readback to keep page_params/edit buffers/page ownership coherent
+            // across the background mesh worker pool.
+            let _gpu_job_guard = state.gpu_job_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            {
+                let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                atlas.assert_page_for_chunk(job.coord, page_index);
+            }
+            if page_was_reassigned {
+                clear_page_buffers(state, page_index);
+            }
+            clear_job_scratch_buffers(state);
+
             if active_frontier_count > 0 {
                 state.runtime.run_active_frontier(
                     state,
@@ -953,19 +1037,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 DrawIndirectArgs::default()
             };
 
-            let diagnostics = {
-                let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.assert_page_for_chunk(job.coord, page_index);
-                atlas
-                    .diagnostics_for_chunk
-                    .get(&job.coord)
-                    .copied()
-                    .unwrap_or_default()
-            };
             let generated_materials = readback_page_materials(
                 state,
                 page_index,
-                (current_state + 1) & 1,
+                next_state,
                 job.snapshot.center_voxels.len(),
             )
             .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
@@ -997,6 +1072,21 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 },
             })
         })();
+
+        if job_result.is_ok() {
+            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+            atlas.assert_page_for_chunk(job.coord, page_index);
+            atlas.version_for_chunk.insert(job.coord, job.version);
+            atlas.state_for_chunk.insert(job.coord, next_state);
+            atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
+            atlas
+                .frontier_len_for_chunk
+                .insert(job.coord, active_frontier_count);
+            atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
+            atlas
+                .cached_materials
+                .insert(job.coord, job.snapshot.center_voxels.as_ref().to_vec());
+        }
 
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         atlas.release_page_from_job(page_index);
