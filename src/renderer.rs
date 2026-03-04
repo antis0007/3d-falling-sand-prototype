@@ -326,6 +326,8 @@ pub struct Renderer {
     index_arena: BufferArena,
 
     dirty_queues: DirtyChunkQueues,
+    urgent_mesh_queue: VecDeque<ChunkCoord>,
+    urgent_mesh_set: HashSet<ChunkCoord>,
     dirty_near_starve_frames: u32,
     dirty_far_starve_frames: u32,
     dirty_fair_cursor: u8,
@@ -511,6 +513,12 @@ impl DirtyChunkQueues {
         }
     }
 
+    fn remove_coord(&mut self, coord: ChunkCoord) {
+        if let Some(tier) = self.tiers.remove(&coord) {
+            self.decr_tier(tier);
+        }
+    }
+
     fn clear(&mut self) {
         self.urgent.clear();
         self.near.clear();
@@ -585,6 +593,7 @@ pub(crate) struct MeshJob {
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
     pub(crate) greedy: bool,
+    pub(crate) urgent: bool,
 }
 
 struct MeshResult {
@@ -593,6 +602,7 @@ struct MeshResult {
     version: u64,
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
+    urgent: bool,
 }
 
 pub(crate) enum ChunkMeshArtifact {
@@ -653,6 +663,16 @@ struct BackgroundMeshQueue {
     inflight: usize,
 }
 
+fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> ChunkMeshArtifact {
+    match mesh_backend {
+        MeshPipelineBackend::Cpu => cpu_generate_material_field(job).mesh_artifact,
+        #[cfg(feature = "gpu-compute")]
+        MeshPipelineBackend::Gpu => run_chunk_job_on_worker(job)
+            .map(|output| output.mesh_artifact)
+            .unwrap_or_else(|_| cpu_generate_material_field(job).mesh_artifact),
+    }
+}
+
 impl BackgroundMeshQueue {
     fn new(worker_count: usize, queue_bound: usize, mesh_backend: MeshPipelineBackend) -> Self {
         let (tx, job_rx) = sync_channel::<MeshJob>(queue_bound);
@@ -673,13 +693,7 @@ impl BackgroundMeshQueue {
                         break;
                     };
 
-                    let artifact = match mesh_backend {
-                        MeshPipelineBackend::Cpu => cpu_generate_material_field(&job).mesh_artifact,
-                        #[cfg(feature = "gpu-compute")]
-                        MeshPipelineBackend::Gpu => run_chunk_job_on_worker(&job)
-                            .map(|output| output.mesh_artifact)
-                            .unwrap_or_else(|_| cpu_generate_material_field(&job).mesh_artifact),
-                    };
+                    let artifact = build_mesh_artifact(mesh_backend, &job);
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
@@ -687,6 +701,7 @@ impl BackgroundMeshQueue {
                             version: job.version,
                             queued_at: job.queued_at,
                             artifact,
+                            urgent: job.urgent,
                         })
                         .is_err()
                     {
@@ -877,6 +892,8 @@ impl Renderer {
                 4 * 1024 * 1024,
             ),
             dirty_queues: DirtyChunkQueues::default(),
+            urgent_mesh_queue: VecDeque::new(),
+            urgent_mesh_set: HashSet::new(),
             dirty_near_starve_frames: 0,
             dirty_far_starve_frames: 0,
             dirty_fair_cursor: 0,
@@ -967,7 +984,7 @@ impl Renderer {
     ) -> MeshRebuildStats {
         let lod_radii = lod_radii.normalized();
         for coord in store.take_urgent_dirty_chunks() {
-            self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
+            self.enqueue_urgent_mesh_chunk(coord);
         }
         for coord in store.take_dirty_chunks() {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
@@ -980,6 +997,44 @@ impl Renderer {
         let mut mid_jobs = Vec::new();
         let mut far_jobs = Vec::new();
         let mut ultra_jobs = Vec::new();
+
+        let mut urgent_jobs = self.pop_urgent_mesh_jobs(store, &mut stats, player_chunk, lod_radii);
+
+        for job in urgent_jobs.drain(..) {
+            let lod = job.lod;
+            let queued_at = job.queued_at;
+            match self.mesh_queue.try_submit(job) {
+                Ok(()) => {
+                    stats.mesh_count += 1;
+                    match lod {
+                        ChunkLod::Near => stats.near_mesh_count += 1,
+                        ChunkLod::Mid => stats.mid_mesh_count += 1,
+                        ChunkLod::Far => stats.far_mesh_count += 1,
+                        ChunkLod::Ultra => stats.ultra_mesh_count += 1,
+                    }
+                }
+                Err(TrySendError::Full(job)) => {
+                    let artifact = build_mesh_artifact(self.mesh_backend, &job);
+                    self.completed_meshes.push(MeshResult {
+                        coord: job.coord,
+                        lod,
+                        version: job.version,
+                        queued_at,
+                        artifact,
+                        urgent: job.urgent,
+                    });
+                    stats.mesh_count += 1;
+                    match lod {
+                        ChunkLod::Near => stats.near_mesh_count += 1,
+                        ChunkLod::Mid => stats.mid_mesh_count += 1,
+                        ChunkLod::Far => stats.far_mesh_count += 1,
+                        ChunkLod::Ultra => stats.ultra_mesh_count += 1,
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+
         let chunk_snapshot_budget = mesh_budget.max(1);
         let mut snapshot_coords = self.pop_priority_dirty_chunks(
             chunk_snapshot_budget,
@@ -1019,6 +1074,7 @@ impl Renderer {
                     queued_at: Instant::now(),
                     snapshot: snapshot.clone(),
                     greedy: self.settings.greedy_meshing,
+                    urgent: false,
                 });
             };
 
@@ -1152,7 +1208,8 @@ impl Renderer {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, result)| {
-                    matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra).then_some(idx)
+                    (matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra) && !result.urgent)
+                        .then_some(idx)
                 })
                 .collect();
             low_priority_indices.sort_by_key(|idx| self.completed_meshes[*idx].queued_at);
@@ -1203,7 +1260,7 @@ impl Renderer {
 
             let bytes = verts.len() * std::mem::size_of::<Vertex>()
                 + inds.len() * std::mem::size_of::<u32>();
-            if bytes_uploaded + bytes > upload_byte_budget {
+            if !result.urgent && bytes_uploaded + bytes > upload_byte_budget {
                 deferred.push(result);
                 continue;
             }
@@ -1415,6 +1472,8 @@ impl Renderer {
             self.index_arena.free(mesh.index_alloc);
         }
         self.dirty_queues.clear();
+        self.urgent_mesh_queue.clear();
+        self.urgent_mesh_set.clear();
         self.dirty_near_starve_frames = 0;
         self.dirty_far_starve_frames = 0;
         self.dirty_fair_cursor = 0;
@@ -1550,6 +1609,65 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn enqueue_urgent_mesh_chunk(&mut self, coord: ChunkCoord) {
+        if self.urgent_mesh_set.insert(coord) {
+            self.urgent_mesh_queue.push_back(coord);
+        }
+        self.dirty_queues.remove_coord(coord);
+    }
+
+    fn pop_urgent_mesh_jobs(
+        &mut self,
+        store: &ChunkStore,
+        stats: &mut MeshRebuildStats,
+        player_chunk: ChunkCoord,
+        lod_radii: LodRadii,
+    ) -> Vec<MeshJob> {
+        let mut jobs = Vec::new();
+        while let Some(coord) = self.urgent_mesh_queue.pop_front() {
+            self.urgent_mesh_set.remove(&coord);
+
+            let t0 = Instant::now();
+            let snapshot =
+                build_chunk_snapshot(store, coord, self.settings.unknown_neighbor_policy);
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            stats.total_ms += ms;
+            if ms > stats.max_ms {
+                stats.max_ms = ms;
+            }
+
+            let prev = self.lod_selection.get(&coord).copied();
+            let primary_lod = select_lod(coord, player_chunk, lod_radii, prev);
+            let fallback_lod =
+                fallback_lod_near_threshold(coord, player_chunk, lod_radii, primary_lod);
+            let version = store.chunk_voxel_version(coord);
+            let queued_at = Instant::now();
+            jobs.push(MeshJob {
+                coord,
+                lod: primary_lod,
+                version,
+                queued_at,
+                snapshot: snapshot.clone(),
+                greedy: self.settings.greedy_meshing,
+                urgent: true,
+            });
+            if let Some(lod) = fallback_lod {
+                jobs.push(MeshJob {
+                    coord,
+                    lod,
+                    version,
+                    queued_at,
+                    snapshot: snapshot.clone(),
+                    greedy: self.settings.greedy_meshing,
+                    urgent: true,
+                });
+            }
+
+            self.dirty_queues.remove_coord(coord);
+        }
+        jobs
+    }
+
     fn classify_dirty_tier(
         coord: ChunkCoord,
         player_chunk: ChunkCoord,
@@ -1574,6 +1692,9 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
+        if self.urgent_mesh_set.contains(&coord) {
+            return;
+        }
         let tier = Self::classify_dirty_tier(coord, player_chunk, chunk_priority_scores);
         self.dirty_queues.queue_coord(coord, tier);
     }
