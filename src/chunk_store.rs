@@ -328,6 +328,7 @@ pub enum NeighborDirtyPolicy {
 
 pub struct ChunkStore {
     chunks: HashMap<ChunkCoord, Chunk>,
+    chunk_voxel_versions: HashMap<ChunkCoord, u64>,
     dirty_chunks: HashSet<ChunkCoord>,
     urgent_dirty_chunks: HashSet<ChunkCoord>,
     modified_chunks: HashSet<ChunkCoord>,
@@ -341,6 +342,7 @@ impl ChunkStore {
     pub fn new() -> Self {
         Self {
             chunks: HashMap::new(),
+            chunk_voxel_versions: HashMap::new(),
             dirty_chunks: HashSet::new(),
             urgent_dirty_chunks: HashSet::new(),
             modified_chunks: HashSet::new(),
@@ -382,6 +384,8 @@ impl ChunkStore {
             return;
         }
         chunk.set(x, y, z, material);
+        let version = self.chunk_voxel_versions.entry(chunk_coord).or_insert(0);
+        *version = version.saturating_add(1);
         self.sim_dirty_voxels.push(coord);
         self.dirty_chunks.insert(chunk_coord);
         self.modified_chunks.insert(chunk_coord);
@@ -463,6 +467,10 @@ impl ChunkStore {
         self.get_chunk(coord)
             .map(Chunk::face_non_empty_mask)
             .unwrap_or(0)
+    }
+
+    pub fn chunk_voxel_version(&self, coord: ChunkCoord) -> u64 {
+        self.chunk_voxel_versions.get(&coord).copied().unwrap_or(0)
     }
 
     pub fn chunk_border_strips(&self, coord: ChunkCoord) -> ChunkBorderStrips {
@@ -547,6 +555,8 @@ impl ChunkStore {
         let new_face_mask = chunk.face_non_empty_mask();
         let old_face_mask = self.chunks.get(&coord).map(Chunk::face_non_empty_mask);
         self.chunks.insert(coord, chunk);
+        let version = self.chunk_voxel_versions.entry(coord).or_insert(0);
+        *version = version.saturating_add(1);
         self.unmeshed_chunks.insert(coord);
         self.modified_chunks.remove(&coord);
 
@@ -577,6 +587,7 @@ impl ChunkStore {
             self.dirty_chunks.remove(&coord);
             self.urgent_dirty_chunks.remove(&coord);
             self.unmeshed_chunks.remove(&coord);
+            self.chunk_voxel_versions.remove(&coord);
             self.deferred_neighbor_dirty_on_mesh.remove(&coord);
             return removed.map(|chunk| (chunk, was_modified));
         }
@@ -585,6 +596,7 @@ impl ChunkStore {
 
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.chunk_voxel_versions.clear();
         self.dirty_chunks.clear();
         self.urgent_dirty_chunks.clear();
         self.modified_chunks.clear();
@@ -785,6 +797,23 @@ mod tests {
         let dirty = store.take_sim_dirty_voxels();
         assert_eq!(dirty, vec![v]);
         assert!(store.take_sim_dirty_voxels().is_empty());
+    }
+
+    #[test]
+    fn chunk_voxel_version_increments_on_voxel_edits() {
+        let mut store = ChunkStore::new();
+        let chunk = ChunkCoord { x: 0, y: 0, z: 0 };
+        let v = VoxelCoord { x: 1, y: 1, z: 1 };
+
+        assert_eq!(store.chunk_voxel_version(chunk), 0);
+        store.set_voxel(v, 4);
+        assert_eq!(store.chunk_voxel_version(chunk), 1);
+
+        store.set_voxel(v, 4);
+        assert_eq!(store.chunk_voxel_version(chunk), 1);
+
+        store.set_voxel(v, 5);
+        assert_eq!(store.chunk_voxel_version(chunk), 2);
     }
 
     #[test]
