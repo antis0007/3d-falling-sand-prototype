@@ -1155,8 +1155,8 @@ impl Renderer {
                             &wgpu::util::BufferInitDescriptor {
                                 label: Some("store chunk indirect"),
                                 contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
-                                    index_count: indirect.vertex_count,
-                                    instance_count: 1,
+                                    index_count: indirect.index_count,
+                                    instance_count: indirect.instance_count.max(1),
                                     first_index: 0,
                                     base_vertex: 0,
                                     first_instance: 0,

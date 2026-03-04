@@ -15,7 +15,7 @@ struct FrameParams {
 };
 
 struct DrawIndirectArgs {
-    vertex_count: atomic<u32>,
+    index_count: atomic<u32>,
     instance_count: u32,
     first_vertex: u32,
     first_instance: u32,
@@ -64,7 +64,7 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let params = frame_params[0u];
     if (i == 0u) {
-        atomicStore(&page_indirect[params.page_index].vertex_count, 0u);
+        atomicStore(&page_indirect[params.page_index].index_count, 0u);
         page_indirect[params.page_index].instance_count = 1u;
         page_indirect[params.page_index].first_vertex = 0u;
         page_indirect[params.page_index].first_instance = 0u;
@@ -85,7 +85,7 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) { faces = faces + 1u; }
     }
     if (faces > 0u) {
-        atomicAdd(&page_indirect[params.page_index].vertex_count, faces * 6u);
+        atomicAdd(&page_indirect[params.page_index].index_count, faces * 6u);
         atomicAdd(&diagnostics[0u], faces);
     }
 

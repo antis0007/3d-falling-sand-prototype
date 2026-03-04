@@ -1085,8 +1085,8 @@ pub async fn run() -> anyhow::Result<()> {
                         renderer.set_origin_voxel(origin_voxel);
                         // Keep resident meshes across recenter events.
                         //
-                        // Chunk meshes are authored in world-space voxel coordinates, and the
-                        // renderer applies origin_voxel as a render-space offset. Clearing the
+                        // Chunk meshes are authored in chunk-local voxel coordinates, and the
+                        // renderer applies chunk origin + origin_voxel in a single render transform. Clearing the
                         // cache here drops all mesh rebuild/version state without re-dirtying
                         // already-resident chunks, which can leave the nearby world invisible.
 

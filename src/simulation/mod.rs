@@ -71,36 +71,12 @@ impl SimulationBackend for CpuCellularBackend {
 pub enum SimulationMode {
     CpuCellular,
     GpuFluid,
-    CpuFallback,
-}
-
-#[derive(Default)]
-pub struct CpuFallbackBackend {
-    cpu: CpuCellularBackend,
-}
-
-impl SimulationBackend for CpuFallbackBackend {
-    fn step(
-        &mut self,
-        store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
-        center: ChunkCoord,
-        rng: &mut Rng,
-        metadata: SimulationStepMetadata,
-    ) -> SimulationStepStats {
-        self.cpu.step(store, region, center, rng, metadata)
-    }
-
-    fn queue_place_edit(&mut self, coord: VoxelCoord, material_id: u16) {
-        self.cpu.queue_place_edit(coord, material_id);
-    }
 }
 
 #[derive(Default)]
 pub struct SimulationRuntime {
     cpu: CpuCellularBackend,
     gpu: GpuFluidBackend,
-    fallback: CpuFallbackBackend,
     active_emitter_chunks: HashSet<ChunkCoord>,
 }
 
@@ -112,7 +88,6 @@ impl SimulationRuntime {
         // in a single backend and appear as frozen particles.
         self.cpu.queue_place_edit(coord, material_id);
         self.gpu.queue_place_edit(coord, material_id);
-        self.fallback.queue_place_edit(coord, material_id);
         let _ = mode;
     }
 
@@ -136,7 +111,6 @@ impl SimulationRuntime {
         match mode {
             SimulationMode::CpuCellular => self.cpu.step(store, region, center, rng, metadata),
             SimulationMode::GpuFluid => self.gpu.step(store, region, center, rng, metadata),
-            SimulationMode::CpuFallback => self.fallback.step(store, region, center, rng, metadata),
         }
     }
 }

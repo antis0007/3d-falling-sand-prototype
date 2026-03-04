@@ -969,28 +969,18 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 job.snapshot.center_voxels.len(),
             )
             .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
-            let mesh_indirect = if indirect.vertex_count == 0 {
-                DrawIndirectArgs {
-                    vertex_count: (job
-                        .snapshot
-                        .center_voxels
-                        .iter()
-                        .filter(|v| **v != EMPTY)
-                        .count() as u32)
-                        .saturating_mul(6),
-                    instance_count: 1,
-                    first_vertex: 0,
-                    first_instance: 0,
-                }
-            } else {
-                indirect
-            };
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
             let snapshot = job
                 .snapshot
                 .with_center_materials(generated_materials.clone());
             let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
                 mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
+            let mesh_indirect = DrawIndirectArgs {
+                index_count: inds.len() as u32,
+                instance_count: indirect.instance_count.max(1),
+                first_vertex: 0,
+                first_instance: 0,
+            };
 
             Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: diagnostics,
@@ -1063,7 +1053,7 @@ fn device_page_params(
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndirectArgs {
-    pub vertex_count: u32,
+    pub index_count: u32,
     pub instance_count: u32,
     pub first_vertex: u32,
     pub first_instance: u32,
@@ -1094,7 +1084,7 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
             verts,
             inds,
             indirect: DrawIndirectArgs {
-                vertex_count: surface,
+                index_count: surface,
                 instance_count: 1,
                 first_vertex: 0,
                 first_instance: 0,
