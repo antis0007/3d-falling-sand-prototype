@@ -1,6 +1,6 @@
 struct Camera {
   vp: mat4x4<f32>,
-  origin_offset: vec3<f32>,
+  world_origin_offset: vec3<f32>,
   _pad: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -22,7 +22,7 @@ fn vs_main(i: VsIn) -> VsOut {
   // Transform path: chunk-local vertex + chunk world origin - floating origin
   // offset, then project with camera VP.
   let world_pos = i.pos + i.chunk_origin_world;
-  let render_pos = world_pos - camera.origin_offset;
+  let render_pos = world_pos - camera.world_origin_offset;
   o.pos = camera.vp * vec4<f32>(render_pos, 1.0);
   o.color = i.color;
   return o;

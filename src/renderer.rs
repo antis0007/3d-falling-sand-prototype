@@ -7,8 +7,9 @@
 //!   (scaled by [`VOXEL_SIZE`]), independent of world placement.
 //! - **Chunk transform ownership:** draw-time code applies world placement via a
 //!   per-instance chunk origin buffer.
-//! - **Floating-origin contract:** `origin_offset` is only for world-to-camera
-//!   conversion and must never be coupled to chunk placement.
+//! - **Floating-origin contract:** renderer APIs accept **world-space camera
+//!   coordinates**. The renderer then derives both world-space culling and
+//!   render-space projection from that one source of truth.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
@@ -79,7 +80,7 @@ impl Vertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     vp: [[f32; 4]; 4],
-    origin_offset: [f32; 3],
+    world_origin_offset: [f32; 3],
     _pad: f32,
 }
 
@@ -204,6 +205,11 @@ struct MeshAllocatorTelemetry {
 }
 
 pub struct Camera {
+    /// Camera position in **world space**.
+    ///
+    /// Renderer APIs (`render_world`, `cull_stats`, `mesh_draw_stats`) expect
+    /// this to be absolute world coordinates. Floating-origin rebasing is
+    /// handled internally by [`Renderer`] using `origin_voxel`.
     pub pos: Vec3,
     pub dir: Vec3,
     pub aspect: f32,
@@ -216,14 +222,14 @@ impl Camera {
         proj * view
     }
 
-    fn view_proj_for_world_origin(&self, origin_voxel: VoxelCoord) -> Mat4 {
+    fn view_proj_rebased_to_origin(&self, origin_voxel: VoxelCoord) -> Mat4 {
         let origin_world = voxel_to_world(origin_voxel);
-        let world_camera = Camera {
-            pos: self.pos + origin_world,
+        let rebased_camera = Camera {
+            pos: self.pos - origin_world,
             dir: self.dir,
             aspect: self.aspect,
         };
-        world_camera.view_proj()
+        rebased_camera.view_proj()
     }
 }
 
@@ -775,7 +781,7 @@ impl Renderer {
             label: Some("cam"),
             contents: bytemuck::bytes_of(&CameraUniform {
                 vp: Mat4::IDENTITY.to_cols_array_2d(),
-                origin_offset: [0.0, 0.0, 0.0],
+                world_origin_offset: [0.0, 0.0, 0.0],
                 _pad: 0.0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -912,8 +918,8 @@ impl Renderer {
         // CPU culling is evaluated in world space to match chunk AABBs.
         // Mesh vertices are chunk-local and become world-space in the shader
         // after applying `chunk_origin_world`.
-        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
-        let world_camera_pos = camera_world_position(camera, self.origin_voxel);
+        let vp_world = camera.view_proj();
+        let world_camera_pos = camera_world_position(camera);
         let mut stats = CullStats::default();
         for (&(coord, lod), mesh) in &self.store_meshes {
             if self
@@ -1449,7 +1455,7 @@ impl Renderer {
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
         // Keep CPU frustum checks in world space; do not pre-apply origin
         // offsets to chunk AABBs here.
-        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
+        let vp_world = camera.view_proj();
         let mut chunks = 0usize;
         let mut inds = 0u64;
         for (&(coord, lod), m) in &self.store_meshes {
@@ -1471,22 +1477,22 @@ impl Renderer {
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
-        let vp_render = camera.view_proj();
-        // World-space culling uses world-space camera/AABBs. Draw still uses
-        // floating-origin subtraction in the shader via `origin_offset`.
-        let vp_world = camera.view_proj_for_world_origin(self.origin_voxel);
-        let world_camera_pos = camera_world_position(camera, self.origin_voxel);
+        let vp_render = camera.view_proj_rebased_to_origin(self.origin_voxel);
+        // World-space culling uses world-space camera/AABBs.
+        // Draw uses rebased camera VP + shader world-origin subtraction.
+        let vp_world = camera.view_proj();
+        let world_camera_pos = camera_world_position(camera);
+        let origin_offset_world = voxel_to_world(self.origin_voxel);
+
+        debug_assert!(camera.pos.is_finite());
+        debug_assert!(origin_offset_world.is_finite());
 
         self.queue.write_buffer(
             &self.cam_buf,
             0,
             bytemuck::bytes_of(&CameraUniform {
                 vp: vp_render.to_cols_array_2d(),
-                origin_offset: [
-                    self.origin_voxel.x as f32 * VOXEL_SIZE,
-                    self.origin_voxel.y as f32 * VOXEL_SIZE,
-                    self.origin_voxel.z as f32 * VOXEL_SIZE,
-                ],
+                world_origin_offset: origin_offset_world.to_array(),
                 _pad: 0.0,
             }),
         );
@@ -1530,7 +1536,6 @@ impl Renderer {
                 continue;
             }
             if debug_visible_logged < DEBUG_VISIBLE_CHUNK_LOG_COUNT {
-                let origin_offset_world = voxel_to_world(self.origin_voxel);
                 let computed_world_origin = voxel_to_world(chunk_to_world_min(coord));
                 let render_translation = mesh.chunk_origin_world - origin_offset_world;
                 log::debug!(
@@ -2456,8 +2461,8 @@ fn fallback_lod_near_threshold(
     }
 }
 
-fn camera_world_position(camera: &Camera, origin_voxel: VoxelCoord) -> Vec3 {
-    camera.pos + voxel_to_world(origin_voxel)
+fn camera_world_position(camera: &Camera) -> Vec3 {
+    camera.pos
 }
 
 fn chunk_visible_in_world_space(
@@ -2750,7 +2755,7 @@ mod tests {
     #[test]
     fn frustum_culls_and_accepts_expected_aabbs() {
         let camera = Camera {
-            pos: Vec3::new(0.0, 0.0, 0.0),
+            pos: origin_world,
             dir: Vec3::new(0.0, 0.0, -1.0),
             aspect: 1.0,
         };
@@ -2771,7 +2776,6 @@ mod tests {
 
     #[test]
     fn culling_visibility_with_zero_origin_is_consistent() {
-        let origin = VoxelCoord { x: 0, y: 0, z: 0 };
         let camera = Camera {
             pos: Vec3::new(0.0, 0.0, 0.0),
             dir: Vec3::new(0.0, 0.0, -1.0),
@@ -2782,8 +2786,8 @@ mod tests {
 
         let world_visible = chunk_visible_in_world_space(
             true,
-            camera.view_proj_for_world_origin(origin),
-            camera_world_position(&camera, origin),
+            camera.view_proj(),
+            camera_world_position(&camera),
             ChunkLod::Far,
             world_min,
             world_max,
@@ -2802,7 +2806,7 @@ mod tests {
         };
         let origin_world = voxel_to_world(origin);
         let camera = Camera {
-            pos: Vec3::new(0.0, 0.0, 0.0),
+            pos: origin_world,
             dir: Vec3::new(0.0, 0.0, -1.0),
             aspect: 1.0,
         };
@@ -2811,8 +2815,8 @@ mod tests {
 
         let world_visible = chunk_visible_in_world_space(
             true,
-            camera.view_proj_for_world_origin(origin),
-            camera_world_position(&camera, origin),
+            camera.view_proj(),
+            camera_world_position(&camera),
             ChunkLod::Ultra,
             world_min,
             world_max,
@@ -2824,15 +2828,10 @@ mod tests {
 
     #[test]
     fn cpu_culling_is_origin_invariant_for_same_world_relationship() {
-        let rebased_camera = Camera {
-            pos: Vec3::new(0.0, 0.0, 0.0),
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
         let world_camera = Camera {
             pos: Vec3::new(1_000_000.0, 0.0, -2_000_000.0),
-            dir: rebased_camera.dir,
-            aspect: rebased_camera.aspect,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
         };
         let origin = VoxelCoord {
             x: (world_camera.pos.x / VOXEL_SIZE) as i32,
@@ -2854,8 +2853,8 @@ mod tests {
         );
         let rebased_world = chunk_visible_in_world_space(
             true,
-            rebased_camera.view_proj_for_world_origin(origin),
-            camera_world_position(&rebased_camera, origin),
+            world_camera.view_proj_rebased_to_origin(origin),
+            camera_world_position(&world_camera),
             ChunkLod::Far,
             world_min,
             world_max,
@@ -2863,6 +2862,33 @@ mod tests {
         );
 
         assert_eq!(baseline_world, rebased_world);
+    }
+
+    #[test]
+    fn rebased_draw_transform_matches_world_space_projection() {
+        let origin = VoxelCoord {
+            x: 4_000_000,
+            y: 1_500,
+            z: -3_250_000,
+        };
+        let world_camera = Camera {
+            pos: voxel_to_world(origin) + Vec3::new(0.75, 1.0, 2.5),
+            dir: Vec3::new(0.0, -0.1, -1.0).normalize(),
+            aspect: 16.0 / 9.0,
+        };
+        let chunk_origin_world = voxel_to_world(VoxelCoord {
+            x: origin.x + 64,
+            y: origin.y + 32,
+            z: origin.z - 96,
+        });
+        let local_vertex = Vec3::new(3.0 * VOXEL_SIZE, 5.0 * VOXEL_SIZE, 2.0 * VOXEL_SIZE);
+        let world_pos = chunk_origin_world + local_vertex;
+
+        let clip_world = world_camera.view_proj() * world_pos.extend(1.0);
+        let clip_rebased = world_camera.view_proj_rebased_to_origin(origin)
+            * (world_pos - voxel_to_world(origin)).extend(1.0);
+
+        assert!(clip_world.abs_diff_eq(clip_rebased, 1e-2));
     }
 
     #[test]
