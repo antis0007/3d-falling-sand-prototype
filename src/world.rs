@@ -42,6 +42,25 @@ impl Default for AreaToolSettings {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct MaterialJetSettings {
+    pub launch_velocity: f32,
+    pub flow_rate: usize,
+    pub spread: f32,
+    pub max_range: f32,
+}
+
+impl Default for MaterialJetSettings {
+    fn default() -> Self {
+        Self {
+            launch_velocity: 28.0,
+            flow_rate: 10,
+            spread: 0.15,
+            max_range: 18.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct BrushSettings {
     pub radius: i32,
     pub shape: BrushShape,
@@ -51,6 +70,7 @@ pub struct BrushSettings {
     pub repeat_interval_s: f32,
     pub minecraft_style_placement: bool,
     pub area_tool: AreaToolSettings,
+    pub material_jet: MaterialJetSettings,
 }
 
 impl Default for BrushSettings {
@@ -61,9 +81,10 @@ impl Default for BrushSettings {
             mode: BrushMode::Place,
             max_distance: 16.0,
             fixed_distance: false,
-            repeat_interval_s: 0.12,
+            repeat_interval_s: 0.02,
             minecraft_style_placement: false,
             area_tool: AreaToolSettings::default(),
+            material_jet: MaterialJetSettings::default(),
         }
     }
 }

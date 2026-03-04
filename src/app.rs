@@ -961,6 +961,7 @@ pub async fn run() -> anyhow::Result<()> {
                                     KeyCode::KeyX => ui.active_tool = ToolKind::BuildersWand,
                                     KeyCode::KeyC => ui.active_tool = ToolKind::DestructorWand,
                                     KeyCode::KeyV => ui.active_tool = ToolKind::AreaTool,
+                                    KeyCode::KeyN => ui.active_tool = ToolKind::MaterialJet,
                                     _ => {}
                                 }
                             }
@@ -1860,8 +1861,21 @@ pub async fn run() -> anyhow::Result<()> {
                         preview_block_list =
                             preview_blocks(&store, &brush, raycast, preview_mode, ui.active_tool);
 
-                        if !gameplay_blocked
-                            && apply_mouse_edit(
+                        if !gameplay_blocked {
+                            if ui.active_tool == ToolKind::MaterialJet {
+                                let _ = apply_material_jet(
+                                    &mut store,
+                                    &brush,
+                                    selected_material(&ui, ui.selected_slot),
+                                    &input,
+                                    &mut edit_runtime,
+                                    now,
+                                    ctrl.look_dir(),
+                                    raycast,
+                                    &mut simulation_runtime,
+                                    if ui.sim_use_gpu_pipeline { SimulationMode::GpuFluid } else { SimulationMode::CpuCellular },
+                                );
+                            } else if apply_mouse_edit(
                                 &mut store,
                                 &brush,
                                 selected_material(&ui, ui.selected_slot),
@@ -1872,9 +1886,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 ui.active_tool,
                                 &mut simulation_runtime,
                                     if ui.sim_use_gpu_pipeline { SimulationMode::GpuFluid } else { SimulationMode::CpuCellular },
-                            )
-                        {
-                            // dirtied by set_voxel
+                            ) {
+                                // dirtied by set_voxel
+                            }
                         }
 
                         let do_step = sim_running && !ui.paused_menu && ui.sim_speed > 0.0;
@@ -2877,6 +2891,9 @@ fn current_action_mode(input: &InputState, raycast: RaycastResult, tool: ToolKin
     if tool == ToolKind::DestructorWand {
         return BrushMode::Erase;
     }
+    if tool == ToolKind::MaterialJet {
+        return BrushMode::Place;
+    }
     if input.rmb {
         BrushMode::Erase
     } else if input.lmb || raycast.hit.is_none() {
@@ -2905,6 +2922,9 @@ fn preview_blocks(
 ) -> Vec<[i32; 3]> {
     if tool == ToolKind::AreaTool {
         return preview_area_tool_blocks(brush, raycast, mode);
+    }
+    if tool == ToolKind::MaterialJet {
+        return vec![raycast.place];
     }
     if (tool == ToolKind::BuildersWand || tool == ToolKind::DestructorWand) && brush.radius == 0 {
         return preview_wand_blocks(store, raycast, tool, 256);
@@ -3003,11 +3023,91 @@ fn apply_mouse_edit(
             z: p[2],
         };
         store.set_voxel(coord, target);
+        let (chunk_coord, _) = voxel_to_chunk(coord);
+        store.mark_dirty_urgent(chunk_coord);
         simulation_runtime.queue_place_edit(sim_mode, coord, target);
     }
     edit_runtime.last_edit_at = Some(now);
     edit_runtime.last_edit_mode = Some(mode);
     true
+}
+
+fn apply_material_jet(
+    store: &mut ChunkStore,
+    brush: &BrushSettings,
+    mat: u16,
+    input: &InputState,
+    edit_runtime: &mut EditRuntimeState,
+    now: Instant,
+    look_dir: Vec3,
+    raycast: RaycastResult,
+    simulation_runtime: &mut SimulationRuntime,
+    sim_mode: SimulationMode,
+) -> bool {
+    if !input.lmb {
+        edit_runtime.last_edit_mode = None;
+        return false;
+    }
+
+    let repeat_interval_s = brush.repeat_interval_s.max(0.0);
+    let repeat_ready = edit_runtime.last_edit_mode != Some(BrushMode::Place)
+        || edit_runtime
+            .last_edit_at
+            .map(|last| (now - last).as_secs_f32() >= repeat_interval_s)
+            .unwrap_or(true);
+    if !repeat_ready {
+        return false;
+    }
+
+    let cfg = brush.material_jet;
+    let dir = look_dir.normalize_or_zero();
+    if dir.length_squared() <= f32::EPSILON {
+        return false;
+    }
+    let origin = Vec3::new(
+        raycast.place[0] as f32,
+        raycast.place[1] as f32,
+        raycast.place[2] as f32,
+    );
+    let right = dir.cross(Vec3::Y).normalize_or_zero();
+    let up = right.cross(dir).normalize_or_zero();
+    let mut placed = false;
+    let speed_scale = (cfg.launch_velocity / 20.0).clamp(0.25, 4.0);
+    for i in 0..cfg.flow_rate {
+        let fi = i as f32;
+        let jitter =
+            ((fi * 12.9898 + now.elapsed().as_secs_f32() * 17.13).sin() * 43758.5453).fract();
+        let angle = fi * 2.3999632;
+        let radius = cfg.spread * jitter;
+        let spread = right * angle.cos() * radius + up * angle.sin() * radius;
+        let travel = (1.0 + fi * 0.25) * speed_scale;
+        let p = origin + (dir + spread).normalize_or_zero() * travel;
+        let target = VoxelCoord {
+            x: p.x.round() as i32,
+            y: p.y.round() as i32,
+            z: p.z.round() as i32,
+        };
+        let dist = Vec3::new(
+            (target.x - raycast.place[0]) as f32,
+            (target.y - raycast.place[1]) as f32,
+            (target.z - raycast.place[2]) as f32,
+        )
+        .length();
+        if dist > cfg.max_range {
+            continue;
+        }
+        store.set_voxel(target, mat);
+        let (chunk_coord, _) = voxel_to_chunk(target);
+        store.mark_dirty_urgent(chunk_coord);
+        simulation_runtime.queue_place_edit(sim_mode, target, mat);
+        placed = true;
+    }
+
+    if placed {
+        edit_runtime.last_edit_at = Some(now);
+        edit_runtime.last_edit_mode = Some(BrushMode::Place);
+    }
+    placed
 }
 
 fn target_for_edit(

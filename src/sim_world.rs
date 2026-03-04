@@ -111,6 +111,17 @@ impl ChunkFrontierState {
         self.frontier.push(idx);
     }
 
+    fn carry_local(&mut self, idx: u16) {
+        let idx_usize = idx as usize;
+        let word = idx_usize / 64;
+        let bit = 1u64 << (idx_usize % 64);
+        if (self.active_bits[word] & bit) != 0 {
+            return;
+        }
+        self.active_bits[word] |= bit;
+        self.carry_frontier.push(idx);
+    }
+
     fn clear_active(&mut self, idx: u16) {
         let idx_usize = idx as usize;
         let word = idx_usize / 64;
@@ -226,6 +237,7 @@ impl SimWorld {
                 let mut moved_any = false;
                 let mut processed_matching_phase = false;
                 let mut encountered_other_phase = false;
+                let mut deferred_for_other_phase = false;
 
                 let frontier_len = state.frontier.len();
                 let elapsed_ms = step_start.elapsed().as_secs_f32() * 1000.0;
@@ -286,6 +298,7 @@ impl SimWorld {
                     }
                     if !phase_matches_class(mat.phase, metadata.phase_class) {
                         encountered_other_phase = true;
+                        state.carry_local(idx);
                         continue;
                     }
                     processed_matching_phase = true;
@@ -352,12 +365,32 @@ impl SimWorld {
                             continue;
                         }
 
-                        state.pending_writes.push((source, EMPTY));
+                        let displaced_mat = if target_id != EMPTY { target_id } else { EMPTY };
+                        state.pending_writes.push((source, displaced_mat));
                         state.pending_writes.push((destination, mat_id));
                         state.mark_source_moved(idx);
                         moved_any = true;
                         state.activation_centers.push(source);
                         state.activation_centers.push(destination);
+                        if displaced_mat != EMPTY {
+                            // Kick nearby fluid cells so heavy impacts generate visible ripples/waves
+                            // rather than quickly settling into dormancy.
+                            state
+                                .activation_centers
+                                .push(offset_voxel(destination, -1, 0, 0));
+                            state
+                                .activation_centers
+                                .push(offset_voxel(destination, 1, 0, 0));
+                            state
+                                .activation_centers
+                                .push(offset_voxel(destination, 0, 0, -1));
+                            state
+                                .activation_centers
+                                .push(offset_voxel(destination, 0, 0, 1));
+                            state
+                                .activation_centers
+                                .push(offset_voxel(destination, 0, 1, 0));
+                        }
                         break;
                     }
                 }
@@ -379,12 +412,18 @@ impl SimWorld {
 
                 if !processed_matching_phase && encountered_other_phase {
                     stats.skipped_chunks += 1;
+                    deferred_for_other_phase = true;
                 }
 
                 if moved_any {
                     state.cooldown_ticks = 0;
                     state.wait_ticks = 0;
                     state.recent_activity = state.recent_activity.saturating_add(4);
+                } else if deferred_for_other_phase {
+                    // Keep chunks immediately schedulable when this split pass skipped them,
+                    // so the complementary phase pass can run without perceptible stalls.
+                    state.cooldown_ticks = 0;
+                    state.wait_ticks = 0;
                 } else {
                     state.cooldown_ticks =
                         adaptive_chunk_cooldown(state.recent_activity, frontier_len);
@@ -1347,26 +1386,60 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            store.get_voxel(VoxelCoord {
-                x: top.x,
-                y: top.y - 4,
-                z: top.z
-            }),
-            3
+        let final_a = store
+            .get_chunk(c)
+            .expect("chunk a exists")
+            .iter_raw()
+            .to_vec();
+        let final_b = store_ref
+            .get_chunk(c)
+            .expect("chunk b exists")
+            .iter_raw()
+            .to_vec();
+        assert_eq!(final_a, final_b);
+    }
+
+    #[test]
+    fn split_phase_passes_do_not_apply_cooldown_stall() {
+        let mut store = ChunkStore::new();
+        let c = ChunkCoord { x: 0, y: 0, z: 0 };
+        let base = chunk_to_world_min(c);
+        let p = VoxelCoord {
+            x: base.x + 4,
+            y: base.y + 8,
+            z: base.z + 4,
+        };
+        store.set_voxel(p, 3);
+
+        let region = HashSet::from([c]);
+        let mut sim = SimWorld::default();
+        sim.notify_voxel_edit(p);
+        let mut rng = XorShift32::new(99);
+
+        let non_gas = sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata {
+                phase_class: Some(SimulationPhaseClass::SolidsLiquidsPowders),
+                ..SimulationStepMetadata::default()
+            },
         );
-        assert_eq!(
-            store.get_voxel(VoxelCoord {
-                x: top.x,
-                y: top.y - 4,
-                z: top.z
-            }),
-            store_ref.get_voxel(VoxelCoord {
-                x: top.x,
-                y: top.y - 4,
-                z: top.z
-            })
+        assert!(non_gas.processed_frontier_voxels > 0);
+
+        let gas = sim.step_region(
+            &mut store,
+            &region,
+            c,
+            &mut rng,
+            SimulationStepMetadata {
+                phase_class: Some(SimulationPhaseClass::Gas),
+                ..SimulationStepMetadata::default()
+            },
         );
+
+        assert!(gas.processed_frontier_voxels > 0);
     }
 
     #[test]

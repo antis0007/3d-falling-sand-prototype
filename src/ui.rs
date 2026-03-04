@@ -110,14 +110,16 @@ pub enum ToolKind {
     BuildersWand,
     DestructorWand,
     AreaTool,
+    MaterialJet,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 4] = [
+    pub const ALL: [ToolKind; 5] = [
         ToolKind::Brush,
         ToolKind::BuildersWand,
         ToolKind::DestructorWand,
         ToolKind::AreaTool,
+        ToolKind::MaterialJet,
     ];
 
     pub fn label(self) -> &'static str {
@@ -126,6 +128,7 @@ impl ToolKind {
             ToolKind::BuildersWand => "Builder's Wand",
             ToolKind::DestructorWand => "Destructor Wand",
             ToolKind::AreaTool => "Area Tool",
+            ToolKind::MaterialJet => "Material Jet",
         }
     }
 }
@@ -927,7 +930,7 @@ pub fn draw(
             ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
             ui.add(egui::Slider::new(&mut brush.max_distance, 2.0..=48.0).text("Distance"));
             ui.add(
-                egui::Slider::new(&mut brush.repeat_interval_s, 0.01..=0.5).text("Hold repeat (s)"),
+                egui::Slider::new(&mut brush.repeat_interval_s, 0.0..=0.5).text("Hold repeat (s)"),
             );
             ui.checkbox(
                 &mut brush.minecraft_style_placement,
@@ -954,7 +957,7 @@ pub fn draw(
                         AreaFootprintShape::Square,
                         "Square",
                     );
-                } else {
+                } else if ui_state.active_tool != ToolKind::MaterialJet {
                     ui.selectable_value(&mut brush.shape, BrushShape::Sphere, "Sphere");
                     ui.selectable_value(&mut brush.shape, BrushShape::Cube, "Cube");
                     ui.selectable_value(&mut brush.shape, BrushShape::Torus, "Torus");
@@ -970,6 +973,22 @@ pub fn draw(
             if ui_state.active_tool == ToolKind::AreaTool {
                 ui.add(egui::Slider::new(&mut brush.area_tool.radius, 0..=12).text("Radius"));
                 ui.add(egui::Slider::new(&mut brush.area_tool.thickness, 1..=4).text("Thickness"));
+            } else if ui_state.active_tool == ToolKind::MaterialJet {
+                ui.add(
+                    egui::Slider::new(&mut brush.material_jet.launch_velocity, 4.0..=80.0)
+                        .text("Launch velocity"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut brush.material_jet.flow_rate, 1..=64).text("Flow rate"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut brush.material_jet.spread, 0.0..=0.75).text("Spread"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut brush.material_jet.max_range, 2.0..=48.0)
+                        .text("Jet range"),
+                );
+                ui.label("Hold LMB to emit material stream");
             } else {
                 ui.add(egui::Slider::new(&mut brush.radius, 0..=8).text("Radius"));
             }
@@ -1611,6 +1630,7 @@ pub struct ToolTextures {
     pub builders_wand: ToolTexture,
     pub destructor_wand: ToolTexture,
     pub area_tool: ToolTexture,
+    pub material_jet: ToolTexture,
 }
 
 impl ToolTextures {
@@ -1620,6 +1640,7 @@ impl ToolTextures {
             ToolKind::BuildersWand => &self.builders_wand,
             ToolKind::DestructorWand => &self.destructor_wand,
             ToolKind::AreaTool => &self.area_tool,
+            ToolKind::MaterialJet => &self.material_jet,
         }
     }
 }
@@ -1654,11 +1675,19 @@ pub fn load_tool_textures(ctx: &egui::Context, dir: impl AsRef<Path>) -> ToolTex
         "tool_area_tool",
         fallback_tool_texture([240, 220, 120, 255]),
     );
+    let material_jet = load_single_tool_texture(
+        ctx,
+        &dir,
+        "material_jet",
+        "tool_material_jet",
+        fallback_tool_texture([120, 210, 255, 255]),
+    );
     ToolTextures {
         brush,
         builders_wand,
         destructor_wand,
         area_tool,
+        material_jet,
     }
 }
 
