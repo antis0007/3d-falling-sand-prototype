@@ -12,7 +12,7 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
-    cpu_generate_material_field, rebuilt_snapshot_from_materials, GpuComputeRuntime,
+    cpu_generate_material_field, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
     MeshPipelineBackend,
 };
 use crate::sim::{material, Phase};
@@ -266,6 +266,9 @@ pub struct MeshRebuildStats {
     pub mid_mesh_count: usize,
     pub far_mesh_count: usize,
     pub ultra_mesh_count: usize,
+    pub gpu_mesh_jobs: usize,
+    pub gpu_dispatch_ms: f32,
+    pub gpu_readback_bytes: u64,
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -338,11 +341,59 @@ struct MeshResult {
     lod: ChunkLod,
     version: u64,
     queued_at: Instant,
-    verts: Vec<Vertex>,
-    inds: Vec<u32>,
-    aabb_min: Vec3,
-    aabb_max: Vec3,
-    chunk_origin_world: Vec3,
+    artifact: ChunkMeshArtifact,
+}
+
+pub(crate) enum ChunkMeshArtifact {
+    Cpu {
+        verts: Vec<Vertex>,
+        inds: Vec<u32>,
+        indirect: DrawIndirectArgs,
+        aabb_min: Vec3,
+        aabb_max: Vec3,
+        chunk_origin_world: Vec3,
+    },
+    Gpu {
+        verts: Vec<Vertex>,
+        inds: Vec<u32>,
+        indirect: DrawIndirectArgs,
+        aabb_min: Vec3,
+        aabb_max: Vec3,
+        chunk_origin_world: Vec3,
+        dispatch_ms: f32,
+        readback_bytes: u64,
+    },
+}
+
+impl ChunkMeshArtifact {
+    pub(crate) fn geometry(&self) -> (&[Vertex], &[u32], DrawIndirectArgs, Vec3, Vec3, Vec3) {
+        match self {
+            Self::Cpu {
+                verts,
+                inds,
+                indirect,
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+            }
+            | Self::Gpu {
+                verts,
+                inds,
+                indirect,
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+                ..
+            } => (
+                verts,
+                inds,
+                *indirect,
+                *aabb_min,
+                *aabb_max,
+                *chunk_origin_world,
+            ),
+        }
+    }
 }
 
 struct BackgroundMeshQueue {
@@ -371,30 +422,20 @@ impl BackgroundMeshQueue {
                         break;
                     };
 
-                    let material_output = match mesh_backend {
-                        MeshPipelineBackend::Cpu => cpu_generate_material_field(&job),
+                    let artifact = match mesh_backend {
+                        MeshPipelineBackend::Cpu => cpu_generate_material_field(&job).mesh_artifact,
                         #[cfg(feature = "gpu-compute")]
-                        MeshPipelineBackend::Gpu => {
-                            crate::gpu_compute::run_chunk_job_on_worker(&job)
-                                .unwrap_or_else(|_| cpu_generate_material_field(&job))
-                        }
+                        MeshPipelineBackend::Gpu => run_chunk_job_on_worker(&job)
+                            .map(|output| output.mesh_artifact)
+                            .unwrap_or_else(|_| cpu_generate_material_field(&job).mesh_artifact),
                     };
-
-                    let snapshot =
-                        rebuilt_snapshot_from_materials(&job, material_output.generated_materials);
-                    let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
-                        mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
                     if worker_tx
                         .send(MeshResult {
                             coord: job.coord,
                             lod: job.lod,
                             version: job.version,
                             queued_at: job.queued_at,
-                            verts,
-                            inds,
-                            aabb_min,
-                            aabb_max,
-                            chunk_origin_world,
+                            artifact,
                         })
                         .is_err()
                     {
@@ -912,28 +953,41 @@ impl Renderer {
                 self.meshed_versions.insert(result.coord, result.version);
             }
 
-            let bytes = result.verts.len() * std::mem::size_of::<Vertex>()
-                + result.inds.len() * std::mem::size_of::<u32>();
+            if let ChunkMeshArtifact::Gpu {
+                dispatch_ms,
+                readback_bytes,
+                ..
+            } = &result.artifact
+            {
+                stats.gpu_mesh_jobs += 1;
+                stats.gpu_dispatch_ms += *dispatch_ms;
+                stats.gpu_readback_bytes += *readback_bytes;
+            }
+
+            let (verts, inds, indirect, aabb_min, aabb_max, chunk_origin_world) =
+                result.artifact.geometry();
+            let bytes = verts.len() * std::mem::size_of::<Vertex>()
+                + inds.len() * std::mem::size_of::<u32>();
             if bytes_uploaded + bytes > upload_byte_budget {
                 deferred.push(result);
                 continue;
             }
 
-            if result.inds.is_empty() {
+            if inds.is_empty() {
                 self.store_meshes.remove(&(result.coord, result.lod));
             } else {
                 let vb = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("store chunk vb"),
-                        contents: bytemuck::cast_slice(&result.verts),
+                        contents: bytemuck::cast_slice(verts),
                         usage: wgpu::BufferUsages::VERTEX,
                     });
                 let ib = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("store chunk ib"),
-                        contents: bytemuck::cast_slice(&result.inds),
+                        contents: bytemuck::cast_slice(inds),
                         usage: wgpu::BufferUsages::INDEX,
                     });
                 let chunk_origin_buf =
@@ -941,7 +995,7 @@ impl Renderer {
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("store chunk origin instance"),
                             contents: bytemuck::bytes_of(&ChunkOriginInstance {
-                                chunk_origin_world: result.chunk_origin_world.to_array(),
+                                chunk_origin_world: chunk_origin_world.to_array(),
                                 _pad: 0.0,
                             }),
                             usage: wgpu::BufferUsages::VERTEX,
@@ -972,7 +1026,7 @@ impl Renderer {
                             &wgpu::util::BufferInitDescriptor {
                                 label: Some("store chunk indirect"),
                                 contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
-                                    index_count: result.inds.len() as u32,
+                                    index_count: indirect.vertex_count,
                                     instance_count: 1,
                                     first_index: 0,
                                     base_vertex: 0,
@@ -981,13 +1035,13 @@ impl Renderer {
                                 usage: wgpu::BufferUsages::INDIRECT,
                             },
                         ),
-                        index_count: result.inds.len() as u32,
+                        index_count: inds.len() as u32,
                         debug_aabb_vb,
                         debug_aabb_ib,
                         debug_aabb_index_count: debug_aabb_inds.len() as u32,
-                        world_aabb_min: result.aabb_min,
-                        world_aabb_max: result.aabb_max,
-                        chunk_origin_world: result.chunk_origin_world,
+                        world_aabb_min: aabb_min,
+                        world_aabb_max: aabb_max,
+                        chunk_origin_world,
                     },
                 );
             }
@@ -1324,7 +1378,7 @@ fn synthesize_missing_neighbor_borders(
     }
 }
 
-fn mesh_chunk_snapshot(
+pub(crate) fn mesh_chunk_snapshot(
     coord: ChunkCoord,
     snapshot: &ChunkSnapshot,
     lod: ChunkLod,
