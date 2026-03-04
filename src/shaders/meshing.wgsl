@@ -36,9 +36,10 @@ struct ChunkMeshMeta {
 };
 
 struct DrawIndexedIndirectArgs {
-    vertex_count: u32,
+    index_count: u32,
     instance_count: u32,
-    first_vertex: u32,
+    first_index: u32,
+    base_vertex: i32,
     first_instance: u32,
 };
 
@@ -143,9 +144,10 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         page_indirect[page].instance_count = 1u;
     }
 
-    draw_indirect_buffer[page].vertex_count = atomicLoad(&vertex_counter[page]);
+    draw_indirect_buffer[page].index_count = atomicLoad(&index_counter[page]);
     draw_indirect_buffer[page].instance_count = 1u;
-    draw_indirect_buffer[page].first_vertex = 0u;
+    draw_indirect_buffer[page].first_index = 0u;
+    draw_indirect_buffer[page].base_vertex = 0;
     draw_indirect_buffer[page].first_instance = 0u;
 
     atomicAdd(&page_indirect[page].index_count, 6u);
