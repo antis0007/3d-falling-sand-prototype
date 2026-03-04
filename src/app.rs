@@ -2070,6 +2070,10 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.gpu_compute_chunks_completed = gpu_compute.chunks_completed;
                         ui.profiler.gpu_compute_chunks_per_sec = gpu_compute.chunks_per_sec;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
+                        ui.profiler.dirty_urgent_depth = mesh_stats.dirty_urgent_depth;
+                        ui.profiler.dirty_near_depth = mesh_stats.dirty_near_depth;
+                        ui.profiler.dirty_normal_depth = mesh_stats.dirty_normal_depth;
+                        ui.profiler.dirty_far_depth = mesh_stats.dirty_far_depth;
                         ui.profiler.near_radius = effective_stream_tuning.near_radius_xz;
                         ui.profiler.mid_radius = effective_stream_tuning.mid_radius_xz;
                         ui.profiler.far_radius = effective_stream_tuning.far_radius_xz;
@@ -2086,6 +2090,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.auto_tune_dirty_pressure = auto_tune.dirty_pressure;
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
+                        ui.profiler.dirty_queue_drop_count = mesh_stats.dirty_queue_drop_count;
                         ui.profiler.gen_paused_by_worker_queue = gen_dispatch_paused;
                         ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
                         ui.profiler.near_radius = stream_tuning.near_radius_xz;

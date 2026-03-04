@@ -208,8 +208,10 @@ pub struct Renderer {
 
     store_meshes: HashMap<(ChunkCoord, ChunkLod), ChunkMesh>,
 
-    pending_dirty: VecDeque<ChunkCoord>,
-    pending_dirty_set: HashSet<ChunkCoord>,
+    dirty_queues: DirtyChunkQueues,
+    dirty_near_starve_frames: u32,
+    dirty_far_starve_frames: u32,
+    dirty_fair_cursor: u8,
     mesh_versions: HashMap<(ChunkCoord, ChunkLod), u64>,
     meshed_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
@@ -262,6 +264,11 @@ pub struct MeshRebuildStats {
     pub stale_drop_count: usize,
     pub age_drop_count: usize,
     pub pressure_drop_count: usize,
+    pub dirty_queue_drop_count: usize,
+    pub dirty_urgent_depth: usize,
+    pub dirty_near_depth: usize,
+    pub dirty_normal_depth: usize,
+    pub dirty_far_depth: usize,
     pub near_mesh_count: usize,
     pub mid_mesh_count: usize,
     pub far_mesh_count: usize,
@@ -272,6 +279,130 @@ pub struct MeshRebuildStats {
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
+const DIRTY_NEAR_STARVE_LIMIT_FRAMES: u32 = 8;
+const DIRTY_FAR_STARVE_LIMIT_FRAMES: u32 = 20;
+const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum DirtyTier {
+    Urgent,
+    Near,
+    Normal,
+    Far,
+}
+
+impl DirtyTier {
+    fn priority_rank(self) -> u8 {
+        match self {
+            Self::Urgent => 4,
+            Self::Near => 3,
+            Self::Normal => 2,
+            Self::Far => 1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DirtyChunkQueues {
+    urgent: VecDeque<ChunkCoord>,
+    near: VecDeque<ChunkCoord>,
+    normal: VecDeque<ChunkCoord>,
+    far: VecDeque<ChunkCoord>,
+    tiers: HashMap<ChunkCoord, DirtyTier>,
+    urgent_count: usize,
+    near_count: usize,
+    normal_count: usize,
+    far_count: usize,
+}
+
+impl DirtyChunkQueues {
+    fn total_len(&self) -> usize {
+        self.tiers.len()
+    }
+
+    fn tier_len(&self, tier: DirtyTier) -> usize {
+        match tier {
+            DirtyTier::Urgent => self.urgent_count,
+            DirtyTier::Near => self.near_count,
+            DirtyTier::Normal => self.normal_count,
+            DirtyTier::Far => self.far_count,
+        }
+    }
+
+    fn incr_tier(&mut self, tier: DirtyTier) {
+        match tier {
+            DirtyTier::Urgent => self.urgent_count += 1,
+            DirtyTier::Near => self.near_count += 1,
+            DirtyTier::Normal => self.normal_count += 1,
+            DirtyTier::Far => self.far_count += 1,
+        }
+    }
+
+    fn decr_tier(&mut self, tier: DirtyTier) {
+        match tier {
+            DirtyTier::Urgent => self.urgent_count = self.urgent_count.saturating_sub(1),
+            DirtyTier::Near => self.near_count = self.near_count.saturating_sub(1),
+            DirtyTier::Normal => self.normal_count = self.normal_count.saturating_sub(1),
+            DirtyTier::Far => self.far_count = self.far_count.saturating_sub(1),
+        }
+    }
+
+    fn queue_for_mut(&mut self, tier: DirtyTier) -> &mut VecDeque<ChunkCoord> {
+        match tier {
+            DirtyTier::Urgent => &mut self.urgent,
+            DirtyTier::Near => &mut self.near,
+            DirtyTier::Normal => &mut self.normal,
+            DirtyTier::Far => &mut self.far,
+        }
+    }
+
+    fn queue_coord(&mut self, coord: ChunkCoord, tier: DirtyTier) {
+        let old_tier = self.tiers.get(&coord).copied();
+        if let Some(old_tier) = old_tier {
+            if old_tier.priority_rank() >= tier.priority_rank() {
+                return;
+            }
+            self.decr_tier(old_tier);
+        }
+        self.tiers.insert(coord, tier);
+        self.incr_tier(tier);
+        self.queue_for_mut(tier).push_back(coord);
+    }
+
+    fn pop_front_tier(&mut self, tier: DirtyTier) -> Option<ChunkCoord> {
+        loop {
+            let coord = self.queue_for_mut(tier).pop_front()?;
+            if self.tiers.get(&coord).copied() == Some(tier) {
+                self.tiers.remove(&coord);
+                self.decr_tier(tier);
+                return Some(coord);
+            }
+        }
+    }
+
+    fn pop_back_tier(&mut self, tier: DirtyTier) -> Option<ChunkCoord> {
+        loop {
+            let coord = self.queue_for_mut(tier).pop_back()?;
+            if self.tiers.get(&coord).copied() == Some(tier) {
+                self.tiers.remove(&coord);
+                self.decr_tier(tier);
+                return Some(coord);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.urgent.clear();
+        self.near.clear();
+        self.normal.clear();
+        self.far.clear();
+        self.tiers.clear();
+        self.urgent_count = 0;
+        self.near_count = 0;
+        self.normal_count = 0;
+        self.far_count = 0;
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ChunkSnapshot {
@@ -615,8 +746,10 @@ impl Renderer {
             depth_texture,
             depth_view,
             store_meshes: HashMap::new(),
-            pending_dirty: VecDeque::new(),
-            pending_dirty_set: HashSet::new(),
+            dirty_queues: DirtyChunkQueues::default(),
+            dirty_near_starve_frames: 0,
+            dirty_far_starve_frames: 0,
+            dirty_fair_cursor: 0,
             mesh_versions: HashMap::new(),
             meshed_versions: HashMap::new(),
             lod_selection: HashMap::new(),
@@ -704,9 +837,7 @@ impl Renderer {
     ) -> MeshRebuildStats {
         let lod_radii = lod_radii.normalized();
         for coord in store.take_dirty_chunks() {
-            if self.pending_dirty_set.insert(coord) {
-                self.pending_dirty.push_back(coord);
-            }
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
             for lod in [
                 ChunkLod::Near,
                 ChunkLod::Mid,
@@ -717,9 +848,10 @@ impl Renderer {
                 *version = version.saturating_add(1);
             }
         }
-        self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
-
         let mut stats = MeshRebuildStats::default();
+        stats.dirty_queue_drop_count +=
+            self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
+
         let mut near_jobs = Vec::new();
         let mut mid_jobs = Vec::new();
         let mut far_jobs = Vec::new();
@@ -784,9 +916,7 @@ impl Renderer {
         }
 
         for coord in deferred_snapshot_coords {
-            if self.pending_dirty_set.insert(coord) {
-                self.pending_dirty.push_back(coord);
-            }
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
 
         let job_priority = |coord: ChunkCoord| {
@@ -799,7 +929,7 @@ impl Renderer {
         near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
 
-        let far_pressure = self.pending_dirty.len() + self.mesh_queue.inflight;
+        let far_pressure = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         let far_scale = if far_pressure > 4096 {
             4
         } else if far_pressure > 1024 {
@@ -873,11 +1003,10 @@ impl Renderer {
             .chain(far_jobs)
             .chain(ultra_jobs)
         {
-            if self.pending_dirty_set.insert(job.coord) {
-                self.pending_dirty.push_back(job.coord);
-            }
+            self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
         }
-        self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
+        stats.dirty_queue_drop_count +=
+            self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
         while let Ok(result) = self.mesh_queue.try_recv() {
             self.completed_meshes.push(result);
@@ -1059,8 +1188,12 @@ impl Renderer {
         } else {
             0.0
         };
-        stats.dirty_backlog = self.pending_dirty.len();
-        stats.meshing_queue_depth = self.pending_dirty.len() + self.mesh_queue.inflight;
+        stats.dirty_backlog = self.dirty_queues.total_len();
+        stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
+        stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
+        stats.dirty_normal_depth = self.dirty_queues.tier_len(DirtyTier::Normal);
+        stats.dirty_far_depth = self.dirty_queues.tier_len(DirtyTier::Far);
+        stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = self.completed_meshes.len();
 
         let mut drop_keys = Vec::new();
@@ -1090,8 +1223,10 @@ impl Renderer {
     }
     pub fn clear_mesh_cache(&mut self) {
         self.store_meshes.clear();
-        self.pending_dirty.clear();
-        self.pending_dirty_set.clear();
+        self.dirty_queues.clear();
+        self.dirty_near_starve_frames = 0;
+        self.dirty_far_starve_frames = 0;
+        self.dirty_fair_cursor = 0;
         self.completed_meshes.clear();
         self.mesh_versions.clear();
         self.meshed_versions.clear();
@@ -1214,54 +1349,159 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn classify_dirty_tier(
+        coord: ChunkCoord,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) -> DirtyTier {
+        let distance = chunk_chebyshev_dist(player_chunk, coord);
+        let priority = dirty_coord_priority(coord, player_chunk, chunk_priority_scores);
+        if distance <= 1 || priority >= DIRTY_VISIBLE_URGENT_SCORE {
+            DirtyTier::Urgent
+        } else if distance <= 4 {
+            DirtyTier::Near
+        } else if distance <= 12 {
+            DirtyTier::Normal
+        } else {
+            DirtyTier::Far
+        }
+    }
+
+    fn enqueue_dirty_chunk(
+        &mut self,
+        coord: ChunkCoord,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) {
+        let tier = Self::classify_dirty_tier(coord, player_chunk, chunk_priority_scores);
+        self.dirty_queues.queue_coord(coord, tier);
+    }
+
     fn pop_priority_dirty_chunks(
         &mut self,
         count: usize,
-        player_chunk: ChunkCoord,
-        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+        _player_chunk: ChunkCoord,
+        _chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) -> Vec<ChunkCoord> {
-        let mut pooled = Vec::with_capacity(self.pending_dirty.len());
-        pooled.extend(self.pending_dirty.drain(..));
-        pooled.sort_by(|a, b| {
-            dirty_coord_priority(*a, player_chunk, chunk_priority_scores).total_cmp(
-                &dirty_coord_priority(*b, player_chunk, chunk_priority_scores),
-            )
-        });
+        let mut snapshots = Vec::with_capacity(count);
+        let had_near = self.dirty_queues.tier_len(DirtyTier::Near) > 0;
+        let had_far = self.dirty_queues.tier_len(DirtyTier::Far) > 0;
+        let mut popped_near = false;
+        let mut popped_far = false;
 
-        let keep_count = pooled.len().saturating_sub(count.min(pooled.len()));
-        let snapshots = pooled.split_off(keep_count);
-        for coord in &snapshots {
-            self.pending_dirty_set.remove(&coord);
+        for _ in 0..count {
+            if let Some(coord) = self.dirty_queues.pop_front_tier(DirtyTier::Urgent) {
+                snapshots.push(coord);
+                continue;
+            }
+
+            let force_near = self.dirty_near_starve_frames >= DIRTY_NEAR_STARVE_LIMIT_FRAMES;
+            let force_far = self.dirty_far_starve_frames >= DIRTY_FAR_STARVE_LIMIT_FRAMES;
+
+            let mut picked = None;
+            if force_near {
+                picked = self.dirty_queues.pop_front_tier(DirtyTier::Near);
+                if picked.is_some() {
+                    popped_near = true;
+                }
+            } else if force_far {
+                picked = self.dirty_queues.pop_front_tier(DirtyTier::Far);
+                if picked.is_some() {
+                    popped_far = true;
+                }
+            }
+
+            if picked.is_none() {
+                let schedule = [
+                    DirtyTier::Near,
+                    DirtyTier::Near,
+                    DirtyTier::Normal,
+                    DirtyTier::Near,
+                    DirtyTier::Near,
+                    DirtyTier::Near,
+                    DirtyTier::Normal,
+                    DirtyTier::Far,
+                ];
+                let preferred = schedule[self.dirty_fair_cursor as usize % schedule.len()];
+                self.dirty_fair_cursor = self.dirty_fair_cursor.wrapping_add(1);
+                let order = match preferred {
+                    DirtyTier::Near => [
+                        DirtyTier::Near,
+                        DirtyTier::Normal,
+                        DirtyTier::Far,
+                        DirtyTier::Urgent,
+                    ],
+                    DirtyTier::Normal => [
+                        DirtyTier::Normal,
+                        DirtyTier::Near,
+                        DirtyTier::Far,
+                        DirtyTier::Urgent,
+                    ],
+                    DirtyTier::Far => [
+                        DirtyTier::Far,
+                        DirtyTier::Near,
+                        DirtyTier::Normal,
+                        DirtyTier::Urgent,
+                    ],
+                    DirtyTier::Urgent => [
+                        DirtyTier::Urgent,
+                        DirtyTier::Near,
+                        DirtyTier::Normal,
+                        DirtyTier::Far,
+                    ],
+                };
+                for tier in order {
+                    picked = self.dirty_queues.pop_front_tier(tier);
+                    if picked.is_some() {
+                        if tier == DirtyTier::Near {
+                            popped_near = true;
+                        } else if tier == DirtyTier::Far {
+                            popped_far = true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let Some(coord) = picked else {
+                break;
+            };
+            snapshots.push(coord);
         }
-        for coord in pooled {
-            self.pending_dirty.push_back(coord);
-        }
+
+        self.dirty_near_starve_frames = if had_near && !popped_near {
+            self.dirty_near_starve_frames.saturating_add(1)
+        } else {
+            0
+        };
+        self.dirty_far_starve_frames = if had_far && !popped_far {
+            self.dirty_far_starve_frames.saturating_add(1)
+        } else {
+            0
+        };
+
         snapshots
     }
 
     fn enforce_dirty_queue_bound(
         &mut self,
-        player_chunk: ChunkCoord,
-        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
-    ) {
-        if self.pending_dirty.len() <= MAX_PENDING_DIRTY_CHUNKS {
-            return;
+        _player_chunk: ChunkCoord,
+        _chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) -> usize {
+        let mut dropped = 0usize;
+        while self.dirty_queues.total_len() > MAX_PENDING_DIRTY_CHUNKS {
+            let removed = self
+                .dirty_queues
+                .pop_back_tier(DirtyTier::Far)
+                .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Normal))
+                .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Near))
+                .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Urgent));
+            if removed.is_none() {
+                break;
+            }
+            dropped += 1;
         }
-        let mut coords = Vec::with_capacity(self.pending_dirty.len());
-        coords.extend(self.pending_dirty.drain(..));
-        coords.sort_by(|a, b| {
-            dirty_coord_priority(*a, player_chunk, chunk_priority_scores).total_cmp(
-                &dirty_coord_priority(*b, player_chunk, chunk_priority_scores),
-            )
-        });
-
-        let keep_from = coords.len().saturating_sub(MAX_PENDING_DIRTY_CHUNKS);
-        for dropped in coords.iter().take(keep_from) {
-            self.pending_dirty_set.remove(dropped);
-        }
-        for coord in coords.into_iter().skip(keep_from) {
-            self.pending_dirty.push_back(coord);
-        }
+        dropped
     }
 }
 
