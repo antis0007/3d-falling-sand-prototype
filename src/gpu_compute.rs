@@ -79,6 +79,7 @@ struct MeshingBindResources<'a> {
 struct ChunkPageAtlas {
     page_for_chunk: HashMap<ChunkCoord, GpuPageIndex>,
     chunk_for_page: HashMap<GpuPageIndex, ChunkCoord>,
+    in_flight_jobs_for_page: HashMap<GpuPageIndex, u32>,
     version_for_chunk: HashMap<ChunkCoord, u64>,
     state_for_chunk: HashMap<ChunkCoord, u32>,
     frontier_len_for_chunk: HashMap<ChunkCoord, u32>,
@@ -90,20 +91,26 @@ struct ChunkPageAtlas {
 
 #[cfg(feature = "gpu-compute")]
 impl ChunkPageAtlas {
-    fn page_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> GpuPageIndex {
+    fn page_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> anyhow::Result<GpuPageIndex> {
         if let Some(existing) = self.page_for_chunk.get(&chunk).copied() {
-            return existing;
+            return Ok(existing);
         }
 
-        if self.next_page.0 >= GPU_PAGE_CAPACITY {
-            self.clear();
+        if self.next_page.0 < GPU_PAGE_CAPACITY {
+            let page = self.next_page;
+            self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
+            self.page_for_chunk.insert(chunk, page);
+            self.chunk_for_page.insert(page, chunk);
+            return Ok(page);
         }
 
-        let page = self.next_page;
-        self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
+        let page = self.evictable_page().with_context(|| {
+            format!("no reusable gpu atlas pages available for chunk {chunk:?}")
+        })?;
+        self.evict_page(page);
         self.page_for_chunk.insert(chunk, page);
         self.chunk_for_page.insert(page, chunk);
-        page
+        Ok(page)
     }
 
     fn resolve_chunk(&self, page_index: GpuPageIndex) -> Option<ChunkCoord> {
@@ -117,16 +124,37 @@ impl ChunkPageAtlas {
         assert_eq!(resolved, chunk, "gpu page/chunk mapping mismatch");
     }
 
-    fn clear(&mut self) {
-        self.page_for_chunk.clear();
-        self.chunk_for_page.clear();
-        self.version_for_chunk.clear();
-        self.state_for_chunk.clear();
-        self.frontier_len_for_chunk.clear();
-        self.tick_for_chunk.clear();
-        self.diagnostics_for_chunk.clear();
-        self.cached_materials.clear();
-        self.next_page = GpuPageIndex(0);
+    fn acquire_page_for_job(&mut self, chunk: ChunkCoord, page_index: GpuPageIndex) {
+        self.assert_page_for_chunk(chunk, page_index);
+        *self.in_flight_jobs_for_page.entry(page_index).or_insert(0) += 1;
+    }
+
+    fn release_page_from_job(&mut self, page_index: GpuPageIndex) {
+        if let Some(in_flight) = self.in_flight_jobs_for_page.get_mut(&page_index) {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                self.in_flight_jobs_for_page.remove(&page_index);
+            }
+        }
+    }
+
+    fn evictable_page(&self) -> Option<GpuPageIndex> {
+        self.chunk_for_page
+            .keys()
+            .copied()
+            .find(|page| self.in_flight_jobs_for_page.get(page).copied().unwrap_or(0) == 0)
+    }
+
+    fn evict_page(&mut self, page_index: GpuPageIndex) {
+        if let Some(chunk) = self.chunk_for_page.remove(&page_index) {
+            self.page_for_chunk.remove(&chunk);
+            self.version_for_chunk.remove(&chunk);
+            self.state_for_chunk.remove(&chunk);
+            self.frontier_len_for_chunk.remove(&chunk);
+            self.tick_for_chunk.remove(&chunk);
+            self.diagnostics_for_chunk.remove(&chunk);
+            self.cached_materials.remove(&chunk);
+        }
     }
 }
 
@@ -412,7 +440,7 @@ impl GpuComputeRuntime {
         edit_commands: &[EditCommand],
     ) -> anyhow::Result<()> {
         {
-            let atlas = state.atlas.lock().expect("atlas lock");
+            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
         }
         let t0 = Instant::now();
@@ -494,7 +522,7 @@ impl GpuComputeRuntime {
         current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
         {
-            let atlas = state.atlas.lock().expect("atlas lock");
+            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.assert_page_for_chunk(sim_job.chunk_coord, page_index);
         }
         let page_params = device_page_params(
@@ -839,9 +867,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-        let mut atlas = state.atlas.lock().expect("atlas lock");
-        let page_index = atlas.page_for_chunk_or_allocate(job.coord);
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        let page_index = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
+        atlas.acquire_page_for_job(job.coord, page_index);
         let last_version = atlas
             .version_for_chunk
             .get(&job.coord)
@@ -905,60 +934,68 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         );
         drop(atlas);
 
-        if active_frontier_count > 0 {
-            state.runtime.run_active_frontier(
-                state,
-                &sim_job,
-                page_index,
-                current_state,
-                &edit_commands,
-            )?
-        }
-        let indirect = if !edit_commands.is_empty() || last_version != job.version {
-            state
-                .runtime
-                .run_meshing_dispatch(state, &sim_job, page_index, current_state)?
-        } else {
-            DrawIndirectArgs::default()
-        };
-
-        let diagnostics = {
-            let atlas = state.atlas.lock().expect("atlas lock");
-            atlas.assert_page_for_chunk(job.coord, page_index);
-            atlas
-                .diagnostics_for_chunk
-                .get(&job.coord)
-                .copied()
-                .unwrap_or_default()
-        };
-        let generated_materials = readback_page_materials(
-            state,
-            page_index,
-            (current_state + 1) & 1,
-            job.snapshot.center_voxels.len(),
-        )
-        .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
-
-        Ok(ComputedChunkArtifacts {
-            generated_materials,
-            simulation_diagnostics: diagnostics,
-            mesh_indirect: if indirect.vertex_count == 0 {
-                DrawIndirectArgs {
-                    vertex_count: (job
-                        .snapshot
-                        .center_voxels
-                        .iter()
-                        .filter(|v| **v != EMPTY)
-                        .count() as u32)
-                        .saturating_mul(6),
-                    instance_count: 1,
-                    first_vertex: 0,
-                    first_instance: 0,
-                }
+        let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
+            if active_frontier_count > 0 {
+                state.runtime.run_active_frontier(
+                    state,
+                    &sim_job,
+                    page_index,
+                    current_state,
+                    &edit_commands,
+                )?
+            }
+            let indirect = if !edit_commands.is_empty() || last_version != job.version {
+                state
+                    .runtime
+                    .run_meshing_dispatch(state, &sim_job, page_index, current_state)?
             } else {
-                indirect
-            },
-        })
+                DrawIndirectArgs::default()
+            };
+
+            let diagnostics = {
+                let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                atlas.assert_page_for_chunk(job.coord, page_index);
+                atlas
+                    .diagnostics_for_chunk
+                    .get(&job.coord)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            let generated_materials = readback_page_materials(
+                state,
+                page_index,
+                (current_state + 1) & 1,
+                job.snapshot.center_voxels.len(),
+            )
+            .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
+
+            Ok(ComputedChunkArtifacts {
+                generated_materials,
+                simulation_diagnostics: diagnostics,
+                mesh_indirect: if indirect.vertex_count == 0 {
+                    DrawIndirectArgs {
+                        vertex_count: (job
+                            .snapshot
+                            .center_voxels
+                            .iter()
+                            .filter(|v| **v != EMPTY)
+                            .count() as u32)
+                            .saturating_mul(6),
+                        instance_count: 1,
+                        first_vertex: 0,
+                        first_instance: 0,
+                    }
+                } else {
+                    indirect
+                },
+            })
+        })();
+
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        atlas.release_page_from_job(page_index);
+        drop(atlas);
+
+        job_result
     }
 }
 
