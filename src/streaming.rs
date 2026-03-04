@@ -96,9 +96,18 @@ pub struct DesiredChunks {
 
 #[derive(Debug, Clone)]
 pub struct VisibilityContext {
+    /// Camera position expressed in **chunk-space** coordinates (1.0 == one chunk edge).
+    ///
+    /// This must use the same basis as [`ChunkStreaming::desired_set`] chunk centers
+    /// (`chunk_coord + 0.5`) so frustum weighting stays consistent.
     pub camera_pos_chunks: Vec3,
     pub cone_inner_cos: f32,
     pub cone_outer_cos: f32,
+    /// Optional frustum planes in the same **chunk-space** basis as `camera_pos_chunks`.
+    ///
+    /// Plane equations are evaluated against vectors relative to `camera_pos_chunks` and
+    /// chunk centers derived from integer chunk coordinates. Supplying world-space planes
+    /// here can silently skew streaming priorities.
     pub frustum_planes: Option<[Vec4; 6]>,
 }
 
@@ -244,25 +253,27 @@ impl ChunkStreaming {
         let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len());
         let view_dir = view_dir.normalize_or_zero();
         let velocity_dir = player_velocity.normalize_or_zero();
-        let (cone_inner_cos, cone_outer_cos, frustum_planes, camera_pos_chunks) = visibility
-            .map(|ctx| {
-                (
-                    ctx.cone_inner_cos,
-                    ctx.cone_outer_cos,
-                    ctx.frustum_planes.as_ref(),
-                    ctx.camera_pos_chunks,
-                )
-            })
-            .unwrap_or((
-                0.65,
-                0.1,
-                None,
-                Vec3::new(
-                    player_chunk.x as f32,
-                    player_chunk.y as f32,
-                    player_chunk.z as f32,
-                ),
-            ));
+        let (cone_inner_cos, cone_outer_cos, frustum_planes_chunk_space, camera_pos_chunk_space) =
+            visibility
+                .map(|ctx| {
+                    Self::debug_validate_visibility_context(player_chunk, ctx, far_radius, ry);
+                    (
+                        ctx.cone_inner_cos,
+                        ctx.cone_outer_cos,
+                        ctx.frustum_planes.as_ref(),
+                        ctx.camera_pos_chunks,
+                    )
+                })
+                .unwrap_or((
+                    0.65,
+                    0.1,
+                    None,
+                    Vec3::new(
+                        player_chunk.x as f32,
+                        player_chunk.y as f32,
+                        player_chunk.z as f32,
+                    ),
+                ));
 
         let near_set: HashSet<_> = near.iter().copied().collect();
         let mid_set: HashSet<_> = mid.iter().copied().collect();
@@ -286,17 +297,22 @@ impl ChunkStreaming {
                 1.0
             };
 
-            let frustum_weight = if let Some(planes) = frustum_planes {
-                let chunk_center = Vec3::new(
+            let frustum_weight = if let Some(planes_chunk_space) = frustum_planes_chunk_space {
+                // Chunk center in chunk-space coordinates (integer chunk index + half chunk).
+                let chunk_center_chunk_space = Vec3::new(
                     coord.x as f32 + 0.5,
                     coord.y as f32 + 0.5,
                     coord.z as f32 + 0.5,
                 );
-                let relative = chunk_center - camera_pos_chunks;
+                let camera_to_chunk_center_chunk_space =
+                    chunk_center_chunk_space - camera_pos_chunk_space;
                 let radius = 0.866_025_4;
                 let mut min_margin = f32::INFINITY;
-                for plane in planes {
-                    let margin = plane.truncate().dot(relative) + plane.w;
+                for plane_chunk_space in planes_chunk_space {
+                    let margin = plane_chunk_space
+                        .truncate()
+                        .dot(camera_to_chunk_center_chunk_space)
+                        + plane_chunk_space.w;
                     min_margin = min_margin.min(margin);
                 }
                 if min_margin < -radius {
@@ -409,6 +425,48 @@ impl ChunkStreaming {
             generation_scores,
             resident_keep,
         }
+    }
+
+    fn debug_validate_visibility_context(
+        player_chunk: ChunkCoord,
+        visibility: &VisibilityContext,
+        far_radius_xz_chunks: i32,
+        vertical_radius_chunks: i32,
+    ) {
+        debug_assert!(
+            visibility.camera_pos_chunks.is_finite(),
+            "VisibilityContext.camera_pos_chunks must be finite and in chunk-space units"
+        );
+
+        if let Some(planes_chunk_space) = visibility.frustum_planes.as_ref() {
+            for plane_chunk_space in planes_chunk_space {
+                let normal = plane_chunk_space.truncate();
+                debug_assert!(
+                    normal.is_finite() && plane_chunk_space.w.is_finite(),
+                    "VisibilityContext.frustum_planes must be finite and in chunk-space units"
+                );
+                debug_assert!(
+                    normal.length_squared() > f32::EPSILON,
+                    "VisibilityContext.frustum_planes must have non-zero normals"
+                );
+            }
+        }
+
+        // Heuristic contract check: camera chunk-space position should remain near the player
+        // chunk when both are expressed in chunk coordinates. This catches common mixed-space
+        // usage (e.g., world meters passed as chunk units) during debug runs.
+        let expected_camera_chunk_space = Vec3::new(
+            player_chunk.x as f32,
+            player_chunk.y as f32,
+            player_chunk.z as f32,
+        );
+        let delta = visibility.camera_pos_chunks - expected_camera_chunk_space;
+        let allowed_xz = far_radius_xz_chunks as f32 + 2.0;
+        let allowed_y = vertical_radius_chunks as f32 + FAR_RING_UPWARD_BIAS_BUDGET as f32 + 2.0;
+        debug_assert!(
+            delta.x.abs() <= allowed_xz && delta.z.abs() <= allowed_xz && delta.y.abs() <= allowed_y,
+            "VisibilityContext appears to mix spaces: expected camera_pos_chunks near player chunk in chunk-space"
+        );
     }
 
     fn ring_sorted_region(
@@ -1188,5 +1246,79 @@ mod tests {
         assert!(streaming.scheduled_generate.contains(&neighbor_a));
         assert!(streaming.scheduled_generate.contains(&neighbor_b));
         assert!(!streaming.scheduled_generate.contains(&high_y));
+    }
+
+    #[test]
+    fn desired_set_uses_chunk_space_camera_and_planes_for_frustum_weight() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let target = ChunkCoord { x: 2, y: 0, z: 0 };
+
+        let near_radius = 0;
+        let mid_radius = 1;
+        let far_radius = Some(2);
+
+        // Plane normal points +X in camera-relative chunk-space.
+        let include_target = super::VisibilityContext {
+            camera_pos_chunks: Vec3::ZERO,
+            cone_inner_cos: 1.0,
+            cone_outer_cos: 1.0,
+            frustum_planes: Some([glam::vec4(1.0, 0.0, 0.0, -2.0); 6]),
+        };
+        let exclude_target = super::VisibilityContext {
+            camera_pos_chunks: Vec3::ZERO,
+            cone_inner_cos: 1.0,
+            cone_outer_cos: 1.0,
+            frustum_planes: Some([glam::vec4(1.0, 0.0, 0.0, -5.0); 6]),
+        };
+
+        let base = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            None,
+            near_radius,
+            mid_radius,
+            far_radius,
+            0,
+            64,
+            64,
+            &HashMap::new(),
+            0,
+        );
+        let boosted = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Some(&include_target),
+            near_radius,
+            mid_radius,
+            far_radius,
+            0,
+            64,
+            64,
+            &HashMap::new(),
+            0,
+        );
+        let culled = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Some(&exclude_target),
+            near_radius,
+            mid_radius,
+            far_radius,
+            0,
+            64,
+            64,
+            &HashMap::new(),
+            0,
+        );
+
+        let base_score = base.generation_scores[&target];
+        let boosted_score = boosted.generation_scores[&target];
+        let culled_score = culled.generation_scores[&target];
+
+        assert!(boosted_score > base_score);
+        assert!(base_score > culled_score);
     }
 }
