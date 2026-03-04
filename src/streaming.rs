@@ -416,7 +416,8 @@ impl ChunkStreaming {
             generation_scores.insert(coord, score);
         }
 
-        let mut generation_order = Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
+        let mut generation_order =
+            Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
         generation_order.extend(near.iter().copied());
         generation_order.extend(mid.iter().copied());
         generation_order.extend(far.iter().copied());
