@@ -14,6 +14,14 @@ use std::time::Instant;
 const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
 #[cfg(feature = "gpu-compute")]
+const MAC_U_COUNT: usize = (32 + 1) * 32 * 32;
+#[cfg(feature = "gpu-compute")]
+const MAC_V_COUNT: usize = 32 * (32 + 1) * 32;
+#[cfg(feature = "gpu-compute")]
+const MAC_W_COUNT: usize = 32 * 32 * (32 + 1);
+#[cfg(feature = "gpu-compute")]
+const MAC_TOTAL_COUNT: usize = MAC_U_COUNT + MAC_V_COUNT + MAC_W_COUNT;
+#[cfg(feature = "gpu-compute")]
 const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 #[cfg(feature = "gpu-compute")]
 const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
@@ -230,8 +238,8 @@ fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
     );
 
     let velocity_offset =
-        page_index.0 as u64 * CHUNK_VOLUME as u64 * std::mem::size_of::<[f32; 4]>() as u64;
-    let velocity_zeros = vec![[0.0f32; 4]; CHUNK_VOLUME];
+        page_index.0 as u64 * (MAC_TOTAL_COUNT * 2) as u64 * std::mem::size_of::<f32>() as u64;
+    let velocity_zeros = vec![0.0f32; MAC_TOTAL_COUNT * 2];
     state.queue.write_buffer(
         &state.velocity_mac,
         velocity_offset,
@@ -239,8 +247,8 @@ fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
     );
 
     let scalar_offset =
-        page_index.0 as u64 * CHUNK_VOLUME as u64 * std::mem::size_of::<f32>() as u64;
-    let scalar_zeros = vec![0.0f32; CHUNK_VOLUME];
+        page_index.0 as u64 * (CHUNK_VOLUME * 2) as u64 * std::mem::size_of::<f32>() as u64;
+    let scalar_zeros = vec![0.0f32; CHUNK_VOLUME * 2];
     state.queue.write_buffer(
         &state.pressure,
         scalar_offset,
@@ -312,13 +320,21 @@ fn clear_meshing_outputs_for_page(state: &WorkerGpuState, page_index: GpuPageInd
 #[derive(Clone, Copy)]
 struct GpuSimulationRuntimeConfig {
     max_jacobi_iterations: u32,
+    cell_size: f32,
+    cfl_velocity_clamp: f32,
+    velocity_damping: f32,
+    viscosity: f32,
 }
 
 #[cfg(feature = "gpu-compute")]
 impl Default for GpuSimulationRuntimeConfig {
     fn default() -> Self {
         Self {
-            max_jacobi_iterations: 16,
+            max_jacobi_iterations: 32,
+            cell_size: 1.0,
+            cfl_velocity_clamp: 4.0,
+            velocity_damping: 0.995,
+            viscosity: 0.02,
         }
     }
 }
@@ -572,6 +588,7 @@ impl GpuComputeRuntime {
         page_index: GpuPageIndex,
         current_state: u32,
         edit_commands: &[EditCommand],
+        neighbor_pages: [u32; 6],
     ) -> anyhow::Result<()> {
         let t0 = Instant::now();
         let frontier_len = sim_job
@@ -583,52 +600,54 @@ impl GpuComputeRuntime {
                 .queue
                 .write_buffer(&state.edit_commands, 0, bytemuck::cast_slice(edit_commands));
         }
-        let page_params = device_page_params(
-            sim_job,
-            page_index,
-            frontier_len,
-            current_state,
-            edit_commands.len() as u32,
-            state.runtime_config,
-        );
-        state
-            .queue
-            .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&page_params));
 
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let groups = frontier_len
             .max(edit_commands.len() as u32)
             .max(1)
             .div_ceil(64);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_bind_group(0, &state.simulation_bg, &[]);
-
-            // 1. external forces/gravity
-            pass.set_pipeline(&self.force_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-            // 2. velocity advection
-            pass.set_pipeline(&self.advect_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-            // 3. divergence compute
-            pass.set_pipeline(&self.divergence_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-            // 4. Jacobi pressure iterations
-            for _ in 0..state.runtime_config.max_jacobi_iterations {
-                pass.set_pipeline(&self.pressure_jacobi_pipeline);
+        let dispatch_stage = |pipeline: &wgpu::ComputePipeline, params: [FrameParams; 1]| {
+            state
+                .queue
+                .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&params));
+            let mut encoder = state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_bind_group(0, &state.simulation_bg, &[]);
+                pass.set_pipeline(pipeline);
                 pass.dispatch_workgroups(groups, 1, 1);
             }
-            // 5. velocity projection
-            pass.set_pipeline(&self.project_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-            // 6. material advection + boundaries
-            pass.set_pipeline(&self.material_advect_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-        }
+            state.queue.submit(Some(encoder.finish()));
+        };
 
-        state.queue.submit(Some(encoder.finish()));
+        let base_params = |jacobi_iteration: u32| {
+            device_page_params(
+                sim_job,
+                page_index,
+                frontier_len,
+                current_state,
+                edit_commands.len() as u32,
+                state.runtime_config,
+                jacobi_iteration,
+                neighbor_pages,
+            )
+        };
+
+        dispatch_stage(&self.force_pipeline, base_params(0));
+        dispatch_stage(&self.advect_pipeline, base_params(0));
+        dispatch_stage(&self.divergence_pipeline, base_params(0));
+        for jacobi_iter in 0..state.runtime_config.max_jacobi_iterations {
+            dispatch_stage(&self.pressure_jacobi_pipeline, base_params(jacobi_iter));
+        }
+        dispatch_stage(
+            &self.project_pipeline,
+            base_params(state.runtime_config.max_jacobi_iterations),
+        );
+        dispatch_stage(
+            &self.material_advect_pipeline,
+            base_params(state.runtime_config.max_jacobi_iterations),
+        );
 
         #[cfg(feature = "gpu-compute")]
         {
@@ -659,6 +678,8 @@ impl GpuComputeRuntime {
             current_state,
             0,
             state.runtime_config,
+            0,
+            [u32::MAX; 6],
         );
         state
             .queue
@@ -971,21 +992,21 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
             let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk velocity atlas"),
-                size: page_capacity * page_len * std::mem::size_of::<[f32; 4]>() as u64,
+                size: page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let pressure = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk pressure atlas"),
-                size: page_capacity * page_len * std::mem::size_of::<f32>() as u64,
+                size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let divergence = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk divergence atlas"),
-                size: page_capacity * page_len * std::mem::size_of::<f32>() as u64,
+                size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -1131,6 +1152,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         if cached_before.len() != incoming.len() {
             cached_before.resize(incoming.len(), EMPTY);
         }
+        let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
         drop(atlas);
 
         let mut edit_commands = Vec::new();
@@ -1188,6 +1210,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     page_index,
                     current_state,
                     &edit_commands,
+                    neighbor_pages,
                 )?
             }
             let indirect = if !edit_commands.is_empty() || last_version != job.version {
@@ -1257,6 +1280,48 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
     }
 }
 
+#[cfg(feature = "gpu-compute")]
+fn neighbor_pages_for_chunk(atlas: &ChunkPageAtlas, coord: ChunkCoord) -> [u32; 6] {
+    let mut pages = [u32::MAX; 6];
+    let neighbors = [
+        ChunkCoord {
+            x: coord.x - 1,
+            y: coord.y,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x + 1,
+            y: coord.y,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y - 1,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y + 1,
+            z: coord.z,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z - 1,
+        },
+        ChunkCoord {
+            x: coord.x,
+            y: coord.y,
+            z: coord.z + 1,
+        },
+    ];
+    for (i, neighbor) in neighbors.iter().enumerate() {
+        if let Some(page) = atlas.page_for_chunk.get(neighbor) {
+            pages[i] = page.0;
+        }
+    }
+    pages
+}
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 struct EditCommand {
@@ -1278,6 +1343,12 @@ struct FrameParams {
     active_tile_budget: u32,
     jacobi_iterations: u32,
     jacobi_iteration: u32,
+    cell_size: f32,
+    max_velocity: f32,
+    velocity_damping: f32,
+    viscosity: f32,
+    neighbor_pages: [u32; 6],
+    _pad: [u32; 2],
 }
 #[cfg(feature = "gpu-compute")]
 fn device_page_params(
@@ -1287,6 +1358,8 @@ fn device_page_params(
     state_index: u32,
     edit_count: u32,
     runtime_config: GpuSimulationRuntimeConfig,
+    jacobi_iteration: u32,
+    neighbor_pages: [u32; 6],
 ) -> [FrameParams; 1] {
     [FrameParams {
         page_index: page_index.0,
@@ -1297,7 +1370,13 @@ fn device_page_params(
         edit_count,
         active_tile_budget: frontier_len,
         jacobi_iterations: runtime_config.max_jacobi_iterations,
-        jacobi_iteration: 0,
+        jacobi_iteration,
+        cell_size: runtime_config.cell_size,
+        max_velocity: runtime_config.cfl_velocity_clamp,
+        velocity_damping: runtime_config.velocity_damping,
+        viscosity: runtime_config.viscosity,
+        neighbor_pages,
+        _pad: [0; 2],
     }]
 }
 
