@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "procgen-profile")]
@@ -418,6 +418,7 @@ struct VegetationIntent {
     wy: i32,
     wz: i32,
     material: MaterialId,
+    tree_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -2125,7 +2126,10 @@ fn vegetation_pass(
             if roll < tree_p {
                 let base_world_y = config.world_origin[1] + top_y + 1;
                 if can_place_tree(world, lx, top_y + 1, lz, col.stratum, wet, ocean).is_some() {
-                    stage_tree_intents(
+                    if stage_tree_intents(
+                        world,
+                        config,
+                        None,
                         &mut intents,
                         config.seed,
                         wx,
@@ -2133,8 +2137,9 @@ fn vegetation_pass(
                         base_world_y,
                         col.stratum,
                         col.landmark,
-                    );
-                    continue;
+                    ) {
+                        continue;
+                    }
                 }
             }
 
@@ -2159,6 +2164,7 @@ fn vegetation_pass(
                     wy: config.world_origin[1] + top_y + 1,
                     wz,
                     material: flora_material,
+                    tree_id: None,
                 });
             }
         }
@@ -2376,18 +2382,29 @@ fn vegetation_pass_chunk(
                 if roll >= tree_p {
                     continue;
                 }
-                if !has_tree_support_and_headroom(
-                    world,
-                    config,
-                    cache,
-                    anchor.wx,
-                    anchor.wz,
-                    ground_world_y,
-                ) {
+
+                let support_lx = anchor.wx - config.world_origin[0];
+                let support_lz = anchor.wz - config.world_origin[2];
+                let support_ly = ground_world_y - config.world_origin[1];
+                if support_lx < 0
+                    || support_lz < 0
+                    || support_ly < 0
+                    || support_lx >= world.dims[0] as i32
+                    || support_lz >= world.dims[2] as i32
+                    || support_ly >= world.dims[1] as i32
+                {
                     continue;
                 }
 
-                stage_tree_intents(
+                let support = world.get(support_lx, support_ly, support_lz);
+                if !matches!(support, DIRT | GRASS | TURF) {
+                    continue;
+                }
+
+                let _ = stage_tree_intents(
+                    world,
+                    config,
+                    Some(cache),
                     &mut intents,
                     config.seed,
                     anchor.wx,
@@ -2505,6 +2522,7 @@ fn vegetation_pass_chunk(
                     wy: ground_world_y + 1,
                     wz,
                     material: flora_material,
+                    tree_id: None,
                 });
             }
         }
@@ -2664,104 +2682,93 @@ fn apply_vegetation_intents(
         config.world_origin[1],
         config.world_origin[2],
     );
-    let mut anchors = HashMap::<(i32, i32), i32>::new();
+
+    let mut tree_intents = HashMap::<u64, Vec<VegetationIntent>>::new();
+    let mut flora_intents = Vec::new();
     for intent in intents {
-        if intent.material == WOOD {
-            anchors
-                .entry((intent.wx, intent.wz))
-                .and_modify(|base| *base = (*base).min(intent.wy))
-                .or_insert(intent.wy);
+        if let Some(tree_id) = intent.tree_id {
+            tree_intents.entry(tree_id).or_default().push(*intent);
+        } else {
+            flora_intents.push(*intent);
         }
     }
 
-    for intent in intents {
+    for (_tree_id, voxels) in tree_intents {
+        if !voxels.iter().any(|v| v.material == WOOD) {
+            continue;
+        }
+
+        let mut local_obstructed = false;
+        for intent in &voxels {
+            let lx = intent.wx - config.world_origin[0];
+            let ly = intent.wy - config.world_origin[1];
+            let lz = intent.wz - config.world_origin[2];
+            if lx >= 0
+                && ly >= 0
+                && lz >= 0
+                && lx < world.dims[0] as i32
+                && ly < world.dims[1] as i32
+                && lz < world.dims[2] as i32
+                && world.get(lx, ly, lz) != EMPTY
+            {
+                local_obstructed = true;
+                break;
+            }
+        }
+        if local_obstructed {
+            continue;
+        }
+
+        for intent in voxels {
+            let target_chunk = chunk_for_world_voxel(intent.wx, intent.wy, intent.wz);
+            let lx = intent.wx - config.world_origin[0];
+            let ly = intent.wy - config.world_origin[1];
+            let lz = intent.wz - config.world_origin[2];
+
+            if target_chunk == current_chunk {
+                if lx < 0
+                    || ly < 0
+                    || lz < 0
+                    || lx >= world.dims[0] as i32
+                    || ly >= world.dims[1] as i32
+                    || lz >= world.dims[2] as i32
+                {
+                    continue;
+                }
+                let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
+            } else if cache.is_some() {
+                queue_deferred_structure_placement(
+                    target_chunk,
+                    DeferredStructurePlacement {
+                        wx: intent.wx,
+                        wy: intent.wy,
+                        wz: intent.wz,
+                        material: intent.material,
+                    },
+                );
+            }
+        }
+    }
+
+    for intent in flora_intents {
         let target_chunk = chunk_for_world_voxel(intent.wx, intent.wy, intent.wz);
+        if target_chunk != current_chunk {
+            continue;
+        }
         let lx = intent.wx - config.world_origin[0];
         let ly = intent.wy - config.world_origin[1];
         let lz = intent.wz - config.world_origin[2];
-        if matches!(intent.material, WOOD | LEAVES) {
-            let mut supported = false;
-            for dz in -2..=2 {
-                for dx in -2..=2 {
-                    let Some(base_world_y) = anchors.get(&(intent.wx + dx, intent.wz + dz)) else {
-                        continue;
-                    };
-                    if *base_world_y > intent.wy {
-                        continue;
-                    }
-                    let ground_world_y = *base_world_y - 1;
-                    let base_lx = intent.wx + dx - config.world_origin[0];
-                    let base_lz = intent.wz + dz - config.world_origin[2];
-
-                    supported = if base_lx >= 0
-                        && base_lz >= 0
-                        && base_lx < world.dims[0] as i32
-                        && base_lz < world.dims[2] as i32
-                    {
-                        let local_ground_y = ground_world_y - config.world_origin[1];
-                        local_ground_y >= 0
-                            && local_ground_y + 1 < world.dims[1] as i32
-                            && matches!(
-                                world.get(base_lx, local_ground_y, base_lz),
-                                TURF | DIRT | SAND
-                            )
-                            && can_place_tree(
-                                world,
-                                base_lx,
-                                local_ground_y + 1,
-                                base_lz,
-                                VerticalBiomeStratum::Lowland,
-                                0.0,
-                                0.0,
-                            )
-                            .is_some()
-                    } else {
-                        cache.is_some_and(|field_cache| {
-                            has_deterministic_tree_support(
-                                config,
-                                field_cache,
-                                intent.wx + dx,
-                                intent.wz + dz,
-                                ground_world_y,
-                            )
-                        })
-                    };
-
-                    if supported {
-                        break;
-                    }
-                }
-                if supported {
-                    break;
-                }
-            }
-            if !supported {
-                continue;
-            }
+        if lx < 0
+            || ly < 0
+            || lz < 0
+            || lx >= world.dims[0] as i32
+            || ly >= world.dims[1] as i32
+            || lz >= world.dims[2] as i32
+        {
+            continue;
         }
-        if target_chunk == current_chunk {
-            if lx < 0
-                || ly < 0
-                || lz < 0
-                || lx >= world.dims[0] as i32
-                || ly >= world.dims[1] as i32
-                || lz >= world.dims[2] as i32
-            {
-                continue;
-            }
-            if world.get(lx, ly, lz) == EMPTY {
-                let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
-            }
-        } else if cache.is_some() && matches!(intent.material, WOOD | LEAVES) {
-            queue_deferred_structure_placement(
-                target_chunk,
-                DeferredStructurePlacement {
-                    wx: intent.wx,
-                    wy: intent.wy,
-                    wz: intent.wz,
-                    material: intent.material,
-                },
-            );
+        if world.get(lx, ly, lz) == EMPTY {
+            let _ = world.set_raw_no_side_effects(lx, ly, lz, intent.material);
         }
     }
 }
@@ -2786,7 +2793,36 @@ fn vegetation_ground_cover(col: &ColumnGenData, flora_roll: f32, ground: Materia
     }
 }
 
+fn voxel_obstructed_for_tree(
+    world: &ProcGenVolume,
+    config: &ProcGenConfig,
+    cache: Option<&ProcGenFieldCache>,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+) -> bool {
+    let lx = wx - config.world_origin[0];
+    let ly = wy - config.world_origin[1];
+    let lz = wz - config.world_origin[2];
+    if lx >= 0
+        && ly >= 0
+        && lz >= 0
+        && lx < world.dims[0] as i32
+        && ly < world.dims[1] as i32
+        && lz < world.dims[2] as i32
+    {
+        return world.get(lx, ly, lz) != EMPTY;
+    }
+
+    cache
+        .and_then(|field_cache| field_cache.cell_world(config, wx, wz))
+        .is_some_and(|field| wy <= field.surface_height)
+}
+
 fn stage_tree_intents(
+    world: &ProcGenVolume,
+    config: &ProcGenConfig,
+    cache: Option<&ProcGenFieldCache>,
     intents: &mut Vec<VegetationIntent>,
     seed: u64,
     wx: i32,
@@ -2794,7 +2830,25 @@ fn stage_tree_intents(
     base_world_y: i32,
     stratum: VerticalBiomeStratum,
     landmark: Option<LandmarkKind>,
-) {
+) -> bool {
+    let support_lx = wx - config.world_origin[0];
+    let support_ly = base_world_y - 1 - config.world_origin[1];
+    let support_lz = wz - config.world_origin[2];
+    if support_lx < 0
+        || support_lz < 0
+        || support_ly < 0
+        || support_lx >= world.dims[0] as i32
+        || support_lz >= world.dims[2] as i32
+        || support_ly >= world.dims[1] as i32
+    {
+        return false;
+    }
+
+    let support = world.get(support_lx, support_ly, support_lz);
+    if !matches!(support, DIRT | GRASS | TURF) {
+        return false;
+    }
+
     let mut trunk_h = 4 + (hash01(seed ^ 0x7133_5599, wx, base_world_y, wz) * 4.0) as i32;
     if matches!(stratum, VerticalBiomeStratum::Alpine) {
         trunk_h = trunk_h.saturating_sub(2).max(2);
@@ -2803,42 +2857,91 @@ fn stage_tree_intents(
         trunk_h = trunk_h.saturating_sub(1).max(2);
     }
 
+    let tree_id = hash_u64(seed ^ 0x51F0_0D11, wx, base_world_y, wz);
+    let mut structure_voxels = Vec::new();
+    let mut occupied = HashSet::new();
+
     for ty in 0..trunk_h {
-        intents.push(VegetationIntent {
-            wx,
-            wy: base_world_y + ty,
-            wz,
-            material: WOOD,
-        });
+        let wy = base_world_y + ty;
+        if occupied.insert((wx, wy, wz)) {
+            structure_voxels.push((wx, wy, wz, WOOD));
+        }
     }
 
-    if matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
-        return;
-    }
+    let top = base_world_y + trunk_h - 1;
+    if !matches!(landmark, Some(LandmarkKind::DeadwoodGrove)) {
+        for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let bx = wx + dx;
+            let bz = wz + dz;
+            let by = top;
+            if occupied.insert((bx, by, bz)) {
+                structure_voxels.push((bx, by, bz, WOOD));
+            }
+        }
 
-    let radius = if matches!(stratum, VerticalBiomeStratum::Alpine) {
-        1
-    } else {
-        2
-    };
-    let top = base_world_y + trunk_h;
-    for dz in -radius..=radius {
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let dist = dx * dx + dz * dz + (dy * dy * 2 / 3);
-                let cap = if radius == 1 { 2 } else { 6 };
-                if dist > cap {
-                    continue;
+        let radius = if matches!(stratum, VerticalBiomeStratum::Alpine) {
+            1
+        } else {
+            2
+        };
+        let canopy_center_y = base_world_y + trunk_h;
+        for dz in -radius..=radius {
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let dist = dx * dx + dz * dz + (dy * dy * 2 / 3);
+                    let cap = if radius == 1 { 2 } else { 6 };
+                    if dist > cap {
+                        continue;
+                    }
+                    let lx = wx + dx;
+                    let ly = canopy_center_y + dy;
+                    let lz = wz + dz;
+                    if occupied.insert((lx, ly, lz)) {
+                        structure_voxels.push((lx, ly, lz, LEAVES));
+                    }
                 }
-                intents.push(VegetationIntent {
-                    wx: wx + dx,
-                    wy: top + dy,
-                    wz: wz + dz,
-                    material: LEAVES,
-                });
             }
         }
     }
+
+    let mut min_wx = i32::MAX;
+    let mut max_wx = i32::MIN;
+    let mut min_wy = i32::MAX;
+    let mut max_wy = i32::MIN;
+    let mut min_wz = i32::MAX;
+    let mut max_wz = i32::MIN;
+    for (vx, vy, vz, _) in &structure_voxels {
+        min_wx = min_wx.min(*vx);
+        max_wx = max_wx.max(*vx);
+        min_wy = min_wy.min(*vy);
+        max_wy = max_wy.max(*vy);
+        min_wz = min_wz.min(*vz);
+        max_wz = max_wz.max(*vz);
+    }
+    let _footprint = ((min_wx, min_wy, min_wz), (max_wx, max_wy, max_wz));
+
+    for (vx, vy, vz, material) in &structure_voxels {
+        if *material == WOOD && (*vx != wx || *vz != wz) {
+            if voxel_obstructed_for_tree(world, config, cache, *vx, *vy, *vz) {
+                return false;
+            }
+            continue;
+        }
+        if voxel_obstructed_for_tree(world, config, cache, *vx, *vy, *vz) {
+            return false;
+        }
+    }
+
+    for (vx, vy, vz, material) in structure_voxels {
+        intents.push(VegetationIntent {
+            wx: vx,
+            wy: vy,
+            wz: vz,
+            material,
+            tree_id: Some(tree_id),
+        });
+    }
+    true
 }
 
 pub fn find_safe_spawn(world: &ProcGenVolume, seed: u64) -> [f32; 3] {
