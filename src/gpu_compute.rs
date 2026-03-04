@@ -199,7 +199,6 @@ struct WorkerGpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     runtime: GpuComputeRuntime,
-    gpu_job_lock: Mutex<()>,
     atlas: Mutex<ChunkPageAtlas>,
     atlas_voxels: wgpu::Buffer,
     velocity_mac: wgpu::Buffer,
@@ -271,7 +270,11 @@ fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
 }
 
 #[cfg(feature = "gpu-compute")]
-fn clear_job_scratch_buffers(state: &WorkerGpuState) {
+fn clear_job_scratch_buffers(
+    state: &WorkerGpuState,
+    active_tile_len: usize,
+    dirty_page_len: usize,
+) {
     let zero_u32x4 = [0u32; 4];
 
     state.queue.write_buffer(
@@ -288,19 +291,23 @@ fn clear_job_scratch_buffers(state: &WorkerGpuState) {
         .queue
         .write_buffer(&state.diagnostics, 0, bytemuck::cast_slice(&zero_u32x4));
 
-    let active_tile_zeros = vec![0u32; CHUNK_VOLUME];
-    state.queue.write_buffer(
-        &state.active_tiles,
-        0,
-        bytemuck::cast_slice(&active_tile_zeros),
-    );
+    if active_tile_len > 0 {
+        let active_tile_zeros = vec![0u32; active_tile_len.min(CHUNK_VOLUME)];
+        state.queue.write_buffer(
+            &state.active_tiles,
+            0,
+            bytemuck::cast_slice(&active_tile_zeros),
+        );
+    }
 
-    let dirty_page_zeros = vec![0u32; GPU_PAGE_CAPACITY as usize];
-    state.queue.write_buffer(
-        &state.dirty_page_indices,
-        0,
-        bytemuck::cast_slice(&dirty_page_zeros),
-    );
+    if dirty_page_len > 0 {
+        let dirty_page_zeros = vec![0u32; dirty_page_len.min(GPU_PAGE_CAPACITY as usize)];
+        state.queue.write_buffer(
+            &state.dirty_page_indices,
+            0,
+            bytemuck::cast_slice(&dirty_page_zeros),
+        );
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -605,22 +612,6 @@ impl GpuComputeRuntime {
             .max(edit_commands.len() as u32)
             .max(1)
             .div_ceil(64);
-        let dispatch_stage = |pipeline: &wgpu::ComputePipeline, params: [FrameParams; 1]| {
-            state
-                .queue
-                .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&params));
-            let mut encoder = state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_bind_group(0, &state.simulation_bg, &[]);
-                pass.set_pipeline(pipeline);
-                pass.dispatch_workgroups(groups, 1, 1);
-            }
-            state.queue.submit(Some(encoder.finish()));
-        };
-
         let base_params = |jacobi_iteration: u32| {
             device_page_params(
                 sim_job,
@@ -634,20 +625,62 @@ impl GpuComputeRuntime {
             )
         };
 
-        dispatch_stage(&self.force_pipeline, base_params(0));
-        dispatch_stage(&self.advect_pipeline, base_params(0));
-        dispatch_stage(&self.divergence_pipeline, base_params(0));
+        let mut staged_params =
+            Vec::with_capacity(state.runtime_config.max_jacobi_iterations as usize + 5);
+        staged_params.push(base_params(0)[0]); // force
+        staged_params.push(base_params(0)[0]); // advect
+        staged_params.push(base_params(0)[0]); // divergence
         for jacobi_iter in 0..state.runtime_config.max_jacobi_iterations {
-            dispatch_stage(&self.pressure_jacobi_pipeline, base_params(jacobi_iter));
+            staged_params.push(base_params(jacobi_iter)[0]);
         }
-        dispatch_stage(
-            &self.project_pipeline,
-            base_params(state.runtime_config.max_jacobi_iterations),
-        );
-        dispatch_stage(
-            &self.material_advect_pipeline,
-            base_params(state.runtime_config.max_jacobi_iterations),
-        );
+        staged_params.push(base_params(state.runtime_config.max_jacobi_iterations)[0]); // projection
+        staged_params.push(base_params(state.runtime_config.max_jacobi_iterations)[0]); // material advection
+
+        let staged_params_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simulation staged frame params"),
+            size: (staged_params.len() * std::mem::size_of::<FrameParams>()) as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = staged_params_buffer.slice(..).get_mapped_range_mut();
+            mapped.copy_from_slice(bytemuck::cast_slice(&staged_params));
+        }
+        staged_params_buffer.unmap();
+
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let params_stride = std::mem::size_of::<FrameParams>() as u64;
+        let mut stage_index = 0u64;
+        let mut encode_stage = |encoder: &mut wgpu::CommandEncoder,
+                                pipeline: &wgpu::ComputePipeline| {
+            encoder.copy_buffer_to_buffer(
+                &staged_params_buffer,
+                stage_index * params_stride,
+                &state.page_params,
+                0,
+                params_stride,
+            );
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_bind_group(0, &state.simulation_bg, &[]);
+                pass.set_pipeline(pipeline);
+                pass.dispatch_workgroups(groups, 1, 1);
+            }
+            stage_index += 1;
+        };
+
+        encode_stage(&mut encoder, &self.force_pipeline);
+        encode_stage(&mut encoder, &self.advect_pipeline);
+        encode_stage(&mut encoder, &self.divergence_pipeline);
+        for _ in 0..state.runtime_config.max_jacobi_iterations {
+            encode_stage(&mut encoder, &self.pressure_jacobi_pipeline);
+        }
+        encode_stage(&mut encoder, &self.project_pipeline);
+        encode_stage(&mut encoder, &self.material_advect_pipeline);
+
+        state.queue.submit(Some(encoder.finish()));
 
         #[cfg(feature = "gpu-compute")]
         {
@@ -662,6 +695,7 @@ impl GpuComputeRuntime {
 
         Ok(())
     }
+    #[cfg(feature = "gpu_meshing_experimental")]
     fn run_meshing_dispatch(
         &self,
         state: &WorkerGpuState,
@@ -703,12 +737,29 @@ impl GpuComputeRuntime {
 }
 
 #[cfg(feature = "gpu-compute")]
+struct PendingReadback {
+    readback: wgpu::Buffer,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+#[cfg(feature = "gpu-compute")]
 fn readback_page_materials(
     state: &WorkerGpuState,
     page_index: GpuPageIndex,
     state_index: u32,
     voxel_count: usize,
 ) -> anyhow::Result<Vec<MaterialId>> {
+    let pending = begin_material_readback(state, page_index, state_index, voxel_count)?;
+    finish_material_readback(state, pending)
+}
+
+#[cfg(feature = "gpu-compute")]
+fn begin_material_readback(
+    state: &WorkerGpuState,
+    page_index: GpuPageIndex,
+    state_index: u32,
+    voxel_count: usize,
+) -> anyhow::Result<PendingReadback> {
     let atlas_offset_voxels = (page_index.0 as u64 * CHUNK_VOLUME as u64 * 2)
         + (state_index as u64 * CHUNK_VOLUME as u64);
     let byte_offset = atlas_offset_voxels * std::mem::size_of::<u32>() as u64;
@@ -731,15 +782,58 @@ fn readback_page_materials(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    state.device.poll(wgpu::Maintain::Wait);
-    rx.recv().context("gpu readback completion")??;
 
+    Ok(PendingReadback { readback, rx })
+}
+
+#[cfg(feature = "gpu-compute")]
+fn finish_material_readback(
+    state: &WorkerGpuState,
+    pending: PendingReadback,
+) -> anyhow::Result<Vec<MaterialId>> {
+    loop {
+        if let Ok(done) = pending.rx.try_recv() {
+            done.context("gpu readback completion")?;
+            break;
+        }
+        state.device.poll(wgpu::Maintain::Poll);
+        std::thread::yield_now();
+    }
+
+    let slice = pending.readback.slice(..);
     let bytes = slice.get_mapped_range();
     let words: &[u32] = bytemuck::cast_slice(&bytes);
     let materials = words.iter().map(|m| *m as MaterialId).collect();
     drop(bytes);
-    readback.unmap();
+    pending.readback.unmap();
     Ok(materials)
+}
+
+#[cfg(feature = "gpu-compute")]
+fn validate_storage_buffer_size(
+    label: &str,
+    size: u64,
+    limits: &wgpu::Limits,
+) -> anyhow::Result<()> {
+    if size > limits.max_storage_buffer_binding_size as u64 {
+        log::error!(
+            "gpu buffer '{}' requires {} bytes, exceeding adapter max_storage_buffer_binding_size={}.",
+            label,
+            size,
+            limits.max_storage_buffer_binding_size
+        );
+        anyhow::bail!("buffer '{}' exceeds max_storage_buffer_binding_size", label);
+    }
+    if size > limits.max_buffer_size {
+        log::error!(
+            "gpu buffer '{}' requires {} bytes, exceeding adapter max_buffer_size={}",
+            label,
+            size,
+            limits.max_buffer_size
+        );
+        anyhow::bail!("buffer '{}' exceeds max_buffer_size", label);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -917,9 +1011,25 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
             let page_capacity = GPU_PAGE_CAPACITY as u64;
             let page_len = CHUNK_VOLUME as u64;
+            let atlas_voxel_size =
+                page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64;
+            let velocity_mac_size =
+                page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64;
+            let chunk_vertex_size = page_capacity
+                * GPU_MESH_VERTEX_CAPACITY_PER_PAGE
+                * std::mem::size_of::<GpuVertex>() as u64;
+            let chunk_index_size = page_capacity
+                * GPU_MESH_INDEX_CAPACITY_PER_PAGE
+                * std::mem::size_of::<u32>() as u64;
+
+            validate_storage_buffer_size("atlas_voxels", atlas_voxel_size, &limits)?;
+            validate_storage_buffer_size("velocity_mac", velocity_mac_size, &limits)?;
+            validate_storage_buffer_size("chunk_vertex_buffer", chunk_vertex_size, &limits)?;
+            validate_storage_buffer_size("chunk_index_buffer", chunk_index_size, &limits)?;
+
             let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk atlas voxels"),
-                size: page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64,
+                size: atlas_voxel_size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
@@ -935,18 +1045,14 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
             let chunk_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk mesh vertex buffer"),
-                size: page_capacity
-                    * GPU_MESH_VERTEX_CAPACITY_PER_PAGE
-                    * std::mem::size_of::<GpuVertex>() as u64,
+                size: chunk_vertex_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let chunk_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk mesh index buffer"),
-                size: page_capacity
-                    * GPU_MESH_INDEX_CAPACITY_PER_PAGE
-                    * std::mem::size_of::<u32>() as u64,
+                size: chunk_index_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -992,7 +1098,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
             let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk velocity atlas"),
-                size: page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64,
+                size: velocity_mac_size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -1099,7 +1205,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 device,
                 queue,
                 runtime,
-                gpu_job_lock: Mutex::new(()),
                 atlas: Mutex::new(ChunkPageAtlas::default()),
                 atlas_voxels,
                 velocity_mac,
@@ -1132,7 +1237,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
         atlas.acquire_page_for_job(job.coord, page_index);
-        let last_version = atlas
+        let _last_version = atlas
             .version_for_chunk
             .get(&job.coord)
             .copied()
@@ -1189,11 +1294,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let dispatch_t0 = Instant::now();
         let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
-            // The worker uses a shared set of writable scratch buffers/bind groups.
-            // Serialize dispatch and readback to keep page_params/edit buffers/page ownership coherent
-            // across the background mesh worker pool.
-            let _gpu_job_guard = state.gpu_job_lock.lock().unwrap_or_else(|e| e.into_inner());
-
             {
                 let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
                 atlas.assert_page_for_chunk(job.coord, page_index);
@@ -1201,7 +1301,11 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             if page_was_reassigned {
                 clear_page_buffers(state, page_index);
             }
-            clear_job_scratch_buffers(state);
+            clear_job_scratch_buffers(
+                state,
+                active_frontier_count.max(previous_frontier) as usize,
+                1,
+            );
 
             if active_frontier_count > 0 {
                 state.runtime.run_active_frontier(
@@ -1213,13 +1317,17 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     neighbor_pages,
                 )?
             }
-            let indirect = if !edit_commands.is_empty() || last_version != job.version {
+            #[cfg(feature = "gpu_meshing_experimental")]
+            let indirect = if !edit_commands.is_empty() || _last_version != job.version {
                 state
                     .runtime
                     .run_meshing_dispatch(state, &sim_job, page_index, current_state)?
             } else {
                 DrawIndirectArgs::default()
             };
+
+            #[cfg(not(feature = "gpu_meshing_experimental"))]
+            let indirect = DrawIndirectArgs::default();
 
             let generated_materials = readback_page_materials(
                 state,
