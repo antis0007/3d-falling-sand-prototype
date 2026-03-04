@@ -1945,13 +1945,13 @@ pub async fn run() -> anyhow::Result<()> {
                                 let non_gas = simulation_runtime.step(
                                     sim_mode,
                                     &mut store,
-                                    &cached_sim_region,
                                     player_chunk,
                                     &mut rng,
                                     SimulationStepMetadata {
                                         phase_class: Some(SimulationPhaseClass::SolidsLiquidsPowders),
                                         boundary_dissipation_strength: 0.0,
                                         core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                        max_voxels_to_process: 8192,
                                     },
                                 );
                                 sim_chunk_steps += non_gas.stepped_chunks;
@@ -1960,13 +1960,13 @@ pub async fn run() -> anyhow::Result<()> {
                                 let gas = simulation_runtime.step(
                                     sim_mode,
                                     &mut store,
-                                    &cached_gas_sim_region,
                                     player_chunk,
                                     &mut rng,
                                     SimulationStepMetadata {
                                         phase_class: Some(SimulationPhaseClass::Gas),
                                         boundary_dissipation_strength: ui.sim_gas_boundary_dissipation,
                                         core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                        max_voxels_to_process: 8192,
                                     },
                                 );
                                 sim_chunk_steps += gas.stepped_chunks;
@@ -1985,13 +1985,13 @@ pub async fn run() -> anyhow::Result<()> {
                             let non_gas = simulation_runtime.step(
                                 sim_mode,
                                 &mut store,
-                                &cached_sim_region,
                                 player_chunk,
                                 &mut rng,
                                 SimulationStepMetadata {
                                     phase_class: Some(SimulationPhaseClass::SolidsLiquidsPowders),
                                     boundary_dissipation_strength: 0.0,
                                     core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                    max_voxels_to_process: 8192,
                                 },
                             );
                             sim_chunk_steps += non_gas.stepped_chunks;
@@ -2000,13 +2000,13 @@ pub async fn run() -> anyhow::Result<()> {
                             let gas = simulation_runtime.step(
                                 sim_mode,
                                 &mut store,
-                                &cached_gas_sim_region,
                                 player_chunk,
                                 &mut rng,
                                 SimulationStepMetadata {
                                     phase_class: Some(SimulationPhaseClass::Gas),
                                     boundary_dissipation_strength: ui.sim_gas_boundary_dissipation,
                                     core_radius_chunks: SIMULATION_RADIUS_CHUNKS,
+                                    max_voxels_to_process: 8192,
                                 },
                             );
                             sim_chunk_steps += gas.stepped_chunks;

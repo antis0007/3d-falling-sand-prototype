@@ -8,6 +8,46 @@ const CHUNK_VOLUME: usize =
 const CHUNK_SIDE: usize = CHUNK_SIZE_VOXELS as usize;
 const CHUNK_BORDER_AREA: usize = CHUNK_SIDE * CHUNK_SIDE;
 
+const DIRTY_VOXEL_WORDS: usize = CHUNK_VOLUME.div_ceil(64);
+
+#[derive(Clone, Default)]
+struct DirtyVoxelSet {
+    active_voxels: Vec<u16>,
+    visited_flags: Vec<u64>,
+}
+
+impl DirtyVoxelSet {
+    fn with_capacity() -> Self {
+        Self {
+            active_voxels: Vec::with_capacity(128),
+            visited_flags: vec![0; DIRTY_VOXEL_WORDS],
+        }
+    }
+
+    fn activate(&mut self, idx: u16) {
+        let i = idx as usize;
+        let word = i / 64;
+        let bit = 1u64 << (i % 64);
+        if (self.visited_flags[word] & bit) != 0 {
+            return;
+        }
+        self.visited_flags[word] |= bit;
+        self.active_voxels.push(idx);
+    }
+
+    fn drain_indices(&mut self) -> Vec<u16> {
+        let mut out = Vec::new();
+        std::mem::swap(&mut out, &mut self.active_voxels);
+        for idx in &out {
+            let i = *idx as usize;
+            let word = i / 64;
+            let bit = 1u64 << (i % 64);
+            self.visited_flags[word] &= !bit;
+        }
+        out
+    }
+}
+
 #[derive(Clone)]
 pub struct ChunkBorderStrips {
     pub neg_x: [MaterialId; CHUNK_BORDER_AREA],
@@ -335,7 +375,7 @@ pub struct ChunkStore {
     unmeshed_chunks: HashSet<ChunkCoord>,
     deferred_dirty_on_load: HashSet<ChunkCoord>,
     deferred_neighbor_dirty_on_mesh: HashMap<ChunkCoord, Option<u8>>,
-    sim_dirty_voxels: Vec<VoxelCoord>,
+    sim_dirty_voxels: HashMap<ChunkCoord, DirtyVoxelSet>,
 }
 
 impl ChunkStore {
@@ -349,7 +389,7 @@ impl ChunkStore {
             unmeshed_chunks: HashSet::new(),
             deferred_dirty_on_load: HashSet::new(),
             deferred_neighbor_dirty_on_mesh: HashMap::new(),
-            sim_dirty_voxels: Vec::new(),
+            sim_dirty_voxels: HashMap::new(),
         }
     }
 
@@ -386,7 +426,11 @@ impl ChunkStore {
         chunk.set(x, y, z, material);
         let version = self.chunk_voxel_versions.entry(chunk_coord).or_insert(0);
         *version = version.saturating_add(1);
-        self.sim_dirty_voxels.push(coord);
+        let idx = Chunk::index(x, y, z) as u16;
+        self.sim_dirty_voxels
+            .entry(chunk_coord)
+            .or_insert_with(DirtyVoxelSet::with_capacity)
+            .activate(idx);
         self.dirty_chunks.insert(chunk_coord);
         self.modified_chunks.insert(chunk_coord);
 
@@ -654,7 +698,23 @@ impl ChunkStore {
     }
 
     pub fn take_sim_dirty_voxels(&mut self) -> Vec<VoxelCoord> {
-        std::mem::take(&mut self.sim_dirty_voxels)
+        let mut dirty = Vec::new();
+        for (chunk_coord, mut locals) in std::mem::take(&mut self.sim_dirty_voxels) {
+            let base = crate::types::chunk_to_world_min(chunk_coord);
+            for local_idx in locals.drain_indices() {
+                let idx = local_idx as usize;
+                let sz = CHUNK_SIZE_VOXELS as usize;
+                let x = idx % sz;
+                let y = (idx / sz) % sz;
+                let z = idx / (sz * sz);
+                dirty.push(VoxelCoord {
+                    x: base.x + x as i32,
+                    y: base.y + y as i32,
+                    z: base.z + z as i32,
+                });
+            }
+        }
+        dirty
     }
 
     pub fn iter_loaded_chunks(&self) -> impl Iterator<Item = &ChunkCoord> {

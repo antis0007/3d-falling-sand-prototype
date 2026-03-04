@@ -74,25 +74,29 @@ impl SimulationBackend for GpuFluidBackend {
     fn step(
         &mut self,
         store: &mut ChunkStore,
-        region: &HashSet<ChunkCoord>,
+        active_chunks: &HashSet<ChunkCoord>,
         _center: ChunkCoord,
         _rng: &mut Rng,
         _metadata: SimulationStepMetadata,
     ) -> SimulationStepStats {
+        let mut region: HashSet<ChunkCoord> = active_chunks.iter().copied().collect();
+        if region.is_empty() && !self.command_buffer.is_empty() {
+            region.extend(self.command_buffer.iter().map(|cmd| voxel_to_chunk(cmd.coord).0));
+        }
         #[cfg(feature = "gpu-compute")]
         {
-            return self.step_gpu_native(store, region);
+            return self.step_gpu_native(store, &region);
         }
 
         #[cfg(not(feature = "gpu-compute"))]
         {
             let mut stepped_chunks: HashSet<ChunkCoord> = HashSet::new();
 
-            let edited_chunks = self.stage_edit_commands(store, region);
+            let edited_chunks = self.stage_edit_commands(store, &region);
             stepped_chunks.extend(edited_chunks);
 
             for substep in 0..SUBSTEPS {
-                let touched = self.dispatch_substep(store, region, substep as u64);
+                let touched = self.dispatch_substep(store, &region, substep as u64);
                 stepped_chunks.extend(touched);
             }
 
@@ -116,7 +120,7 @@ impl GpuFluidBackend {
         store: &mut ChunkStore,
         region: &HashSet<ChunkCoord>,
     ) -> SimulationStepStats {
-        let mut stepped_chunks: HashSet<ChunkCoord> = self.stage_edit_commands(store, region);
+        let mut stepped_chunks: HashSet<ChunkCoord> = self.stage_edit_commands(store, &region);
 
         self.ensure_resident_pages(store, region);
         self.last_dirty_metadata = DirtySimulationMetadata::default();
