@@ -935,8 +935,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         drop(atlas);
 
         let dispatch_t0 = Instant::now();
-        if active_frontier_count > 0 {
-            state.runtime.run_active_frontier(
         let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
             if active_frontier_count > 0 {
                 state.runtime.run_active_frontier(
@@ -971,83 +969,45 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 job.snapshot.center_voxels.len(),
             )
             .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
+            let mesh_indirect = if indirect.vertex_count == 0 {
+                DrawIndirectArgs {
+                    vertex_count: (job
+                        .snapshot
+                        .center_voxels
+                        .iter()
+                        .filter(|v| **v != EMPTY)
+                        .count() as u32)
+                        .saturating_mul(6),
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                }
+            } else {
+                indirect
+            };
+            let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
+            let snapshot = job
+                .snapshot
+                .with_center_materials(generated_materials.clone());
+            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
+                mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
 
             Ok(ComputedChunkArtifacts {
-                generated_materials,
                 simulation_diagnostics: diagnostics,
-                mesh_indirect: if indirect.vertex_count == 0 {
-                    DrawIndirectArgs {
-                        vertex_count: (job
-                            .snapshot
-                            .center_voxels
-                            .iter()
-                            .filter(|v| **v != EMPTY)
-                            .count() as u32)
-                            .saturating_mul(6),
-                        instance_count: 1,
-                        first_vertex: 0,
-                        first_instance: 0,
-                    }
-                } else {
-                    indirect
+                mesh_artifact: ChunkMeshArtifact::Gpu {
+                    verts,
+                    inds,
+                    indirect: mesh_indirect,
+                    aabb_min,
+                    aabb_max,
+                    chunk_origin_world,
+                    dispatch_ms,
+                    readback_bytes: generated_materials.len() as u64
+                        * std::mem::size_of::<MaterialId>() as u64,
                 },
             })
         })();
 
-        let diagnostics = {
-            let atlas = state.atlas.lock().expect("atlas lock");
-            atlas.assert_page_for_chunk(job.coord, page_index);
-            atlas
-                .diagnostics_for_chunk
-                .get(&job.coord)
-                .copied()
-                .unwrap_or_default()
-        };
-        let generated_materials = readback_page_materials(
-            state,
-            page_index,
-            (current_state + 1) & 1,
-            job.snapshot.center_voxels.len(),
-        )
-        .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
-
-        let mesh_indirect = if indirect.vertex_count == 0 {
-            DrawIndirectArgs {
-                vertex_count: (job
-                    .snapshot
-                    .center_voxels
-                    .iter()
-                    .filter(|v| **v != EMPTY)
-                    .count() as u32)
-                    .saturating_mul(6),
-                instance_count: 1,
-                first_vertex: 0,
-                first_instance: 0,
-            }
-        } else {
-            indirect
-        };
-        let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
-        let snapshot = job
-            .snapshot
-            .with_center_materials(generated_materials.clone());
-        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
-            mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
-
-        Ok(ComputedChunkArtifacts {
-            simulation_diagnostics: diagnostics,
-            mesh_artifact: ChunkMeshArtifact::Gpu {
-                verts,
-                inds,
-                indirect: mesh_indirect,
-                aabb_min,
-                aabb_max,
-                chunk_origin_world,
-                dispatch_ms,
-                readback_bytes: generated_materials.len() as u64
-                    * std::mem::size_of::<MaterialId>() as u64,
-            },
-        })
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         atlas.release_page_from_job(page_index);
         drop(atlas);
