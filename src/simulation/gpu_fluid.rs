@@ -81,7 +81,11 @@ impl SimulationBackend for GpuFluidBackend {
     ) -> SimulationStepStats {
         let mut region: HashSet<ChunkCoord> = active_chunks.iter().copied().collect();
         if region.is_empty() && !self.command_buffer.is_empty() {
-            region.extend(self.command_buffer.iter().map(|cmd| voxel_to_chunk(cmd.coord).0));
+            region.extend(
+                self.command_buffer
+                    .iter()
+                    .map(|cmd| voxel_to_chunk(cmd.coord).0),
+            );
         }
         #[cfg(feature = "gpu-compute")]
         {

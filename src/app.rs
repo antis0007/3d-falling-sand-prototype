@@ -386,6 +386,8 @@ struct DesiredCapStats {
     mid_dropped: usize,
     far_kept: usize,
     far_dropped: usize,
+    ultra_kept: usize,
+    ultra_dropped: usize,
     uncapped_kept: usize,
     budget_dropped: usize,
 }
@@ -436,6 +438,10 @@ fn cap_desired_generation_order(
     }
     for &coord in &desired.far {
         stats.far_kept += 1;
+        prioritized.push(coord);
+    }
+    for &coord in &desired.ultra {
+        stats.ultra_kept += 1;
         prioritized.push(coord);
     }
 
@@ -704,6 +710,7 @@ pub async fn run() -> anyhow::Result<()> {
         stream_tuning.near_radius_xz,
         stream_tuning.mid_radius_xz,
         Some(stream_tuning.far_radius_xz),
+        Some(stream_tuning.ultra_radius_xz),
         stream_tuning.vertical_radius,
         RESIDENT_KEEP_MID_CAP,
         RESIDENT_KEEP_FAR_CAP,
@@ -1280,6 +1287,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 effective_stream_tuning.near_radius_xz,
                                 effective_stream_tuning.mid_radius_xz,
                                 Some(effective_stream_tuning.far_radius_xz),
+                                Some(effective_stream_tuning.ultra_radius_xz),
                                 effective_stream_tuning.vertical_radius,
                                 RESIDENT_KEEP_MID_CAP,
                                 RESIDENT_KEEP_FAR_CAP,
@@ -1355,7 +1363,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     * (1.0 - backpressure))
                                 .round() as i32;
                             generation_priority.retain(|coord| {
-                                chebyshev_from_player(player_chunk, *coord) <= far_radius_cutoff
+                                let dx = (coord.x - player_chunk.x) as f32;
+                                let dz = (coord.z - player_chunk.z) as f32;
+                                (dx * dx + dz * dz).sqrt() <= far_radius_cutoff as f32
                             });
                         }
                         let stream_stats = streaming.update(
@@ -1396,6 +1406,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let mut dispatch_near = Vec::new();
                         let mut dispatch_mid = Vec::new();
                         let mut dispatch_far = Vec::new();
+                        let mut dispatch_ultra = Vec::new();
 
                         for &coord in &generation_priority {
                             if streaming.resident.contains(&coord)
@@ -1409,8 +1420,10 @@ pub async fn run() -> anyhow::Result<()> {
                                 dispatch_near.push(coord);
                             } else if cached_desired.mid.contains(&coord) {
                                 dispatch_mid.push(coord);
-                            } else {
+                            } else if cached_desired.far.contains(&coord) {
                                 dispatch_far.push(coord);
+                            } else {
+                                dispatch_ultra.push(coord);
                             }
                         }
 
@@ -1554,6 +1567,23 @@ pub async fn run() -> anyhow::Result<()> {
                                     far_budget = far_budget.saturating_sub(1);
                                 }
                                 for coord in dispatch_far {
+                                    if far_budget == 0 {
+                                        break;
+                                    }
+                                    if !dispatch_coord(
+                                        coord,
+                                        GenerateJobClass::Far,
+                                        &mut gen_request_count,
+                                        &mut gen_worker_inflight,
+                                        &mut store,
+                                        &mut streaming,
+                                        &mut cached_modified_chunks,
+                                    ) {
+                                        break;
+                                    }
+                                    far_budget = far_budget.saturating_sub(1);
+                                }
+                                for coord in dispatch_ultra {
                                     if far_budget == 0 {
                                         break;
                                     }
@@ -3392,6 +3422,7 @@ mod tests {
             near: near.clone(),
             mid: mid.clone(),
             far: far.clone(),
+            ultra: Vec::new(),
             generation_order: Vec::new(),
             generation_scores: HashMap::new(),
             resident_keep: HashSet::new(),

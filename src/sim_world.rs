@@ -199,7 +199,6 @@ impl SimWorld {
         self.enqueue_with_neighbors(coord);
     }
 
-
     pub fn step_region(
         &mut self,
         store: &mut ChunkStore,
