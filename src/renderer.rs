@@ -1226,8 +1226,9 @@ impl Renderer {
                 stats.gpu_readback_bytes += *readback_bytes;
             }
 
-            let (verts, inds, _indirect, aabb_min, aabb_max, chunk_origin_world) =
+            let (verts, inds, _mesh_indirect, aabb_min, aabb_max, chunk_origin_world) =
                 result.artifact.geometry();
+
             let bytes = verts.len() * std::mem::size_of::<Vertex>()
                 + inds.len() * std::mem::size_of::<u32>();
             if bytes_uploaded + bytes > upload_byte_budget {
@@ -1356,20 +1357,6 @@ impl Renderer {
                     ChunkMesh {
                         vertex_alloc,
                         chunk_origin_buf,
-                        ib,
-                        indirect: self.device.create_buffer_init(
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("store chunk indirect"),
-                                contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
-                                    index_count: indirect.index_count,
-                                    instance_count: indirect.instance_count.max(1),
-                                    first_index: 0,
-                                    base_vertex: 0,
-                                    first_instance: 0,
-                                }),
-                                usage: wgpu::BufferUsages::INDIRECT,
-                            },
-                        ),
                         index_alloc,
                         index_count: inds.len() as u32,
                         debug_aabb_vb,
@@ -2755,7 +2742,7 @@ mod tests {
     #[test]
     fn frustum_culls_and_accepts_expected_aabbs() {
         let camera = Camera {
-            pos: origin_world,
+            pos: Vec3::new(0.0, 0.0, 0.0),
             dir: Vec3::new(0.0, 0.0, -1.0),
             aspect: 1.0,
         };

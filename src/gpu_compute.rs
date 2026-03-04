@@ -185,8 +185,10 @@ struct WorkerGpuState {
     active_tile_counter: wgpu::Buffer,
     edit_commands: wgpu::Buffer,
     page_params: wgpu::Buffer,
+    page_indirect: wgpu::Buffer,
     dirty_page_indices: wgpu::Buffer,
     dirty_page_counter: wgpu::Buffer,
+    diagnostics: wgpu::Buffer,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
     runtime_config: GpuSimulationRuntimeConfig,
@@ -239,16 +241,22 @@ fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
 
 #[cfg(feature = "gpu-compute")]
 fn clear_job_scratch_buffers(state: &WorkerGpuState) {
-    let zero_u32 = [0u32; 4];
+    let zero_u32x4 = [0u32; 4];
+
     state.queue.write_buffer(
         &state.active_tile_counter,
         0,
-        bytemuck::cast_slice(&zero_u32),
+        bytemuck::cast_slice(&zero_u32x4),
     );
     state.queue.write_buffer(
         &state.dirty_page_counter,
         0,
-        bytemuck::cast_slice(&zero_u32),
+        bytemuck::cast_slice(&zero_u32x4),
+    );
+    state.queue.write_buffer(
+        &state.diagnostics,
+        0,
+        bytemuck::cast_slice(&zero_u32x4),
     );
 
     let active_tile_zeros = vec![0u32; CHUNK_VOLUME];
@@ -257,11 +265,25 @@ fn clear_job_scratch_buffers(state: &WorkerGpuState) {
         0,
         bytemuck::cast_slice(&active_tile_zeros),
     );
+
     let dirty_page_zeros = vec![0u32; GPU_PAGE_CAPACITY as usize];
     state.queue.write_buffer(
         &state.dirty_page_indices,
         0,
         bytemuck::cast_slice(&dirty_page_zeros),
+    );
+}
+
+#[cfg(feature = "gpu-compute")]
+fn clear_meshing_outputs_for_page(state: &WorkerGpuState, page_index: GpuPageIndex) {
+    let zero_indirect = DrawIndirectArgs::default();
+    let indirect_stride = std::mem::size_of::<DrawIndirectArgs>() as u64;
+    let indirect_offset = page_index.0 as u64 * indirect_stride;
+
+    state.queue.write_buffer(
+        &state.page_indirect,
+        indirect_offset,
+        bytemuck::bytes_of(&zero_indirect),
     );
 }
 
@@ -594,7 +616,6 @@ impl GpuComputeRuntime {
 
         Ok(())
     }
-
     fn run_meshing_dispatch(
         &self,
         state: &WorkerGpuState,
@@ -602,6 +623,8 @@ impl GpuComputeRuntime {
         page_index: GpuPageIndex,
         current_state: u32,
     ) -> anyhow::Result<DrawIndirectArgs> {
+        clear_meshing_outputs_for_page(state, page_index);
+
         let page_params = device_page_params(
             sim_job,
             page_index,
@@ -613,15 +636,19 @@ impl GpuComputeRuntime {
         state
             .queue
             .write_buffer(&state.page_params, 0, bytemuck::cast_slice(&page_params));
+
         let groups = sim_job.active_frontier_count.max(1).div_ceil(64);
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_bind_group(0, &state.meshing_bg, &[]);
-        pass.set_pipeline(&self.meshing_pipeline);
-        pass.dispatch_workgroups(groups, 1, 1);
-        drop(pass);
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_bind_group(0, &state.meshing_bg, &[]);
+            pass.set_pipeline(&self.meshing_pipeline);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+
         state.queue.submit(Some(encoder.finish()));
         Ok(DrawIndirectArgs::default())
     }
@@ -826,76 +853,88 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
+
             let page_indirect = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk page indirect"),
                 size: page_capacity * std::mem::size_of::<DrawIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk velocity atlas"),
                 size: page_capacity * page_len * std::mem::size_of::<[f32; 4]>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let pressure = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk pressure atlas"),
                 size: page_capacity * page_len * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let divergence = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk divergence atlas"),
                 size: page_capacity * page_len * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let material_density = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk material density atlas"),
                 size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let page_params = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk page params"),
                 size: std::mem::size_of::<FrameParams>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let frontier = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk active frontier"),
                 size: page_len * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let active_tile_counter = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("active tile counter"),
                 size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let edit_commands = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("edit command buffer"),
                 size: MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let dirty_page_indices = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dirty page indices"),
                 size: page_capacity * std::mem::size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let dirty_page_counter = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("dirty page counter"),
                 size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
             let diagnostics = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk diagnostics"),
                 size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let simulation_resources = SimulationBindResources {
@@ -936,8 +975,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 active_tile_counter,
                 edit_commands,
                 page_params,
+                page_indirect,
                 dirty_page_indices,
                 dirty_page_counter,
+                diagnostics,
                 simulation_bg,
                 meshing_bg,
                 runtime_config: GpuSimulationRuntimeConfig::default(),
@@ -1118,7 +1159,7 @@ struct FrameParams {
     jacobi_iterations: u32,
     jacobi_iteration: u32,
 }
-
+#[cfg(feature = "gpu-compute")]
 fn device_page_params(
     sim_job: &SimulationJob,
     page_index: GpuPageIndex,
