@@ -22,3 +22,11 @@
 ## Legacy world ownership removal
 
 The former `world::World` / `world::Chunk` ownership path is removed from chunk generation and chunk insertion APIs. `world.rs` now only carries shared schema/constants used across UI/tooling.
+
+## Coordinate and GPU slot contract
+
+- `ChunkCoord` is the only logical chunk identity used by streaming/simulation/render scheduling.
+- `ChunkOriginWorld`/`chunk_to_world_min` derives world-space placement from `ChunkCoord` exactly once.
+- Mesh vertices are generated in **chunk-local** space.
+- Render-time instance data carries chunk world origin; shader applies `chunk_origin_world - origin_offset` once.
+- `GpuPageIndex` is storage residency only and must never be interpreted as a spatial transform.

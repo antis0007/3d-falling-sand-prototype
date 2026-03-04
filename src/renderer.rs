@@ -1350,6 +1350,20 @@ impl Renderer {
                     ChunkMesh {
                         vertex_alloc,
                         chunk_origin_buf,
+                        ib,
+                        indirect: self.device.create_buffer_init(
+                            &wgpu::util::BufferInitDescriptor {
+                                label: Some("store chunk indirect"),
+                                contents: bytemuck::bytes_of(&DrawIndexedIndirectPod {
+                                    index_count: indirect.index_count,
+                                    instance_count: indirect.instance_count.max(1),
+                                    first_index: 0,
+                                    base_vertex: 0,
+                                    first_instance: 0,
+                                }),
+                                usage: wgpu::BufferUsages::INDIRECT,
+                            },
+                        ),
                         index_alloc,
                         index_count: inds.len() as u32,
                         debug_aabb_vb,
