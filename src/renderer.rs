@@ -12,6 +12,8 @@
 //!   render-space projection from that one source of truth.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
+#[cfg(feature = "gpu-compute")]
+use crate::gpu_compute::gpu_page_capacity;
 use crate::gpu_compute::{
     cpu_generate_material_field, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
     MeshPipelineBackend,
@@ -759,7 +761,8 @@ impl Renderer {
             #[cfg(feature = "gpu-compute")]
             {
                 log::info!(
-                    "mesh backend selected: gpu-compute (adapter supports compute pipelines)"
+                    "mesh backend selected: gpu-compute (adapter supports compute pipelines, page_capacity={})",
+                    gpu_page_capacity()
                 );
                 MeshPipelineBackend::Gpu
             }
