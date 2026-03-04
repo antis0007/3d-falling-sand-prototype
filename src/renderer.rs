@@ -1485,8 +1485,12 @@ impl Renderer {
         let mut total_latency_ms = 0.0f32;
         let mut deferred = Vec::new();
         let mut remesh_coords = Vec::new();
+        let mut stale_result_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
-            if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
+            let voxel_version = store.chunk_voxel_version(result.coord);
+            if ((result.version < voxel_version) && matches!(result.artifact, ChunkMeshArtifact::Skipped)) {
+                stats.age_drop_count += 1;
+                stale_result_coords.push(result.coord);
                 continue;
             }
 
@@ -1600,8 +1604,17 @@ impl Renderer {
             bytes_uploaded += bytes;
             uploaded += 1;
             total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
+
+            let mesh_version = *self.mesh_versions.get(&result.coord).unwrap_or(&0);
+            if mesh_version < voxel_version {
+                remesh_coords.push(result.coord);
+            }
         }
         self.completed_meshes.extend(deferred);
+        for coord in stale_result_coords {
+            self.pending_lod_remesh.remove(&coord);
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
