@@ -983,6 +983,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         use std::sync::OnceLock;
 
         static STATE: OnceLock<anyhow::Result<WorkerGpuState>> = OnceLock::new();
+        static GPU_JOB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let state = STATE.get_or_init(|| {
             let instance = wgpu::Instance::default();
             let adapter =
@@ -1231,6 +1232,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             })
         });
         let state = state.as_ref().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _job_guard = GPU_JOB_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let incoming = job.snapshot.center_voxels.as_ref();
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
