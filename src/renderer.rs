@@ -1551,7 +1551,6 @@ impl Renderer {
                         origin: *chunk_origin_world,
                     },
                 );
-                println!("gpu chunks visible {}", self.visible_gpu_chunks.len());
                 self.mesh_versions.insert(result.coord, result.version);
                 store.mark_chunk_meshed(result.coord);
                 continue;
@@ -1824,10 +1823,6 @@ impl Renderer {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
-
-        if !self.visible_gpu_chunks.is_empty() {
-            println!("gpu chunks visible {}", self.visible_gpu_chunks.len());
-        }
 
         let mut debug_visible_logged = 0usize;
         for (&coord, cache) in &self.store_meshes {

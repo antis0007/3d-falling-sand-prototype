@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["gpu-compute"]
+default = ["gpu-compute", "gpu_meshing_experimental"]
 procgen-profile = []
 gpu-compute = []
 legacy-world-sim = []
