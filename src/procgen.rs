@@ -171,6 +171,7 @@ pub fn apply_generated_chunk(store: &mut ChunkStore, c: ChunkCoord, chunk: Chunk
     let mut chunk = chunk;
     apply_deferred_structure_placements(c, &mut chunk);
     store.insert_chunk_with_policy(c, chunk, true, NeighborDirtyPolicy::GeneratedConditional);
+    apply_deferred_structure_placements_to_loaded_chunks(store);
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +227,38 @@ fn apply_deferred_structure_placements(chunk_coord: ChunkCoord, chunk: &mut Chun
         if chunk.get(lx, ly, lz) == EMPTY {
             chunk.set(lx, ly, lz, placement.material);
         }
+    }
+}
+
+fn apply_deferred_structure_placements_to_loaded_chunks(store: &mut ChunkStore) {
+    let queued_for_loaded_chunks = {
+        let mut deferred = deferred_structure_placements()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready_chunks: Vec<ChunkCoord> = deferred
+            .keys()
+            .copied()
+            .filter(|coord| store.is_chunk_loaded(*coord))
+            .collect();
+
+        let mut placements = Vec::new();
+        for chunk_coord in ready_chunks {
+            if let Some(chunk_placements) = deferred.remove(&chunk_coord) {
+                placements.extend(chunk_placements);
+            }
+        }
+        placements
+    };
+
+    for placement in queued_for_loaded_chunks {
+        let _ = store.set_generated_voxel_if_loaded(
+            crate::types::VoxelCoord {
+                x: placement.wx,
+                y: placement.wy,
+                z: placement.wz,
+            },
+            placement.material,
+        );
     }
 }
 
@@ -4511,9 +4544,11 @@ mod tests {
     fn apply_generated_chunk_applies_deferred_cross_chunk_structure_writes() {
         clear_deferred_structure_placements_for_tests();
         let target_chunk = ChunkCoord { x: 2, y: -1, z: 3 };
+        let source_chunk = ChunkCoord { x: 1, y: -1, z: 3 };
         let world_x = target_chunk.x * CHUNK_SIZE_VOXELS + 5;
         let world_y = target_chunk.y * CHUNK_SIZE_VOXELS + 7;
         let world_z = target_chunk.z * CHUNK_SIZE_VOXELS + 9;
+        let world_x_2 = world_x + 1;
 
         queue_deferred_structure_placement(
             target_chunk,
@@ -4535,6 +4570,33 @@ mod tests {
                 z: world_z,
             }),
             WOOD
+        );
+
+        queue_deferred_structure_placement(
+            target_chunk,
+            DeferredStructurePlacement {
+                wx: world_x_2,
+                wy: world_y,
+                wz: world_z,
+                material: LEAVES,
+            },
+        );
+
+        store.take_dirty_chunks();
+        apply_generated_chunk(&mut store, source_chunk, Chunk::new_empty());
+
+        assert_eq!(
+            store.get_voxel(crate::types::VoxelCoord {
+                x: world_x_2,
+                y: world_y,
+                z: world_z,
+            }),
+            LEAVES,
+            "queued writes for already-loaded chunks should apply immediately without waiting for reload"
+        );
+        assert!(
+            store.is_dirty(target_chunk),
+            "target chunk should be remeshed when deferred tree voxels are applied post-load"
         );
     }
 
