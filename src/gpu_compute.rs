@@ -15,6 +15,15 @@ const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
 #[cfg(feature = "gpu-compute")]
 const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
+#[cfg(feature = "gpu-compute")]
+const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
+#[cfg(feature = "gpu-compute")]
+const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 6;
+
+#[cfg(feature = "gpu-compute")]
+pub const fn gpu_page_capacity() -> u32 {
+    GPU_PAGE_CAPACITY
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
@@ -72,6 +81,12 @@ struct MeshingBindResources<'a> {
     dirty_page_indices: &'a wgpu::Buffer,
     dirty_page_counter: &'a wgpu::Buffer,
     diagnostics: &'a wgpu::Buffer,
+    chunk_vertex_buffer: &'a wgpu::Buffer,
+    chunk_index_buffer: &'a wgpu::Buffer,
+    draw_indirect_buffer: &'a wgpu::Buffer,
+    mesh_meta_buffer: &'a wgpu::Buffer,
+    vertex_counter: &'a wgpu::Buffer,
+    index_counter: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -189,6 +204,12 @@ struct WorkerGpuState {
     dirty_page_indices: wgpu::Buffer,
     dirty_page_counter: wgpu::Buffer,
     diagnostics: wgpu::Buffer,
+    chunk_vertex_buffer: wgpu::Buffer,
+    chunk_index_buffer: wgpu::Buffer,
+    draw_indirect_buffer: wgpu::Buffer,
+    mesh_meta_buffer: wgpu::Buffer,
+    vertex_counter: wgpu::Buffer,
+    index_counter: wgpu::Buffer,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
     runtime_config: GpuSimulationRuntimeConfig,
@@ -253,11 +274,9 @@ fn clear_job_scratch_buffers(state: &WorkerGpuState) {
         0,
         bytemuck::cast_slice(&zero_u32x4),
     );
-    state.queue.write_buffer(
-        &state.diagnostics,
-        0,
-        bytemuck::cast_slice(&zero_u32x4),
-    );
+    state
+        .queue
+        .write_buffer(&state.diagnostics, 0, bytemuck::cast_slice(&zero_u32x4));
 
     let active_tile_zeros = vec![0u32; CHUNK_VOLUME];
     state.queue.write_buffer(
@@ -458,6 +477,12 @@ impl GpuComputeRuntime {
                 bgl_entry(10, false),
                 bgl_entry(11, false),
                 bgl_entry(12, false),
+                bgl_entry(13, false),
+                bgl_entry(14, false),
+                bgl_entry(15, false),
+                bgl_entry(16, false),
+                bgl_entry(17, false),
+                bgl_entry(18, false),
             ];
             let meshing_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("meshing compute bgl"),
@@ -786,6 +811,30 @@ impl GpuComputeRuntime {
                     binding: 12,
                     resource: resources.diagnostics.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: resources.chunk_vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: resources.chunk_index_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: resources.draw_indirect_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: resources.mesh_meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 17,
+                    resource: resources.vertex_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 18,
+                    resource: resources.index_counter.as_entire_binding(),
+                },
             ],
         })
     }
@@ -860,6 +909,63 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
+
+            let chunk_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk mesh vertex buffer"),
+                size: page_capacity
+                    * GPU_MESH_VERTEX_CAPACITY_PER_PAGE
+                    * std::mem::size_of::<GpuVertex>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let chunk_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk mesh index buffer"),
+                size: page_capacity
+                    * GPU_MESH_INDEX_CAPACITY_PER_PAGE
+                    * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk draw indexed indirect buffer"),
+                size: page_capacity * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mesh_meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk mesh meta buffer"),
+                size: page_capacity * std::mem::size_of::<ChunkMeshMeta>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let vertex_counter = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk mesh vertex counter"),
+                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let index_counter = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk mesh index counter"),
+                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            log::debug!(
+                "gpu mesh buffers allocated: page_capacity={} vertex_bytes={} index_bytes={} indirect_bytes={} meta_bytes={} vertex_counter_bytes={} index_counter_bytes={}",
+                page_capacity,
+                page_capacity * GPU_MESH_VERTEX_CAPACITY_PER_PAGE * std::mem::size_of::<GpuVertex>() as u64,
+                page_capacity * GPU_MESH_INDEX_CAPACITY_PER_PAGE * std::mem::size_of::<u32>() as u64,
+                page_capacity * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                page_capacity * std::mem::size_of::<ChunkMeshMeta>() as u64,
+                page_capacity * std::mem::size_of::<u32>() as u64,
+                page_capacity * std::mem::size_of::<u32>() as u64,
+            );
 
             let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk velocity atlas"),
@@ -958,6 +1064,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 dirty_page_indices: &dirty_page_indices,
                 dirty_page_counter: &dirty_page_counter,
                 diagnostics: &diagnostics,
+                chunk_vertex_buffer: &chunk_vertex_buffer,
+                chunk_index_buffer: &chunk_index_buffer,
+                draw_indirect_buffer: &draw_indirect_buffer,
+                mesh_meta_buffer: &mesh_meta_buffer,
+                vertex_counter: &vertex_counter,
+                index_counter: &index_counter,
             };
             let meshing_bg = runtime.create_meshing_bind_group(&device, meshing_resources);
             Ok(WorkerGpuState {
@@ -979,6 +1091,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 dirty_page_indices,
                 dirty_page_counter,
                 diagnostics,
+                chunk_vertex_buffer,
+                chunk_index_buffer,
+                draw_indirect_buffer,
+                mesh_meta_buffer,
+                vertex_counter,
+                index_counter,
                 simulation_bg,
                 meshing_bg,
                 runtime_config: GpuSimulationRuntimeConfig::default(),
@@ -1187,6 +1305,35 @@ pub struct DrawIndirectArgs {
     pub index_count: u32,
     pub instance_count: u32,
     pub first_vertex: u32,
+    pub first_instance: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct GpuVertex {
+    pub position: [f32; 3],
+    pub material_id: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct ChunkMeshMeta {
+    pub page_index: u32,
+    pub vertex_offset: u32,
+    pub index_offset: u32,
+    pub _pad: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+#[repr(C)]
+pub struct DrawIndexedIndirectArgs {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub base_vertex: i32,
     pub first_instance: u32,
 }
 

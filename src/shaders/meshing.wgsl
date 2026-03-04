@@ -21,6 +21,26 @@ struct DrawIndirectArgs {
     first_instance: u32,
 };
 
+struct GpuVertex {
+    position: vec3<f32>,
+    material_id: u32,
+};
+
+struct ChunkMeshMeta {
+    page_index: u32,
+    vertex_offset: u32,
+    index_offset: u32,
+    _pad: u32,
+};
+
+struct DrawIndexedIndirectArgs {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+};
+
 @group(0) @binding(0) var<storage, read_write> atlas_voxels: array<u32>;
 @group(0) @binding(5) var<storage, read_write> active_tiles: array<u32>;
 @group(0) @binding(8) var<storage, read> frame_params: array<FrameParams>;
@@ -28,6 +48,12 @@ struct DrawIndirectArgs {
 @group(0) @binding(10) var<storage, read_write> dirty_page_indices: array<u32>;
 @group(0) @binding(11) var<storage, read_write> dirty_page_counter: array<atomic<u32>>;
 @group(0) @binding(12) var<storage, read_write> diagnostics: array<atomic<u32>>;
+@group(0) @binding(13) var<storage, read_write> chunk_vertex_buffer: array<GpuVertex>;
+@group(0) @binding(14) var<storage, read_write> chunk_index_buffer: array<u32>;
+@group(0) @binding(15) var<storage, read_write> draw_indirect_buffer: array<DrawIndexedIndirectArgs>;
+@group(0) @binding(16) var<storage, read_write> mesh_meta_buffer: array<ChunkMeshMeta>;
+@group(0) @binding(17) var<storage, read_write> vertex_counter: array<atomic<u32>>;
+@group(0) @binding(18) var<storage, read_write> index_counter: array<atomic<u32>>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
     return page * (CHUNK_VOLUME * 2u) + state * CHUNK_VOLUME;
