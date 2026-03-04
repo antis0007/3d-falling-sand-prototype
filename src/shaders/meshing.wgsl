@@ -63,13 +63,13 @@ fn voxel_at(base_off: u32, p: vec3<i32>) -> u32 {
 fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let params = frame_params[0u];
-    if (i == 0u) {
-        atomicStore(&page_indirect[params.page_index].index_count, 0u);
-        page_indirect[params.page_index].instance_count = 1u;
-        page_indirect[params.page_index].first_vertex = 0u;
-        page_indirect[params.page_index].first_instance = 0u;
-        atomicStore(&diagnostics[0u], 0u);
-    }
+
+    // NOTE: This shader intentionally does not clear shared counters/indirect args.
+    // WGSL has no cross-workgroup global barrier, so "i == 0" initialization inside
+    // this dispatch can race with other invocations and clobber valid increments.
+    // Host code must reset/initialize page_indirect[page_index].index_count,
+    // page_indirect[page_index].instance_count/first_vertex/first_instance,
+    // diagnostics[0], diagnostics[1], and dirty_page_counter before dispatch.
 
     if (i >= params.frontier_len) { return; }
     let src_off = atlas_state_offset(params.page_index, (params.state_index + 1u) & 1u);
@@ -85,12 +85,17 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) { faces = faces + 1u; }
     }
     if (faces > 0u) {
+        let previous_faces = atomicAdd(&diagnostics[0u], faces);
         atomicAdd(&page_indirect[params.page_index].index_count, faces * 6u);
-        atomicAdd(&diagnostics[0u], faces);
-    }
 
-    if (i == 0u && atomicLoad(&diagnostics[1u]) > 0u) {
-        let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
-        dirty_page_indices[dirty_idx] = params.page_index;
+        // Enqueue this page once per dispatch based only on state written in this pass.
+        // This requires diagnostics[0] to be reset to 0 by the host before dispatch.
+        if (previous_faces == 0u) {
+            let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
+            let dirty_len = arrayLength(&dirty_page_indices);
+            if (dirty_idx < dirty_len) {
+                dirty_page_indices[dirty_idx] = params.page_index;
+            }
+        }
     }
 }
