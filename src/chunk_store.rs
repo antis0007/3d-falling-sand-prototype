@@ -329,6 +329,7 @@ pub enum NeighborDirtyPolicy {
 pub struct ChunkStore {
     chunks: HashMap<ChunkCoord, Chunk>,
     dirty_chunks: HashSet<ChunkCoord>,
+    urgent_dirty_chunks: HashSet<ChunkCoord>,
     modified_chunks: HashSet<ChunkCoord>,
     unmeshed_chunks: HashSet<ChunkCoord>,
     deferred_dirty_on_load: HashSet<ChunkCoord>,
@@ -341,6 +342,7 @@ impl ChunkStore {
         Self {
             chunks: HashMap::new(),
             dirty_chunks: HashSet::new(),
+            urgent_dirty_chunks: HashSet::new(),
             modified_chunks: HashSet::new(),
             unmeshed_chunks: HashSet::new(),
             deferred_dirty_on_load: HashSet::new(),
@@ -573,6 +575,7 @@ impl ChunkStore {
             let removed = self.chunks.remove(&coord);
             let was_modified = self.modified_chunks.remove(&coord);
             self.dirty_chunks.remove(&coord);
+            self.urgent_dirty_chunks.remove(&coord);
             self.unmeshed_chunks.remove(&coord);
             self.deferred_neighbor_dirty_on_mesh.remove(&coord);
             return removed.map(|chunk| (chunk, was_modified));
@@ -583,6 +586,7 @@ impl ChunkStore {
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.dirty_chunks.clear();
+        self.urgent_dirty_chunks.clear();
         self.modified_chunks.clear();
         self.unmeshed_chunks.clear();
         self.deferred_dirty_on_load.clear();
@@ -606,6 +610,17 @@ impl ChunkStore {
                 old_face_mask,
             );
         }
+    }
+
+    pub fn mark_dirty_urgent(&mut self, coord: ChunkCoord) {
+        if self.chunk_exists(coord) {
+            self.dirty_chunks.insert(coord);
+            self.urgent_dirty_chunks.insert(coord);
+        }
+    }
+
+    pub fn take_urgent_dirty_chunks(&mut self) -> Vec<ChunkCoord> {
+        self.urgent_dirty_chunks.drain().collect()
     }
 
     pub fn mark_dirty(&mut self, coord: ChunkCoord) {

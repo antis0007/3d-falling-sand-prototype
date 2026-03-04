@@ -968,6 +968,18 @@ impl Renderer {
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
         let lod_radii = lod_radii.normalized();
+        for coord in store.take_urgent_dirty_chunks() {
+            self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
+            for lod in [
+                ChunkLod::Near,
+                ChunkLod::Mid,
+                ChunkLod::Far,
+                ChunkLod::Ultra,
+            ] {
+                let version = self.mesh_versions.entry((coord, lod)).or_insert(0);
+                *version = version.saturating_add(1);
+            }
+        }
         for coord in store.take_dirty_chunks() {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
             for lod in [
