@@ -89,6 +89,7 @@ pub struct DesiredChunks {
     pub near: Vec<ChunkCoord>,
     pub mid: Vec<ChunkCoord>,
     pub far: Vec<ChunkCoord>,
+    pub ultra: Vec<ChunkCoord>,
     pub generation_order: Vec<ChunkCoord>,
     pub generation_scores: HashMap<ChunkCoord, f32>,
     pub resident_keep: HashSet<ChunkCoord>,
@@ -238,6 +239,7 @@ impl ChunkStreaming {
         near_radius_xz: i32,
         mid_radius_xz: i32,
         far_radius_xz: Option<i32>,
+        ultra_radius_xz: Option<i32>,
         vertical_radius: i32,
         resident_keep_mid_cap: usize,
         resident_keep_far_cap: usize,
@@ -247,6 +249,7 @@ impl ChunkStreaming {
         let near_radius = near_radius_xz.max(0);
         let mid_radius = mid_radius_xz.max(near_radius);
         let far_radius = far_radius_xz.unwrap_or(mid_radius).max(mid_radius);
+        let ultra_radius = ultra_radius_xz.unwrap_or(far_radius).max(far_radius);
         let ry = vertical_radius.max(0);
 
         let near = Self::ring_sorted_region(player_chunk, near_radius, ry, 0, 0);
@@ -264,8 +267,15 @@ impl ChunkStreaming {
             mid_radius + 1,
             FAR_RING_UPWARD_BIAS_BUDGET,
         );
+        let ultra = Self::ring_sorted_region(
+            player_chunk,
+            ultra_radius,
+            ry,
+            far_radius + 1,
+            FAR_RING_UPWARD_BIAS_BUDGET,
+        );
 
-        let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len());
+        let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
         let view_dir = view_dir.normalize_or_zero();
         let velocity_dir = player_velocity.normalize_or_zero();
         let (cone_inner_cos, cone_outer_cos, frustum_planes_chunk_space, camera_pos_chunk_space) =
@@ -297,6 +307,7 @@ impl ChunkStreaming {
             .copied()
             .chain(mid.iter().copied())
             .chain(far.iter().copied())
+            .chain(ultra.iter().copied())
         {
             let dx = i64::from(coord.x - player_chunk.x);
             let dy = i64::from(coord.y - player_chunk.y);
@@ -356,9 +367,11 @@ impl ChunkStreaming {
             let lod_need = if cheb <= near_radius {
                 1.0
             } else if cheb <= mid_radius {
-                0.65
+                0.75
+            } else if cheb <= far_radius {
+                0.45
             } else {
-                0.35
+                0.2
             };
             let depth_penalty = if dy_i32 < -DEPTH_PENALTY_START_DELTA_Y {
                 (-dy_i32 - DEPTH_PENALTY_START_DELTA_Y) as f32 * DEPTH_PENALTY_PER_CHUNK
@@ -398,12 +411,16 @@ impl ChunkStreaming {
                 .then_with(|| a.0.z.cmp(&b.0.z))
         });
 
-        let mut generation_order = Vec::with_capacity(weighted.len());
         let mut generation_scores = HashMap::with_capacity(weighted.len());
         for (coord, score, ..) in weighted {
-            generation_order.push(coord);
             generation_scores.insert(coord, score);
         }
+
+        let mut generation_order = Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
+        generation_order.extend(near.iter().copied());
+        generation_order.extend(mid.iter().copied());
+        generation_order.extend(far.iter().copied());
+        generation_order.extend(ultra.iter().copied());
 
         let mut resident_keep = HashSet::with_capacity(
             near.len()
@@ -436,6 +453,7 @@ impl ChunkStreaming {
             near,
             mid,
             far,
+            ultra,
             generation_order,
             generation_scores,
             resident_keep,
@@ -499,9 +517,12 @@ impl ChunkStreaming {
 
         for ring in start..=radius {
             let mut ring_coords = Vec::new();
+            let ring2 = ring * ring;
+            let inner2 = (ring.saturating_sub(1)).pow(2);
             for dz in -ring..=ring {
                 for dx in -ring..=ring {
-                    if dx.abs().max(dz.abs()) != ring {
+                    let dist2 = dx * dx + dz * dz;
+                    if dist2 > ring2 || (ring > 0 && dist2 <= inner2) {
                         continue;
                     }
                     for dy in min_dy..=max_dy {
@@ -1177,6 +1198,7 @@ mod tests {
             1,
             3,
             Some(5),
+            Some(7),
             3,
             32,
             32,
@@ -1218,6 +1240,7 @@ mod tests {
             1,
             3,
             Some(5),
+            Some(7),
             3,
             32,
             32,
@@ -1294,6 +1317,7 @@ mod tests {
             near_radius,
             mid_radius,
             far_radius,
+            far_radius,
             0,
             64,
             64,
@@ -1308,6 +1332,7 @@ mod tests {
             near_radius,
             mid_radius,
             far_radius,
+            far_radius,
             0,
             64,
             64,
@@ -1321,6 +1346,7 @@ mod tests {
             Some(&exclude_target),
             near_radius,
             mid_radius,
+            far_radius,
             far_radius,
             0,
             64,

@@ -86,114 +86,180 @@ struct CameraUniform {
 }
 
 #[derive(Clone, Copy)]
-struct BufferSuballocation {
-    slab_index: usize,
+struct MeshBufferRange {
     offset: u64,
     size: u64,
 }
 
-struct BufferSlab {
-    buffer: wgpu::Buffer,
+#[derive(Clone, Copy)]
+struct MeshAllocation {
+    page_index: usize,
+    vertex: MeshBufferRange,
+    index: MeshBufferRange,
+}
+
+#[derive(Clone, Copy)]
+struct MeshPageRange {
+    vertex: MeshBufferRange,
+    index: MeshBufferRange,
+}
+
+struct MeshPage {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    free_ranges: Vec<MeshPageRange>,
     capacity: u64,
-    cursor: u64,
-    free: Vec<BufferSuballocation>,
+    vertex_cursor: u64,
+    index_cursor: u64,
+    live_allocations: usize,
 }
 
-struct BufferArena {
+struct MeshPageAllocator {
     label: &'static str,
-    usage: wgpu::BufferUsages,
-    min_slab_size: u64,
-    slabs: Vec<BufferSlab>,
+    page_size: u64,
+    pages: Vec<Option<MeshPage>>,
 }
 
-impl BufferArena {
-    fn new(label: &'static str, usage: wgpu::BufferUsages, min_slab_size: u64) -> Self {
+impl MeshPageAllocator {
+    fn new(label: &'static str, page_size: u64) -> Self {
         Self {
             label,
-            usage,
-            min_slab_size,
-            slabs: Vec::new(),
+            page_size,
+            pages: Vec::new(),
         }
     }
 
-    fn buffer(&self, slab_index: usize) -> &wgpu::Buffer {
-        &self.slabs[slab_index].buffer
+    fn page(&self, page_index: usize) -> Option<&MeshPage> {
+        self.pages.get(page_index).and_then(|page| page.as_ref())
     }
 
     fn allocate(
         &mut self,
         device: &wgpu::Device,
-        size: u64,
+        vertex_size: u64,
+        index_size: u64,
         telemetry: &mut MeshAllocatorTelemetry,
-    ) -> BufferSuballocation {
-        for (slab_index, slab) in self.slabs.iter_mut().enumerate() {
-            if let Some((free_idx, free_alloc)) = slab
-                .free
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, alloc)| alloc.size >= size)
+    ) -> MeshAllocation {
+        for (page_index, page) in self.pages.iter_mut().enumerate() {
+            let Some(page) = page.as_mut() else {
+                continue;
+            };
+
+            if let Some((free_idx, free_alloc)) =
+                page.free_ranges
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, alloc)| {
+                        alloc.vertex.size >= vertex_size && alloc.index.size >= index_size
+                    })
             {
-                slab.free.swap_remove(free_idx);
-                telemetry.bytes_reused += size as usize;
-                if free_alloc.size > size {
-                    slab.free.push(BufferSuballocation {
-                        slab_index,
-                        offset: free_alloc.offset + size,
-                        size: free_alloc.size - size,
+                page.free_ranges.swap_remove(free_idx);
+                telemetry.bytes_reused += (vertex_size + index_size) as usize;
+                if free_alloc.vertex.size > vertex_size && free_alloc.index.size > index_size {
+                    page.free_ranges.push(MeshPageRange {
+                        vertex: MeshBufferRange {
+                            offset: free_alloc.vertex.offset + vertex_size,
+                            size: free_alloc.vertex.size - vertex_size,
+                        },
+                        index: MeshBufferRange {
+                            offset: free_alloc.index.offset + index_size,
+                            size: free_alloc.index.size - index_size,
+                        },
                     });
                 }
-                return BufferSuballocation {
-                    slab_index,
-                    offset: free_alloc.offset,
-                    size,
+                page.live_allocations += 1;
+                return MeshAllocation {
+                    page_index,
+                    vertex: MeshBufferRange {
+                        offset: free_alloc.vertex.offset,
+                        size: vertex_size,
+                    },
+                    index: MeshBufferRange {
+                        offset: free_alloc.index.offset,
+                        size: index_size,
+                    },
                 };
             }
 
-            if slab.capacity - slab.cursor >= size {
-                let offset = slab.cursor;
-                slab.cursor += size;
-                return BufferSuballocation {
-                    slab_index,
-                    offset,
-                    size,
+            if page.capacity - page.vertex_cursor >= vertex_size
+                && page.capacity - page.index_cursor >= index_size
+            {
+                let vertex_offset = page.vertex_cursor;
+                let index_offset = page.index_cursor;
+                page.vertex_cursor += vertex_size;
+                page.index_cursor += index_size;
+                page.live_allocations += 1;
+                return MeshAllocation {
+                    page_index,
+                    vertex: MeshBufferRange {
+                        offset: vertex_offset,
+                        size: vertex_size,
+                    },
+                    index: MeshBufferRange {
+                        offset: index_offset,
+                        size: index_size,
+                    },
                 };
             }
         }
 
-        let last_capacity = self
-            .slabs
-            .last()
-            .map(|slab| slab.capacity)
-            .unwrap_or(self.min_slab_size);
-        let new_capacity = self
-            .min_slab_size
-            .max(last_capacity.saturating_mul(2))
-            .max(size);
-        let slab_index = self.slabs.len();
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(self.label),
+        let new_capacity = self.page_size.max(vertex_size).max(index_size);
+        let page_index = self
+            .pages
+            .iter()
+            .position(|page| page.is_none())
+            .unwrap_or(self.pages.len());
+        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{} vertex page", self.label)),
             size: new_capacity,
-            usage: self.usage | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.slabs.push(BufferSlab {
-            buffer,
-            capacity: new_capacity,
-            cursor: size,
-            free: Vec::new(),
+        let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("{} index page", self.label)),
+            size: new_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        telemetry.bytes_allocated += new_capacity as usize;
-        BufferSuballocation {
-            slab_index,
-            offset: 0,
-            size,
+        let page = MeshPage {
+            vertex_buffer,
+            index_buffer,
+            free_ranges: Vec::new(),
+            capacity: new_capacity,
+            vertex_cursor: vertex_size,
+            index_cursor: index_size,
+            live_allocations: 1,
+        };
+        if page_index == self.pages.len() {
+            self.pages.push(Some(page));
+        } else {
+            self.pages[page_index] = Some(page);
+        }
+        telemetry.bytes_allocated += (new_capacity * 2) as usize;
+        MeshAllocation {
+            page_index,
+            vertex: MeshBufferRange {
+                offset: 0,
+                size: vertex_size,
+            },
+            index: MeshBufferRange {
+                offset: 0,
+                size: index_size,
+            },
         }
     }
 
-    fn free(&mut self, allocation: BufferSuballocation) {
-        if let Some(slab) = self.slabs.get_mut(allocation.slab_index) {
-            slab.free.push(allocation);
+    fn free(&mut self, allocation: MeshAllocation) {
+        if let Some(Some(page)) = self.pages.get_mut(allocation.page_index) {
+            page.free_ranges.push(MeshPageRange {
+                vertex: allocation.vertex,
+                index: allocation.index,
+            });
+            page.live_allocations = page.live_allocations.saturating_sub(1);
+            if page.live_allocations == 0 {
+                self.pages[allocation.page_index] = None;
+            }
         }
     }
 }
@@ -235,9 +301,8 @@ impl Camera {
 }
 
 pub struct ChunkMesh {
-    vertex_alloc: BufferSuballocation,
+    allocation: MeshAllocation,
     chunk_origin_buf: wgpu::Buffer,
-    index_alloc: BufferSuballocation,
     index_count: u32,
     debug_aabb_vb: wgpu::Buffer,
     debug_aabb_ib: wgpu::Buffer,
@@ -275,23 +340,24 @@ impl ChunkMeshCache {
     }
 
     fn best_available(&self, selected: ChunkLod) -> Option<(ChunkLod, &ChunkMesh)> {
-        if let Some(mesh) = self.get(selected) {
-            return Some((selected, mesh));
-        }
-
-        let selected_rank = lod_rank(selected) as i32;
-        [
+        let ordered = [
             ChunkLod::Near,
             ChunkLod::Mid,
             ChunkLod::Far,
             ChunkLod::Ultra,
-        ]
-        .into_iter()
-        .filter_map(|lod| self.get(lod).map(|mesh| (lod, mesh)))
-        .min_by_key(|(lod, _)| {
-            let rank = lod_rank(*lod) as i32;
-            ((rank - selected_rank).abs(), lod_rank(*lod))
-        })
+        ];
+        let start = lod_rank(selected);
+        for lod in ordered.iter().skip(start).copied() {
+            if let Some(mesh) = self.get(lod) {
+                return Some((lod, mesh));
+            }
+        }
+        for lod in ordered.iter().take(start).copied() {
+            if let Some(mesh) = self.get(lod) {
+                return Some((lod, mesh));
+            }
+        }
+        None
     }
 
     fn drain(self) -> impl Iterator<Item = ChunkMesh> {
@@ -390,8 +456,7 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     store_meshes: HashMap<ChunkCoord, ChunkMeshCache>,
-    vertex_arena: BufferArena,
-    index_arena: BufferArena,
+    mesh_allocator: MeshPageAllocator,
 
     dirty_queues: DirtyChunkQueues,
     urgent_mesh_queue: VecDeque<ChunkCoord>,
@@ -473,7 +538,7 @@ const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
 const DIRTY_NEAR_STARVE_LIMIT_FRAMES: u32 = 8;
 const DIRTY_FAR_STARVE_LIMIT_FRAMES: u32 = 20;
 const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
-const FAR_CACHE_EVICT_BAND_CHUNKS: i32 = 16;
+const MAX_LOD_REMESH_PER_FRAME: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -972,16 +1037,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             store_meshes: HashMap::new(),
-            vertex_arena: BufferArena::new(
-                "chunk vertex arena",
-                wgpu::BufferUsages::VERTEX,
-                4 * 1024 * 1024,
-            ),
-            index_arena: BufferArena::new(
-                "chunk index arena",
-                wgpu::BufferUsages::INDEX,
-                4 * 1024 * 1024,
-            ),
+            mesh_allocator: MeshPageAllocator::new("chunk mesh", 12 * 1024 * 1024),
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
             urgent_mesh_set: HashSet::new(),
@@ -1362,34 +1418,30 @@ impl Renderer {
             let cache = self.store_meshes.entry(result.coord).or_default();
             if inds.is_empty() {
                 if let Some(old_mesh) = cache.slot_mut(result.lod).take() {
-                    self.vertex_arena.free(old_mesh.vertex_alloc);
-                    self.index_arena.free(old_mesh.index_alloc);
+                    self.mesh_allocator.free(old_mesh.allocation);
                 }
             } else {
                 let vertex_bytes = (verts.len() * std::mem::size_of::<Vertex>()) as u64;
                 let index_bytes = (inds.len() * std::mem::size_of::<u32>()) as u64;
 
-                let vertex_alloc = self.vertex_arena.allocate(
+                let allocation = self.mesh_allocator.allocate(
                     &self.device,
                     vertex_bytes,
-                    &mut self.allocator_telemetry,
-                );
-                let index_alloc = self.index_arena.allocate(
-                    &self.device,
                     index_bytes,
                     &mut self.allocator_telemetry,
                 );
-
-                self.queue.write_buffer(
-                    self.vertex_arena.buffer(vertex_alloc.slab_index),
-                    vertex_alloc.offset,
-                    bytemuck::cast_slice(verts),
-                );
-                self.queue.write_buffer(
-                    self.index_arena.buffer(index_alloc.slab_index),
-                    index_alloc.offset,
-                    bytemuck::cast_slice(inds),
-                );
+                if let Some(page) = self.mesh_allocator.page(allocation.page_index) {
+                    self.queue.write_buffer(
+                        &page.vertex_buffer,
+                        allocation.vertex.offset,
+                        bytemuck::cast_slice(verts),
+                    );
+                    self.queue.write_buffer(
+                        &page.index_buffer,
+                        allocation.index.offset,
+                        bytemuck::cast_slice(inds),
+                    );
+                }
 
                 let chunk_origin_buf =
                     self.device
@@ -1418,9 +1470,8 @@ impl Renderer {
                         });
 
                 let new_mesh = ChunkMesh {
-                    vertex_alloc,
+                    allocation,
                     chunk_origin_buf,
-                    index_alloc,
                     index_count: inds.len() as u32,
                     debug_aabb_vb,
                     debug_aabb_ib,
@@ -1431,8 +1482,7 @@ impl Renderer {
                 };
 
                 if let Some(old_mesh) = cache.slot_mut(result.lod).replace(new_mesh) {
-                    self.vertex_arena.free(old_mesh.vertex_alloc);
-                    self.index_arena.free(old_mesh.index_alloc);
+                    self.mesh_allocator.free(old_mesh.allocation);
                 }
             }
 
@@ -1477,39 +1527,43 @@ impl Renderer {
         stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = self.completed_meshes.len();
 
-        let ultra_mesh_evict_distance = lod_radii.ultra.saturating_sub(lod_radii.hysteresis.max(1));
+        let ultra_mesh_evict_distance =
+            lod_radii.ultra.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
         let far_mesh_evict_distance =
-            ultra_mesh_evict_distance.saturating_sub(FAR_CACHE_EVICT_BAND_CHUNKS);
+            lod_radii.far.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
+        let mid_mesh_evict_distance =
+            lod_radii.mid.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
         let mut evict_lod_slots = Vec::new();
         for &coord in self.store_meshes.keys() {
-            let d = chunk_chebyshev_dist(player_chunk, coord);
+            let d = chunk_horizontal_distance(player_chunk, coord);
             if d > ultra_mesh_evict_distance {
                 evict_lod_slots.push((coord, ChunkLod::Ultra));
             }
             if d > far_mesh_evict_distance {
                 evict_lod_slots.push((coord, ChunkLod::Far));
             }
+            if d > mid_mesh_evict_distance {
+                evict_lod_slots.push((coord, ChunkLod::Mid));
+            }
         }
         for (coord, lod) in evict_lod_slots {
             if let Some(cache) = self.store_meshes.get_mut(&coord) {
                 if let Some(mesh) = cache.slot_mut(lod).take() {
-                    self.vertex_arena.free(mesh.vertex_alloc);
-                    self.index_arena.free(mesh.index_alloc);
+                    self.mesh_allocator.free(mesh.allocation);
                 }
             }
         }
 
         let mut drop_keys = Vec::new();
         for &coord in self.store_meshes.keys() {
-            if chunk_chebyshev_dist(player_chunk, coord) > lod_radii.ultra {
+            if chunk_horizontal_distance(player_chunk, coord) > lod_radii.ultra as f32 {
                 drop_keys.push(coord);
             }
         }
         for coord in drop_keys {
             if let Some(cache) = self.store_meshes.remove(&coord) {
                 for mesh in cache.drain() {
-                    self.vertex_arena.free(mesh.vertex_alloc);
-                    self.index_arena.free(mesh.index_alloc);
+                    self.mesh_allocator.free(mesh.allocation);
                 }
             }
             self.lod_selection.remove(&coord);
@@ -1517,21 +1571,29 @@ impl Renderer {
         }
 
         let cached_coords: Vec<ChunkCoord> = self.store_meshes.keys().copied().collect();
+        let mut lod_changes = Vec::new();
         for coord in cached_coords {
             let prev = self.lod_selection.get(&coord).copied();
             let lod = select_lod(coord, player_chunk, lod_radii, prev);
             if prev != Some(lod) {
-                self.enqueue_lod_remesh(coord, player_chunk, chunk_priority_scores);
+                lod_changes.push(coord);
             }
             self.lod_selection.insert(coord, lod);
+        }
+        lod_changes.sort_by(|a, b| {
+            let ad = chunk_horizontal_distance(*a, player_chunk);
+            let bd = chunk_horizontal_distance(*b, player_chunk);
+            ad.total_cmp(&bd)
+        });
+        for coord in lod_changes.into_iter().take(MAX_LOD_REMESH_PER_FRAME) {
+            self.enqueue_lod_remesh(coord, player_chunk, chunk_priority_scores);
         }
         stats
     }
     pub fn clear_mesh_cache(&mut self) {
         for (_, cache) in self.store_meshes.drain() {
             for mesh in cache.drain() {
-                self.vertex_arena.free(mesh.vertex_alloc);
-                self.index_arena.free(mesh.index_alloc);
+                self.mesh_allocator.free(mesh.allocation);
             }
         }
         self.dirty_queues.clear();
@@ -1646,18 +1708,21 @@ impl Renderer {
                 mesh.chunk_origin_world,
                 voxel_to_world(chunk_to_world_min(coord))
             );
+            let Some(page) = self.mesh_allocator.page(mesh.allocation.page_index) else {
+                continue;
+            };
             pass.set_vertex_buffer(
                 0,
-                self.vertex_arena
-                    .buffer(mesh.vertex_alloc.slab_index)
-                    .slice(
-                        mesh.vertex_alloc.offset..mesh.vertex_alloc.offset + mesh.vertex_alloc.size,
-                    ),
+                page.vertex_buffer.slice(
+                    mesh.allocation.vertex.offset
+                        ..mesh.allocation.vertex.offset + mesh.allocation.vertex.size,
+                ),
             );
             pass.set_vertex_buffer(1, mesh.chunk_origin_buf.slice(..));
             pass.set_index_buffer(
-                self.index_arena.buffer(mesh.index_alloc.slab_index).slice(
-                    mesh.index_alloc.offset..mesh.index_alloc.offset + mesh.index_alloc.size,
+                page.index_buffer.slice(
+                    mesh.allocation.index.offset
+                        ..mesh.allocation.index.offset + mesh.allocation.index.size,
                 ),
                 wgpu::IndexFormat::Uint32,
             );
@@ -2586,25 +2651,34 @@ fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
         .max((a.z - b.z).abs())
 }
 
+fn chunk_horizontal_distance(a: ChunkCoord, b: ChunkCoord) -> f32 {
+    let dx = (a.x - b.x) as f32;
+    let dz = (a.z - b.z) as f32;
+    (dx * dx + dz * dz).sqrt()
+}
+
 fn select_lod(
     coord: ChunkCoord,
     player_chunk: ChunkCoord,
     radii: LodRadii,
     prev: Option<ChunkLod>,
 ) -> ChunkLod {
-    let d = chunk_chebyshev_dist(coord, player_chunk);
+    let d = chunk_horizontal_distance(coord, player_chunk);
     let h = radii.hysteresis.max(1);
-    let near_down = radii.near.saturating_sub(h);
-    let mid_down = radii.mid.saturating_sub(h * 2);
-    let far_down = radii.far.saturating_sub(h * 3);
+    let near_down = (radii.near.saturating_sub(h * 5)) as f32;
+    let mid_down = (radii.mid.saturating_sub(h * 10)) as f32;
+    let far_down = (radii.far.saturating_sub(h * 20)) as f32;
+    let near_up = radii.near as f32;
+    let mid_up = radii.mid as f32;
+    let far_up = radii.far as f32;
 
     match prev {
         Some(ChunkLod::Near) => {
-            if d <= radii.near {
+            if d <= near_up {
                 ChunkLod::Near
-            } else if d <= radii.mid {
+            } else if d <= mid_up {
                 ChunkLod::Mid
-            } else if d <= radii.far {
+            } else if d <= far_up {
                 ChunkLod::Far
             } else {
                 ChunkLod::Ultra
@@ -2613,9 +2687,9 @@ fn select_lod(
         Some(ChunkLod::Mid) => {
             if d <= near_down {
                 ChunkLod::Near
-            } else if d <= radii.mid {
+            } else if d <= mid_up {
                 ChunkLod::Mid
-            } else if d <= radii.far {
+            } else if d <= far_up {
                 ChunkLod::Far
             } else {
                 ChunkLod::Ultra
@@ -2624,7 +2698,7 @@ fn select_lod(
         Some(ChunkLod::Far) => {
             if d <= mid_down {
                 ChunkLod::Mid
-            } else if d <= radii.far {
+            } else if d <= far_up {
                 ChunkLod::Far
             } else {
                 ChunkLod::Ultra
@@ -2638,11 +2712,11 @@ fn select_lod(
             }
         }
         None => {
-            if d <= radii.near {
+            if d <= near_up {
                 ChunkLod::Near
-            } else if d <= radii.mid {
+            } else if d <= mid_up {
                 ChunkLod::Mid
-            } else if d <= radii.far {
+            } else if d <= far_up {
                 ChunkLod::Far
             } else {
                 ChunkLod::Ultra
@@ -2657,12 +2731,12 @@ fn fallback_lod_near_threshold(
     radii: LodRadii,
     primary: ChunkLod,
 ) -> Option<ChunkLod> {
-    let d = chunk_chebyshev_dist(coord, player_chunk);
-    let h = radii.hysteresis.max(1);
+    let d = chunk_horizontal_distance(coord, player_chunk);
+    let h = radii.hysteresis.max(1) as f32;
 
-    let near_edge = (d - radii.near).abs() <= h;
-    let mid_edge = (d - radii.mid).abs() <= h;
-    let far_edge = (d - radii.far).abs() <= h;
+    let near_edge = (d - radii.near as f32).abs() <= h;
+    let mid_edge = (d - radii.mid as f32).abs() <= h;
+    let far_edge = (d - radii.far as f32).abs() <= h;
 
     match primary {
         ChunkLod::Near if near_edge => Some(ChunkLod::Mid),
