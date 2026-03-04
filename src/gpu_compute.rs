@@ -1564,11 +1564,15 @@ pub struct ChunkMeshMeta {
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 #[repr(C)]
 pub struct DrawIndexedIndirectArgs {
-    pub vertex_count: u32,
+    pub index_count: u32,
     pub instance_count: u32,
-    pub first_vertex: u32,
+    pub first_index: u32,
+    pub base_vertex: i32,
     pub first_instance: u32,
 }
+
+#[cfg(feature = "gpu-compute")]
+const _: [(); 20] = [(); std::mem::size_of::<DrawIndexedIndirectArgs>()];
 
 pub struct ComputedChunkArtifacts {
     pub simulation_diagnostics: ChunkSimulationDiagnostics,
