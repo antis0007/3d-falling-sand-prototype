@@ -1,4 +1,4 @@
-use crate::renderer::MeshJob;
+use crate::renderer::{mesh_chunk_snapshot, ChunkMeshArtifact, MeshJob};
 use crate::types::{ChunkCoord, GpuPageIndex};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
@@ -905,6 +905,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         );
         drop(atlas);
 
+        let dispatch_t0 = Instant::now();
         if active_frontier_count > 0 {
             state.runtime.run_active_frontier(
                 state,
@@ -939,24 +940,41 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         )
         .unwrap_or_else(|_| job.snapshot.center_voxels.to_vec());
 
+        let mesh_indirect = if indirect.vertex_count == 0 {
+            DrawIndirectArgs {
+                vertex_count: (job
+                    .snapshot
+                    .center_voxels
+                    .iter()
+                    .filter(|v| **v != EMPTY)
+                    .count() as u32)
+                    .saturating_mul(6),
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            }
+        } else {
+            indirect
+        };
+        let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
+        let snapshot = job
+            .snapshot
+            .with_center_materials(generated_materials.clone());
+        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
+            mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
+
         Ok(ComputedChunkArtifacts {
-            generated_materials,
             simulation_diagnostics: diagnostics,
-            mesh_indirect: if indirect.vertex_count == 0 {
-                DrawIndirectArgs {
-                    vertex_count: (job
-                        .snapshot
-                        .center_voxels
-                        .iter()
-                        .filter(|v| **v != EMPTY)
-                        .count() as u32)
-                        .saturating_mul(6),
-                    instance_count: 1,
-                    first_vertex: 0,
-                    first_instance: 0,
-                }
-            } else {
-                indirect
+            mesh_artifact: ChunkMeshArtifact::Gpu {
+                verts,
+                inds,
+                indirect: mesh_indirect,
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+                dispatch_ms,
+                readback_bytes: generated_materials.len() as u64
+                    * std::mem::size_of::<MaterialId>() as u64,
             },
         })
     }
@@ -1016,38 +1034,40 @@ pub struct DrawIndirectArgs {
 }
 
 pub struct ComputedChunkArtifacts {
-    pub generated_materials: Vec<MaterialId>,
     pub simulation_diagnostics: ChunkSimulationDiagnostics,
-    pub mesh_indirect: DrawIndirectArgs,
+    pub(crate) mesh_artifact: ChunkMeshArtifact,
 }
 
 impl ComputedChunkArtifacts {
     pub fn has_any_surface(&self) -> bool {
-        self.mesh_indirect.vertex_count > 0
+        let (_, inds, _, _, _, _) = self.mesh_artifact.geometry();
+        !inds.is_empty()
     }
 }
 
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
     let mut out = vec![EMPTY; job.snapshot.center_voxels.len()];
     out.copy_from_slice(job.snapshot.center_voxels.as_ref());
-    let surface = out.iter().filter(|v| **v != EMPTY).count() as u32;
+    let snapshot = job.snapshot.with_center_materials(out);
+    let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
+        mesh_chunk_snapshot(job.coord, &snapshot, job.lod, job.greedy);
+    let surface = inds.len() as u32;
     ComputedChunkArtifacts {
-        generated_materials: out,
         simulation_diagnostics: ChunkSimulationDiagnostics::default(),
-        mesh_indirect: DrawIndirectArgs {
-            vertex_count: surface.saturating_mul(6),
-            instance_count: 1,
-            first_vertex: 0,
-            first_instance: 0,
+        mesh_artifact: ChunkMeshArtifact::Cpu {
+            verts,
+            inds,
+            indirect: DrawIndirectArgs {
+                vertex_count: surface,
+                instance_count: 1,
+                first_vertex: 0,
+                first_instance: 0,
+            },
+            aabb_min,
+            aabb_max,
+            chunk_origin_world,
         },
     }
-}
-
-pub(crate) fn rebuilt_snapshot_from_materials(
-    job: &MeshJob,
-    materials: Vec<MaterialId>,
-) -> crate::renderer::ChunkSnapshot {
-    job.snapshot.with_center_materials(materials)
 }
 
 #[cfg(test)]

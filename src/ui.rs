@@ -79,6 +79,10 @@ pub struct ProfilerStats {
     pub gpu_compute_bytes_transferred: u64,
     pub gpu_compute_chunks_per_sec: f32,
     pub gpu_compute_chunks_completed: u64,
+    pub gpu_mesh_adoption_pct: f32,
+    pub gpu_meshing_dispatch_ms: f32,
+    pub cpu_meshing_ms: f32,
+    pub gpu_readback_bytes_frame: u64,
     pub loaded_chunks: usize,
     pub resident_chunks: usize,
     pub scheduled_chunks: usize,
@@ -740,6 +744,13 @@ pub fn draw(
                     ui_state.profiler.gpu_compute_bytes_transferred,
                     ui_state.profiler.gpu_compute_chunks_completed,
                     ui_state.profiler.gpu_compute_chunks_per_sec,
+                ));
+                ui.monospace(format!(
+                    "gpu meshing adoption: {:.1}% | cpu meshing: {:.2} ms | gpu meshing dispatch: {:.2} ms | readback bytes/frame: {}",
+                    ui_state.profiler.gpu_mesh_adoption_pct,
+                    ui_state.profiler.cpu_meshing_ms,
+                    ui_state.profiler.gpu_meshing_dispatch_ms,
+                    ui_state.profiler.gpu_readback_bytes_frame,
                 ));
                 ui.separator();
                 ui.heading("Renderer Debug");
