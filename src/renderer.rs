@@ -405,7 +405,6 @@ struct DrawIndexedIndirectCommand {
     first_instance: u32,
 }
 
-
 // Deprecated: CPU mesh pipeline removed. Structures retained temporarily
 // to avoid breaking references during GPU renderer migration.
 #[derive(Clone, Copy, Debug)]
@@ -480,6 +479,7 @@ pub struct Renderer {
     global_gpu_vertex_buffer: wgpu::Buffer,
     global_gpu_index_buffer: wgpu::Buffer,
     global_gpu_draw_indirect_buffer: wgpu::Buffer,
+    supports_multi_draw_indirect: bool,
 
     dirty_queues: DirtyChunkQueues,
     urgent_mesh_queue: VecDeque<ChunkCoord>,
@@ -1008,8 +1008,28 @@ impl Renderer {
             .await
             .context("adapter")?;
 
+        let supported_features = adapter.features();
+        let required_features =
+            wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        let enabled_features = supported_features & required_features;
+        let supports_multi_draw_indirect =
+            enabled_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+
+        if !supports_multi_draw_indirect {
+            log::warn!(
+                "adapter does not support MULTI_DRAW_INDIRECT; falling back to per-command indirect draws"
+            );
+        }
+
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("Voxel Renderer Device"),
+                    required_features: enabled_features,
+                    required_limits: wgpu::Limits::default(),
+                },
+                None,
+            )
             .await?;
 
         let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter) {
@@ -1171,6 +1191,7 @@ impl Renderer {
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
             global_gpu_draw_indirect_buffer,
+            supports_multi_draw_indirect,
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
             urgent_mesh_set: HashSet::new(),
@@ -1634,7 +1655,6 @@ impl Renderer {
             self.visible_gpu_chunks.remove(&result.coord);
             self.pending_lod_remesh.remove(&result.coord);
             continue;
-
         }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
@@ -1719,6 +1739,7 @@ impl Renderer {
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
+        self.device.poll(wgpu::Maintain::Poll);
         let vp_render = camera.view_proj_rebased_to_origin(self.origin_voxel);
         // World-space culling uses world-space camera/AABBs.
         // Draw uses rebased camera VP + shader world-origin subtraction.
@@ -1752,7 +1773,21 @@ impl Renderer {
                 self.global_gpu_index_buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
-            pass.multi_draw_indexed_indirect(&self.global_gpu_draw_indirect_buffer, 0, draw_count);
+            if self.supports_multi_draw_indirect {
+                pass.multi_draw_indexed_indirect(
+                    &self.global_gpu_draw_indirect_buffer,
+                    0,
+                    draw_count,
+                );
+            } else {
+                let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+                for i in 0..draw_count {
+                    pass.draw_indexed_indirect(
+                        &self.global_gpu_draw_indirect_buffer,
+                        i as u64 * stride,
+                    );
+                }
+            }
         }
     }
 }
