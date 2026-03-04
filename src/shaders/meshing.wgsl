@@ -1,6 +1,8 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
 const EMPTY: u32 = 0u;
+const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME;
+const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME * 6u;
 
 struct FrameParams {
     page_index: u32,
@@ -34,10 +36,9 @@ struct ChunkMeshMeta {
 };
 
 struct DrawIndexedIndirectArgs {
-    index_count: u32,
+    vertex_count: u32,
     instance_count: u32,
-    first_index: u32,
-    base_vertex: i32,
+    first_vertex: u32,
     first_instance: u32,
 };
 
@@ -90,13 +91,6 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let params = frame_params[0u];
 
-    // NOTE: This shader intentionally does not clear shared counters/indirect args.
-    // WGSL has no cross-workgroup global barrier, so "i == 0" initialization inside
-    // this dispatch can race with other invocations and clobber valid increments.
-    // Host code must reset/initialize page_indirect[page_index].index_count,
-    // page_indirect[page_index].instance_count/first_vertex/first_instance,
-    // diagnostics[0], diagnostics[1], and dirty_page_counter before dispatch.
-
     if (i >= params.frontier_len) { return; }
     let src_off = atlas_state_offset(params.page_index, (params.state_index + 1u) & 1u);
     let voxel_idx = active_tiles[i];
@@ -108,20 +102,51 @@ fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec3<i32>(unpack(voxel_idx));
     var faces: u32 = 0u;
     for (var d = 0u; d < 6u; d = d + 1u) {
-        if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) { faces = faces + 1u; }
-    }
-    if (faces > 0u) {
-        let previous_faces = atomicAdd(&diagnostics[0u], faces);
-        atomicAdd(&page_indirect[params.page_index].index_count, faces * 6u);
-
-        // Enqueue this page once per dispatch based only on state written in this pass.
-        // This requires diagnostics[0] to be reset to 0 by the host before dispatch.
-        if (previous_faces == 0u) {
-            let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
-            let dirty_len = arrayLength(&dirty_page_indices);
-            if (dirty_idx < dirty_len) {
-                dirty_page_indices[dirty_idx] = params.page_index;
-            }
+        if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) {
+            faces = faces + 1u;
         }
     }
+    if (faces == 0u) { return; }
+
+    let page = params.page_index;
+    let vertex_base = page * GPU_MESH_VERTEX_CAPACITY_PER_PAGE;
+    let index_base = page * GPU_MESH_INDEX_CAPACITY_PER_PAGE;
+
+    let local_vertex_index = atomicAdd(&vertex_counter[page], 1u);
+    if (local_vertex_index >= GPU_MESH_VERTEX_CAPACITY_PER_PAGE) {
+        return;
+    }
+
+    let local_index_offset = atomicAdd(&index_counter[page], 6u);
+    if (local_index_offset + 5u >= GPU_MESH_INDEX_CAPACITY_PER_PAGE) {
+        return;
+    }
+
+    let vtx = vertex_base + local_vertex_index;
+    chunk_vertex_buffer[vtx] = GpuVertex(
+        vec3<f32>(vec3<u32>(p)) + vec3<f32>(0.5, 0.5, 0.5),
+        id,
+    );
+
+    for (var k = 0u; k < 6u; k = k + 1u) {
+        chunk_index_buffer[index_base + local_index_offset + k] = local_vertex_index;
+    }
+
+    mesh_meta_buffer[page] = ChunkMeshMeta(page, vertex_base, index_base, 0u);
+
+    let dirty_prev = atomicAdd(&diagnostics[0u], 1u);
+    if (dirty_prev == 0u) {
+        let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
+        if (dirty_idx < arrayLength(&dirty_page_indices)) {
+            dirty_page_indices[dirty_idx] = page;
+        }
+        page_indirect[page].instance_count = 1u;
+    }
+
+    draw_indirect_buffer[page].vertex_count = atomicLoad(&vertex_counter[page]);
+    draw_indirect_buffer[page].instance_count = 1u;
+    draw_indirect_buffer[page].first_vertex = 0u;
+    draw_indirect_buffer[page].first_instance = 0u;
+
+    atomicAdd(&page_indirect[page].index_count, 6u);
 }
