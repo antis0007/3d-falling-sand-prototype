@@ -540,6 +540,12 @@ impl GpuFluidBackend {
                             if *snapshot.get(&to).unwrap_or(&EMPTY) != EMPTY {
                                 continue;
                             }
+                            if phase == Phase::Liquid
+                                && from.y == to.y
+                                && has_adjacent_liquid(snapshot, from)
+                            {
+                                continue;
+                            }
                             intents.push(MoveIntent {
                                 from,
                                 to,
@@ -643,6 +649,36 @@ fn movement_candidates(origin: VoxelCoord, phase: Phase) -> Vec<VoxelCoord> {
             z: origin.z + dz,
         })
         .collect()
+}
+
+fn has_adjacent_liquid(snapshot: &HashMap<VoxelCoord, u16>, origin: VoxelCoord) -> bool {
+    [
+        VoxelCoord {
+            x: origin.x - 1,
+            y: origin.y,
+            z: origin.z,
+        },
+        VoxelCoord {
+            x: origin.x + 1,
+            y: origin.y,
+            z: origin.z,
+        },
+        VoxelCoord {
+            x: origin.x,
+            y: origin.y,
+            z: origin.z - 1,
+        },
+        VoxelCoord {
+            x: origin.x,
+            y: origin.y,
+            z: origin.z + 1,
+        },
+    ]
+    .into_iter()
+    .any(|neighbor| {
+        let mat = *snapshot.get(&neighbor).unwrap_or(&EMPTY);
+        mat != EMPTY && material(mat).phase == Phase::Liquid
+    })
 }
 
 fn voxel_neighbors_26(origin: VoxelCoord) -> impl Iterator<Item = VoxelCoord> {
