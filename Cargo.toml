@@ -8,6 +8,7 @@ default = ["gpu-compute"]
 procgen-profile = []
 gpu-compute = []
 legacy-world-sim = []
+cpu_meshing_debug = []
 
 [dependencies]
 anyhow = "1"

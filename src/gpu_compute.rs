@@ -27,6 +27,7 @@ pub const fn gpu_page_capacity() -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
+    #[cfg(feature = "cpu_meshing_debug")]
     Cpu,
     #[cfg(feature = "gpu-compute")]
     Gpu,
@@ -35,6 +36,7 @@ pub enum MeshPipelineBackend {
 impl MeshPipelineBackend {
     pub fn label(self) -> &'static str {
         match self {
+            #[cfg(feature = "cpu_meshing_debug")]
             Self::Cpu => "cpu",
             #[cfg(feature = "gpu-compute")]
             Self::Gpu => "gpu",
@@ -1349,6 +1351,7 @@ impl ComputedChunkArtifacts {
     }
 }
 
+#[cfg(feature = "cpu_meshing_debug")]
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
     let mut out = vec![EMPTY; job.snapshot.center_voxels.len()];
     out.copy_from_slice(job.snapshot.center_voxels.as_ref());
