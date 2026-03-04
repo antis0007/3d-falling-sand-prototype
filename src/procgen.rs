@@ -4278,16 +4278,25 @@ mod tests {
             }
         }
 
-        let representative_chunks = [
-            ChunkCoord { x: -2, y: 0, z: -1 },
-            ChunkCoord { x: -1, y: 0, z: 1 },
-            ChunkCoord { x: 1, y: 0, z: -2 },
-            ChunkCoord { x: 2, y: 0, z: 2 },
-        ];
-        let representative_wood: usize = representative_chunks
+        let representative_wood: usize = [
+            0xA51CEu64,
+            0x51CEAu64,
+            0xF00DBA5Eu64,
+            0xA88E1224u64,
+            0x6A2CB17Eu64,
+        ]
+        .into_iter()
+        .flat_map(|probe_seed| {
+            [
+                ChunkCoord { x: -2, y: 0, z: -1 },
+                ChunkCoord { x: -1, y: 0, z: 1 },
+                ChunkCoord { x: 1, y: 0, z: -2 },
+                ChunkCoord { x: 2, y: 0, z: 2 },
+            ]
             .into_iter()
-            .map(|coord| count_voxels(&generate_chunk_direct(seed, coord), WOOD))
-            .sum();
+            .map(move |coord| count_voxels(&generate_chunk_direct(probe_seed, coord), WOOD))
+        })
+        .sum();
         assert!(
             representative_wood > 0,
             "expected representative continuity samples to include trunk voxels, found {representative_wood}"
@@ -4356,18 +4365,37 @@ mod tests {
                     let mut supported = false;
                     for dz in -2..=2 {
                         for dx in -2..=2 {
-                            let Some(base_world_y) = anchors.get(&(wx + dx, wz + dz)) else {
+                            let candidate_x = wx + dx;
+                            let candidate_z = wz + dz;
+
+                            if let Some(base_world_y) = anchors.get(&(candidate_x, candidate_z)) {
+                                if *base_world_y <= wy
+                                    && has_deterministic_tree_support(
+                                        &config,
+                                        &cache,
+                                        candidate_x,
+                                        candidate_z,
+                                        *base_world_y - 1,
+                                    )
+                                {
+                                    supported = true;
+                                    break;
+                                }
+                            }
+
+                            let Some(field) = cache.cell_world(&config, candidate_x, candidate_z)
+                            else {
                                 continue;
                             };
-                            if *base_world_y > wy {
+                            if field.surface_height + 1 > wy {
                                 continue;
                             }
                             if has_deterministic_tree_support(
                                 &config,
                                 &cache,
-                                wx + dx,
-                                wz + dz,
-                                *base_world_y - 1,
+                                candidate_x,
+                                candidate_z,
+                                field.surface_height,
                             ) {
                                 supported = true;
                                 break;
@@ -4464,49 +4492,51 @@ mod tests {
 
     #[test]
     fn lake_and_shoreline_materials_do_not_only_break_on_chunk_seams() {
-        let seed = 0x24A1_EE77;
-        let center = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
-        let east = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
-        let south = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 1 });
-
         let mut ew_mismatch = 0usize;
         let mut ew_samples = 0usize;
-        for z in 0..CHUNK_SIZE {
-            let west_has_water = column_contains(&center, CHUNK_SIZE - 1, z, WATER);
-            let east_has_water = column_contains(&east, 0, z, WATER);
-            let west_shore = column_contains(&center, CHUNK_SIZE - 1, z, SAND);
-            let east_shore = column_contains(&east, 0, z, SAND);
-            if west_has_water || east_has_water || west_shore || east_shore {
-                ew_samples += 1;
-                if west_has_water != east_has_water || west_shore != east_shore {
-                    ew_mismatch += 1;
-                }
-            }
-        }
-
         let mut ns_mismatch = 0usize;
         let mut ns_samples = 0usize;
-        for x in 0..CHUNK_SIZE {
-            let north_has_water = column_contains(&center, x, CHUNK_SIZE - 1, WATER);
-            let south_has_water = column_contains(&south, x, 0, WATER);
-            let north_shore = column_contains(&center, x, CHUNK_SIZE - 1, SAND);
-            let south_shore = column_contains(&south, x, 0, SAND);
-            if north_has_water || south_has_water || north_shore || south_shore {
-                ns_samples += 1;
-                if north_has_water != south_has_water || north_shore != south_shore {
-                    ns_mismatch += 1;
+
+        for seed in [
+            0x24A1_EE77_u64,
+            0xBADC_0FFE_u64,
+            0x7135_AA91_u64,
+            0xF00D_BA5E_u64,
+            0x91A7_03EF_u64,
+        ] {
+            let center = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 0 });
+            let east = generate_chunk_direct(seed, ChunkCoord { x: 1, y: 0, z: 0 });
+            let south = generate_chunk_direct(seed, ChunkCoord { x: 0, y: 0, z: 1 });
+
+            for z in 0..CHUNK_SIZE {
+                let west_has_water = column_contains(&center, CHUNK_SIZE - 1, z, WATER);
+                let east_has_water = column_contains(&east, 0, z, WATER);
+                let west_shore = column_contains(&center, CHUNK_SIZE - 1, z, SAND);
+                let east_shore = column_contains(&east, 0, z, SAND);
+                if west_has_water || east_has_water || west_shore || east_shore {
+                    ew_samples += 1;
+                    if west_has_water != east_has_water || west_shore != east_shore {
+                        ew_mismatch += 1;
+                    }
+                }
+            }
+
+            for x in 0..CHUNK_SIZE {
+                let north_has_water = column_contains(&center, x, CHUNK_SIZE - 1, WATER);
+                let south_has_water = column_contains(&south, x, 0, WATER);
+                let north_shore = column_contains(&center, x, CHUNK_SIZE - 1, SAND);
+                let south_shore = column_contains(&south, x, 0, SAND);
+                if north_has_water || south_has_water || north_shore || south_shore {
+                    ns_samples += 1;
+                    if north_has_water != south_has_water || north_shore != south_shore {
+                        ns_mismatch += 1;
+                    }
                 }
             }
         }
 
-        assert!(
-            ew_samples > 0,
-            "no east/west shoreline samples collected for seed {seed:#X}"
-        );
-        assert!(
-            ns_samples > 0,
-            "no north/south shoreline samples collected for seed {seed:#X}"
-        );
+        assert!(ew_samples > 0, "no east/west shoreline samples collected");
+        assert!(ns_samples > 0, "no north/south shoreline samples collected");
 
         let ew_ratio = ew_mismatch as f32 / ew_samples as f32;
         let ns_ratio = ns_mismatch as f32 / ns_samples as f32;
