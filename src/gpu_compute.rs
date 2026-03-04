@@ -1,4 +1,4 @@
-#[cfg(feature = "cpu_meshing_debug")]
+#[cfg(not(feature = "gpu_meshing_experimental"))]
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob};
 use crate::types::{ChunkCoord, GpuPageIndex};
@@ -463,8 +463,6 @@ static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
-#[cfg(feature = "gpu-compute")]
-static GPU_JOB_MUTEX: Mutex<()> = Mutex::new(());
 
 pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfilerSnapshot {
     #[cfg(not(feature = "gpu-compute"))]
@@ -792,6 +790,7 @@ impl GpuComputeRuntime {
         encode_stage(&mut encoder, &self.material_advect_pipeline);
 
         state.queue.submit(Some(encoder.finish()));
+        state.device.poll(wgpu::Maintain::Wait);
 
         #[cfg(feature = "gpu-compute")]
         {
@@ -861,6 +860,7 @@ impl GpuComputeRuntime {
         }
 
         state.queue.submit(Some(encoder.finish()));
+        state.device.poll(wgpu::Maintain::Wait);
         Ok(MeshArtifactGPU {
             page_index,
             lod,
@@ -1239,11 +1239,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .copied()
             .unwrap_or(0);
         let current_state = atlas.state_for_chunk.get(&job.coord).copied().unwrap_or(0);
-        let previous_frontier = atlas
-            .frontier_len_for_chunk
-            .get(&job.coord)
-            .copied()
-            .unwrap_or(0);
         let tick = atlas.tick_for_chunk.get(&job.coord).copied().unwrap_or(0);
         let mut cached_before = atlas
             .cached_materials
@@ -1281,10 +1276,11 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             }
         }
 
-        let seeded_active = incoming.iter().filter(|m| **m != EMPTY).count() as u32;
-        let active_frontier_count = seeded_active
-            .max(previous_frontier)
-            .max(edit_commands.len() as u32);
+        let mut active_tiles_seed = Vec::with_capacity(edit_commands.len());
+        for edit in &edit_commands {
+            active_tiles_seed.push(edit.voxel_index);
+        }
+        let active_frontier_count = active_tiles_seed.len() as u32;
         let sim_job = SimulationJob {
             chunk_coord: job.coord,
             materials: incoming.to_vec(),
@@ -1303,8 +1299,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let dispatch_t0 = Instant::now();
         let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
-            // FIX 3: current worker scratch/resources are shared; serialize dispatch for safety.
-            let _job_guard = GPU_JOB_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             {
                 let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
                 atlas.assert_page_for_chunk(job.coord, page_index);
@@ -1314,12 +1308,15 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 if page_was_reassigned {
                     clear_page_buffers(&state, page_index);
                 }
-                clear_job_scratch_buffers(
-                    &state,
-                    &scratch,
-                    active_frontier_count.max(previous_frontier) as usize,
-                    1,
-                );
+                clear_job_scratch_buffers(&state, &scratch, active_frontier_count as usize, 1);
+
+                if !active_tiles_seed.is_empty() {
+                    state.queue.write_buffer(
+                        &scratch.active_tiles,
+                        0,
+                        bytemuck::cast_slice(&active_tiles_seed),
+                    );
+                }
 
                 if active_frontier_count > 0 {
                     state.runtime.run_active_frontier(
@@ -1361,26 +1358,51 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             };
 
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
-            let _ = gpu_artifact;
-
+            #[cfg(not(feature = "gpu_meshing_experimental"))]
+            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
+                mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
+            #[cfg(feature = "gpu_meshing_experimental")]
+            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = (
+                Vec::new(),
+                Vec::new(),
+                glam::Vec3::ZERO,
+                glam::Vec3::ZERO,
+                glam::Vec3::new(
+                    job.coord.x as f32 * 32.0,
+                    job.coord.y as f32 * 32.0,
+                    job.coord.z as f32 * 32.0,
+                ),
+            );
             Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: diagnostics,
-                mesh_artifact: ChunkMeshArtifact::Gpu {
-                    page_index: gpu_artifact.page_index,
-                    draw_indirect_index: gpu_artifact.draw_indirect_index,
-                    lod: gpu_artifact.lod,
-                    verts: Vec::new(),
-                    inds: Vec::new(),
-                    indirect: DrawIndirectArgs::default(),
-                    aabb_min: glam::Vec3::ZERO,
-                    aabb_max: glam::Vec3::ZERO,
-                    chunk_origin_world: glam::Vec3::new(
-                        job.coord.x as f32 * 32.0,
-                        job.coord.y as f32 * 32.0,
-                        job.coord.z as f32 * 32.0,
-                    ),
-                    dispatch_ms,
-                    readback_bytes: 0,
+                mesh_artifact: {
+                    #[cfg(feature = "gpu_meshing_experimental")]
+                    {
+                        ChunkMeshArtifact::Gpu {
+                            page_index: gpu_artifact.page_index,
+                            draw_indirect_index: gpu_artifact.draw_indirect_index,
+                            lod: gpu_artifact.lod,
+                            verts,
+                            inds,
+                            indirect: DrawIndirectArgs::default(),
+                            aabb_min,
+                            aabb_max,
+                            chunk_origin_world,
+                            dispatch_ms,
+                            readback_bytes: 0,
+                        }
+                    }
+                    #[cfg(not(feature = "gpu_meshing_experimental"))]
+                    {
+                        ChunkMeshArtifact::Cpu {
+                            verts,
+                            inds,
+                            indirect: DrawIndirectArgs::default(),
+                            aabb_min,
+                            aabb_max,
+                            chunk_origin_world,
+                        }
+                    }
                 },
             })
         })();
@@ -1395,7 +1417,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 .frontier_len_for_chunk
                 .insert(job.coord, active_frontier_count);
             atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
-            atlas.cached_materials.insert(job.coord, Vec::new());
+            atlas.cached_materials.insert(job.coord, incoming.to_vec());
         }
 
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
