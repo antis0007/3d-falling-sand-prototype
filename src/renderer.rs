@@ -15,8 +15,7 @@ use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::gpu_page_capacity;
 use crate::gpu_compute::{
-    cpu_generate_material_field, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
-    MeshPipelineBackend,
+    run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -608,6 +607,7 @@ struct MeshResult {
 }
 
 pub(crate) enum ChunkMeshArtifact {
+    #[cfg(feature = "cpu_meshing_debug")]
     Cpu {
         verts: Vec<Vertex>,
         inds: Vec<u32>,
@@ -631,6 +631,7 @@ pub(crate) enum ChunkMeshArtifact {
 impl ChunkMeshArtifact {
     pub(crate) fn geometry(&self) -> (&[Vertex], &[u32], DrawIndirectArgs, Vec3, Vec3, Vec3) {
         match self {
+            #[cfg(feature = "cpu_meshing_debug")]
             Self::Cpu {
                 verts,
                 inds,
@@ -638,8 +639,15 @@ impl ChunkMeshArtifact {
                 aabb_min,
                 aabb_max,
                 chunk_origin_world,
-            }
-            | Self::Gpu {
+            } => (
+                verts,
+                inds,
+                *indirect,
+                *aabb_min,
+                *aabb_max,
+                *chunk_origin_world,
+            ),
+            Self::Gpu {
                 verts,
                 inds,
                 indirect,
@@ -667,11 +675,14 @@ struct BackgroundMeshQueue {
 
 fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> ChunkMeshArtifact {
     match mesh_backend {
-        MeshPipelineBackend::Cpu => cpu_generate_material_field(job).mesh_artifact,
+        #[cfg(feature = "cpu_meshing_debug")]
+        MeshPipelineBackend::Cpu => {
+            crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
+        }
         #[cfg(feature = "gpu-compute")]
         MeshPipelineBackend::Gpu => run_chunk_job_on_worker(job)
             .map(|output| output.mesh_artifact)
-            .unwrap_or_else(|_| cpu_generate_material_field(job).mesh_artifact),
+            .expect("gpu meshing worker failed; cpu fallback is disabled"),
     }
 }
 
@@ -768,16 +779,24 @@ impl Renderer {
             }
             #[cfg(not(feature = "gpu-compute"))]
             {
+                anyhow::bail!(
+                    "gpu meshing is required at runtime, but `gpu-compute` feature is disabled"
+                );
+            }
+        } else {
+            #[cfg(feature = "cpu_meshing_debug")]
+            {
                 log::warn!(
-                    "mesh backend selected: cpu (adapter supports GPU compute but `gpu-compute` feature is disabled at compile time)"
+                    "mesh backend selected: cpu debug path (adapter/runtime does not satisfy gpu-compute requirements)"
                 );
                 MeshPipelineBackend::Cpu
             }
-        } else {
-            log::warn!(
-                "mesh backend selected: cpu (adapter/runtime does not satisfy gpu-compute requirements)"
-            );
-            MeshPipelineBackend::Cpu
+            #[cfg(not(feature = "cpu_meshing_debug"))]
+            {
+                anyhow::bail!(
+                    "gpu meshing is required at runtime, but adapter/runtime does not satisfy gpu-compute requirements"
+                );
+            }
         };
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -1247,6 +1266,7 @@ impl Renderer {
         let mut deferred = Vec::new();
         let mut remesh_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
+            #[allow(irrefutable_let_patterns)]
             if let ChunkMeshArtifact::Gpu {
                 dispatch_ms,
                 readback_bytes,
