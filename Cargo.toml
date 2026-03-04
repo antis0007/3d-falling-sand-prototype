@@ -9,6 +9,7 @@ procgen-profile = []
 gpu-compute = []
 legacy-world-sim = []
 cpu_meshing_debug = []
+gpu_meshing_experimental = []
 
 [dependencies]
 anyhow = "1"
