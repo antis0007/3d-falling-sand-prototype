@@ -628,7 +628,21 @@ impl ChunkStreaming {
         if self.pending_generate.contains(&coord) {
             return;
         }
-        self.enqueue_generate(coord, class, 0.0);
+        if matches!(class, GenerateJobClass::Urgent) {
+            self.enqueue_seq = self.enqueue_seq.saturating_add(1);
+            self.generate_meta.insert(
+                coord,
+                GenerateQueueMeta {
+                    class: Some(class),
+                    score: 0.0,
+                    enqueue_seq: self.enqueue_seq,
+                    far_version: self.far_generation_version,
+                },
+            );
+            self.pending_generate.push_front(coord);
+        } else {
+            self.enqueue_generate(coord, class, 0.0);
+        }
     }
 
     pub fn invalidate_far_jobs(&mut self) {
