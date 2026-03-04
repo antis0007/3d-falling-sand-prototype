@@ -351,15 +351,9 @@ impl ChunkMeshCache {
             ChunkLod::Far,
             ChunkLod::Ultra,
         ];
-        let allowed_lods: &[ChunkLod] = if chunk_distance < near_lod_distance {
-            &[ChunkLod::Near, ChunkLod::Mid]
-        } else {
-            &ordered
-        };
-
         let start = lod_rank(selected);
         for lod in ordered.iter().skip(start).copied() {
-            if !allowed_lods.contains(&lod) {
+            if chunk_distance < near_lod_distance && lod_rank(lod) > lod_rank(ChunkLod::Mid) {
                 continue;
             }
             if let Some(mesh) = self.get(lod) {
@@ -367,7 +361,7 @@ impl ChunkMeshCache {
             }
         }
         for lod in ordered.iter().take(start).copied() {
-            if !allowed_lods.contains(&lod) {
+            if chunk_distance < near_lod_distance && lod_rank(lod) > lod_rank(ChunkLod::Mid) {
                 continue;
             }
             if let Some(mesh) = self.get(lod) {
@@ -1245,6 +1239,25 @@ impl Renderer {
         for job in urgent_jobs.drain(..) {
             let lod = job.lod;
             let queued_at = job.queued_at;
+            if self.mesh_queue.inflight == 0 {
+                let artifact = build_mesh_artifact(self.mesh_backend, &job);
+                self.completed_meshes.push(MeshResult {
+                    coord: job.coord,
+                    lod,
+                    version: job.version,
+                    queued_at,
+                    artifact,
+                    urgent: true,
+                });
+                stats.mesh_count += 1;
+                match lod {
+                    ChunkLod::Near => stats.near_mesh_count += 1,
+                    ChunkLod::Mid => stats.mid_mesh_count += 1,
+                    ChunkLod::Far => stats.far_mesh_count += 1,
+                    ChunkLod::Ultra => stats.ultra_mesh_count += 1,
+                }
+                continue;
+            }
             match self.mesh_queue.try_submit(job) {
                 Ok(()) => {
                     stats.mesh_count += 1;
@@ -1347,9 +1360,10 @@ impl Renderer {
                 .copied()
                 .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
         };
-        far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+        far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+        ultra_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
 
         let far_pressure = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         let far_scale = if far_pressure > 4096 {
@@ -1406,18 +1420,14 @@ impl Renderer {
                 }
             };
 
-        submit_from(&mut near_jobs, lod_budgets.near, &mut stats);
-        submit_from(&mut mid_jobs, lod_budgets.mid, &mut stats);
-        submit_from(&mut far_jobs, far_budget, &mut stats);
-        submit_from(&mut ultra_jobs, ultra_budget, &mut stats);
-        submit_from(&mut near_jobs, mesh_budget, &mut stats);
-        submit_from(&mut mid_jobs, mesh_budget, &mut stats);
-        submit_from(&mut far_jobs, mesh_budget / far_scale.max(1), &mut stats);
         submit_from(
-            &mut ultra_jobs,
-            mesh_budget / (far_scale.saturating_mul(2)).max(1),
+            &mut near_jobs,
+            lod_budgets.near.min(mesh_budget),
             &mut stats,
         );
+        submit_from(&mut mid_jobs, lod_budgets.mid.min(mesh_budget), &mut stats);
+        submit_from(&mut far_jobs, far_budget.min(mesh_budget), &mut stats);
+        submit_from(&mut ultra_jobs, ultra_budget.min(mesh_budget), &mut stats);
 
         for job in near_jobs
             .into_iter()
@@ -1488,9 +1498,17 @@ impl Renderer {
         let mut stale_result_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             let voxel_version = store.chunk_voxel_version(result.coord);
-            if ((result.version < voxel_version) && matches!(result.artifact, ChunkMeshArtifact::Skipped)) {
+            if result.version < voxel_version
+                && matches!(result.artifact, ChunkMeshArtifact::Skipped)
+            {
                 stats.age_drop_count += 1;
                 stale_result_coords.push(result.coord);
+                continue;
+            }
+
+            if result.version < voxel_version {
+                stats.stale_drop_count += 1;
+                remesh_coords.push(result.coord);
                 continue;
             }
 
@@ -1504,12 +1522,6 @@ impl Renderer {
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 stats.gpu_readback_bytes += *readback_bytes;
-            }
-
-            let voxel_version = store.chunk_voxel_version(result.coord);
-            if result.version < voxel_version {
-                remesh_coords.push(result.coord);
-                continue;
             }
 
             let (verts, inds, _mesh_indirect, aabb_min, aabb_max, chunk_origin_world) =
@@ -1593,7 +1605,7 @@ impl Renderer {
                 }
             }
 
-            if cache.is_empty() {
+            if cache.is_empty() && !self.pending_lod_remesh.contains(&result.coord) {
                 self.store_meshes.remove(&result.coord);
                 self.pending_lod_remesh.remove(&result.coord);
             }
@@ -1645,7 +1657,7 @@ impl Renderer {
             lod_radii.mid.saturating_sub(lod_radii.hysteresis.max(1)) as f32;
         let mut evict_lod_slots = Vec::new();
         for &coord in self.store_meshes.keys() {
-            let d = chunk_horizontal_distance(player_chunk, coord);
+            let d = chunk_distance(player_chunk, coord);
             if d > ultra_mesh_evict_distance {
                 evict_lod_slots.push((coord, ChunkLod::Ultra));
             }
@@ -1666,7 +1678,7 @@ impl Renderer {
 
         let mut drop_keys = Vec::new();
         for &coord in self.store_meshes.keys() {
-            if chunk_horizontal_distance(player_chunk, coord) > lod_radii.ultra as f32 {
+            if chunk_distance(player_chunk, coord) > lod_radii.ultra as f32 {
                 drop_keys.push(coord);
             }
         }
@@ -1691,8 +1703,8 @@ impl Renderer {
             self.lod_selection.insert(coord, lod);
         }
         lod_changes.sort_by(|a, b| {
-            let ad = chunk_horizontal_distance(*a, player_chunk);
-            let bd = chunk_horizontal_distance(*b, player_chunk);
+            let ad = chunk_distance(*a, player_chunk);
+            let bd = chunk_distance(*b, player_chunk);
             ad.total_cmp(&bd)
         });
         for coord in lod_changes.into_iter().take(MAX_LOD_REMESH_PER_FRAME) {
@@ -2208,7 +2220,6 @@ pub(crate) fn mesh_chunk_snapshot(
     let chunk_world_min = snapshot.world_min;
     debug_assert_eq!(chunk_world_min, chunk_to_world_min(coord));
     let chunk_origin_world = voxel_to_world(chunk_world_min);
-    let chunk_extent = Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
     let (verts, inds) = match lod {
         ChunkLod::Near => {
             if greedy {
@@ -2221,13 +2232,8 @@ pub(crate) fn mesh_chunk_snapshot(
         ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, 4),
         ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, 8),
     };
-    (
-        verts,
-        inds,
-        chunk_origin_world,
-        chunk_origin_world + chunk_extent,
-        chunk_origin_world,
-    )
+    let (aabb_min, aabb_max) = chunk_world_aabb_from_vertices(chunk_origin_world, &verts);
+    (verts, inds, aabb_min, aabb_max, chunk_origin_world)
 }
 
 fn mesh_chunk_voxel_faces(snapshot: &ChunkSnapshot, step: i32) -> (Vec<Vertex>, Vec<u32>) {
@@ -2767,10 +2773,11 @@ fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
         .max((a.z - b.z).abs())
 }
 
-fn chunk_horizontal_distance(a: ChunkCoord, b: ChunkCoord) -> f32 {
+fn chunk_distance(a: ChunkCoord, b: ChunkCoord) -> f32 {
     let dx = (a.x - b.x) as f32;
+    let dy = (a.y - b.y) as f32;
     let dz = (a.z - b.z) as f32;
-    (dx * dx + dz * dz).sqrt()
+    (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
 fn chunk_horizontal_distance_to_camera(coord: ChunkCoord, world_camera_pos: Vec3) -> f32 {
@@ -2780,13 +2787,28 @@ fn chunk_horizontal_distance_to_camera(coord: ChunkCoord, world_camera_pos: Vec3
     (delta.x.hypot(delta.z)) / (CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE)
 }
 
+fn chunk_world_aabb_from_vertices(chunk_origin_world: Vec3, verts: &[Vertex]) -> (Vec3, Vec3) {
+    if verts.is_empty() {
+        return (chunk_origin_world, chunk_origin_world);
+    }
+
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for v in verts {
+        let p = chunk_origin_world + Vec3::from_array(v.pos);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    (min, max)
+}
+
 fn select_lod(
     coord: ChunkCoord,
     player_chunk: ChunkCoord,
     radii: LodRadii,
     prev: Option<ChunkLod>,
 ) -> ChunkLod {
-    let d = chunk_horizontal_distance(coord, player_chunk);
+    let d = chunk_distance(coord, player_chunk);
     let h = radii.hysteresis.max(1);
     let near_down = (radii.near.saturating_sub(h * 5)) as f32;
     let mid_down = (radii.mid.saturating_sub(h * 10)) as f32;
@@ -2854,7 +2876,7 @@ fn fallback_lod_near_threshold(
     radii: LodRadii,
     primary: ChunkLod,
 ) -> Option<ChunkLod> {
-    let d = chunk_horizontal_distance(coord, player_chunk);
+    let d = chunk_distance(coord, player_chunk);
     let h = radii.hysteresis.max(1) as f32;
 
     let near_edge = (d - radii.near as f32).abs() <= h;
