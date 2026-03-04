@@ -1366,6 +1366,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: diagnostics,
                 mesh_artifact: ChunkMeshArtifact::Gpu {
+                    page_index: gpu_artifact.page_index,
+                    draw_indirect_index: gpu_artifact.draw_indirect_index,
+                    lod: gpu_artifact.lod,
                     verts: Vec::new(),
                     inds: Vec::new(),
                     indirect: DrawIndirectArgs::default(),

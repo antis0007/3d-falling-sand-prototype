@@ -18,7 +18,7 @@ use crate::gpu_compute::{
     run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
 };
 use crate::sim::{material, Phase};
-use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord, CHUNK_SIZE_VOXELS};
+use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
@@ -467,6 +467,7 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     store_meshes: HashMap<ChunkCoord, ChunkMeshCache>,
+    visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
     mesh_allocator: MeshPageAllocator,
 
     dirty_queues: DirtyChunkQueues,
@@ -816,6 +817,14 @@ struct MeshResult {
     urgent: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GpuChunkDraw {
+    page_index: GpuPageIndex,
+    draw_indirect_index: u32,
+    lod: u8,
+    origin: Vec3,
+}
+
 pub(crate) enum ChunkMeshArtifact {
     #[cfg(feature = "cpu_meshing_debug")]
     Cpu {
@@ -827,6 +836,9 @@ pub(crate) enum ChunkMeshArtifact {
         chunk_origin_world: Vec3,
     },
     Gpu {
+        page_index: GpuPageIndex,
+        draw_indirect_index: u32,
+        lod: u8,
         verts: Vec<Vertex>,
         inds: Vec<u32>,
         indirect: DrawIndirectArgs,
@@ -1122,6 +1134,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             store_meshes: HashMap::new(),
+            visible_gpu_chunks: HashMap::new(),
             mesh_allocator: MeshPageAllocator::new("chunk mesh", 12 * 1024 * 1024),
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
@@ -1517,14 +1530,31 @@ impl Renderer {
 
             #[allow(irrefutable_let_patterns)]
             if let ChunkMeshArtifact::Gpu {
+                page_index,
+                draw_indirect_index,
+                lod,
                 dispatch_ms,
                 readback_bytes,
+                chunk_origin_world,
                 ..
             } = &result.artifact
             {
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 stats.gpu_readback_bytes += *readback_bytes;
+                self.visible_gpu_chunks.insert(
+                    result.coord,
+                    GpuChunkDraw {
+                        page_index: *page_index,
+                        draw_indirect_index: *draw_indirect_index,
+                        lod: *lod,
+                        origin: *chunk_origin_world,
+                    },
+                );
+                println!("gpu chunks visible {}", self.visible_gpu_chunks.len());
+                self.mesh_versions.insert(result.coord, result.version);
+                store.mark_chunk_meshed(result.coord);
+                continue;
             }
 
             let (verts, inds, _mesh_indirect, aabb_min, aabb_max, chunk_origin_world) =
@@ -1702,6 +1732,7 @@ impl Renderer {
                     self.mesh_allocator.free(mesh.allocation);
                 }
             }
+            self.visible_gpu_chunks.remove(&coord);
             self.lod_selection.remove(&coord);
             self.pending_lod_remesh.remove(&coord);
         }
@@ -1732,6 +1763,7 @@ impl Renderer {
                 self.mesh_allocator.free(mesh.allocation);
             }
         }
+        self.visible_gpu_chunks.clear();
         self.dirty_queues.clear();
         self.urgent_mesh_queue.clear();
         self.urgent_mesh_set.clear();
@@ -1792,6 +1824,10 @@ impl Renderer {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
+
+        if !self.visible_gpu_chunks.is_empty() {
+            println!("gpu chunks visible {}", self.visible_gpu_chunks.len());
+        }
 
         let mut debug_visible_logged = 0usize;
         for (&coord, cache) in &self.store_meshes {
