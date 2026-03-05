@@ -1925,7 +1925,7 @@ impl Renderer {
             if let ChunkMeshArtifact::Gpu {
                 page_index,
                 draw_indirect_index,
-                index_count,
+                index_count: _index_count,
                 lod,
                 dispatch_ms,
                 aabb_min,
@@ -1956,12 +1956,9 @@ impl Renderer {
                     remesh_coords.push(result.coord);
                     continue;
                 }
-                let resolved_index_count = (*index_count).max(1);
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
                 // For GPU meshing, the indirect draw buffer is authoritative.
-                // Do not infer metadata from the numeric value; GPU artifacts
-                // always carry no CPU-resolved index count.
-                // let resolved_index_count = None;
+                // Do not infer metadata from GPU artifact placeholder counts.
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 stats.gpu_mesh_adopted_count += 1;
@@ -1975,7 +1972,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: Some(resolved_index_count),
+                        index_count: None,
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
