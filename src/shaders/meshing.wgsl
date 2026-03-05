@@ -39,7 +39,7 @@ struct DrawIndexedIndirectArgs {
 };
 
 struct ChunkMeshMeta {
-    page_index: u32,
+    slot_index: u32,
     vertex_offset: u32,
     index_offset: u32,
     _pad: u32,
@@ -259,8 +259,9 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (mask == 0u) { return; }
 
     let total_faces = face_count[0u];
-    let vertex_base = page * GPU_MESH_VERTEX_CAPACITY_PER_PAGE;
-    let index_base = page * GPU_MESH_INDEX_CAPACITY_PER_PAGE;
+    let mesh_meta = mesh_meta_buffer[page];
+    let vertex_base = mesh_meta.vertex_offset;
+    let index_base = mesh_meta.index_offset;
     let p = vec3<i32>(unpack(voxel_idx));
     let base = vec3<f32>(vec3<u32>(p));
 
@@ -304,11 +305,11 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if (voxel_idx == 0u) {
-        draw_indirect_buffer[page].index_count = total_faces * 6u;
-        draw_indirect_buffer[page].instance_count = 1u;
-        draw_indirect_buffer[page].first_index = index_base;
-        draw_indirect_buffer[page].base_vertex = i32(vertex_base);
-        draw_indirect_buffer[page].first_instance = 0u;
-        mesh_meta_buffer[page] = ChunkMeshMeta(page, vertex_base, index_base, 0u);
+        let draw_slot = mesh_meta.slot_index;
+        draw_indirect_buffer[draw_slot].index_count = total_faces * 6u;
+        draw_indirect_buffer[draw_slot].instance_count = 1u;
+        draw_indirect_buffer[draw_slot].first_index = index_base;
+        draw_indirect_buffer[draw_slot].base_vertex = i32(vertex_base);
+        draw_indirect_buffer[draw_slot].first_instance = 0u;
     }
 }
