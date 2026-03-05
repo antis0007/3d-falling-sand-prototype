@@ -58,6 +58,7 @@ pub const fn gpu_page_capacity() -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
+    Disabled,
     #[cfg(feature = "cpu_meshing_debug")]
     Cpu,
     #[cfg(feature = "gpu-compute")]
@@ -67,6 +68,7 @@ pub enum MeshPipelineBackend {
 impl MeshPipelineBackend {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Disabled => "disabled",
             #[cfg(feature = "cpu_meshing_debug")]
             Self::Cpu => "cpu",
             #[cfg(feature = "gpu-compute")]

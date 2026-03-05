@@ -597,6 +597,10 @@ fn seed_from_cli() -> Option<u64> {
     None
 }
 
+fn cli_has_flag(name: &str) -> bool {
+    std::env::args().any(|arg| arg == name)
+}
+
 fn seed_from_save_state() -> Option<u64> {
     fs::read_to_string(Path::new(WORLD_SEED_SAVE_PATH))
         .ok()
@@ -645,7 +649,13 @@ pub async fn run() -> anyhow::Result<()> {
             .build(&event_loop)?,
     ));
 
-    let mut renderer = Renderer::new(window).await?;
+    let require_gpu_meshing = cli_has_flag("--require-gpu-meshing");
+    let mut renderer = Renderer::new(window, require_gpu_meshing).await?;
+    if renderer.mesh_backend.label() == "disabled" {
+        log::warn!(
+            "renderer started in mesh-disabled mode; world meshing is unavailable on this hardware/build"
+        );
+    }
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
     let mut egui_state =
