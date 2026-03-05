@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "gpu-compute")]
+use std::time::Duration;
 use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
@@ -488,6 +490,10 @@ const SAFE_ACTIVE_FRONTIER_LIMIT: u32 = 2048;
 const STARTUP_JACOBI_ITERATIONS: u32 = 8;
 #[cfg(feature = "gpu-compute")]
 const HIGH_PRESSURE_JACOBI_ITERATIONS: u32 = 16;
+#[cfg(feature = "gpu-compute")]
+const GPU_DISPATCH_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "gpu-compute")]
+const GPU_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Default, Clone, Copy)]
 pub struct GpuComputeProfilerSnapshot {
@@ -506,6 +512,10 @@ static GPU_TRANSFER_BYTES: AtomicU64 = AtomicU64::new(0);
 static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_DISPATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -838,7 +848,12 @@ impl GpuComputeRuntime {
         encode_stage(&mut encoder, &self.material_advect_pipeline);
 
         state.queue.submit(Some(encoder.finish()));
-        state.device.poll(wgpu::Maintain::Wait);
+        wait_for_gpu_dispatch_completion(
+            &state.device,
+            &state.queue,
+            "active_frontier",
+            GPU_DISPATCH_WAIT_TIMEOUT,
+        )?;
 
         #[cfg(feature = "gpu-compute")]
         {
@@ -913,12 +928,49 @@ impl GpuComputeRuntime {
         }
 
         state.queue.submit(Some(encoder.finish()));
-        state.device.poll(wgpu::Maintain::Wait);
+        wait_for_gpu_dispatch_completion(
+            &state.device,
+            &state.queue,
+            "meshing_dispatch",
+            GPU_DISPATCH_WAIT_TIMEOUT,
+        )?;
         Ok(MeshArtifactGPU {
             page_index,
             lod,
             draw_indirect_index: page_index.0,
         })
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+fn wait_for_gpu_dispatch_completion(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    stage: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    queue.on_submitted_work_done(move || {
+        let _ = done_tx.try_send(());
+    });
+
+    let started_at = Instant::now();
+    loop {
+        device.poll(wgpu::Maintain::Poll);
+
+        if done_rx.try_recv().is_ok() {
+            return Ok(());
+        }
+
+        if started_at.elapsed() >= timeout {
+            GPU_DISPATCH_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!(
+                "gpu dispatch timeout ({stage}) after {} ms; worker will retry",
+                timeout.as_millis()
+            );
+        }
+
+        std::thread::sleep(GPU_DISPATCH_WAIT_POLL_INTERVAL);
     }
 }
 
@@ -1455,6 +1507,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 .insert(job.coord, active_frontier_count);
             atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
             atlas.cached_materials.insert(job.coord, incoming.to_vec());
+        } else {
+            GPU_DISPATCH_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
