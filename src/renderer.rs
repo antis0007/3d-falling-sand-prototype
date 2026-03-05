@@ -43,6 +43,9 @@ const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
 const MESH_RETRY_MAX_ATTEMPTS: u32 = 6;
 const MESH_RETRY_BASE_BACKOFF_FRAMES: u64 = 2;
+const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
+const MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS: u32 = 3;
+const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -587,6 +590,7 @@ pub struct MeshRebuildStats {
     pub gpu_job_failures: usize,
     pub gpu_job_timeouts: usize,
     pub gpu_job_skipped: usize,
+    pub gpu_mesh_slot_alloc_failed: usize,
     pub gpu_readback_bytes: u64,
     pub allocator_bytes_allocated: usize,
     pub allocator_bytes_reused: usize,
@@ -607,7 +611,7 @@ struct MeshRetryState {
 #[derive(Clone, Copy)]
 enum MeshRetryKind {
     Failed,
-    Skipped,
+    Skipped(MeshSkipReason),
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -918,7 +922,19 @@ pub(crate) enum ChunkMeshArtifact {
     Failed {
         reason: String,
     },
-    Skipped,
+    Skipped {
+        reason: MeshSkipReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MeshSkipReason {
+    BackendDisabled,
+    WorkerBusy,
+    MeshSlotCapacitySaturated {
+        slot_capacity: u32,
+        in_flight_fences: u32,
+    },
 }
 
 impl ChunkMeshArtifact {
@@ -954,7 +970,7 @@ impl ChunkMeshArtifact {
                 *aabb_max,
                 *chunk_origin_world,
             ),
-            Self::Skipped => (
+            Self::Skipped { .. } => (
                 &[],
                 &[],
                 DrawIndirectArgs::default(),
@@ -984,7 +1000,9 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
     match mesh_backend {
         MeshPipelineBackend::Disabled => {
             let _ = job;
-            ChunkMeshArtifact::Skipped
+            ChunkMeshArtifact::Skipped {
+                reason: MeshSkipReason::BackendDisabled,
+            }
         }
         MeshPipelineBackend::Cpu => {
             crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
@@ -1865,7 +1883,7 @@ impl Renderer {
         let mut gpu_adoption_latency_ms_total = 0.0f32;
         let mut remesh_coords = Vec::new();
         let mut failed_retry_coords = Vec::new();
-        let mut skipped_retry_coords = Vec::new();
+        let mut skipped_retry_chunks = Vec::new();
         let completed_meshes_depth = self.completed_meshes.len();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
@@ -1879,9 +1897,12 @@ impl Renderer {
             }
 
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
-            if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
+            if let ChunkMeshArtifact::Skipped { reason } = result.artifact {
                 stats.gpu_job_skipped += 1;
-                skipped_retry_coords.push(result.coord);
+                if matches!(reason, MeshSkipReason::MeshSlotCapacitySaturated { .. }) {
+                    stats.gpu_mesh_slot_alloc_failed += 1;
+                }
+                skipped_retry_chunks.push((result.coord, reason));
                 continue;
             }
 
@@ -1904,6 +1925,7 @@ impl Renderer {
             if let ChunkMeshArtifact::Gpu {
                 page_index,
                 draw_indirect_index,
+                index_count,
                 lod,
                 dispatch_ms,
                 aabb_min,
@@ -1953,7 +1975,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: resolved_index_count,
+                        index_count: Some(resolved_index_count),
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
@@ -2145,8 +2167,8 @@ impl Renderer {
         for coord in failed_retry_coords {
             self.schedule_mesh_retry(coord, MeshRetryKind::Failed);
         }
-        for coord in skipped_retry_coords {
-            self.schedule_mesh_retry(coord, MeshRetryKind::Skipped);
+        for (coord, reason) in skipped_retry_chunks {
+            self.schedule_mesh_retry(coord, MeshRetryKind::Skipped(reason));
         }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
@@ -2460,7 +2482,7 @@ impl Renderer {
                 &mut state.failed_attempts,
                 &mut state.failed_next_retry_frame,
             ),
-            MeshRetryKind::Skipped => (
+            MeshRetryKind::Skipped(_) => (
                 &mut state.skipped_attempts,
                 &mut state.skipped_next_retry_frame,
             ),
@@ -2469,8 +2491,32 @@ impl Renderer {
             return;
         }
         *attempts += 1;
-        let exp = (*attempts).saturating_sub(1).min(8);
-        let backoff_frames = MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
+        let backoff_frames = match kind {
+            MeshRetryKind::Failed => {
+                let exp = (*attempts).saturating_sub(1).min(8);
+                MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp)
+            }
+            MeshRetryKind::Skipped(reason) => {
+                let exp = (*attempts).saturating_sub(1).min(6);
+                let raw = MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
+                let bounded = raw.min(MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES);
+                if *attempts >= MESH_RETRY_SKIPPED_WARN_ATTEMPTS {
+                    if let MeshSkipReason::MeshSlotCapacitySaturated {
+                        slot_capacity,
+                        in_flight_fences,
+                    } = reason
+                    {
+                        log::warn!(
+                            "[mesh] repeated skipped retries chunk={coord:?} attempts={} slot_capacity={} in_flight_fences={}",
+                            *attempts,
+                            slot_capacity,
+                            in_flight_fences
+                        );
+                    }
+                }
+                bounded
+            }
+        };
         *next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
     }
 
@@ -2480,6 +2526,7 @@ impl Renderer {
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
         let mut ready = Vec::new();
+        let mut urgent_boost = Vec::new();
         self.mesh_retry_state.retain(|coord, state| {
             let failed_ready = state.failed_attempts < MESH_RETRY_MAX_ATTEMPTS
                 && state.failed_next_retry_frame <= self.mesh_rebuild_frame_index;
@@ -2493,12 +2540,19 @@ impl Renderer {
                 state.failed_next_retry_frame = u64::MAX;
             }
             if skipped_ready {
+                let skipped_attempts = state.skipped_attempts;
                 state.skipped_attempts = 0;
                 state.skipped_next_retry_frame = u64::MAX;
+                if skipped_attempts >= MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS {
+                    urgent_boost.push(*coord);
+                }
             }
 
             state.failed_attempts > 0 || state.skipped_attempts > 0
         });
+        for coord in urgent_boost {
+            self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
+        }
         for coord in ready {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
