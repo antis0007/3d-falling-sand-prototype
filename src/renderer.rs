@@ -568,6 +568,7 @@ pub struct MeshRebuildStats {
     pub gpu_mesh_jobs: usize,
     pub gpu_dispatch_ms: f32,
     pub gpu_job_failures: usize,
+    pub gpu_job_timeouts: usize,
     pub gpu_job_skipped: usize,
     pub gpu_readback_bytes: u64,
     pub allocator_bytes_allocated: usize,
@@ -979,6 +980,10 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
 
 fn short_error_message(reason: &str) -> &str {
     reason.lines().next().unwrap_or("unknown")
+}
+
+fn is_gpu_timeout_reason(reason: &str) -> bool {
+    reason.contains("gpu dispatch timeout")
 }
 
 impl BackgroundMeshQueue {
@@ -1789,6 +1794,9 @@ impl Renderer {
 
             if let ChunkMeshArtifact::Failed { reason } = &result.artifact {
                 stats.gpu_job_failures += 1;
+                if is_gpu_timeout_reason(reason) {
+                    stats.gpu_job_timeouts += 1;
+                }
                 log::warn!(
                     "[mesh] dropping failed artifact chunk={:?} lod={:?} error={}",
                     result.coord,

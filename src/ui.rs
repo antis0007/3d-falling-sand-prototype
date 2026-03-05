@@ -40,6 +40,7 @@ pub struct ProfilerStats {
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
     pub mesh_gpu_job_failure_count: usize,
+    pub mesh_gpu_job_timeout_count: usize,
     pub mesh_gpu_job_skipped_count: usize,
     pub dirty_queue_drop_count: usize,
     pub dirty_urgent_depth: usize,
@@ -609,13 +610,14 @@ pub fn draw(
                     ui_state.profiler.dirty_backlog
                 ));
                 ui.monospace(format!(
-                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {} | gpu failures/skips: {}/{} | dirty queue drops: {}",
+                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {} | gpu failures/timeouts/skips: {}/{}/{} | dirty queue drops: {}",
                     ui_state.profiler.mesh_queue_depth,
                     ui_state.profiler.mesh_completed_depth,
                     ui_state.profiler.mesh_stale_drop_count,
                     ui_state.profiler.mesh_age_drop_count,
                     ui_state.profiler.mesh_pressure_drop_count,
                     ui_state.profiler.mesh_gpu_job_failure_count,
+                    ui_state.profiler.mesh_gpu_job_timeout_count,
                     ui_state.profiler.mesh_gpu_job_skipped_count,
                     ui_state.profiler.dirty_queue_drop_count,
                 ));

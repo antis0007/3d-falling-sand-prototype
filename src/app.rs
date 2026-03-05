@@ -2112,6 +2112,7 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_age_drop_count = mesh_stats.age_drop_count;
                         ui.profiler.mesh_pressure_drop_count = mesh_stats.pressure_drop_count;
                         ui.profiler.mesh_gpu_job_failure_count = mesh_stats.gpu_job_failures;
+                        ui.profiler.mesh_gpu_job_timeout_count = mesh_stats.gpu_job_timeouts;
                         ui.profiler.mesh_gpu_job_skipped_count = mesh_stats.gpu_job_skipped;
                         ui.profiler.dirty_queue_drop_count = mesh_stats.dirty_queue_drop_count;
                         ui.profiler.gen_paused_by_worker_queue = gen_dispatch_paused;
