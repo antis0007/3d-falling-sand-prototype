@@ -19,7 +19,9 @@ use crate::gpu_compute::{
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
-    gpu_page_capacity, required_storage_buffer_binding_size_bytes, COMPUTE_STORAGE_BINDING_COUNT,
+    gpu_page_capacity, mesh_pool_slot_capacity, required_storage_buffer_binding_size_bytes,
+    COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -1341,13 +1343,10 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
         let page_capacity = gpu_page_capacity() as u64;
-        let verts_per_page =
-            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 24;
-        let indices_per_page =
-            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 36;
+        let mesh_slot_capacity = mesh_pool_slot_capacity() as u64;
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
-            size: page_capacity * verts_per_page * std::mem::size_of::<Vertex>() as u64,
+            size: GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -1355,7 +1354,7 @@ impl Renderer {
         }));
         let global_gpu_index_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh index buffer"),
-            size: page_capacity * indices_per_page * std::mem::size_of::<u32>() as u64,
+            size: GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
             usage: wgpu::BufferUsages::INDEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -1364,7 +1363,7 @@ impl Renderer {
         let global_gpu_draw_indirect_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global gpu draw indirect buffer"),
-                size: page_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+                size: mesh_slot_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
                 usage: wgpu::BufferUsages::INDIRECT
                     | wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
@@ -1406,6 +1405,17 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+
+        debug_assert!(
+            mesh_slot_capacity > 0,
+            "mesh pool must support at least one slot"
+        );
+        log::info!(
+            "gpu mesh pool initialized: vertex={} MiB index={} MiB slots={}",
+            GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / (1024 * 1024),
+            GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / (1024 * 1024),
+            mesh_slot_capacity
+        );
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -2068,7 +2078,7 @@ impl Renderer {
         let _ = vp_world;
         let _ = world_camera_pos;
 
-        let draw_count = gpu_page_capacity();
+        let draw_count = mesh_pool_slot_capacity();
         if draw_count > 0 {
             pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
             pass.set_index_buffer(
