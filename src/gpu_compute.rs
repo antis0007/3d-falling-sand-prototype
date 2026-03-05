@@ -739,10 +739,7 @@ impl GpuComputeRuntime {
             let vertex_face_limit = GPU_MESH_VERTEX_CAPACITY_PER_PAGE / 4;
             let index_face_limit = GPU_MESH_INDEX_CAPACITY_PER_PAGE / 6;
             let max_faces = vertex_face_limit.min(index_face_limit);
-            let generated_consts = format!(
-                "const GPU_MAX_FACES_PER_PAGE: u32 = {}u;",
-                max_faces
-            );
+            let generated_consts = format!("const GPU_MAX_FACES_PER_PAGE: u32 = {}u;", max_faces);
             let meshing_source = format!(
                 "{}\n{}",
                 generated_consts,
@@ -1436,6 +1433,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         ChunkMeshArtifact::Gpu {
                             page_index,
                             draw_indirect_index: mesh_slice.slot_index,
+                            index_count: inds.len() as u32,
                             lod: job.lod as u8,
                             verts,
                             inds,

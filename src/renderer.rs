@@ -30,6 +30,7 @@ use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -884,6 +885,11 @@ struct GpuChunkDraw {
     index_count: u32,
 }
 
+const GPU_MESH_VERTEX_CAPACITY_PER_SLOT: u64 =
+    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 24;
+const GPU_MESH_INDEX_CAPACITY_PER_SLOT: u64 =
+    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 36;
+
 pub(crate) enum ChunkMeshArtifact {
     Cpu {
         verts: Vec<Vertex>,
@@ -896,6 +902,7 @@ pub(crate) enum ChunkMeshArtifact {
     Gpu {
         page_index: GpuPageIndex,
         draw_indirect_index: u32,
+        index_count: u32,
         lod: u8,
         verts: Vec<Vertex>,
         inds: Vec<u32>,
@@ -1017,7 +1024,24 @@ impl BackgroundMeshQueue {
                     };
                     log::info!("[mesh-worker] picked job chunk={:?}", job.coord);
 
-                    let artifact = build_mesh_artifact(mesh_backend, &job);
+                    let artifact = catch_unwind(AssertUnwindSafe(|| {
+                        build_mesh_artifact(mesh_backend, &job)
+                    }))
+                    .unwrap_or_else(|panic_payload| {
+                        let panic_reason = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        ChunkMeshArtifact::Failed {
+                            reason: format!(
+                                "chunk={:?} lod={:?}: worker panic while building mesh artifact: {}",
+                                job.coord, job.lod, panic_reason
+                            ),
+                        }
+                    });
                     if let ChunkMeshArtifact::Failed { reason } = &artifact {
                         log::warn!(
                             "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
@@ -1780,13 +1804,6 @@ impl Renderer {
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
-        #[cfg(feature = "gpu-compute")]
-        {
-            if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
-                let _ = dispatch_gpu_chunk_tasks_on_renderer(32);
-            }
-        }
-
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::info!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
@@ -1844,6 +1861,7 @@ impl Renderer {
         let mut remesh_coords = Vec::new();
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_coords = Vec::new();
+        let completed_meshes_depth = self.completed_meshes.len();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
@@ -1881,6 +1899,7 @@ impl Renderer {
             if let ChunkMeshArtifact::Gpu {
                 page_index,
                 draw_indirect_index,
+                index_count,
                 lod,
                 dispatch_ms,
                 aabb_min,
@@ -1889,6 +1908,29 @@ impl Renderer {
                 ..
             } = &result.artifact
             {
+                if page_index.0 >= gpu_page_capacity() {
+                    log::warn!(
+                        "[mesh] rejecting gpu artifact chunk={:?}: page index {} out of range (capacity {})",
+                        result.coord,
+                        page_index.0,
+                        gpu_page_capacity()
+                    );
+                    stats.mesh_artifacts_rejected += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+                if *draw_indirect_index >= mesh_pool_slot_capacity() {
+                    log::warn!(
+                        "[mesh] rejecting gpu artifact chunk={:?}: draw index {} out of range (capacity {})",
+                        result.coord,
+                        draw_indirect_index,
+                        mesh_pool_slot_capacity()
+                    );
+                    stats.mesh_artifacts_rejected += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+                let resolved_index_count = (*index_count).max(1);
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 self.visible_gpu_chunks.insert(
@@ -1900,7 +1942,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: 0,
+                        index_count: resolved_index_count,
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
@@ -1950,8 +1992,136 @@ impl Renderer {
                 continue;
             }
 
-            // Deprecated CPU meshing path: keep artifact handling non-breaking, but
-            // do not allocate pages or upload CPU mesh geometry.
+            if let ChunkMeshArtifact::Cpu {
+                verts,
+                inds,
+                indirect,
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+            } = &result.artifact
+            {
+                let mesh_slot_capacity = mesh_pool_slot_capacity();
+                if mesh_slot_capacity == 0 {
+                    stats.mesh_artifacts_rejected += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+                let slot = if let Some(existing) = self.visible_gpu_chunks.get(&result.coord) {
+                    existing.draw_indirect_index
+                } else {
+                    let mut used_slots = HashSet::with_capacity(self.visible_gpu_chunks.len());
+                    for draw in self.visible_gpu_chunks.values() {
+                        used_slots.insert(draw.draw_indirect_index);
+                    }
+                    let mut selected = None;
+                    for candidate in 0..mesh_slot_capacity {
+                        if !used_slots.contains(&candidate) {
+                            selected = Some(candidate);
+                            break;
+                        }
+                    }
+                    let Some(selected) = selected else {
+                        log::warn!(
+                            "[mesh] rejecting cpu artifact chunk={:?}: no free mesh slots (capacity {})",
+                            result.coord,
+                            mesh_slot_capacity
+                        );
+                        stats.mesh_artifacts_rejected += 1;
+                        remesh_coords.push(result.coord);
+                        continue;
+                    };
+                    selected
+                };
+                let vertex_capacity = GPU_MESH_VERTEX_CAPACITY_PER_SLOT as usize;
+                let index_capacity = GPU_MESH_INDEX_CAPACITY_PER_SLOT as usize;
+                if verts.len() > vertex_capacity || inds.len() > index_capacity {
+                    log::warn!(
+                        "[mesh] rejecting cpu artifact chunk={:?}: mesh exceeds slot capacity (verts {}/{}, inds {}/{})",
+                        result.coord,
+                        verts.len(),
+                        vertex_capacity,
+                        inds.len(),
+                        index_capacity
+                    );
+                    stats.mesh_artifacts_rejected += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+
+                let vertex_offset = slot as u64
+                    * GPU_MESH_VERTEX_CAPACITY_PER_SLOT
+                    * std::mem::size_of::<Vertex>() as u64;
+                let index_offset = slot as u64
+                    * GPU_MESH_INDEX_CAPACITY_PER_SLOT
+                    * std::mem::size_of::<u32>() as u64;
+                let draw_offset =
+                    slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+                let vertex_bytes = verts.len() as u64 * std::mem::size_of::<Vertex>() as u64;
+                let index_bytes = inds.len() as u64 * std::mem::size_of::<u32>() as u64;
+                if vertex_offset + vertex_bytes > GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES
+                    || index_offset + index_bytes > GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES
+                {
+                    log::warn!(
+                        "[mesh] rejecting cpu artifact chunk={:?}: upload offsets exceed global mesh buffers",
+                        result.coord
+                    );
+                    stats.mesh_artifacts_rejected += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+
+                if !verts.is_empty() {
+                    self.queue.write_buffer(
+                        &self.global_gpu_vertex_buffer,
+                        vertex_offset,
+                        bytemuck::cast_slice(verts),
+                    );
+                }
+                if !inds.is_empty() {
+                    self.queue.write_buffer(
+                        &self.global_gpu_index_buffer,
+                        index_offset,
+                        bytemuck::cast_slice(inds),
+                    );
+                }
+
+                let resolved_index_count = indirect.index_count.max(inds.len() as u32);
+                let draw_command = DrawIndexedIndirectCommand {
+                    index_count: resolved_index_count,
+                    instance_count: 1,
+                    first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
+                    base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
+                    first_instance: 0,
+                };
+                self.queue.write_buffer(
+                    &self.global_gpu_draw_indirect_buffer,
+                    draw_offset,
+                    bytemuck::bytes_of(&draw_command),
+                );
+
+                self.visible_gpu_chunks.insert(
+                    result.coord,
+                    GpuChunkDraw {
+                        page_index: GpuPageIndex(slot),
+                        draw_indirect_index: slot,
+                        lod: result.lod as u8,
+                        origin: *chunk_origin_world,
+                        world_aabb_min: *aabb_min,
+                        world_aabb_max: *aabb_max,
+                        index_count: resolved_index_count,
+                    },
+                );
+                self.mesh_versions.insert(result.coord, result.version);
+                self.mesh_retry_state.remove(&result.coord);
+                store.mark_chunk_meshed(result.coord);
+                continue;
+            }
+
+            log::warn!(
+                "[mesh] rejecting unhandled artifact variant for chunk={:?}",
+                result.coord
+            );
             stats.mesh_artifacts_rejected += 1;
             self.visible_gpu_chunks.remove(&result.coord);
             self.pending_lod_remesh.remove(&result.coord);
@@ -1984,7 +2154,7 @@ impl Renderer {
         stats.dirty_normal_depth = self.dirty_queues.tier_len(DirtyTier::Normal);
         stats.dirty_far_depth = self.dirty_queues.tier_len(DirtyTier::Far);
         stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
-        stats.meshing_completed_depth = self.completed_meshes.len();
+        stats.meshing_completed_depth = completed_meshes_depth;
 
         let mut drop_keys = Vec::new();
         for &coord in self.visible_gpu_chunks.keys() {
@@ -2128,6 +2298,19 @@ impl Renderer {
                     ChunkLod::Mid => stats.mid_mesh_count += 1,
                     ChunkLod::Far => stats.far_mesh_count += 1,
                     ChunkLod::Ultra => stats.ultra_mesh_count += 1,
+                }
+                #[cfg(feature = "gpu-compute")]
+                if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+                    let dispatch_start = Instant::now();
+                    match dispatch_gpu_chunk_tasks_on_renderer(32) {
+                        Ok(_) => {
+                            stats.gpu_dispatch_ms +=
+                                dispatch_start.elapsed().as_secs_f32() * 1000.0;
+                        }
+                        Err(err) => {
+                            log::warn!("[mesh] renderer-side gpu dispatch failed after job submit: {err:#}");
+                        }
+                    }
                 }
                 Ok(())
             }
