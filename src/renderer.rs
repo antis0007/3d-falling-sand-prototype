@@ -13,7 +13,7 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 #[cfg(feature = "gpu-compute")]
-use crate::gpu_compute::gpu_page_capacity;
+use crate::gpu_compute::{gpu_page_capacity, COMPUTE_STORAGE_BINDING_COUNT};
 use crate::gpu_compute::{
     initialize_gpu_compute_worker, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
     MeshPipelineBackend, SharedMeshBuffers,
@@ -1023,11 +1023,37 @@ impl Renderer {
             .context("adapter")?;
 
         let supported_features = adapter.features();
+        let adapter_limits = adapter.limits();
         let required_features =
             wgpu::Features::MULTI_DRAW_INDIRECT | wgpu::Features::INDIRECT_FIRST_INSTANCE;
         let enabled_features = supported_features & required_features;
         let supports_multi_draw_indirect =
             enabled_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
+
+        let mut requested_limits = wgpu::Limits::default();
+        #[cfg(feature = "gpu-compute")]
+        {
+            let requested_storage_buffers = requested_limits
+                .max_storage_buffers_per_shader_stage
+                .max(COMPUTE_STORAGE_BINDING_COUNT);
+            requested_limits.max_storage_buffers_per_shader_stage =
+                requested_storage_buffers.min(adapter_limits.max_storage_buffers_per_shader_stage);
+            log::info!(
+                "device limits: storage-buffers-per-stage requested={} adapter-supported={} runtime-required={}",
+                requested_limits.max_storage_buffers_per_shader_stage,
+                adapter_limits.max_storage_buffers_per_shader_stage,
+                COMPUTE_STORAGE_BINDING_COUNT
+            );
+        }
+
+        #[cfg(not(feature = "gpu-compute"))]
+        {
+            log::info!(
+                "device limits: storage-buffers-per-stage requested={} adapter-supported={}",
+                requested_limits.max_storage_buffers_per_shader_stage,
+                adapter_limits.max_storage_buffers_per_shader_stage,
+            );
+        }
 
         if !supports_multi_draw_indirect {
             log::warn!(
@@ -1040,13 +1066,13 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("Voxel Renderer Device"),
                     required_features: enabled_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: requested_limits.clone(),
                 },
                 None,
             )
             .await?;
 
-        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter) {
+        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter, &requested_limits) {
             #[cfg(feature = "gpu-compute")]
             {
                 log::info!(

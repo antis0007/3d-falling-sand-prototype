@@ -24,7 +24,7 @@ const MAC_W_COUNT: usize = 32 * 32 * (32 + 1);
 #[cfg(feature = "gpu-compute")]
 const MAC_TOTAL_COUNT: usize = MAC_U_COUNT + MAC_V_COUNT + MAC_W_COUNT;
 #[cfg(feature = "gpu-compute")]
-const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
+pub(crate) const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 #[cfg(feature = "gpu-compute")]
 const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
 #[cfg(feature = "gpu-compute")]
@@ -548,10 +548,10 @@ pub struct MeshArtifactGPU {
 }
 
 impl GpuComputeRuntime {
-    pub fn runtime_supported(adapter: &wgpu::Adapter) -> bool {
+    pub fn runtime_supported(adapter: &wgpu::Adapter, effective_limits: &wgpu::Limits) -> bool {
         #[cfg(not(feature = "gpu-compute"))]
         {
-            let _ = adapter;
+            let _ = (adapter, effective_limits);
             false
         }
 
@@ -562,7 +562,10 @@ impl GpuComputeRuntime {
             downlevel
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-                && limits.max_storage_buffers_per_shader_stage >= COMPUTE_STORAGE_BINDING_COUNT
+                && effective_limits.max_storage_buffers_per_shader_stage
+                    >= COMPUTE_STORAGE_BINDING_COUNT
+                && limits.max_storage_buffers_per_shader_stage
+                    >= effective_limits.max_storage_buffers_per_shader_stage
                 && limits.max_storage_buffer_binding_size
                     >= (CHUNK_VOLUME * std::mem::size_of::<u32>() * 2 * GPU_PAGE_CAPACITY as usize)
                         as u32
@@ -1103,6 +1106,11 @@ pub fn initialize_gpu_compute_worker(
 ) -> anyhow::Result<()> {
     let state_result = WORKER_STATE.get_or_init(|| {
         let limits = device.limits();
+        log::info!(
+            "gpu worker limits: storage-buffers-per-stage device={} required={}",
+            limits.max_storage_buffers_per_shader_stage,
+            COMPUTE_STORAGE_BINDING_COUNT
+        );
         if limits.max_storage_buffers_per_shader_stage < COMPUTE_STORAGE_BINDING_COUNT {
             anyhow::bail!(
                 "adapter exposes {} storage buffers per compute stage but runtime requires {}",
