@@ -27,9 +27,9 @@ const MAC_TOTAL_COUNT: usize = MAC_U_COUNT + MAC_V_COUNT + MAC_W_COUNT;
 #[cfg(feature = "gpu-compute")]
 pub(crate) const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 #[cfg(feature = "gpu-compute")]
-const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
+const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 24;
 #[cfg(feature = "gpu-compute")]
-const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 6;
+const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 36;
 
 #[cfg(feature = "gpu-compute")]
 const fn atlas_voxel_size_bytes() -> u64 {
@@ -87,7 +87,9 @@ pub struct GpuComputeRuntime {
     pressure_jacobi_pipeline: wgpu::ComputePipeline,
     project_pipeline: wgpu::ComputePipeline,
     material_advect_pipeline: wgpu::ComputePipeline,
-    meshing_pipeline: wgpu::ComputePipeline,
+    detect_faces_pipeline: wgpu::ComputePipeline,
+    prefix_scan_pipeline: wgpu::ComputePipeline,
+    emit_mesh_pipeline: wgpu::ComputePipeline,
     simulation_bgl: wgpu::BindGroupLayout,
     meshing_bgl: wgpu::BindGroupLayout,
 }
@@ -100,8 +102,9 @@ pub struct SharedMeshBuffers {
     pub draw_indirect_buffer: Arc<wgpu::Buffer>,
     pub page_indirect: Arc<wgpu::Buffer>,
     pub mesh_meta_buffer: Arc<wgpu::Buffer>,
-    pub vertex_counter: Arc<wgpu::Buffer>,
-    pub index_counter: Arc<wgpu::Buffer>,
+    pub face_mask_buffer: Arc<wgpu::Buffer>,
+    pub face_offset_buffer: Arc<wgpu::Buffer>,
+    pub face_count_buffer: Arc<wgpu::Buffer>,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -121,18 +124,14 @@ struct SimulationBindResources<'a> {
 #[cfg(feature = "gpu-compute")]
 struct MeshingBindResources<'a> {
     atlas_voxels: &'a wgpu::Buffer,
-    active_tiles: &'a wgpu::Buffer,
     page_params: &'a wgpu::Buffer,
-    page_indirect: &'a wgpu::Buffer,
-    dirty_page_indices: &'a wgpu::Buffer,
-    dirty_page_counter: &'a wgpu::Buffer,
-    diagnostics: &'a wgpu::Buffer,
+    face_mask_buffer: &'a wgpu::Buffer,
+    face_offset_buffer: &'a wgpu::Buffer,
+    face_count_buffer: &'a wgpu::Buffer,
     chunk_vertex_buffer: &'a wgpu::Buffer,
     chunk_index_buffer: &'a wgpu::Buffer,
     draw_indirect_buffer: &'a wgpu::Buffer,
     mesh_meta_buffer: &'a wgpu::Buffer,
-    vertex_counter: &'a wgpu::Buffer,
-    index_counter: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -236,8 +235,9 @@ struct WorkerGpuState {
     chunk_index_buffer: Arc<wgpu::Buffer>,
     draw_indirect_buffer: Arc<wgpu::Buffer>,
     mesh_meta_buffer: Arc<wgpu::Buffer>,
-    vertex_counter: Arc<wgpu::Buffer>,
-    index_counter: Arc<wgpu::Buffer>,
+    face_mask_buffer: Arc<wgpu::Buffer>,
+    face_offset_buffer: Arc<wgpu::Buffer>,
+    face_count_buffer: Arc<wgpu::Buffer>,
     runtime_config: GpuSimulationRuntimeConfig,
     scratch: GpuScratchPool,
     simulation_bg: wgpu::BindGroup,
@@ -402,18 +402,20 @@ fn clear_meshing_outputs_for_page(state: &WorkerGpuState, page_index: GpuPageInd
         bytemuck::bytes_of(&zero_meta),
     );
 
-    let zero_counter = [0u32; 1];
-    let counter_stride = std::mem::size_of::<u32>() as u64;
-    let counter_offset = page_index.0 as u64 * counter_stride;
     state.queue.write_buffer(
-        &state.vertex_counter,
-        counter_offset,
-        bytemuck::cast_slice(&zero_counter),
+        &state.face_count_buffer,
+        0,
+        bytemuck::cast_slice(&[0u32; 1]),
     );
     state.queue.write_buffer(
-        &state.index_counter,
-        counter_offset,
-        bytemuck::cast_slice(&zero_counter),
+        &state.face_mask_buffer,
+        0,
+        bytemuck::cast_slice(&vec![0u32; CHUNK_VOLUME]),
+    );
+    state.queue.write_buffer(
+        &state.face_offset_buffer,
+        0,
+        bytemuck::cast_slice(&vec![0u32; CHUNK_VOLUME]),
     );
 }
 
@@ -677,19 +679,15 @@ impl GpuComputeRuntime {
                     entries: &simulation_entries,
                 });
             let meshing_entries = [
-                bgl_entry(0, false),
+                bgl_entry(0, true),
+                bgl_entry(1, false),
+                bgl_entry(2, false),
+                bgl_entry(3, false),
+                bgl_entry(4, false),
                 bgl_entry(5, false),
-                bgl_entry(8, true),
-                bgl_entry(9, false),
-                bgl_entry(10, false),
-                bgl_entry(11, false),
-                bgl_entry(12, false),
-                bgl_entry(13, false),
-                bgl_entry(14, false),
-                bgl_entry(15, false),
-                bgl_entry(16, false),
-                bgl_entry(17, false),
-                bgl_entry(18, false),
+                bgl_entry(6, true),
+                bgl_entry(7, false),
+                bgl_entry(8, false),
             ];
             let meshing_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("meshing compute bgl"),
@@ -747,12 +745,26 @@ impl GpuComputeRuntime {
                     module: &fluid_material_advect_module,
                     entry_point: "main",
                 });
-            let meshing_pipeline =
+            let detect_faces_pipeline =
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("meshing pipeline"),
+                    label: Some("meshing detect faces pipeline"),
                     layout: Some(&meshing_pl),
                     module: &meshing_module,
-                    entry_point: "meshing_main",
+                    entry_point: "detect_faces",
+                });
+            let prefix_scan_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("meshing prefix scan pipeline"),
+                    layout: Some(&meshing_pl),
+                    module: &meshing_module,
+                    entry_point: "prefix_scan",
+                });
+            let emit_mesh_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("meshing emit mesh pipeline"),
+                    layout: Some(&meshing_pl),
+                    module: &meshing_module,
+                    entry_point: "emit_mesh",
                 });
 
             Some(Self {
@@ -762,7 +774,9 @@ impl GpuComputeRuntime {
                 pressure_jacobi_pipeline,
                 project_pipeline,
                 material_advect_pipeline,
-                meshing_pipeline,
+                detect_faces_pipeline,
+                prefix_scan_pipeline,
+                emit_mesh_pipeline,
                 simulation_bgl,
                 meshing_bgl,
             })
@@ -875,7 +889,7 @@ impl GpuComputeRuntime {
             .queue
             .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&page_params));
 
-        let groups = sim_job.active_frontier_count.max(1).div_ceil(64);
+        let groups = (CHUNK_VOLUME as u32).div_ceil(128);
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -888,7 +902,11 @@ impl GpuComputeRuntime {
                 timestamp_writes: None,
             });
             pass.set_bind_group(0, &state.meshing_bg, &[]);
-            pass.set_pipeline(&self.meshing_pipeline);
+            pass.set_pipeline(&self.detect_faces_pipeline);
+            pass.dispatch_workgroups(groups, 1, 1);
+            pass.set_pipeline(&self.prefix_scan_pipeline);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.emit_mesh_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
         }
 
@@ -997,52 +1015,36 @@ impl GpuComputeRuntime {
                     resource: resources.atlas_voxels.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: resources.active_tiles.as_entire_binding(),
+                    binding: 1,
+                    resource: resources.face_mask_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: resources.page_params.as_entire_binding(),
+                    binding: 2,
+                    resource: resources.face_offset_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: resources.page_indirect.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: resources.dirty_page_indices.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: resources.dirty_page_counter.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 12,
-                    resource: resources.diagnostics.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 13,
+                    binding: 3,
                     resource: resources.chunk_vertex_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 14,
+                    binding: 4,
                     resource: resources.chunk_index_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 15,
+                    binding: 5,
                     resource: resources.draw_indirect_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 16,
+                    binding: 6,
+                    resource: resources.page_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: resources.face_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
                     resource: resources.mesh_meta_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 17,
-                    resource: resources.vertex_counter.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 18,
-                    resource: resources.index_counter.as_entire_binding(),
                 },
             ],
         })
@@ -1169,18 +1171,14 @@ pub fn initialize_gpu_compute_worker(
             &device,
             MeshingBindResources {
                 atlas_voxels: &atlas_voxels,
-                active_tiles: &scratch.active_tiles,
                 page_params: &scratch.page_params,
-                page_indirect: &shared_mesh_buffers.page_indirect,
-                dirty_page_indices: &scratch.dirty_page_indices,
-                dirty_page_counter: &scratch.dirty_page_counter,
-                diagnostics: &scratch.diagnostics,
+                face_mask_buffer: &shared_mesh_buffers.face_mask_buffer,
+                face_offset_buffer: &shared_mesh_buffers.face_offset_buffer,
+                face_count_buffer: &shared_mesh_buffers.face_count_buffer,
                 chunk_vertex_buffer: &shared_mesh_buffers.chunk_vertex_buffer,
                 chunk_index_buffer: &shared_mesh_buffers.chunk_index_buffer,
                 draw_indirect_buffer: &shared_mesh_buffers.draw_indirect_buffer,
                 mesh_meta_buffer: &shared_mesh_buffers.mesh_meta_buffer,
-                vertex_counter: &shared_mesh_buffers.vertex_counter,
-                index_counter: &shared_mesh_buffers.index_counter,
             },
         );
 
@@ -1199,8 +1197,9 @@ pub fn initialize_gpu_compute_worker(
             chunk_index_buffer: shared_mesh_buffers.chunk_index_buffer,
             draw_indirect_buffer: shared_mesh_buffers.draw_indirect_buffer,
             mesh_meta_buffer: shared_mesh_buffers.mesh_meta_buffer,
-            vertex_counter: shared_mesh_buffers.vertex_counter,
-            index_counter: shared_mesh_buffers.index_counter,
+            face_mask_buffer: shared_mesh_buffers.face_mask_buffer,
+            face_offset_buffer: shared_mesh_buffers.face_offset_buffer,
+            face_count_buffer: shared_mesh_buffers.face_count_buffer,
             runtime_config: GpuSimulationRuntimeConfig::default(),
             scratch,
             simulation_bg,
