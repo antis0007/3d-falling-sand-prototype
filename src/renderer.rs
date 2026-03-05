@@ -15,7 +15,8 @@ use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::gpu_page_capacity;
 use crate::gpu_compute::{
-    run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
+    initialize_gpu_compute_worker, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
+    MeshPipelineBackend, SharedMeshBuffers,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -223,13 +224,17 @@ impl MeshPageAllocator {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("{} vertex page", self.label)),
             size: new_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("{} index page", self.label)),
             size: new_capacity,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let page = MeshPage {
@@ -463,8 +468,8 @@ pub struct LodMeshingBudgets {
 
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
     pub config: wgpu::SurfaceConfiguration,
     pub size: PhysicalSize<u32>,
 
@@ -476,9 +481,13 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
-    global_gpu_vertex_buffer: wgpu::Buffer,
-    global_gpu_index_buffer: wgpu::Buffer,
-    global_gpu_draw_indirect_buffer: wgpu::Buffer,
+    global_gpu_vertex_buffer: Arc<wgpu::Buffer>,
+    global_gpu_index_buffer: Arc<wgpu::Buffer>,
+    global_gpu_draw_indirect_buffer: Arc<wgpu::Buffer>,
+    global_gpu_page_indirect_buffer: Arc<wgpu::Buffer>,
+    global_gpu_mesh_meta_buffer: Arc<wgpu::Buffer>,
+    global_gpu_vertex_counter_buffer: Arc<wgpu::Buffer>,
+    global_gpu_index_counter_buffer: Arc<wgpu::Buffer>,
     supports_multi_draw_indirect: bool,
 
     dirty_queues: DirtyChunkQueues,
@@ -959,10 +968,7 @@ impl BackgroundMeshQueue {
                         artifact,
                         urgent: job.urgent,
                     };
-                    log::info!(
-                        "[mesh-worker] sending result chunk={:?}",
-                        result.coord
-                    );
+                    log::info!("[mesh-worker] sending result chunk={:?}", result.coord);
                     if worker_tx.send(result).is_err() {
                         break;
                     }
@@ -1165,24 +1171,76 @@ impl Renderer {
         let page_capacity = gpu_page_capacity() as u64;
         let verts_per_page = (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
         let indices_per_page = verts_per_page * 6;
-        let global_gpu_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
             size: page_capacity * verts_per_page * std::mem::size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let global_gpu_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        }));
+        let global_gpu_index_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh index buffer"),
             size: page_capacity * indices_per_page * std::mem::size_of::<u32>() as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let global_gpu_draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("global gpu draw indirect buffer"),
-            size: page_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
-            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        }));
+        let global_gpu_draw_indirect_buffer =
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global gpu draw indirect buffer"),
+                size: page_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+                usage: wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+        let global_gpu_page_indirect_buffer =
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global gpu page indirect buffer"),
+                size: page_capacity * std::mem::size_of::<DrawIndirectArgs>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        let global_gpu_mesh_meta_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("global gpu mesh meta buffer"),
+            size: page_capacity * std::mem::size_of::<crate::gpu_compute::ChunkMeshMeta>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        }));
+        let global_gpu_vertex_counter_buffer =
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global gpu vertex counter buffer"),
+                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        let global_gpu_index_counter_buffer =
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global gpu index counter buffer"),
+                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        initialize_gpu_compute_worker(
+            Arc::clone(&device),
+            Arc::clone(&queue),
+            SharedMeshBuffers {
+                chunk_vertex_buffer: Arc::clone(&global_gpu_vertex_buffer),
+                chunk_index_buffer: Arc::clone(&global_gpu_index_buffer),
+                draw_indirect_buffer: Arc::clone(&global_gpu_draw_indirect_buffer),
+                page_indirect: Arc::clone(&global_gpu_page_indirect_buffer),
+                mesh_meta_buffer: Arc::clone(&global_gpu_mesh_meta_buffer),
+                vertex_counter: Arc::clone(&global_gpu_vertex_counter_buffer),
+                index_counter: Arc::clone(&global_gpu_index_counter_buffer),
+            },
+        )?;
 
         Ok(Self {
             surface,
@@ -1199,6 +1257,10 @@ impl Renderer {
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
             global_gpu_draw_indirect_buffer,
+            global_gpu_page_indirect_buffer,
+            global_gpu_mesh_meta_buffer,
+            global_gpu_vertex_counter_buffer,
+            global_gpu_index_counter_buffer,
             supports_multi_draw_indirect,
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
@@ -1518,10 +1580,7 @@ impl Renderer {
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
         while let Ok(result) = self.mesh_queue.try_recv() {
-            log::info!(
-                "[renderer] received mesh result chunk={:?}",
-                result.coord
-            );
+            log::info!("[renderer] received mesh result chunk={:?}", result.coord);
             self.completed_meshes.push(result);
         }
 
@@ -1622,35 +1681,38 @@ impl Renderer {
                 self.mesh_versions.insert(result.coord, result.version);
                 store.mark_chunk_meshed(result.coord);
 
-                let verts_per_page =
-                    (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
-                let indices_per_page = verts_per_page * 6;
-                let vertex_offset =
-                    page_index.0 as u64 * verts_per_page * std::mem::size_of::<Vertex>() as u64;
-                let index_offset =
-                    page_index.0 as u64 * indices_per_page * std::mem::size_of::<u32>() as u64;
-                let draw_offset = *draw_indirect_index as u64
-                    * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-                let (verts, inds, _indirect, ..) = result.artifact.geometry();
-                if !verts.is_empty() {
+                #[cfg(feature = "legacy_gpu_artifact_upload")]
+                {
+                    let verts_per_page =
+                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+                    let indices_per_page = verts_per_page * 6;
+                    let vertex_offset =
+                        page_index.0 as u64 * verts_per_page * std::mem::size_of::<Vertex>() as u64;
+                    let index_offset =
+                        page_index.0 as u64 * indices_per_page * std::mem::size_of::<u32>() as u64;
+                    let draw_offset = *draw_indirect_index as u64
+                        * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+                    let (verts, inds, _indirect, ..) = result.artifact.geometry();
+                    if !verts.is_empty() {
+                        self.queue.write_buffer(
+                            &self.global_gpu_vertex_buffer,
+                            vertex_offset,
+                            bytemuck::cast_slice(verts),
+                        );
+                    }
+                    if !inds.is_empty() {
+                        self.queue.write_buffer(
+                            &self.global_gpu_index_buffer,
+                            index_offset,
+                            bytemuck::cast_slice(inds),
+                        );
+                    }
                     self.queue.write_buffer(
-                        &self.global_gpu_vertex_buffer,
-                        vertex_offset,
-                        bytemuck::cast_slice(verts),
+                        &self.global_gpu_draw_indirect_buffer,
+                        draw_offset,
+                        bytemuck::cast_slice(gpu_draw_command),
                     );
                 }
-                if !inds.is_empty() {
-                    self.queue.write_buffer(
-                        &self.global_gpu_index_buffer,
-                        index_offset,
-                        bytemuck::cast_slice(inds),
-                    );
-                }
-                self.queue.write_buffer(
-                    &self.global_gpu_draw_indirect_buffer,
-                    draw_offset,
-                    bytemuck::cast_slice(gpu_draw_command),
-                );
                 continue;
             }
 

@@ -71,6 +71,18 @@ pub struct GpuComputeRuntime {
 }
 
 #[cfg(feature = "gpu-compute")]
+#[derive(Clone)]
+pub struct SharedMeshBuffers {
+    pub chunk_vertex_buffer: Arc<wgpu::Buffer>,
+    pub chunk_index_buffer: Arc<wgpu::Buffer>,
+    pub draw_indirect_buffer: Arc<wgpu::Buffer>,
+    pub page_indirect: Arc<wgpu::Buffer>,
+    pub mesh_meta_buffer: Arc<wgpu::Buffer>,
+    pub vertex_counter: Arc<wgpu::Buffer>,
+    pub index_counter: Arc<wgpu::Buffer>,
+}
+
+#[cfg(feature = "gpu-compute")]
 struct SimulationBindResources<'a> {
     atlas_voxels: &'a wgpu::Buffer,
     velocity_mac: &'a wgpu::Buffer,
@@ -204,8 +216,8 @@ impl ChunkPageAtlas {
 
 #[cfg(feature = "gpu-compute")]
 struct WorkerGpuState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     runtime: GpuComputeRuntime,
     atlas: Mutex<ChunkPageAtlas>,
     atlas_voxels: wgpu::Buffer,
@@ -213,13 +225,13 @@ struct WorkerGpuState {
     pressure: wgpu::Buffer,
     divergence: wgpu::Buffer,
     material_density: wgpu::Buffer,
-    page_indirect: wgpu::Buffer,
-    chunk_vertex_buffer: wgpu::Buffer,
-    chunk_index_buffer: wgpu::Buffer,
-    draw_indirect_buffer: wgpu::Buffer,
-    mesh_meta_buffer: wgpu::Buffer,
-    vertex_counter: wgpu::Buffer,
-    index_counter: wgpu::Buffer,
+    page_indirect: Arc<wgpu::Buffer>,
+    chunk_vertex_buffer: Arc<wgpu::Buffer>,
+    chunk_index_buffer: Arc<wgpu::Buffer>,
+    draw_indirect_buffer: Arc<wgpu::Buffer>,
+    mesh_meta_buffer: Arc<wgpu::Buffer>,
+    vertex_counter: Arc<wgpu::Buffer>,
+    index_counter: Arc<wgpu::Buffer>,
     runtime_config: GpuSimulationRuntimeConfig,
 }
 
@@ -291,12 +303,11 @@ fn read_gpu_draw_indirect_command(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut encoder =
-        state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("draw indirect readback encoder"),
-            });
+    let mut encoder = state
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("draw indirect readback encoder"),
+        });
     encoder.copy_buffer_to_buffer(
         &state.draw_indirect_buffer,
         draw_indirect_index as u64 * size,
@@ -1078,6 +1089,101 @@ fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+#[cfg(feature = "gpu-compute")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "gpu-compute")]
+static WORKER_STATE: OnceLock<anyhow::Result<Arc<WorkerGpuState>>> = OnceLock::new();
+
+#[cfg(feature = "gpu-compute")]
+pub fn initialize_gpu_compute_worker(
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    shared_mesh_buffers: SharedMeshBuffers,
+) -> anyhow::Result<()> {
+    let state_result = WORKER_STATE.get_or_init(|| {
+        let limits = device.limits();
+        if limits.max_storage_buffers_per_shader_stage < COMPUTE_STORAGE_BINDING_COUNT {
+            anyhow::bail!(
+                "adapter exposes {} storage buffers per compute stage but runtime requires {}",
+                limits.max_storage_buffers_per_shader_stage,
+                COMPUTE_STORAGE_BINDING_COUNT
+            );
+        }
+        let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
+        let page_capacity = GPU_PAGE_CAPACITY as u64;
+        let page_len = CHUNK_VOLUME as u64;
+        let atlas_voxel_size = page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64;
+        let velocity_mac_size =
+            page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64;
+
+        validate_storage_buffer_size("atlas_voxels", atlas_voxel_size, &limits)?;
+        validate_storage_buffer_size("velocity_mac", velocity_mac_size, &limits)?;
+
+        let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk atlas voxels"),
+            size: atlas_voxel_size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk velocity atlas"),
+            size: velocity_mac_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let pressure = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk pressure atlas"),
+            size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let divergence = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk divergence atlas"),
+            size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let material_density = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk material density atlas"),
+            size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Arc::new(WorkerGpuState {
+            device,
+            queue,
+            runtime,
+            atlas: Mutex::new(ChunkPageAtlas::default()),
+            atlas_voxels,
+            velocity_mac,
+            pressure,
+            divergence,
+            material_density,
+            page_indirect: shared_mesh_buffers.page_indirect,
+            chunk_vertex_buffer: shared_mesh_buffers.chunk_vertex_buffer,
+            chunk_index_buffer: shared_mesh_buffers.chunk_index_buffer,
+            draw_indirect_buffer: shared_mesh_buffers.draw_indirect_buffer,
+            mesh_meta_buffer: shared_mesh_buffers.mesh_meta_buffer,
+            vertex_counter: shared_mesh_buffers.vertex_counter,
+            index_counter: shared_mesh_buffers.index_counter,
+            runtime_config: GpuSimulationRuntimeConfig::default(),
+        }))
+    });
+
+    if let Err(err) = state_result.as_ref() {
+        return Err(anyhow::anyhow!(err.to_string()));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedChunkArtifacts> {
     #[cfg(not(feature = "gpu-compute"))]
     {
@@ -1087,173 +1193,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
     #[cfg(feature = "gpu-compute")]
     {
-        use std::sync::OnceLock;
-
-        static STATE: OnceLock<anyhow::Result<Arc<WorkerGpuState>>> = OnceLock::new();
-        let state = STATE.get_or_init(|| {
-            let instance = wgpu::Instance::default();
-            let adapter =
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                }))
-                .context("compute adapter")?;
-            let (device, queue) = pollster::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
-                    label: Some("gpu-compute worker device"),
-                },
-                None,
-            ))?;
-            let limits = device.limits();
-            if limits.max_storage_buffers_per_shader_stage < COMPUTE_STORAGE_BINDING_COUNT {
-                anyhow::bail!(
-                    "adapter exposes {} storage buffers per compute stage but runtime requires {}",
-                    limits.max_storage_buffers_per_shader_stage,
-                    COMPUTE_STORAGE_BINDING_COUNT
-                );
-            }
-            let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
-            let page_capacity = GPU_PAGE_CAPACITY as u64;
-            let page_len = CHUNK_VOLUME as u64;
-            let atlas_voxel_size =
-                page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64;
-            let velocity_mac_size =
-                page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64;
-            let chunk_vertex_size = page_capacity
-                * GPU_MESH_VERTEX_CAPACITY_PER_PAGE
-                * std::mem::size_of::<GpuVertex>() as u64;
-            let chunk_index_size = page_capacity
-                * GPU_MESH_INDEX_CAPACITY_PER_PAGE
-                * std::mem::size_of::<u32>() as u64;
-
-            validate_storage_buffer_size("atlas_voxels", atlas_voxel_size, &limits)?;
-            validate_storage_buffer_size("velocity_mac", velocity_mac_size, &limits)?;
-            validate_storage_buffer_size("chunk_vertex_buffer", chunk_vertex_size, &limits)?;
-            validate_storage_buffer_size("chunk_index_buffer", chunk_index_size, &limits)?;
-
-            let atlas_voxels = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk atlas voxels"),
-                size: atlas_voxel_size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let page_indirect = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk page indirect"),
-                size: page_capacity * std::mem::size_of::<DrawIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let chunk_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk mesh vertex buffer"),
-                size: chunk_vertex_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let chunk_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk mesh index buffer"),
-                size: chunk_index_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk draw indexed indirect buffer"),
-                size: page_capacity * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            let mesh_meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk mesh meta buffer"),
-                size: page_capacity * std::mem::size_of::<ChunkMeshMeta>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let vertex_counter = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk mesh vertex counter"),
-                size: page_capacity * std::mem::size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let index_counter = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk mesh index counter"),
-                size: page_capacity * std::mem::size_of::<u32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            log::debug!(
-                "gpu mesh buffers allocated: page_capacity={} vertex_bytes={} index_bytes={} indirect_bytes={} meta_bytes={} vertex_counter_bytes={} index_counter_bytes={}",
-                page_capacity,
-                page_capacity * GPU_MESH_VERTEX_CAPACITY_PER_PAGE * std::mem::size_of::<GpuVertex>() as u64,
-                page_capacity * GPU_MESH_INDEX_CAPACITY_PER_PAGE * std::mem::size_of::<u32>() as u64,
-                page_capacity * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
-                page_capacity * std::mem::size_of::<ChunkMeshMeta>() as u64,
-                page_capacity * std::mem::size_of::<u32>() as u64,
-                page_capacity * std::mem::size_of::<u32>() as u64,
-            );
-
-            let velocity_mac = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk velocity atlas"),
-                size: velocity_mac_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let pressure = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk pressure atlas"),
-                size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let divergence = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk divergence atlas"),
-                size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let material_density = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk material density atlas"),
-                size: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            Ok(Arc::new(WorkerGpuState {
-                device,
-                queue,
-                runtime,
-                atlas: Mutex::new(ChunkPageAtlas::default()),
-                atlas_voxels,
-                velocity_mac,
-                pressure,
-                divergence,
-                material_density,
-                page_indirect,
-                chunk_vertex_buffer,
-                chunk_index_buffer,
-                draw_indirect_buffer,
-                mesh_meta_buffer,
-                vertex_counter,
-                index_counter,
-                runtime_config: GpuSimulationRuntimeConfig::default(),
-            }))
-        });
-        let state = state
+        let state = WORKER_STATE
+            .get()
+            .context("gpu worker runtime is not initialized; renderer must call initialize_gpu_compute_worker")?
             .as_ref()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .clone();
