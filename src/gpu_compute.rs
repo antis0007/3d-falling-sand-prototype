@@ -24,11 +24,32 @@ const MAC_W_COUNT: usize = 32 * 32 * (32 + 1);
 #[cfg(feature = "gpu-compute")]
 const MAC_TOTAL_COUNT: usize = MAC_U_COUNT + MAC_V_COUNT + MAC_W_COUNT;
 #[cfg(feature = "gpu-compute")]
-const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
+pub(crate) const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 #[cfg(feature = "gpu-compute")]
 const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
 #[cfg(feature = "gpu-compute")]
 const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 6;
+
+#[cfg(feature = "gpu-compute")]
+const fn atlas_voxel_size_bytes() -> u64 {
+    (GPU_PAGE_CAPACITY as u64) * (CHUNK_VOLUME as u64) * 2 * std::mem::size_of::<u32>() as u64
+}
+
+#[cfg(feature = "gpu-compute")]
+const fn velocity_mac_size_bytes() -> u64 {
+    (GPU_PAGE_CAPACITY as u64) * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64
+}
+
+#[cfg(feature = "gpu-compute")]
+const fn required_storage_buffer_binding_size_bytes() -> u64 {
+    let atlas = atlas_voxel_size_bytes();
+    let velocity = velocity_mac_size_bytes();
+    if atlas > velocity {
+        atlas
+    } else {
+        velocity
+    }
+}
 
 #[cfg(feature = "gpu-compute")]
 pub const fn gpu_page_capacity() -> u32 {
@@ -548,10 +569,10 @@ pub struct MeshArtifactGPU {
 }
 
 impl GpuComputeRuntime {
-    pub fn runtime_supported(adapter: &wgpu::Adapter) -> bool {
+    pub fn runtime_supported(adapter: &wgpu::Adapter, effective_limits: &wgpu::Limits) -> bool {
         #[cfg(not(feature = "gpu-compute"))]
         {
-            let _ = adapter;
+            let _ = (adapter, effective_limits);
             false
         }
 
@@ -562,10 +583,13 @@ impl GpuComputeRuntime {
             downlevel
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-                && limits.max_storage_buffers_per_shader_stage >= COMPUTE_STORAGE_BINDING_COUNT
-                && limits.max_storage_buffer_binding_size
-                    >= (CHUNK_VOLUME * std::mem::size_of::<u32>() * 2 * GPU_PAGE_CAPACITY as usize)
-                        as u32
+                && effective_limits.max_storage_buffers_per_shader_stage
+                    >= COMPUTE_STORAGE_BINDING_COUNT
+                && limits.max_storage_buffers_per_shader_stage
+                    >= effective_limits.max_storage_buffers_per_shader_stage
+                && limits.max_storage_buffer_binding_size as u64
+                    >= required_storage_buffer_binding_size_bytes()
+                && limits.max_buffer_size >= required_storage_buffer_binding_size_bytes()
         }
     }
 
@@ -1103,6 +1127,11 @@ pub fn initialize_gpu_compute_worker(
 ) -> anyhow::Result<()> {
     let state_result = WORKER_STATE.get_or_init(|| {
         let limits = device.limits();
+        log::info!(
+            "gpu worker limits: storage-buffers-per-stage device={} required={}",
+            limits.max_storage_buffers_per_shader_stage,
+            COMPUTE_STORAGE_BINDING_COUNT
+        );
         if limits.max_storage_buffers_per_shader_stage < COMPUTE_STORAGE_BINDING_COUNT {
             anyhow::bail!(
                 "adapter exposes {} storage buffers per compute stage but runtime requires {}",
@@ -1113,9 +1142,17 @@ pub fn initialize_gpu_compute_worker(
         let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
         let page_capacity = GPU_PAGE_CAPACITY as u64;
         let page_len = CHUNK_VOLUME as u64;
-        let atlas_voxel_size = page_capacity * page_len * 2 * std::mem::size_of::<u32>() as u64;
-        let velocity_mac_size =
-            page_capacity * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64;
+        let atlas_voxel_size = atlas_voxel_size_bytes();
+        let velocity_mac_size = velocity_mac_size_bytes();
+        let required_storage_size = required_storage_buffer_binding_size_bytes();
+        log::info!(
+            "gpu worker storage-buffer sizes: atlas_voxels={}B velocity_mac={}B required-max={}B adapter-max-binding={}B adapter-max-buffer={}B",
+            atlas_voxel_size,
+            velocity_mac_size,
+            required_storage_size,
+            limits.max_storage_buffer_binding_size,
+            limits.max_buffer_size
+        );
 
         validate_storage_buffer_size("atlas_voxels", atlas_voxel_size, &limits)?;
         validate_storage_buffer_size("velocity_mac", velocity_mac_size, &limits)?;
