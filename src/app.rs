@@ -2096,6 +2096,9 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_count = mesh_stats.upload_count;
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
+                        ui.profiler.mesh_gpu_adopt_count = mesh_stats.gpu_mesh_adopted_count;
+                        ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
+                        ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
                         let gpu_compute = take_gpu_compute_profiler_snapshot(now.elapsed().as_secs_f32());
                         ui.profiler.gpu_compute_dispatch_ms = gpu_compute.dispatch_ms;
