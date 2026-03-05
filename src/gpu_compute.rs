@@ -280,6 +280,48 @@ fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
 }
 
 #[cfg(feature = "gpu-compute")]
+fn read_gpu_draw_indirect_command(
+    state: &WorkerGpuState,
+    draw_indirect_index: u32,
+) -> anyhow::Result<[u32; 5]> {
+    let size = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+    let staging = state.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("draw indirect readback staging"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder =
+        state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("draw indirect readback encoder"),
+            });
+    encoder.copy_buffer_to_buffer(
+        &state.draw_indirect_buffer,
+        draw_indirect_index as u64 * size,
+        &staging,
+        0,
+        size,
+    );
+    state.queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    state.device.poll(wgpu::Maintain::Wait);
+    rx.recv().context("draw indirect readback recv")??;
+
+    let mapped = slice.get_mapped_range();
+    let words = *bytemuck::from_bytes::<[u32; 5]>(&mapped[..std::mem::size_of::<[u32; 5]>()]);
+    drop(mapped);
+    staging.unmap();
+    Ok(words)
+}
+
+#[cfg(feature = "gpu-compute")]
 fn create_job_scratch_buffers(state: &WorkerGpuState) -> JobScratchBuffers {
     let page_len = CHUNK_VOLUME as u64;
     let page_capacity = GPU_PAGE_CAPACITY as u64;
@@ -1125,7 +1167,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             let draw_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("chunk draw indexed indirect buffer"),
                 size: page_capacity * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
 
@@ -1363,6 +1407,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             };
 
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
+            #[cfg(feature = "gpu_meshing_experimental")]
+            let gpu_draw_command =
+                read_gpu_draw_indirect_command(&state, gpu_artifact.draw_indirect_index)?;
             #[cfg(not(feature = "gpu_meshing_experimental"))]
             let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
                 mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
@@ -1389,7 +1436,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             lod: gpu_artifact.lod,
                             verts,
                             inds,
-                            indirect: DrawIndirectArgs::default(),
+                            gpu_draw_command,
                             aabb_min,
                             aabb_max,
                             chunk_origin_world,
