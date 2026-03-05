@@ -1,5 +1,5 @@
 use crate::renderer::mesh_chunk_snapshot;
-use crate::renderer::{ChunkMeshArtifact, MeshJob};
+use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason};
 use crate::types::{ChunkCoord, GpuPageIndex};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
@@ -166,6 +166,8 @@ struct ChunkPageAtlas {
     cached_materials: HashMap<ChunkCoord, Vec<MaterialId>>,
     mesh_slice_for_chunk: HashMap<ChunkCoord, MeshBufferSlice>,
     chunk_for_mesh_slot: HashMap<u32, ChunkCoord>,
+    mesh_slot_last_used: HashMap<u32, u64>,
+    mesh_slot_epoch: u64,
     next_mesh_slot: u32,
     next_page: GpuPageIndex,
 }
@@ -199,6 +201,7 @@ impl ChunkPageAtlas {
 
     fn mesh_slice_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> Option<MeshBufferSlice> {
         if let Some(existing) = self.mesh_slice_for_chunk.get(&chunk).copied() {
+            self.touch_mesh_slot(existing.slot_index);
             return Some(existing);
         }
 
@@ -212,16 +215,7 @@ impl ChunkPageAtlas {
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
             slot
         } else {
-            self.chunk_for_mesh_slot.keys().copied().find(|slot| {
-                self.chunk_for_mesh_slot
-                    .get(slot)
-                    .and_then(|owner| self.page_for_chunk.get(owner))
-                    .map(|page| {
-                        let fence = self.page_fences.get(page).copied().unwrap_or_default();
-                        fence.last_completed >= fence.last_submitted
-                    })
-                    .unwrap_or(false)
-            })?
+            self.evictable_mesh_slot(slot_capacity)?
         };
 
         if let Some(evicted_chunk) = self.chunk_for_mesh_slot.remove(&slot) {
@@ -235,7 +229,46 @@ impl ChunkPageAtlas {
         };
         self.mesh_slice_for_chunk.insert(chunk, slice);
         self.chunk_for_mesh_slot.insert(slot, chunk);
+        self.touch_mesh_slot(slot);
         Some(slice)
+    }
+
+    fn touch_mesh_slot(&mut self, slot: u32) {
+        self.mesh_slot_epoch = self.mesh_slot_epoch.saturating_add(1);
+        self.mesh_slot_last_used.insert(slot, self.mesh_slot_epoch);
+    }
+
+    fn is_mesh_slot_fence_safe(&self, slot: u32) -> bool {
+        self.chunk_for_mesh_slot
+            .get(&slot)
+            .and_then(|owner| self.page_for_chunk.get(owner))
+            .map(|page| {
+                let fence = self.page_fences.get(page).copied().unwrap_or_default();
+                fence.last_completed >= fence.last_submitted
+            })
+            .unwrap_or(false)
+    }
+
+    fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
+        let mut selected: Option<(u64, u32)> = None;
+        for slot in 0..slot_capacity {
+            if !self.is_mesh_slot_fence_safe(slot) {
+                continue;
+            }
+            let age = self.mesh_slot_last_used.get(&slot).copied().unwrap_or(0);
+            let candidate = (age, slot);
+            if selected.map(|cur| candidate < cur).unwrap_or(true) {
+                selected = Some(candidate);
+            }
+        }
+        selected.map(|(_, slot)| slot)
+    }
+
+    fn in_flight_mesh_slot_fence_count(&self) -> u32 {
+        self.chunk_for_mesh_slot
+            .keys()
+            .filter(|slot| !self.is_mesh_slot_fence_safe(**slot))
+            .count() as u32
     }
 
     fn resolve_chunk(&self, page_index: GpuPageIndex) -> Option<ChunkCoord> {
@@ -278,6 +311,7 @@ impl ChunkPageAtlas {
             self.cached_materials.remove(&chunk);
             if let Some(slice) = self.mesh_slice_for_chunk.remove(&chunk) {
                 self.chunk_for_mesh_slot.remove(&slice.slot_index);
+                self.mesh_slot_last_used.remove(&slice.slot_index);
             }
             self.page_fences.remove(&page_index);
         }
@@ -545,6 +579,7 @@ pub struct GpuComputeProfilerSnapshot {
     pub bytes_transferred: u64,
     pub chunks_completed: u64,
     pub frontier_cap_events: u64,
+    pub mesh_slot_alloc_failed: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -556,6 +591,8 @@ static GPU_TRANSFER_BYTES: AtomicU64 = AtomicU64::new(0);
 static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_SLOT_ALLOC_FAILED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -647,12 +684,14 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let bytes_transferred = GPU_TRANSFER_BYTES.swap(0, Ordering::Relaxed);
         let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
         let frontier_cap_events = GPU_FRONTIER_CAP_EVENTS.swap(0, Ordering::Relaxed);
+        let mesh_slot_alloc_failed = GPU_MESH_SLOT_ALLOC_FAILED.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
             bytes_transferred,
             chunks_completed,
             frontier_cap_events,
+            mesh_slot_alloc_failed,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -1322,7 +1361,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         if !try_acquire_active_job(job.coord) {
             return Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: ChunkSimulationDiagnostics::default(),
-                mesh_artifact: ChunkMeshArtifact::Skipped,
+                mesh_artifact: ChunkMeshArtifact::Skipped {
+                    reason: MeshSkipReason::WorkerBusy,
+                },
             });
         }
 
@@ -1330,7 +1371,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
+        let mesh_slot_capacity = mesh_pool_slot_capacity();
         let mesh_slice = atlas.mesh_slice_for_chunk_or_allocate(job.coord);
+        let mesh_slot_in_flight_fences = atlas.in_flight_mesh_slot_fence_count();
         let _last_version = atlas
             .version_for_chunk
             .get(&job.coord)
@@ -1446,11 +1489,19 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             dispatch_ms: 0.0,
                         }
                     } else {
+                        let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
                         log::debug!(
-                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted",
-                            job.coord
+                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted (slot_capacity={}, in_flight_fences={})",
+                            job.coord,
+                            mesh_slot_capacity,
+                            mesh_slot_in_flight_fences,
                         );
-                        ChunkMeshArtifact::Skipped
+                        ChunkMeshArtifact::Skipped {
+                            reason: MeshSkipReason::MeshSlotCapacitySaturated {
+                                slot_capacity: mesh_slot_capacity,
+                                in_flight_fences: mesh_slot_in_flight_fences,
+                            },
+                        }
                     }
                 }
                 #[cfg(not(feature = "gpu_meshing_experimental"))]
