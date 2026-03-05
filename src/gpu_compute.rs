@@ -41,7 +41,7 @@ const fn velocity_mac_size_bytes() -> u64 {
 }
 
 #[cfg(feature = "gpu-compute")]
-const fn required_storage_buffer_binding_size_bytes() -> u64 {
+pub(crate) const fn required_storage_buffer_binding_size_bytes() -> u64 {
     let atlas = atlas_voxel_size_bytes();
     let velocity = velocity_mac_size_bytes();
     if atlas > velocity {
@@ -579,17 +579,14 @@ impl GpuComputeRuntime {
         #[cfg(feature = "gpu-compute")]
         {
             let downlevel = adapter.get_downlevel_capabilities();
-            let limits = adapter.limits();
+            let required_storage_size = required_storage_buffer_binding_size_bytes();
             downlevel
                 .flags
                 .contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
                 && effective_limits.max_storage_buffers_per_shader_stage
                     >= COMPUTE_STORAGE_BINDING_COUNT
-                && limits.max_storage_buffers_per_shader_stage
-                    >= effective_limits.max_storage_buffers_per_shader_stage
-                && limits.max_storage_buffer_binding_size as u64
-                    >= required_storage_buffer_binding_size_bytes()
-                && limits.max_buffer_size >= required_storage_buffer_binding_size_bytes()
+                && effective_limits.max_storage_buffer_binding_size as u64 >= required_storage_size
+                && effective_limits.max_buffer_size >= required_storage_size
         }
     }
 

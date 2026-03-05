@@ -13,7 +13,9 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 #[cfg(feature = "gpu-compute")]
-use crate::gpu_compute::{gpu_page_capacity, COMPUTE_STORAGE_BINDING_COUNT};
+use crate::gpu_compute::{
+    gpu_page_capacity, required_storage_buffer_binding_size_bytes, COMPUTE_STORAGE_BINDING_COUNT,
+};
 use crate::gpu_compute::{
     initialize_gpu_compute_worker, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
     MeshPipelineBackend, SharedMeshBuffers,
@@ -1033,16 +1035,32 @@ impl Renderer {
         let mut requested_limits = wgpu::Limits::default();
         #[cfg(feature = "gpu-compute")]
         {
+            let required_storage_size = required_storage_buffer_binding_size_bytes();
             let requested_storage_buffers = requested_limits
                 .max_storage_buffers_per_shader_stage
                 .max(COMPUTE_STORAGE_BINDING_COUNT);
             requested_limits.max_storage_buffers_per_shader_stage =
                 requested_storage_buffers.min(adapter_limits.max_storage_buffers_per_shader_stage);
+
+            requested_limits.max_storage_buffer_binding_size = requested_limits
+                .max_storage_buffer_binding_size
+                .max(required_storage_size as u32)
+                .min(adapter_limits.max_storage_buffer_binding_size);
+            requested_limits.max_buffer_size = requested_limits
+                .max_buffer_size
+                .max(required_storage_size)
+                .min(adapter_limits.max_buffer_size);
+
             log::info!(
-                "device limits: storage-buffers-per-stage requested={} adapter-supported={} runtime-required={}",
+                "gpu compute required limits: storage-buffers-per-stage requested={} adapter-supported={} runtime-required={} required-storage-size={}B requested-max-binding={}B adapter-max-binding={}B requested-max-buffer={}B adapter-max-buffer={}B",
                 requested_limits.max_storage_buffers_per_shader_stage,
                 adapter_limits.max_storage_buffers_per_shader_stage,
-                COMPUTE_STORAGE_BINDING_COUNT
+                COMPUTE_STORAGE_BINDING_COUNT,
+                required_storage_size,
+                requested_limits.max_storage_buffer_binding_size,
+                adapter_limits.max_storage_buffer_binding_size,
+                requested_limits.max_buffer_size,
+                adapter_limits.max_buffer_size,
             );
         }
 
@@ -1072,7 +1090,8 @@ impl Renderer {
             )
             .await?;
 
-        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter, &requested_limits) {
+        let device_limits = device.limits();
+        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter, &device_limits) {
             #[cfg(feature = "gpu-compute")]
             {
                 log::info!(
@@ -1090,6 +1109,17 @@ impl Renderer {
         } else {
             #[cfg(feature = "cpu_meshing_debug")]
             {
+                #[cfg(feature = "gpu-compute")]
+                {
+                    let required_storage_size = required_storage_buffer_binding_size_bytes();
+                    log::warn!(
+                        "gpu compute unsupported; falling back to cpu debug path (required_storage_size={}B adapter-max-binding={}B requested-max-binding={}B device-max-binding={}B)",
+                        required_storage_size,
+                        adapter_limits.max_storage_buffer_binding_size,
+                        requested_limits.max_storage_buffer_binding_size,
+                        device_limits.max_storage_buffer_binding_size
+                    );
+                }
                 log::warn!(
                     "mesh backend selected: cpu debug path (adapter/runtime does not satisfy gpu-compute requirements)"
                 );
@@ -1097,6 +1127,17 @@ impl Renderer {
             }
             #[cfg(not(feature = "cpu_meshing_debug"))]
             {
+                #[cfg(feature = "gpu-compute")]
+                {
+                    let required_storage_size = required_storage_buffer_binding_size_bytes();
+                    log::error!(
+                        "gpu compute unsupported; bailing out (required_storage_size={}B adapter-max-binding={}B requested-max-binding={}B device-max-binding={}B)",
+                        required_storage_size,
+                        adapter_limits.max_storage_buffer_binding_size,
+                        requested_limits.max_storage_buffer_binding_size,
+                        device_limits.max_storage_buffer_binding_size
+                    );
+                }
                 anyhow::bail!(
                     "gpu meshing is required at runtime, but adapter/runtime does not satisfy gpu-compute requirements"
                 );
