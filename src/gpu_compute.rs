@@ -5,13 +5,13 @@ use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "gpu-compute")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 #[cfg(feature = "gpu-compute")]
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
@@ -140,7 +140,7 @@ struct MeshingBindResources<'a> {
 struct ChunkPageAtlas {
     page_for_chunk: HashMap<ChunkCoord, GpuPageIndex>,
     chunk_for_page: HashMap<GpuPageIndex, ChunkCoord>,
-    in_flight_jobs_for_page: HashMap<GpuPageIndex, u32>,
+    page_fences: HashMap<GpuPageIndex, PageFence>,
     version_for_chunk: HashMap<ChunkCoord, u64>,
     state_for_chunk: HashMap<ChunkCoord, u32>,
     frontier_len_for_chunk: HashMap<ChunkCoord, u32>,
@@ -188,42 +188,25 @@ impl ChunkPageAtlas {
         assert_eq!(resolved, chunk, "gpu page/chunk mapping mismatch");
     }
 
-    fn acquire_page_for_job(&mut self, chunk: ChunkCoord, page_index: GpuPageIndex) {
-        self.assert_page_for_chunk(chunk, page_index);
-        *self.in_flight_jobs_for_page.entry(page_index).or_insert(0) += 1;
+    fn mark_page_submitted(&mut self, page_index: GpuPageIndex, serial: u64) {
+        let fence = self.page_fences.entry(page_index).or_default();
+        fence.last_submitted = serial;
     }
 
-    fn acquire_existing_page_for_job(&mut self, page_index: GpuPageIndex) {
-        if self.resolve_chunk(page_index).is_some() {
-            *self.in_flight_jobs_for_page.entry(page_index).or_insert(0) += 1;
-        }
-    }
-
-    fn release_page_from_job(&mut self, page_index: GpuPageIndex) {
-        if let Some(in_flight) = self.in_flight_jobs_for_page.get_mut(&page_index) {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.in_flight_jobs_for_page.remove(&page_index);
-            }
+    fn refresh_completed_serial(&mut self, completed: u64) {
+        for fence in self.page_fences.values_mut() {
+            fence.last_completed = fence.last_completed.max(completed);
         }
     }
 
     fn evictable_page(&self) -> Option<GpuPageIndex> {
-        self.chunk_for_page
-            .keys()
-            .copied()
-            .find(|page| self.in_flight_jobs_for_page.get(page).copied().unwrap_or(0) == 0)
+        self.chunk_for_page.keys().copied().find(|page| {
+            let fence = self.page_fences.get(page).copied().unwrap_or_default();
+            fence.last_completed >= fence.last_submitted
+        })
     }
 
     fn evict_page(&mut self, page_index: GpuPageIndex) {
-        debug_assert_eq!(
-            self.in_flight_jobs_for_page
-                .get(&page_index)
-                .copied()
-                .unwrap_or(0),
-            0,
-            "attempted to evict an in-flight gpu page"
-        );
         if let Some(chunk) = self.chunk_for_page.remove(&page_index) {
             self.page_for_chunk.remove(&chunk);
             self.version_for_chunk.remove(&chunk);
@@ -232,6 +215,7 @@ impl ChunkPageAtlas {
             self.tick_for_chunk.remove(&chunk);
             self.diagnostics_for_chunk.remove(&chunk);
             self.cached_materials.remove(&chunk);
+            self.page_fences.remove(&page_index);
         }
     }
 }
@@ -255,10 +239,13 @@ struct WorkerGpuState {
     vertex_counter: Arc<wgpu::Buffer>,
     index_counter: Arc<wgpu::Buffer>,
     runtime_config: GpuSimulationRuntimeConfig,
+    scratch: GpuScratchPool,
+    simulation_bg: wgpu::BindGroup,
+    meshing_bg: wgpu::BindGroup,
 }
 
 #[cfg(feature = "gpu-compute")]
-struct JobScratchBuffers {
+pub struct GpuScratchPool {
     page_params: wgpu::Buffer,
     active_tiles: wgpu::Buffer,
     active_tile_counter: wgpu::Buffer,
@@ -269,56 +256,48 @@ struct JobScratchBuffers {
 }
 
 #[cfg(feature = "gpu-compute")]
-fn clear_page_buffers(state: &WorkerGpuState, page_index: GpuPageIndex) {
-    let voxel_words = CHUNK_VOLUME * 2;
-    let atlas_byte_offset =
-        page_index.0 as u64 * voxel_words as u64 * std::mem::size_of::<u32>() as u64;
-    let atlas_zeros = vec![0u32; voxel_words];
-    state.queue.write_buffer(
+fn clear_page_buffers(
+    encoder: &mut wgpu::CommandEncoder,
+    state: &WorkerGpuState,
+    page_index: GpuPageIndex,
+) {
+    let atlas_page = CHUNK_VOLUME as u64 * 2 * std::mem::size_of::<u32>() as u64;
+    encoder.clear_buffer(
         &state.atlas_voxels,
-        atlas_byte_offset,
-        bytemuck::cast_slice(&atlas_zeros),
+        page_index.0 as u64 * atlas_page,
+        Some(atlas_page),
     );
 
-    let velocity_offset =
-        page_index.0 as u64 * (MAC_TOTAL_COUNT * 2) as u64 * std::mem::size_of::<f32>() as u64;
-    let velocity_zeros = vec![0.0f32; MAC_TOTAL_COUNT * 2];
-    state.queue.write_buffer(
+    let velocity_page = (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64;
+    encoder.clear_buffer(
         &state.velocity_mac,
-        velocity_offset,
-        bytemuck::cast_slice(&velocity_zeros),
+        page_index.0 as u64 * velocity_page,
+        Some(velocity_page),
     );
 
-    let scalar_offset =
-        page_index.0 as u64 * (CHUNK_VOLUME * 2) as u64 * std::mem::size_of::<f32>() as u64;
-    let scalar_zeros = vec![0.0f32; CHUNK_VOLUME * 2];
-    state.queue.write_buffer(
+    let scalar_page = CHUNK_VOLUME as u64 * 2 * std::mem::size_of::<f32>() as u64;
+    encoder.clear_buffer(
         &state.pressure,
-        scalar_offset,
-        bytemuck::cast_slice(&scalar_zeros),
+        page_index.0 as u64 * scalar_page,
+        Some(scalar_page),
     );
-    state.queue.write_buffer(
+    encoder.clear_buffer(
         &state.divergence,
-        scalar_offset,
-        bytemuck::cast_slice(&scalar_zeros),
+        page_index.0 as u64 * scalar_page,
+        Some(scalar_page),
     );
-
-    let density_offset =
-        page_index.0 as u64 * CHUNK_VOLUME as u64 * 2 * std::mem::size_of::<f32>() as u64;
-    let density_zeros = vec![0.0f32; CHUNK_VOLUME * 2];
-    state.queue.write_buffer(
+    encoder.clear_buffer(
         &state.material_density,
-        density_offset,
-        bytemuck::cast_slice(&density_zeros),
+        page_index.0 as u64 * scalar_page,
+        Some(scalar_page),
     );
 }
 
 #[cfg(feature = "gpu-compute")]
-fn create_job_scratch_buffers(state: &WorkerGpuState) -> JobScratchBuffers {
+fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
     let page_len = CHUNK_VOLUME as u64;
     let page_capacity = GPU_PAGE_CAPACITY as u64;
-    let device = &state.device;
-    JobScratchBuffers {
+    GpuScratchPool {
         page_params: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk page params"),
             size: std::mem::size_of::<FrameParams>() as u64,
@@ -365,9 +344,9 @@ fn create_job_scratch_buffers(state: &WorkerGpuState) -> JobScratchBuffers {
 }
 
 #[cfg(feature = "gpu-compute")]
-fn clear_job_scratch_buffers(
+fn clear_gpu_scratch_pool(
     state: &WorkerGpuState,
-    scratch: &JobScratchBuffers,
+    scratch: &GpuScratchPool,
     _active_tile_len: usize,
     _dirty_page_len: usize,
 ) {
@@ -487,11 +466,6 @@ const SAFE_ACTIVE_FRONTIER_LIMIT: u32 = 2048;
 const STARTUP_JACOBI_ITERATIONS: u32 = 8;
 #[cfg(feature = "gpu-compute")]
 const HIGH_PRESSURE_JACOBI_ITERATIONS: u32 = 16;
-#[cfg(feature = "gpu-compute")]
-const GPU_DISPATCH_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
-#[cfg(feature = "gpu-compute")]
-const GPU_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
 #[derive(Default, Clone, Copy)]
 pub struct GpuComputeProfilerSnapshot {
     pub dispatch_ms: f32,
@@ -514,9 +488,70 @@ static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_DISPATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
-static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
+    std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
+#[cfg(feature = "gpu-compute")]
+static GPU_TASK_TX: OnceLock<SyncSender<GpuChunkTask>> = OnceLock::new();
+#[cfg(feature = "gpu-compute")]
+static GPU_TASK_RX: OnceLock<Mutex<Receiver<GpuChunkTask>>> = OnceLock::new();
+#[cfg(feature = "gpu-compute")]
+static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone)]
+pub struct GpuChunkTask {
+    pub coord: ChunkCoord,
+    pub page_index: GpuPageIndex,
+    pub frontier_count: u32,
+    pub edit_commands: Vec<EditCommand>,
+    pub jacobi_iterations: u32,
+    pub neighbor_pages: [u32; 6],
+    pub simulation_tick: u32,
+    pub current_state: u32,
+    pub startup_seeding_mode: bool,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Default)]
+struct PageFence {
+    last_submitted: u64,
+    last_completed: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+fn active_job_slot(coord: ChunkCoord) -> (usize, u64) {
+    let h = (coord.x as i64).wrapping_mul(73856093)
+        ^ (coord.y as i64).wrapping_mul(19349663)
+        ^ (coord.z as i64).wrapping_mul(83492791);
+    let idx = (h.unsigned_abs() as usize) % (ACTIVE_GPU_JOBS_BITS.len() * 64);
+    (idx / 64, 1u64 << (idx % 64))
+}
+
+#[cfg(feature = "gpu-compute")]
+fn try_acquire_active_job(coord: ChunkCoord) -> bool {
+    let (word, mask) = active_job_slot(coord);
+    let bits = &ACTIVE_GPU_JOBS_BITS[word];
+    loop {
+        let cur = bits.load(Ordering::Relaxed);
+        if cur & mask != 0 {
+            return false;
+        }
+        if bits
+            .compare_exchange_weak(cur, cur | mask, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+fn release_active_job(coord: ChunkCoord) {
+    let (word, mask) = active_job_slot(coord);
+    ACTIVE_GPU_JOBS_BITS[word].fetch_and(!mask, Ordering::Release);
+}
 pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfilerSnapshot {
     #[cfg(not(feature = "gpu-compute"))]
     {
@@ -738,7 +773,7 @@ impl GpuComputeRuntime {
     fn run_active_frontier(
         &self,
         state: &WorkerGpuState,
-        scratch: &JobScratchBuffers,
+        scratch: &GpuScratchPool,
         sim_job: &SimulationJob,
         page_index: GpuPageIndex,
         current_state: u32,
@@ -776,81 +811,30 @@ impl GpuComputeRuntime {
             )
         };
 
-        let mut staged_params = Vec::with_capacity(max_jacobi_iterations as usize + 5);
-        staged_params.push(base_params(0)[0]); // force
-        staged_params.push(base_params(0)[0]); // advect
-        staged_params.push(base_params(0)[0]); // divergence
+        let mut dispatch = |pipeline: &wgpu::ComputePipeline, jacobi_iteration: u32| {
+            let params = base_params(jacobi_iteration);
+            state
+                .queue
+                .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&params));
+            let mut encoder = state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_bind_group(0, &state.simulation_bg, &[]);
+            pass.set_pipeline(pipeline);
+            pass.dispatch_workgroups(groups, 1, 1);
+            drop(pass);
+            state.queue.submit(Some(encoder.finish()));
+        };
+
+        dispatch(&self.force_pipeline, 0);
+        dispatch(&self.advect_pipeline, 0);
+        dispatch(&self.divergence_pipeline, 0);
         for jacobi_iter in 0..max_jacobi_iterations {
-            staged_params.push(base_params(jacobi_iter)[0]);
+            dispatch(&self.pressure_jacobi_pipeline, jacobi_iter);
         }
-        staged_params.push(base_params(max_jacobi_iterations)[0]); // projection
-        staged_params.push(base_params(max_jacobi_iterations)[0]); // material advection
-
-        let staged_params_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("simulation staged frame params"),
-            size: (staged_params.len() * std::mem::size_of::<FrameParams>()) as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        {
-            let mut mapped = staged_params_buffer.slice(..).get_mapped_range_mut();
-            mapped.copy_from_slice(bytemuck::cast_slice(&staged_params));
-        }
-        staged_params_buffer.unmap();
-
-        let simulation_resources = SimulationBindResources {
-            atlas_voxels: &state.atlas_voxels,
-            velocity_mac: &state.velocity_mac,
-            pressure: &state.pressure,
-            divergence: &state.divergence,
-            material_density: &state.material_density,
-            active_tiles: &scratch.active_tiles,
-            active_tile_counter: &scratch.active_tile_counter,
-            edit_commands: &scratch.edit_commands,
-            page_params: &scratch.page_params,
-            diagnostics: &scratch.diagnostics,
-        };
-        let simulation_bg = self.create_simulation_bind_group(&state.device, simulation_resources);
-
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let params_stride = std::mem::size_of::<FrameParams>() as u64;
-        let mut stage_index = 0u64;
-        let mut encode_stage = |encoder: &mut wgpu::CommandEncoder,
-                                pipeline: &wgpu::ComputePipeline| {
-            encoder.copy_buffer_to_buffer(
-                &staged_params_buffer,
-                stage_index * params_stride,
-                &scratch.page_params,
-                0,
-                params_stride,
-            );
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-                pass.set_bind_group(0, &simulation_bg, &[]);
-                pass.set_pipeline(pipeline);
-                pass.dispatch_workgroups(groups, 1, 1);
-            }
-            stage_index += 1;
-        };
-
-        encode_stage(&mut encoder, &self.force_pipeline);
-        encode_stage(&mut encoder, &self.advect_pipeline);
-        encode_stage(&mut encoder, &self.divergence_pipeline);
-        for _ in 0..max_jacobi_iterations {
-            encode_stage(&mut encoder, &self.pressure_jacobi_pipeline);
-        }
-        encode_stage(&mut encoder, &self.project_pipeline);
-        encode_stage(&mut encoder, &self.material_advect_pipeline);
-
-        state.queue.submit(Some(encoder.finish()));
-        wait_for_gpu_dispatch_completion(
-            &state.device,
-            &state.queue,
-            "active_frontier",
-            GPU_DISPATCH_WAIT_TIMEOUT,
-        )?;
+        dispatch(&self.project_pipeline, max_jacobi_iterations);
+        dispatch(&self.material_advect_pipeline, max_jacobi_iterations);
 
         #[cfg(feature = "gpu-compute")]
         {
@@ -869,7 +853,7 @@ impl GpuComputeRuntime {
     fn run_meshing_dispatch(
         &self,
         state: &WorkerGpuState,
-        scratch: &JobScratchBuffers,
+        scratch: &GpuScratchPool,
         sim_job: &SimulationJob,
         page_index: GpuPageIndex,
         current_state: u32,
@@ -892,22 +876,6 @@ impl GpuComputeRuntime {
             .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&page_params));
 
         let groups = sim_job.active_frontier_count.max(1).div_ceil(64);
-        let meshing_resources = MeshingBindResources {
-            atlas_voxels: &state.atlas_voxels,
-            active_tiles: &scratch.active_tiles,
-            page_params: &scratch.page_params,
-            page_indirect: &state.page_indirect,
-            dirty_page_indices: &scratch.dirty_page_indices,
-            dirty_page_counter: &scratch.dirty_page_counter,
-            diagnostics: &scratch.diagnostics,
-            chunk_vertex_buffer: &state.chunk_vertex_buffer,
-            chunk_index_buffer: &state.chunk_index_buffer,
-            draw_indirect_buffer: &state.draw_indirect_buffer,
-            mesh_meta_buffer: &state.mesh_meta_buffer,
-            vertex_counter: &state.vertex_counter,
-            index_counter: &state.index_counter,
-        };
-        let meshing_bg = self.create_meshing_bind_group(&state.device, meshing_resources);
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -919,55 +887,17 @@ impl GpuComputeRuntime {
                 label: Some("meshing_pass"),
                 timestamp_writes: None,
             });
-            pass.set_bind_group(0, &meshing_bg, &[]);
+            pass.set_bind_group(0, &state.meshing_bg, &[]);
             pass.set_pipeline(&self.meshing_pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
         }
 
         state.queue.submit(Some(encoder.finish()));
-        wait_for_gpu_dispatch_completion(
-            &state.device,
-            &state.queue,
-            "meshing_dispatch",
-            GPU_DISPATCH_WAIT_TIMEOUT,
-        )?;
         Ok(MeshArtifactGPU {
             page_index,
             lod,
             draw_indirect_index: page_index.0,
         })
-    }
-}
-
-#[cfg(feature = "gpu-compute")]
-fn wait_for_gpu_dispatch_completion(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    stage: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-    queue.on_submitted_work_done(move || {
-        let _ = done_tx.try_send(());
-    });
-
-    let started_at = Instant::now();
-    loop {
-        device.poll(wgpu::Maintain::Poll);
-
-        if done_rx.try_recv().is_ok() {
-            return Ok(());
-        }
-
-        if started_at.elapsed() >= timeout {
-            GPU_DISPATCH_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            anyhow::bail!(
-                "gpu dispatch timeout ({stage}) after {} ms; worker will retry",
-                timeout.as_millis()
-            );
-        }
-
-        std::thread::sleep(GPU_DISPATCH_WAIT_POLL_INTERVAL);
     }
 }
 
@@ -1145,6 +1075,11 @@ pub fn initialize_gpu_compute_worker(
     queue: Arc<wgpu::Queue>,
     shared_mesh_buffers: SharedMeshBuffers,
 ) -> anyhow::Result<()> {
+    if GPU_TASK_TX.get().is_none() {
+        let (tx, rx) = sync_channel(4096);
+        let _ = GPU_TASK_TX.set(tx);
+        let _ = GPU_TASK_RX.set(Mutex::new(rx));
+    }
     let state_result = WORKER_STATE.get_or_init(|| {
         let limits = device.limits();
         log::info!(
@@ -1214,6 +1149,41 @@ pub fn initialize_gpu_compute_worker(
             mapped_at_creation: false,
         });
 
+        let scratch = create_gpu_scratch_pool(&device);
+        let simulation_bg = runtime.create_simulation_bind_group(
+            &device,
+            SimulationBindResources {
+                atlas_voxels: &atlas_voxels,
+                velocity_mac: &velocity_mac,
+                pressure: &pressure,
+                divergence: &divergence,
+                material_density: &material_density,
+                active_tiles: &scratch.active_tiles,
+                active_tile_counter: &scratch.active_tile_counter,
+                edit_commands: &scratch.edit_commands,
+                page_params: &scratch.page_params,
+                diagnostics: &scratch.diagnostics,
+            },
+        );
+        let meshing_bg = runtime.create_meshing_bind_group(
+            &device,
+            MeshingBindResources {
+                atlas_voxels: &atlas_voxels,
+                active_tiles: &scratch.active_tiles,
+                page_params: &scratch.page_params,
+                page_indirect: &shared_mesh_buffers.page_indirect,
+                dirty_page_indices: &scratch.dirty_page_indices,
+                dirty_page_counter: &scratch.dirty_page_counter,
+                diagnostics: &scratch.diagnostics,
+                chunk_vertex_buffer: &shared_mesh_buffers.chunk_vertex_buffer,
+                chunk_index_buffer: &shared_mesh_buffers.chunk_index_buffer,
+                draw_indirect_buffer: &shared_mesh_buffers.draw_indirect_buffer,
+                mesh_meta_buffer: &shared_mesh_buffers.mesh_meta_buffer,
+                vertex_counter: &shared_mesh_buffers.vertex_counter,
+                index_counter: &shared_mesh_buffers.index_counter,
+            },
+        );
+
         Ok(Arc::new(WorkerGpuState {
             device,
             queue,
@@ -1232,6 +1202,9 @@ pub fn initialize_gpu_compute_worker(
             vertex_counter: shared_mesh_buffers.vertex_counter,
             index_counter: shared_mesh_buffers.index_counter,
             runtime_config: GpuSimulationRuntimeConfig::default(),
+            scratch,
+            simulation_bg,
+            meshing_bg,
         }))
     });
 
@@ -1256,31 +1229,18 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             .as_ref()
             .map_err(|e| anyhow::anyhow!(e.to_string()))?
             .clone();
-        {
-            let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
-            if !active_jobs.insert(job.coord) {
-                // Prevent concurrent jobs for the same chunk from racing GPU artifacts.
-                return Ok(ComputedChunkArtifacts {
-                    simulation_diagnostics: ChunkSimulationDiagnostics::default(),
-                    mesh_artifact: ChunkMeshArtifact::Skipped,
-                });
-            }
+
+        if !try_acquire_active_job(job.coord) {
+            return Ok(ComputedChunkArtifacts {
+                simulation_diagnostics: ChunkSimulationDiagnostics::default(),
+                mesh_artifact: ChunkMeshArtifact::Skipped,
+            });
         }
 
         let incoming = job.snapshot.center_voxels.as_ref();
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        let (page_index, page_was_reassigned) = match atlas.page_for_chunk_or_allocate(job.coord) {
-            Ok(value) => value,
-            Err(err) => {
-                drop(atlas);
-                let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
-                active_jobs.remove(&job.coord);
-                return Err(err);
-            }
-        };
+        let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
-        // FIX 6: pin the primary page until dispatch/readback completion.
-        atlas.acquire_page_for_job(job.coord, page_index);
         let _last_version = atlas
             .version_for_chunk
             .get(&job.coord)
@@ -1296,20 +1256,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         if cached_before.len() != incoming.len() {
             cached_before.resize(incoming.len(), EMPTY);
         }
-        // FIX 4: freeze neighbor page indices while atlas lock is held.
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
-        let mut pinned_pages = vec![page_index];
-        for neighbor_page in neighbor_pages {
-            if neighbor_page == u32::MAX {
-                continue;
-            }
-            let neighbor_index = GpuPageIndex(neighbor_page);
-            if !pinned_pages.contains(&neighbor_index) {
-                // FIX 6: pin neighbor pages for the full job to prevent eviction races.
-                atlas.acquire_existing_page_for_job(neighbor_index);
-                pinned_pages.push(neighbor_index);
-            }
-        }
         drop(atlas);
 
         let mut edit_commands = Vec::new();
@@ -1323,179 +1270,42 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 });
             }
         }
-
-        let mut active_tiles_seed = Vec::with_capacity(edit_commands.len());
-        for edit in &edit_commands {
-            active_tiles_seed.push(edit.voxel_index);
-        }
-        let raw_active_frontier_count = active_tiles_seed.len() as u32;
+        let raw_active_frontier_count = edit_commands.len() as u32;
         let high_edit_volume = edit_commands.len() > HIGH_EDIT_VOLUME_THRESHOLD;
         let startup_seeding_mode = page_was_reassigned;
         let pressure_relief_mode = startup_seeding_mode || high_edit_volume;
         let active_frontier_count = if pressure_relief_mode {
-            let capped = raw_active_frontier_count.min(SAFE_ACTIVE_FRONTIER_LIMIT);
-            if capped < raw_active_frontier_count {
-                let total_caps = GPU_FRONTIER_CAP_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-                log::warn!(
-                    "[mesh-worker] capped active frontier chunk={:?} page={} raw={} capped={} high_edit={} startup={} events={}",
-                    job.coord,
-                    page_index.0,
-                    raw_active_frontier_count,
-                    capped,
-                    high_edit_volume,
-                    startup_seeding_mode,
-                    total_caps,
-                );
-            }
-            capped
+            raw_active_frontier_count.min(SAFE_ACTIVE_FRONTIER_LIMIT)
         } else {
             raw_active_frontier_count
         };
         let jacobi_iterations = if startup_seeding_mode {
-            STARTUP_JACOBI_ITERATIONS.min(state.runtime_config.max_jacobi_iterations)
-        } else if high_edit_volume {
-            HIGH_PRESSURE_JACOBI_ITERATIONS.min(state.runtime_config.max_jacobi_iterations)
+            STARTUP_JACOBI_ITERATIONS
+        } else if pressure_relief_mode {
+            HIGH_PRESSURE_JACOBI_ITERATIONS
         } else {
             state.runtime_config.max_jacobi_iterations
         };
-        let sim_job = SimulationJob {
-            chunk_coord: job.coord,
-            materials: incoming.to_vec(),
-            active_frontier_count,
-            simulation_tick: tick,
-        };
-        let next_state = (current_state + 1) & 1;
-        let diagnostics = ChunkSimulationDiagnostics {
-            changed_voxels: edit_commands.len() as u32,
-            dropped_frontier_writes: edit_commands
-                .len()
-                .saturating_sub(active_frontier_count as usize)
-                as u32,
-            cross_border_attempts: 0,
-        };
 
-        let dispatch_t0 = Instant::now();
-        let job_result = (|| -> anyhow::Result<ComputedChunkArtifacts> {
-            {
-                let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.assert_page_for_chunk(job.coord, page_index);
-            }
-            let scratch = create_job_scratch_buffers(&state);
-            let gpu_artifact = {
-                if page_was_reassigned {
-                    clear_page_buffers(&state, page_index);
-                }
-                clear_job_scratch_buffers(&state, &scratch, active_frontier_count as usize, 1);
+        GPU_TASK_TX
+            .get()
+            .expect("gpu task queue")
+            .send(GpuChunkTask {
+                coord: job.coord,
+                page_index,
+                frontier_count: active_frontier_count,
+                edit_commands,
+                jacobi_iterations,
+                neighbor_pages,
+                simulation_tick: tick,
+                current_state,
+                startup_seeding_mode,
+            });
 
-                if !active_tiles_seed.is_empty() {
-                    state.queue.write_buffer(
-                        &scratch.active_tiles,
-                        0,
-                        bytemuck::cast_slice(&active_tiles_seed[..active_frontier_count as usize]),
-                    );
-                }
-
-                if startup_seeding_mode {
-                    log::info!(
-                        "[mesh-worker] startup seeding mode; skipping fluid simulation chunk={:?} page={} edits={}",
-                        job.coord,
-                        page_index.0,
-                        edit_commands.len()
-                    );
-                } else if active_frontier_count > 0 {
-                    state.runtime.run_active_frontier(
-                        &state,
-                        &scratch,
-                        &sim_job,
-                        page_index,
-                        current_state,
-                        &edit_commands,
-                        jacobi_iterations,
-                        neighbor_pages,
-                    )?
-                }
-                #[cfg(feature = "gpu_meshing_experimental")]
-                let gpu_artifact = if !edit_commands.is_empty() || _last_version != job.version {
-                    state.runtime.run_meshing_dispatch(
-                        &state,
-                        &scratch,
-                        &sim_job,
-                        page_index,
-                        current_state,
-                        job.lod as u8,
-                    )?
-                } else {
-                    MeshArtifactGPU {
-                        page_index,
-                        lod: job.lod as u8,
-                        draw_indirect_index: page_index.0,
-                    }
-                };
-
-                #[cfg(not(feature = "gpu_meshing_experimental"))]
-                let gpu_artifact = MeshArtifactGPU {
-                    page_index,
-                    lod: job.lod as u8,
-                    draw_indirect_index: page_index.0,
-                };
-
-                gpu_artifact
-            };
-
-            log::info!("[mesh-worker] gpu dispatch finished chunk={:?}", job.coord);
-
-            let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
-            #[cfg(not(feature = "gpu_meshing_experimental"))]
-            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
-                mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
-            #[cfg(feature = "gpu_meshing_experimental")]
-            let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = (
-                Vec::new(),
-                Vec::new(),
-                glam::Vec3::ZERO,
-                glam::Vec3::ZERO,
-                glam::Vec3::new(
-                    job.coord.x as f32 * 32.0,
-                    job.coord.y as f32 * 32.0,
-                    job.coord.z as f32 * 32.0,
-                ),
-            );
-            log::info!("[mesh-worker] artifact created chunk={:?}", job.coord);
-            Ok(ComputedChunkArtifacts {
-                simulation_diagnostics: diagnostics,
-                mesh_artifact: {
-                    #[cfg(feature = "gpu_meshing_experimental")]
-                    {
-                        ChunkMeshArtifact::Gpu {
-                            page_index: gpu_artifact.page_index,
-                            draw_indirect_index: gpu_artifact.draw_indirect_index,
-                            lod: gpu_artifact.lod,
-                            verts,
-                            inds,
-                            aabb_min,
-                            aabb_max,
-                            chunk_origin_world,
-                            dispatch_ms,
-                        }
-                    }
-                    #[cfg(not(feature = "gpu_meshing_experimental"))]
-                    {
-                        ChunkMeshArtifact::Cpu {
-                            verts,
-                            inds,
-                            indirect: DrawIndirectArgs::default(),
-                            aabb_min,
-                            aabb_max,
-                            chunk_origin_world,
-                        }
-                    }
-                },
-            })
-        })();
-
-        if job_result.is_ok() {
+        let diagnostics = ChunkSimulationDiagnostics::default();
+        let next_state = current_state ^ 1;
+        {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.assert_page_for_chunk(job.coord, page_index);
             atlas.version_for_chunk.insert(job.coord, job.version);
             atlas.state_for_chunk.insert(job.coord, next_state);
             atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
@@ -1504,20 +1314,153 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 .insert(job.coord, active_frontier_count);
             atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
             atlas.cached_materials.insert(job.coord, incoming.to_vec());
-        } else {
-            GPU_DISPATCH_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
+        release_active_job(job.coord);
 
+        #[cfg(not(feature = "gpu_meshing_experimental"))]
+        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
+            mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
+        #[cfg(feature = "gpu_meshing_experimental")]
+        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = (
+            Vec::new(),
+            Vec::new(),
+            glam::Vec3::ZERO,
+            glam::Vec3::ZERO,
+            glam::Vec3::new(
+                job.coord.x as f32 * 32.0,
+                job.coord.y as f32 * 32.0,
+                job.coord.z as f32 * 32.0,
+            ),
+        );
+
+        Ok(ComputedChunkArtifacts {
+            simulation_diagnostics: diagnostics,
+            mesh_artifact: {
+                #[cfg(feature = "gpu_meshing_experimental")]
+                {
+                    ChunkMeshArtifact::Gpu {
+                        page_index,
+                        draw_indirect_index: page_index.0,
+                        lod: job.lod as u8,
+                        verts,
+                        inds,
+                        aabb_min,
+                        aabb_max,
+                        chunk_origin_world,
+                        dispatch_ms: 0.0,
+                    }
+                }
+                #[cfg(not(feature = "gpu_meshing_experimental"))]
+                {
+                    ChunkMeshArtifact::Cpu {
+                        verts,
+                        inds,
+                        indirect: DrawIndirectArgs::default(),
+                        aabb_min,
+                        aabb_max,
+                        chunk_origin_world,
+                    }
+                }
+            },
+        })
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<usize> {
+    let state = WORKER_STATE
+        .get()
+        .context("gpu worker runtime is not initialized")?
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?
+        .clone();
+    let mut dispatched = 0usize;
+    while dispatched < max_tasks {
+        let Ok(task) = GPU_TASK_RX
+            .get()
+            .expect("gpu task rx")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_recv()
+        else {
+            break;
+        };
+        let scratch = &state.scratch;
+        clear_gpu_scratch_pool(&state, scratch, task.frontier_count as usize, 1);
+        if !task.edit_commands.is_empty() {
+            state.queue.write_buffer(
+                &scratch.edit_commands,
+                0,
+                bytemuck::cast_slice(&task.edit_commands),
+            );
+            let mut active = Vec::with_capacity(task.frontier_count as usize);
+            for cmd in task.edit_commands.iter().take(task.frontier_count as usize) {
+                active.push(cmd.voxel_index);
+            }
+            if !active.is_empty() {
+                state
+                    .queue
+                    .write_buffer(&scratch.active_tiles, 0, bytemuck::cast_slice(&active));
+            }
+        }
+        let sim_job = SimulationJob {
+            chunk_coord: task.coord,
+            materials: vec![0; CHUNK_VOLUME],
+            active_frontier_count: task.frontier_count,
+            simulation_tick: task.simulation_tick,
+        };
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        if task.startup_seeding_mode {
+            clear_page_buffers(&mut encoder, &state, task.page_index);
+        }
+        state.queue.submit(Some(encoder.finish()));
+        if !task.startup_seeding_mode && task.frontier_count > 0 {
+            state.runtime.run_active_frontier(
+                &state,
+                scratch,
+                &sim_job,
+                task.page_index,
+                task.current_state,
+                &task.edit_commands,
+                task.jacobi_iterations,
+                task.neighbor_pages,
+            )?;
+        }
+        #[cfg(feature = "gpu_meshing_experimental")]
+        {
+            let _ = state.runtime.run_meshing_dispatch(
+                &state,
+                scratch,
+                &sim_job,
+                task.page_index,
+                task.current_state,
+                0,
+            )?;
+        }
+        let serial = GPU_SUBMISSION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+            atlas.mark_page_submitted(task.page_index, serial);
+        }
+        state.queue.on_submitted_work_done(move || {
+            let _ = GPU_COMPLETED_SERIAL.fetch_max(serial, Ordering::Relaxed);
+        });
+        dispatched += 1;
+    }
+    Ok(dispatched)
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn update_gpu_page_fences_on_renderer() {
+    if let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    {
+        let completed = GPU_COMPLETED_SERIAL.load(Ordering::Relaxed);
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        for pinned_page in pinned_pages {
-            atlas.release_page_from_job(pinned_page);
-        }
-        drop(atlas);
-
-        let mut active_jobs = ACTIVE_GPU_JOBS.lock().unwrap_or_else(|e| e.into_inner());
-        active_jobs.remove(&job.coord);
-
-        job_result
+        atlas.refresh_completed_serial(completed);
     }
 }
 
