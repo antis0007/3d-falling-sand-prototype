@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
@@ -317,6 +317,9 @@ fn read_gpu_draw_indirect_command(
     state: &WorkerGpuState,
     draw_indirect_index: u32,
 ) -> anyhow::Result<[u32; 5]> {
+    const MAP_WAIT_SLICE: Duration = Duration::from_millis(2);
+    const MAP_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+
     let size = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
     let staging = state.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("draw indirect readback staging"),
@@ -343,8 +346,32 @@ fn read_gpu_draw_indirect_command(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    state.device.poll(wgpu::Maintain::Wait);
-    rx.recv().context("draw indirect readback recv")??;
+    let wait_started = Instant::now();
+    loop {
+        state.device.poll(wgpu::Maintain::Poll);
+        match rx.recv_timeout(MAP_WAIT_SLICE) {
+            Ok(map_result) => {
+                map_result.context("draw indirect readback map")?;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if wait_started.elapsed() >= MAP_WAIT_TIMEOUT {
+                    anyhow::bail!(
+                        "draw indirect readback timed out for draw_indirect_index={} after {:?}",
+                        draw_indirect_index,
+                        wait_started.elapsed(),
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!(
+                    "draw indirect readback channel disconnected for draw_indirect_index={} after {:?}",
+                    draw_indirect_index,
+                    wait_started.elapsed(),
+                );
+            }
+        }
+    }
 
     let mapped = slice.get_mapped_range();
     let words = *bytemuck::from_bytes::<[u32; 5]>(&mapped[..std::mem::size_of::<[u32; 5]>()]);
@@ -1386,8 +1413,28 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
             #[cfg(feature = "gpu_meshing_experimental")]
-            let gpu_draw_command =
-                read_gpu_draw_indirect_command(&state, gpu_artifact.draw_indirect_index)?;
+            let gpu_draw_command = match read_gpu_draw_indirect_command(
+                &state,
+                gpu_artifact.draw_indirect_index,
+            ) {
+                Ok(command) => command,
+                Err(err) => {
+                    let err_text = format!("{err:#}");
+                    if err_text.contains("timed out") {
+                        log::warn!(
+                            "[mesh-worker] draw indirect readback timed out; returning skipped artifact chunk={:?} draw_indirect_index={} err={}",
+                            job.coord,
+                            gpu_artifact.draw_indirect_index,
+                            err_text,
+                        );
+                        return Ok(ComputedChunkArtifacts {
+                            simulation_diagnostics: diagnostics,
+                            mesh_artifact: ChunkMeshArtifact::Skipped,
+                        });
+                    }
+                    return Err(err);
+                }
+            };
             #[cfg(not(feature = "gpu_meshing_experimental"))]
             let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
                 mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
