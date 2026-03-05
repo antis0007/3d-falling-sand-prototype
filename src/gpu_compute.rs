@@ -736,9 +736,21 @@ impl GpuComputeRuntime {
                     label: Some("fluid material advect shader"),
                     source: wgpu::ShaderSource::Wgsl(fluid_material_advect_source.into()),
                 });
+            let vertex_face_limit = GPU_MESH_VERTEX_CAPACITY_PER_PAGE / 4;
+            let index_face_limit = GPU_MESH_INDEX_CAPACITY_PER_PAGE / 6;
+            let max_faces = vertex_face_limit.min(index_face_limit);
+            let generated_consts = format!(
+                "const GPU_MAX_FACES_PER_PAGE: u32 = {}u;",
+                max_faces
+            );
+            let meshing_source = format!(
+                "{}\n{}",
+                generated_consts,
+                include_str!("shaders/meshing.wgsl")
+            );
             let meshing_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("chunk meshing shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/meshing.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(meshing_source.into()),
             });
 
             let simulation_entries = [
