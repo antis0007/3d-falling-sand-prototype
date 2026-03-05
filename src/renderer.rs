@@ -514,7 +514,16 @@ pub struct Renderer {
 
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
+    pub startup_diagnostics: StartupDiagnostics,
     settings: RendererSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartupDiagnostics {
+    pub backend_selected: MeshPipelineBackend,
+    pub required_limits_summary: String,
+    pub adapter_limits_summary: String,
+    pub startup_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -872,7 +881,6 @@ struct GpuChunkDraw {
 }
 
 pub(crate) enum ChunkMeshArtifact {
-    #[cfg(feature = "cpu_meshing_debug")]
     Cpu {
         verts: Vec<Vertex>,
         inds: Vec<u32>,
@@ -901,7 +909,6 @@ pub(crate) enum ChunkMeshArtifact {
 impl ChunkMeshArtifact {
     pub(crate) fn geometry(&self) -> (&[Vertex], &[u32], DrawIndirectArgs, Vec3, Vec3, Vec3) {
         match self {
-            #[cfg(feature = "cpu_meshing_debug")]
             Self::Cpu {
                 verts,
                 inds,
@@ -964,7 +971,6 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
             let _ = job;
             ChunkMeshArtifact::Skipped
         }
-        #[cfg(feature = "cpu_meshing_debug")]
         MeshPipelineBackend::Cpu => {
             crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
         }
@@ -1068,6 +1074,7 @@ impl Renderer {
     pub async fn new(
         window: &'static winit::window::Window,
         require_gpu_meshing: bool,
+        force_disabled_meshing: bool,
     ) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -1148,14 +1155,50 @@ impl Renderer {
             .await?;
 
         let device_limits = device.limits();
-        let mesh_backend = if GpuComputeRuntime::runtime_supported(&adapter, &device_limits) {
+        let required_limits_summary = {
+            #[cfg(feature = "gpu-compute")]
+            {
+                let required_storage_size = required_storage_buffer_binding_size_bytes();
+                format!(
+                    "storage_buffers/stage req={} requested={} device={} | storage_binding req={}B requested={}B device={}B | max_buffer req={}B requested={}B device={}B",
+                    COMPUTE_STORAGE_BINDING_COUNT,
+                    requested_limits.max_storage_buffers_per_shader_stage,
+                    device_limits.max_storage_buffers_per_shader_stage,
+                    required_storage_size,
+                    requested_limits.max_storage_buffer_binding_size,
+                    device_limits.max_storage_buffer_binding_size,
+                    required_storage_size,
+                    requested_limits.max_buffer_size,
+                    device_limits.max_buffer_size,
+                )
+            }
+            #[cfg(not(feature = "gpu-compute"))]
+            {
+                format!(
+                    "storage_buffers/stage requested={} device={}",
+                    requested_limits.max_storage_buffers_per_shader_stage,
+                    device_limits.max_storage_buffers_per_shader_stage,
+                )
+            }
+        };
+        let adapter_limits_summary = format!(
+            "storage_buffers/stage adapter={} | storage_binding adapter={}B | max_buffer adapter={}B",
+            adapter_limits.max_storage_buffers_per_shader_stage,
+            adapter_limits.max_storage_buffer_binding_size,
+            adapter_limits.max_buffer_size,
+        );
+
+        let (mesh_backend, startup_error) = if force_disabled_meshing {
+            log::warn!("mesh backend selected: disabled (explicit CLI override)");
+            (MeshPipelineBackend::Disabled, None)
+        } else if GpuComputeRuntime::runtime_supported(&adapter, &device_limits) {
             #[cfg(feature = "gpu-compute")]
             {
                 log::info!(
                     "mesh backend selected: gpu-compute (adapter supports compute pipelines, page_capacity={})",
                     gpu_page_capacity()
                 );
-                MeshPipelineBackend::Gpu
+                (MeshPipelineBackend::Gpu, None)
             }
             #[cfg(not(feature = "gpu-compute"))]
             {
@@ -1198,20 +1241,10 @@ impl Renderer {
                 );
             }
 
-            #[cfg(feature = "cpu_meshing_debug")]
-            {
-                log::warn!(
-                    "mesh backend selected: cpu debug path (adapter/runtime does not satisfy gpu-compute requirements)"
-                );
-                MeshPipelineBackend::Cpu
-            }
-            #[cfg(not(feature = "cpu_meshing_debug"))]
-            {
-                log::warn!(
-                    "mesh backend selected: disabled (render-only mode with empty meshes; app remains running)"
-                );
-                MeshPipelineBackend::Disabled
-            }
+            log::warn!(
+                "mesh backend selected: cpu fallback path (adapter/runtime does not satisfy gpu-compute requirements)"
+            );
+            (MeshPipelineBackend::Cpu, None)
         };
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -1419,6 +1452,12 @@ impl Renderer {
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
             day: true,
             mesh_backend,
+            startup_diagnostics: StartupDiagnostics {
+                backend_selected: mesh_backend,
+                required_limits_summary,
+                adapter_limits_summary,
+                startup_error,
+            },
             settings: RendererSettings::default(),
         })
     }

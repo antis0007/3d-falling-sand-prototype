@@ -178,6 +178,10 @@ pub struct UiState {
     pub renderer_greedy_meshing: bool,
     pub renderer_conservative_neighbors: bool,
     pub show_chunk_overlay: bool,
+    pub startup_backend_label: String,
+    pub startup_required_limits: String,
+    pub startup_adapter_limits: String,
+    pub startup_error_message: Option<String>,
 
     log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
@@ -361,6 +365,10 @@ impl Default for UiState {
             renderer_greedy_meshing: true,
             renderer_conservative_neighbors: true,
             show_chunk_overlay: false,
+            startup_backend_label: "unknown".to_string(),
+            startup_required_limits: "n/a".to_string(),
+            startup_adapter_limits: "n/a".to_string(),
+            startup_error_message: None,
 
             log_last_seconds: HashMap::new(),
             drag_source: None,
@@ -512,6 +520,31 @@ pub fn draw(
 
     // === Debug panel ===
     // NOTE: This is intentionally simple/cheap to draw.
+    egui::TopBottomPanel::bottom("startup_diagnostics")
+        .resizable(false)
+        .default_height(82.0)
+        .frame(opaque_panel)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Meshing:");
+                ui.monospace(&ui_state.startup_backend_label);
+                if let Some(err) = &ui_state.startup_error_message {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 130, 130),
+                        format!("Error: {err}"),
+                    );
+                }
+            });
+            ui.monospace(format!(
+                "required limits: {}",
+                ui_state.startup_required_limits
+            ));
+            ui.monospace(format!(
+                "adapter limits: {}",
+                ui_state.startup_adapter_limits
+            ));
+        });
+
     if ui_state.show_debug {
         egui::Window::new("Debug / Performance")
             .anchor(egui::Align2::RIGHT_TOP, [-12.0, 52.0])

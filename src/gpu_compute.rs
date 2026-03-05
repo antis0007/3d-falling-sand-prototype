@@ -1,4 +1,3 @@
-#[cfg(not(feature = "gpu_meshing_experimental"))]
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob};
 use crate::types::{ChunkCoord, GpuPageIndex};
@@ -61,7 +60,6 @@ pub const fn gpu_page_capacity() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
     Disabled,
-    #[cfg(feature = "cpu_meshing_debug")]
     Cpu,
     #[cfg(feature = "gpu-compute")]
     Gpu,
@@ -71,7 +69,6 @@ impl MeshPipelineBackend {
     pub fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            #[cfg(feature = "cpu_meshing_debug")]
             Self::Cpu => "cpu",
             #[cfg(feature = "gpu-compute")]
             Self::Gpu => "gpu",
@@ -1677,7 +1674,6 @@ impl ComputedChunkArtifacts {
     }
 }
 
-#[cfg(feature = "cpu_meshing_debug")]
 pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifacts {
     let mut out = vec![EMPTY; job.snapshot.center_voxels.len()];
     out.copy_from_slice(job.snapshot.center_voxels.as_ref());
