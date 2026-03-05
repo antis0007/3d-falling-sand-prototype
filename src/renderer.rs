@@ -12,13 +12,14 @@
 //!   render-space projection from that one source of truth.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
+use crate::gpu_compute::{
+    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
+    update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
+    SharedMeshBuffers,
+};
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
     gpu_page_capacity, required_storage_buffer_binding_size_bytes, COMPUTE_STORAGE_BINDING_COUNT,
-};
-use crate::gpu_compute::{
-    initialize_gpu_compute_worker, run_chunk_job_on_worker, DrawIndirectArgs, GpuComputeRuntime,
-    MeshPipelineBackend, SharedMeshBuffers,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -1756,6 +1757,13 @@ impl Renderer {
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
+        #[cfg(feature = "gpu-compute")]
+        {
+            if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+                let _ = dispatch_gpu_chunk_tasks_on_renderer(32);
+            }
+        }
+
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::info!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
@@ -2018,6 +2026,8 @@ impl Renderer {
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
         self.device.poll(wgpu::Maintain::Poll);
+        #[cfg(feature = "gpu-compute")]
+        update_gpu_page_fences_on_renderer();
         let vp_render = camera.view_proj_rebased_to_origin(self.origin_voxel);
         // World-space culling uses world-space camera/AABBs.
         // Draw uses rebased camera VP + shader world-origin subtraction.
