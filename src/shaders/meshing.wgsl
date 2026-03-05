@@ -16,23 +16,9 @@ struct FrameParams {
     jacobi_iteration: u32,
 };
 
-struct DrawIndirectArgs {
-    index_count: atomic<u32>,
-    instance_count: u32,
-    first_vertex: u32,
-    first_instance: u32,
-};
-
 struct GpuVertex {
     position: vec3<f32>,
     material_id: u32,
-};
-
-struct ChunkMeshMeta {
-    page_index: u32,
-    vertex_offset: u32,
-    index_offset: u32,
-    _pad: u32,
 };
 
 struct DrawIndexedIndirectArgs {
@@ -43,19 +29,22 @@ struct DrawIndexedIndirectArgs {
     first_instance: u32,
 };
 
-@group(0) @binding(0) var<storage, read_write> atlas_voxels: array<u32>;
-@group(0) @binding(5) var<storage, read_write> active_tiles: array<u32>;
-@group(0) @binding(8) var<storage, read> frame_params: array<FrameParams>;
-@group(0) @binding(9) var<storage, read_write> page_indirect: array<DrawIndirectArgs>;
-@group(0) @binding(10) var<storage, read_write> dirty_page_indices: array<u32>;
-@group(0) @binding(11) var<storage, read_write> dirty_page_counter: array<atomic<u32>>;
-@group(0) @binding(12) var<storage, read_write> diagnostics: array<atomic<u32>>;
-@group(0) @binding(13) var<storage, read_write> chunk_vertex_buffer: array<GpuVertex>;
-@group(0) @binding(14) var<storage, read_write> chunk_index_buffer: array<u32>;
-@group(0) @binding(15) var<storage, read_write> draw_indirect_buffer: array<DrawIndexedIndirectArgs>;
-@group(0) @binding(16) var<storage, read_write> mesh_meta_buffer: array<ChunkMeshMeta>;
-@group(0) @binding(17) var<storage, read_write> vertex_counter: array<atomic<u32>>;
-@group(0) @binding(18) var<storage, read_write> index_counter: array<atomic<u32>>;
+struct ChunkMeshMeta {
+    page_index: u32,
+    vertex_offset: u32,
+    index_offset: u32,
+    _pad: u32,
+};
+
+@group(0) @binding(0) var<storage, read> atlas_voxels: array<u32>;
+@group(0) @binding(1) var<storage, read_write> face_mask: array<u32>;
+@group(0) @binding(2) var<storage, read_write> face_offset: array<u32>;
+@group(0) @binding(3) var<storage, read_write> chunk_vertex_buffer: array<GpuVertex>;
+@group(0) @binding(4) var<storage, read_write> chunk_index_buffer: array<u32>;
+@group(0) @binding(5) var<storage, read_write> draw_indirect_buffer: array<DrawIndexedIndirectArgs>;
+@group(0) @binding(6) var<storage, read> frame_params: array<FrameParams>;
+@group(0) @binding(7) var<storage, read_write> face_count: array<u32>;
+@group(0) @binding(8) var<storage, read_write> mesh_meta_buffer: array<ChunkMeshMeta>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
     return page * (CHUNK_VOLUME * 2u) + state * CHUNK_VOLUME;
@@ -87,116 +76,158 @@ fn voxel_at(base_off: u32, p: vec3<i32>) -> u32 {
     return atlas_voxels[base_off + pack(vec3<u32>(p))];
 }
 
-@compute @workgroup_size(64)
-fn meshing_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    let params = frame_params[0u];
+fn write_face_quad(
+    dir: u32,
+    base: vec3<f32>,
+    material_id: u32,
+    global_vertex_offset: u32,
+    global_index_offset: u32,
+    local_vertex_offset: u32,
+) {
+    var c0 = vec3<f32>(0.0, 0.0, 0.0);
+    var c1 = vec3<f32>(0.0, 0.0, 0.0);
+    var c2 = vec3<f32>(0.0, 0.0, 0.0);
+    var c3 = vec3<f32>(0.0, 0.0, 0.0);
+    switch dir {
+        case 0u: {
+            c0 = base + vec3<f32>(1.0, 0.0, 0.0);
+            c1 = base + vec3<f32>(1.0, 1.0, 0.0);
+            c2 = base + vec3<f32>(1.0, 1.0, 1.0);
+            c3 = base + vec3<f32>(1.0, 0.0, 1.0);
+        }
+        case 1u: {
+            c0 = base + vec3<f32>(0.0, 0.0, 1.0);
+            c1 = base + vec3<f32>(0.0, 1.0, 1.0);
+            c2 = base + vec3<f32>(0.0, 1.0, 0.0);
+            c3 = base + vec3<f32>(0.0, 0.0, 0.0);
+        }
+        case 2u: {
+            c0 = base + vec3<f32>(0.0, 1.0, 0.0);
+            c1 = base + vec3<f32>(0.0, 1.0, 1.0);
+            c2 = base + vec3<f32>(1.0, 1.0, 1.0);
+            c3 = base + vec3<f32>(1.0, 1.0, 0.0);
+        }
+        case 3u: {
+            c0 = base + vec3<f32>(0.0, 0.0, 1.0);
+            c1 = base + vec3<f32>(0.0, 0.0, 0.0);
+            c2 = base + vec3<f32>(1.0, 0.0, 0.0);
+            c3 = base + vec3<f32>(1.0, 0.0, 1.0);
+        }
+        case 4u: {
+            c0 = base + vec3<f32>(1.0, 0.0, 1.0);
+            c1 = base + vec3<f32>(1.0, 1.0, 1.0);
+            c2 = base + vec3<f32>(0.0, 1.0, 1.0);
+            c3 = base + vec3<f32>(0.0, 0.0, 1.0);
+        }
+        default: {
+            c0 = base + vec3<f32>(0.0, 0.0, 0.0);
+            c1 = base + vec3<f32>(0.0, 1.0, 0.0);
+            c2 = base + vec3<f32>(1.0, 1.0, 0.0);
+            c3 = base + vec3<f32>(1.0, 0.0, 0.0);
+        }
+    }
 
-    if (i >= params.frontier_len) { return; }
+    let v0 = global_vertex_offset;
+    let v1 = global_vertex_offset + 1u;
+    let v2 = global_vertex_offset + 2u;
+    let v3 = global_vertex_offset + 3u;
+    chunk_vertex_buffer[v0] = GpuVertex(c0, material_id);
+    chunk_vertex_buffer[v1] = GpuVertex(c1, material_id);
+    chunk_vertex_buffer[v2] = GpuVertex(c2, material_id);
+    chunk_vertex_buffer[v3] = GpuVertex(c3, material_id);
+
+    chunk_index_buffer[global_index_offset + 0u] = local_vertex_offset + 0u;
+    chunk_index_buffer[global_index_offset + 1u] = local_vertex_offset + 1u;
+    chunk_index_buffer[global_index_offset + 2u] = local_vertex_offset + 2u;
+    chunk_index_buffer[global_index_offset + 3u] = local_vertex_offset + 0u;
+    chunk_index_buffer[global_index_offset + 4u] = local_vertex_offset + 2u;
+    chunk_index_buffer[global_index_offset + 5u] = local_vertex_offset + 3u;
+}
+
+@compute @workgroup_size(64)
+fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let voxel_idx = gid.x;
+    if (voxel_idx >= CHUNK_VOLUME) { return; }
+
+    let params = frame_params[0u];
     let src_off = atlas_state_offset(params.page_index, (params.state_index + 1u) & 1u);
-    let voxel_idx = active_tiles[i];
+    if (voxel_idx >= params.voxel_count) {
+        face_mask[voxel_idx] = 0u;
+        return;
+    }
+
+    let id = atlas_voxels[src_off + voxel_idx];
+    if (id == EMPTY) {
+        face_mask[voxel_idx] = 0u;
+        return;
+    }
+
+    let p = vec3<i32>(unpack(voxel_idx));
+    var exposed_faces = 0u;
+    for (var d = 0u; d < 6u; d = d + 1u) {
+        if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) {
+            exposed_faces = exposed_faces + 1u;
+        }
+    }
+    face_mask[voxel_idx] = exposed_faces;
+}
+
+@compute @workgroup_size(64)
+fn prefix_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x != 0u) { return; }
+
+    var running = 0u;
+    for (var i = 0u; i < CHUNK_VOLUME; i = i + 1u) {
+        face_offset[i] = running;
+        running = running + face_mask[i];
+    }
+    face_count[0u] = running;
+}
+
+@compute @workgroup_size(64)
+fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let voxel_idx = gid.x;
+    if (voxel_idx >= CHUNK_VOLUME) { return; }
+
+    let params = frame_params[0u];
+    let src_off = atlas_state_offset(params.page_index, (params.state_index + 1u) & 1u);
     if (voxel_idx >= params.voxel_count) { return; }
 
     let id = atlas_voxels[src_off + voxel_idx];
     if (id == EMPTY) { return; }
 
-    let p = vec3<i32>(unpack(voxel_idx));
     let page = params.page_index;
     let vertex_base = page * GPU_MESH_VERTEX_CAPACITY_PER_PAGE;
     let index_base = page * GPU_MESH_INDEX_CAPACITY_PER_PAGE;
+    let p = vec3<i32>(unpack(voxel_idx));
+    let base = vec3<f32>(vec3<u32>(p));
 
+    var write_face = face_offset[voxel_idx];
     for (var d = 0u; d < 6u; d = d + 1u) {
         if (voxel_at(src_off, p + neighbor_dir(d)) != EMPTY) {
             continue;
         }
 
-        let local_vertex_offset = atomicAdd(&vertex_counter[page], 4u);
-        if (local_vertex_offset + 3u >= GPU_MESH_VERTEX_CAPACITY_PER_PAGE) {
-            return;
-        }
-        let local_index_offset = atomicAdd(&index_counter[page], 6u);
-        if (local_index_offset + 5u >= GPU_MESH_INDEX_CAPACITY_PER_PAGE) {
-            return;
-        }
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(
+            d,
+            base,
+            id,
+            vertex_base + local_vertex_offset,
+            index_base + local_index_offset,
+            local_vertex_offset,
+        );
+        write_face = write_face + 1u;
+    }
 
-        let base = vec3<f32>(vec3<u32>(p));
-        var c0 = vec3<f32>(0.0, 0.0, 0.0);
-        var c1 = vec3<f32>(0.0, 0.0, 0.0);
-        var c2 = vec3<f32>(0.0, 0.0, 0.0);
-        var c3 = vec3<f32>(0.0, 0.0, 0.0);
-        switch d {
-            case 0u: {
-                c0 = base + vec3<f32>(1.0, 0.0, 0.0);
-                c1 = base + vec3<f32>(1.0, 1.0, 0.0);
-                c2 = base + vec3<f32>(1.0, 1.0, 1.0);
-                c3 = base + vec3<f32>(1.0, 0.0, 1.0);
-            }
-            case 1u: {
-                c0 = base + vec3<f32>(0.0, 0.0, 1.0);
-                c1 = base + vec3<f32>(0.0, 1.0, 1.0);
-                c2 = base + vec3<f32>(0.0, 1.0, 0.0);
-                c3 = base + vec3<f32>(0.0, 0.0, 0.0);
-            }
-            case 2u: {
-                c0 = base + vec3<f32>(0.0, 1.0, 0.0);
-                c1 = base + vec3<f32>(0.0, 1.0, 1.0);
-                c2 = base + vec3<f32>(1.0, 1.0, 1.0);
-                c3 = base + vec3<f32>(1.0, 1.0, 0.0);
-            }
-            case 3u: {
-                c0 = base + vec3<f32>(0.0, 0.0, 1.0);
-                c1 = base + vec3<f32>(0.0, 0.0, 0.0);
-                c2 = base + vec3<f32>(1.0, 0.0, 0.0);
-                c3 = base + vec3<f32>(1.0, 0.0, 1.0);
-            }
-            case 4u: {
-                c0 = base + vec3<f32>(1.0, 0.0, 1.0);
-                c1 = base + vec3<f32>(1.0, 1.0, 1.0);
-                c2 = base + vec3<f32>(0.0, 1.0, 1.0);
-                c3 = base + vec3<f32>(0.0, 0.0, 1.0);
-            }
-            default: {
-                c0 = base + vec3<f32>(0.0, 0.0, 0.0);
-                c1 = base + vec3<f32>(0.0, 1.0, 0.0);
-                c2 = base + vec3<f32>(1.0, 1.0, 0.0);
-                c3 = base + vec3<f32>(1.0, 0.0, 0.0);
-            }
-        }
-
-        let v0 = vertex_base + local_vertex_offset;
-        let v1 = v0 + 1u;
-        let v2 = v0 + 2u;
-        let v3 = v0 + 3u;
-        chunk_vertex_buffer[v0] = GpuVertex(c0, id);
-        chunk_vertex_buffer[v1] = GpuVertex(c1, id);
-        chunk_vertex_buffer[v2] = GpuVertex(c2, id);
-        chunk_vertex_buffer[v3] = GpuVertex(c3, id);
-
-        let i0 = index_base + local_index_offset;
-        chunk_index_buffer[i0 + 0u] = local_vertex_offset + 0u;
-        chunk_index_buffer[i0 + 1u] = local_vertex_offset + 1u;
-        chunk_index_buffer[i0 + 2u] = local_vertex_offset + 2u;
-        chunk_index_buffer[i0 + 3u] = local_vertex_offset + 0u;
-        chunk_index_buffer[i0 + 4u] = local_vertex_offset + 2u;
-        chunk_index_buffer[i0 + 5u] = local_vertex_offset + 3u;
-
-        mesh_meta_buffer[page] = ChunkMeshMeta(page, vertex_base, index_base, 0u);
-
-        let dirty_prev = atomicAdd(&diagnostics[0u], 1u);
-        if (dirty_prev == 0u) {
-            let dirty_idx = atomicAdd(&dirty_page_counter[0u], 1u);
-            if (dirty_idx < arrayLength(&dirty_page_indices)) {
-                dirty_page_indices[dirty_idx] = page;
-            }
-            page_indirect[page].instance_count = 1u;
-        }
-
-        draw_indirect_buffer[page].index_count = atomicLoad(&index_counter[page]);
+    if (voxel_idx == 0u) {
+        let total_faces = face_count[0u];
+        draw_indirect_buffer[page].index_count = total_faces * 6u;
         draw_indirect_buffer[page].instance_count = 1u;
         draw_indirect_buffer[page].first_index = index_base;
         draw_indirect_buffer[page].base_vertex = i32(vertex_base);
         draw_indirect_buffer[page].first_instance = 0u;
-
-        atomicAdd(&page_indirect[page].index_count, 6u);
+        mesh_meta_buffer[page] = ChunkMeshMeta(page, vertex_base, index_base, 0u);
     }
 }

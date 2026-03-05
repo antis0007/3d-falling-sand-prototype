@@ -491,8 +491,9 @@ pub struct Renderer {
     global_gpu_draw_indirect_buffer: Arc<wgpu::Buffer>,
     global_gpu_page_indirect_buffer: Arc<wgpu::Buffer>,
     global_gpu_mesh_meta_buffer: Arc<wgpu::Buffer>,
-    global_gpu_vertex_counter_buffer: Arc<wgpu::Buffer>,
-    global_gpu_index_counter_buffer: Arc<wgpu::Buffer>,
+    global_gpu_face_mask_buffer: Arc<wgpu::Buffer>,
+    global_gpu_face_offset_buffer: Arc<wgpu::Buffer>,
+    global_gpu_face_count_buffer: Arc<wgpu::Buffer>,
     supports_multi_draw_indirect: bool,
 
     dirty_queues: DirtyChunkQueues,
@@ -1381,17 +1382,25 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
-        let global_gpu_vertex_counter_buffer =
+        let global_gpu_face_mask_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("global gpu face mask buffer"),
+            size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
+                * std::mem::size_of::<u32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        let global_gpu_face_offset_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("global gpu vertex counter buffer"),
-                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                label: Some("global gpu face offset buffer"),
+                size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
+                    * std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
-        let global_gpu_index_counter_buffer =
+        let global_gpu_face_count_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("global gpu index counter buffer"),
-                size: page_capacity * std::mem::size_of::<u32>() as u64,
+                label: Some("global gpu face count buffer"),
+                size: std::mem::size_of::<u32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
@@ -1409,8 +1418,9 @@ impl Renderer {
                     draw_indirect_buffer: Arc::clone(&global_gpu_draw_indirect_buffer),
                     page_indirect: Arc::clone(&global_gpu_page_indirect_buffer),
                     mesh_meta_buffer: Arc::clone(&global_gpu_mesh_meta_buffer),
-                    vertex_counter: Arc::clone(&global_gpu_vertex_counter_buffer),
-                    index_counter: Arc::clone(&global_gpu_index_counter_buffer),
+                    face_mask_buffer: Arc::clone(&global_gpu_face_mask_buffer),
+                    face_offset_buffer: Arc::clone(&global_gpu_face_offset_buffer),
+                    face_count_buffer: Arc::clone(&global_gpu_face_count_buffer),
                 },
             )?;
         }
@@ -1432,8 +1442,9 @@ impl Renderer {
             global_gpu_draw_indirect_buffer,
             global_gpu_page_indirect_buffer,
             global_gpu_mesh_meta_buffer,
-            global_gpu_vertex_counter_buffer,
-            global_gpu_index_counter_buffer,
+            global_gpu_face_mask_buffer,
+            global_gpu_face_offset_buffer,
+            global_gpu_face_count_buffer,
             supports_multi_draw_indirect,
             dirty_queues: DirtyChunkQueues::default(),
             urgent_mesh_queue: VecDeque::new(),
