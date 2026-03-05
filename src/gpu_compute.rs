@@ -480,12 +480,21 @@ pub struct ChunkSimulationDiagnostics {
 
 #[cfg(feature = "gpu-compute")]
 const MAX_EDIT_COMMANDS: u32 = CHUNK_VOLUME as u32;
+#[cfg(feature = "gpu-compute")]
+const HIGH_EDIT_VOLUME_THRESHOLD: usize = 3072;
+#[cfg(feature = "gpu-compute")]
+const SAFE_ACTIVE_FRONTIER_LIMIT: u32 = 2048;
+#[cfg(feature = "gpu-compute")]
+const STARTUP_JACOBI_ITERATIONS: u32 = 8;
+#[cfg(feature = "gpu-compute")]
+const HIGH_PRESSURE_JACOBI_ITERATIONS: u32 = 16;
 
 #[derive(Default, Clone, Copy)]
 pub struct GpuComputeProfilerSnapshot {
     pub dispatch_ms: f32,
     pub bytes_transferred: u64,
     pub chunks_completed: u64,
+    pub frontier_cap_events: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -495,6 +504,8 @@ static GPU_DISPATCH_NS: AtomicU64 = AtomicU64::new(0);
 static GPU_TRANSFER_BYTES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS: std::sync::LazyLock<Mutex<HashSet<ChunkCoord>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -511,11 +522,13 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let dispatch_ns = GPU_DISPATCH_NS.swap(0, Ordering::Relaxed);
         let bytes_transferred = GPU_TRANSFER_BYTES.swap(0, Ordering::Relaxed);
         let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
+        let frontier_cap_events = GPU_FRONTIER_CAP_EVENTS.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
             bytes_transferred,
             chunks_completed,
+            frontier_cap_events,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -723,6 +736,7 @@ impl GpuComputeRuntime {
         page_index: GpuPageIndex,
         current_state: u32,
         edit_commands: &[EditCommand],
+        max_jacobi_iterations: u32,
         neighbor_pages: [u32; 6],
     ) -> anyhow::Result<()> {
         let t0 = Instant::now();
@@ -755,16 +769,15 @@ impl GpuComputeRuntime {
             )
         };
 
-        let mut staged_params =
-            Vec::with_capacity(state.runtime_config.max_jacobi_iterations as usize + 5);
+        let mut staged_params = Vec::with_capacity(max_jacobi_iterations as usize + 5);
         staged_params.push(base_params(0)[0]); // force
         staged_params.push(base_params(0)[0]); // advect
         staged_params.push(base_params(0)[0]); // divergence
-        for jacobi_iter in 0..state.runtime_config.max_jacobi_iterations {
+        for jacobi_iter in 0..max_jacobi_iterations {
             staged_params.push(base_params(jacobi_iter)[0]);
         }
-        staged_params.push(base_params(state.runtime_config.max_jacobi_iterations)[0]); // projection
-        staged_params.push(base_params(state.runtime_config.max_jacobi_iterations)[0]); // material advection
+        staged_params.push(base_params(max_jacobi_iterations)[0]); // projection
+        staged_params.push(base_params(max_jacobi_iterations)[0]); // material advection
 
         let staged_params_buffer = state.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("simulation staged frame params"),
@@ -818,7 +831,7 @@ impl GpuComputeRuntime {
         encode_stage(&mut encoder, &self.force_pipeline);
         encode_stage(&mut encoder, &self.advect_pipeline);
         encode_stage(&mut encoder, &self.divergence_pipeline);
-        for _ in 0..state.runtime_config.max_jacobi_iterations {
+        for _ in 0..max_jacobi_iterations {
             encode_stage(&mut encoder, &self.pressure_jacobi_pipeline);
         }
         encode_stage(&mut encoder, &self.project_pipeline);
@@ -1266,7 +1279,36 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         for edit in &edit_commands {
             active_tiles_seed.push(edit.voxel_index);
         }
-        let active_frontier_count = active_tiles_seed.len() as u32;
+        let raw_active_frontier_count = active_tiles_seed.len() as u32;
+        let high_edit_volume = edit_commands.len() > HIGH_EDIT_VOLUME_THRESHOLD;
+        let startup_seeding_mode = page_was_reassigned;
+        let pressure_relief_mode = startup_seeding_mode || high_edit_volume;
+        let active_frontier_count = if pressure_relief_mode {
+            let capped = raw_active_frontier_count.min(SAFE_ACTIVE_FRONTIER_LIMIT);
+            if capped < raw_active_frontier_count {
+                let total_caps = GPU_FRONTIER_CAP_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                log::warn!(
+                    "[mesh-worker] capped active frontier chunk={:?} page={} raw={} capped={} high_edit={} startup={} events={}",
+                    job.coord,
+                    page_index.0,
+                    raw_active_frontier_count,
+                    capped,
+                    high_edit_volume,
+                    startup_seeding_mode,
+                    total_caps,
+                );
+            }
+            capped
+        } else {
+            raw_active_frontier_count
+        };
+        let jacobi_iterations = if startup_seeding_mode {
+            STARTUP_JACOBI_ITERATIONS.min(state.runtime_config.max_jacobi_iterations)
+        } else if high_edit_volume {
+            HIGH_PRESSURE_JACOBI_ITERATIONS.min(state.runtime_config.max_jacobi_iterations)
+        } else {
+            state.runtime_config.max_jacobi_iterations
+        };
         let sim_job = SimulationJob {
             chunk_coord: job.coord,
             materials: incoming.to_vec(),
@@ -1300,11 +1342,18 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     state.queue.write_buffer(
                         &scratch.active_tiles,
                         0,
-                        bytemuck::cast_slice(&active_tiles_seed),
+                        bytemuck::cast_slice(&active_tiles_seed[..active_frontier_count as usize]),
                     );
                 }
 
-                if active_frontier_count > 0 {
+                if startup_seeding_mode {
+                    log::info!(
+                        "[mesh-worker] startup seeding mode; skipping fluid simulation chunk={:?} page={} edits={}",
+                        job.coord,
+                        page_index.0,
+                        edit_commands.len()
+                    );
+                } else if active_frontier_count > 0 {
                     state.runtime.run_active_frontier(
                         &state,
                         &scratch,
@@ -1312,6 +1361,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         page_index,
                         current_state,
                         &edit_commands,
+                        jacobi_iterations,
                         neighbor_pages,
                     )?
                 }
