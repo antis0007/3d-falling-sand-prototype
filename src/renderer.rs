@@ -503,6 +503,7 @@ pub struct Renderer {
     mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
+    inflight_mesh_chunks: HashSet<ChunkCoord>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
@@ -579,8 +580,16 @@ pub struct MeshRebuildStats {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MeshRetryState {
-    attempts: u32,
-    next_retry_frame: u64,
+    failed_attempts: u32,
+    failed_next_retry_frame: u64,
+    skipped_attempts: u32,
+    skipped_next_retry_frame: u64,
+}
+
+#[derive(Clone, Copy)]
+enum MeshRetryKind {
+    Failed,
+    Skipped,
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -1396,6 +1405,7 @@ impl Renderer {
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
+            inflight_mesh_chunks: HashSet::new(),
             mesh_retry_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
@@ -1501,27 +1511,11 @@ impl Renderer {
         let mut mid_jobs = Vec::new();
         let mut far_jobs = Vec::new();
         let mut ultra_jobs = Vec::new();
+        let mut frame_jobs: HashMap<ChunkCoord, MeshJob> = HashMap::new();
 
         let mut urgent_jobs = self.pop_urgent_mesh_jobs(store, &mut stats, player_chunk, lod_radii);
-
         for job in urgent_jobs.drain(..) {
-            let lod = job.lod;
-            match self.mesh_queue.try_submit(job) {
-                Ok(()) => {
-                    stats.mesh_count += 1;
-                    match lod {
-                        ChunkLod::Near => stats.near_mesh_count += 1,
-                        ChunkLod::Mid => stats.mid_mesh_count += 1,
-                        ChunkLod::Far => stats.far_mesh_count += 1,
-                        ChunkLod::Ultra => stats.ultra_mesh_count += 1,
-                    }
-                }
-                Err(TrySendError::Full(job)) => {
-                    self.enqueue_urgent_mesh_chunk(job.coord);
-                    break;
-                }
-                Err(TrySendError::Disconnected(_)) => break,
-            }
+            Self::enqueue_frame_job(&mut frame_jobs, job);
         }
 
         let chunk_snapshot_budget = mesh_budget.max(1);
@@ -1554,38 +1548,40 @@ impl Renderer {
             let fallback_lod =
                 fallback_lod_near_threshold(coord, player_chunk, lod_radii, primary_lod);
 
-            let push_job = |lod: ChunkLod, jobs: &mut Vec<MeshJob>| {
+            let mut push_job = |lod: ChunkLod| {
                 let version = store.chunk_voxel_version(coord);
-                jobs.push(MeshJob {
-                    coord,
-                    lod,
-                    version,
-                    queued_at: Instant::now(),
-                    snapshot: snapshot.clone(),
-                    greedy: self.settings.greedy_meshing,
-                    urgent: false,
-                });
+                Self::enqueue_frame_job(
+                    &mut frame_jobs,
+                    MeshJob {
+                        coord,
+                        lod,
+                        version,
+                        queued_at: Instant::now(),
+                        snapshot: snapshot.clone(),
+                        greedy: self.settings.greedy_meshing,
+                        urgent: false,
+                    },
+                );
             };
 
-            match primary_lod {
-                ChunkLod::Near => push_job(ChunkLod::Near, &mut near_jobs),
-                ChunkLod::Mid => push_job(ChunkLod::Mid, &mut mid_jobs),
-                ChunkLod::Far => push_job(ChunkLod::Far, &mut far_jobs),
-                ChunkLod::Ultra => push_job(ChunkLod::Ultra, &mut ultra_jobs),
-            }
+            push_job(primary_lod);
 
             if let Some(lod) = fallback_lod {
-                match lod {
-                    ChunkLod::Near => push_job(ChunkLod::Near, &mut near_jobs),
-                    ChunkLod::Mid => push_job(ChunkLod::Mid, &mut mid_jobs),
-                    ChunkLod::Far => push_job(ChunkLod::Far, &mut far_jobs),
-                    ChunkLod::Ultra => push_job(ChunkLod::Ultra, &mut ultra_jobs),
-                }
+                push_job(lod);
             }
         }
 
         for coord in deferred_snapshot_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
+
+        for job in frame_jobs.into_values() {
+            match job.lod {
+                ChunkLod::Near => near_jobs.push(job),
+                ChunkLod::Mid => mid_jobs.push(job),
+                ChunkLod::Far => far_jobs.push(job),
+                ChunkLod::Ultra => ultra_jobs.push(job),
+            }
         }
 
         let job_priority = |coord: ChunkCoord| {
@@ -1594,6 +1590,52 @@ impl Renderer {
                 .copied()
                 .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
         };
+
+        let mut urgent_jobs = Vec::new();
+        near_jobs.retain(|job| {
+            if job.urgent {
+                urgent_jobs.push(job.clone());
+                return false;
+            }
+            true
+        });
+        mid_jobs.retain(|job| {
+            if job.urgent {
+                urgent_jobs.push(job.clone());
+                return false;
+            }
+            true
+        });
+        far_jobs.retain(|job| {
+            if job.urgent {
+                urgent_jobs.push(job.clone());
+                return false;
+            }
+            true
+        });
+        ultra_jobs.retain(|job| {
+            if job.urgent {
+                urgent_jobs.push(job.clone());
+                return false;
+            }
+            true
+        });
+
+        urgent_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
+        for job in urgent_jobs.drain(..) {
+            if self.inflight_mesh_chunks.contains(&job.coord) {
+                self.enqueue_urgent_mesh_chunk(job.coord);
+                continue;
+            }
+            match self.submit_mesh_job(job, &mut stats) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) => {
+                    self.enqueue_urgent_mesh_chunk(job.coord);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
         near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
@@ -1632,18 +1674,14 @@ impl Renderer {
                     let Some(job) = jobs.pop() else {
                         break;
                     };
-                    let lod = job.lod;
-                    match self.mesh_queue.try_submit(job) {
+                    if self.inflight_mesh_chunks.contains(&job.coord) {
+                        self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                        continue;
+                    }
+                    match self.submit_mesh_job(job, stats) {
                         Ok(()) => {
                             taken += 1;
                             submitted += 1;
-                            stats.mesh_count += 1;
-                            match lod {
-                                ChunkLod::Near => stats.near_mesh_count += 1,
-                                ChunkLod::Mid => stats.mid_mesh_count += 1,
-                                ChunkLod::Far => stats.far_mesh_count += 1,
-                                ChunkLod::Ultra => stats.ultra_mesh_count += 1,
-                            }
                         }
                         Err(TrySendError::Full(job)) => {
                             jobs.push(job);
@@ -1676,6 +1714,7 @@ impl Renderer {
 
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::info!("[renderer] received mesh result chunk={:?}", result.coord);
+            self.inflight_mesh_chunks.remove(&result.coord);
             self.completed_meshes.push(result);
         }
 
@@ -1728,7 +1767,8 @@ impl Renderer {
         let uploaded = 0usize;
         let total_latency_ms = 0.0f32;
         let mut remesh_coords = Vec::new();
-        let mut retry_coords = Vec::new();
+        let mut failed_retry_coords = Vec::new();
+        let mut skipped_retry_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
@@ -1743,7 +1783,7 @@ impl Renderer {
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
             if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
                 stats.gpu_job_skipped += 1;
-                retry_coords.push(result.coord);
+                skipped_retry_coords.push(result.coord);
                 continue;
             }
 
@@ -1755,7 +1795,7 @@ impl Renderer {
                     result.lod,
                     short_error_message(reason)
                 );
-                retry_coords.push(result.coord);
+                failed_retry_coords.push(result.coord);
                 continue;
             }
 
@@ -1838,8 +1878,11 @@ impl Renderer {
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
-        for coord in retry_coords {
-            self.schedule_mesh_retry(coord);
+        for coord in failed_retry_coords {
+            self.schedule_mesh_retry(coord, MeshRetryKind::Failed);
+        }
+        for coord in skipped_retry_coords {
+            self.schedule_mesh_retry(coord, MeshRetryKind::Skipped);
         }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
@@ -1908,6 +1951,7 @@ impl Renderer {
         self.mesh_versions.clear();
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
+        self.inflight_mesh_chunks.clear();
         self.mesh_retry_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
@@ -1980,6 +2024,45 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn should_replace_frame_job(candidate: &MeshJob, current: &MeshJob) -> bool {
+        if candidate.urgent != current.urgent {
+            return candidate.urgent;
+        }
+        lod_rank(candidate.lod) < lod_rank(current.lod)
+    }
+
+    fn submit_mesh_job(
+        &mut self,
+        job: MeshJob,
+        stats: &mut MeshRebuildStats,
+    ) -> Result<(), TrySendError<MeshJob>> {
+        let coord = job.coord;
+        let lod = job.lod;
+        match self.mesh_queue.try_submit(job) {
+            Ok(()) => {
+                self.inflight_mesh_chunks.insert(coord);
+                stats.mesh_count += 1;
+                match lod {
+                    ChunkLod::Near => stats.near_mesh_count += 1,
+                    ChunkLod::Mid => stats.mid_mesh_count += 1,
+                    ChunkLod::Far => stats.far_mesh_count += 1,
+                    ChunkLod::Ultra => stats.ultra_mesh_count += 1,
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn enqueue_frame_job(frame_jobs: &mut HashMap<ChunkCoord, MeshJob>, job: MeshJob) {
+        match frame_jobs.get(&job.coord) {
+            Some(current) if !Self::should_replace_frame_job(&job, current) => {}
+            _ => {
+                frame_jobs.insert(job.coord, job);
+            }
+        }
+    }
+
     fn enqueue_urgent_mesh_chunk(&mut self, coord: ChunkCoord) {
         if self.urgent_mesh_set.insert(coord) {
             self.urgent_mesh_queue.push_back(coord);
@@ -2083,15 +2166,25 @@ impl Renderer {
         }
     }
 
-    fn schedule_mesh_retry(&mut self, coord: ChunkCoord) {
+    fn schedule_mesh_retry(&mut self, coord: ChunkCoord, kind: MeshRetryKind) {
         let state = self.mesh_retry_state.entry(coord).or_default();
-        if state.attempts >= MESH_RETRY_MAX_ATTEMPTS {
+        let (attempts, next_retry_frame) = match kind {
+            MeshRetryKind::Failed => (
+                &mut state.failed_attempts,
+                &mut state.failed_next_retry_frame,
+            ),
+            MeshRetryKind::Skipped => (
+                &mut state.skipped_attempts,
+                &mut state.skipped_next_retry_frame,
+            ),
+        };
+        if *attempts >= MESH_RETRY_MAX_ATTEMPTS {
             return;
         }
-        state.attempts += 1;
-        let exp = state.attempts.saturating_sub(1).min(8);
+        *attempts += 1;
+        let exp = (*attempts).saturating_sub(1).min(8);
         let backoff_frames = MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
-        state.next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
+        *next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
     }
 
     fn process_mesh_retry_backoff(
@@ -2101,13 +2194,23 @@ impl Renderer {
     ) {
         let mut ready = Vec::new();
         self.mesh_retry_state.retain(|coord, state| {
-            if state.attempts >= MESH_RETRY_MAX_ATTEMPTS {
-                return false;
-            }
-            if state.next_retry_frame <= self.mesh_rebuild_frame_index {
+            let failed_ready = state.failed_attempts < MESH_RETRY_MAX_ATTEMPTS
+                && state.failed_next_retry_frame <= self.mesh_rebuild_frame_index;
+            let skipped_ready = state.skipped_attempts < MESH_RETRY_MAX_ATTEMPTS
+                && state.skipped_next_retry_frame <= self.mesh_rebuild_frame_index;
+            if failed_ready || skipped_ready {
                 ready.push(*coord);
             }
-            true
+            if failed_ready {
+                state.failed_attempts = 0;
+                state.failed_next_retry_frame = u64::MAX;
+            }
+            if skipped_ready {
+                state.skipped_attempts = 0;
+                state.skipped_next_retry_frame = u64::MAX;
+            }
+
+            state.failed_attempts > 0 || state.skipped_attempts > 0
         });
         for coord in ready {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
