@@ -1406,6 +1406,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 gpu_artifact
             };
 
+            log::info!("[mesh-worker] gpu dispatch finished chunk={:?}", job.coord);
+
             let dispatch_ms = dispatch_t0.elapsed().as_secs_f32() * 1000.0;
             #[cfg(feature = "gpu_meshing_experimental")]
             let gpu_draw_command =
@@ -1425,6 +1427,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     job.coord.z as f32 * 32.0,
                 ),
             );
+            log::info!("[mesh-worker] artifact created chunk={:?}", job.coord);
             Ok(ComputedChunkArtifacts {
                 simulation_diagnostics: diagnostics,
                 mesh_artifact: {
