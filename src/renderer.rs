@@ -1228,19 +1228,21 @@ impl Renderer {
         let device = Arc::new(device);
         let queue = Arc::new(queue);
 
-        initialize_gpu_compute_worker(
-            Arc::clone(&device),
-            Arc::clone(&queue),
-            SharedMeshBuffers {
-                chunk_vertex_buffer: Arc::clone(&global_gpu_vertex_buffer),
-                chunk_index_buffer: Arc::clone(&global_gpu_index_buffer),
-                draw_indirect_buffer: Arc::clone(&global_gpu_draw_indirect_buffer),
-                page_indirect: Arc::clone(&global_gpu_page_indirect_buffer),
-                mesh_meta_buffer: Arc::clone(&global_gpu_mesh_meta_buffer),
-                vertex_counter: Arc::clone(&global_gpu_vertex_counter_buffer),
-                index_counter: Arc::clone(&global_gpu_index_counter_buffer),
-            },
-        )?;
+        if mesh_backend == MeshPipelineBackend::Gpu {
+            initialize_gpu_compute_worker(
+                Arc::clone(&device),
+                Arc::clone(&queue),
+                SharedMeshBuffers {
+                    chunk_vertex_buffer: Arc::clone(&global_gpu_vertex_buffer),
+                    chunk_index_buffer: Arc::clone(&global_gpu_index_buffer),
+                    draw_indirect_buffer: Arc::clone(&global_gpu_draw_indirect_buffer),
+                    page_indirect: Arc::clone(&global_gpu_page_indirect_buffer),
+                    mesh_meta_buffer: Arc::clone(&global_gpu_mesh_meta_buffer),
+                    vertex_counter: Arc::clone(&global_gpu_vertex_counter_buffer),
+                    index_counter: Arc::clone(&global_gpu_index_counter_buffer),
+                },
+            )?;
+        }
 
         Ok(Self {
             surface,
