@@ -1433,7 +1433,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         ChunkMeshArtifact::Gpu {
                             page_index,
                             draw_indirect_index: mesh_slice.slot_index,
-                            index_count: inds.len() as u32,
+                            // GPU meshing emits draw counts into the indirect buffer.
+                            // Keep this metadata value neutral so consumers do not
+                            // accidentally trust CPU-side placeholder geometry.
+                            index_count: 0,
                             lod: job.lod as u8,
                             verts,
                             inds,
