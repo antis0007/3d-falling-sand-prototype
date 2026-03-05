@@ -37,6 +37,8 @@ use winit::dpi::PhysicalSize;
 pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
+const MESH_RETRY_MAX_ATTEMPTS: u32 = 6;
+const MESH_RETRY_BASE_BACKOFF_FRAMES: u64 = 2;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -501,6 +503,8 @@ pub struct Renderer {
     mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
+    mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
+    mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
 
     mesh_queue: BackgroundMeshQueue,
@@ -562,6 +566,8 @@ pub struct MeshRebuildStats {
     pub ultra_mesh_count: usize,
     pub gpu_mesh_jobs: usize,
     pub gpu_dispatch_ms: f32,
+    pub gpu_job_failures: usize,
+    pub gpu_job_skipped: usize,
     pub gpu_readback_bytes: u64,
     pub allocator_bytes_allocated: usize,
     pub allocator_bytes_reused: usize,
@@ -569,6 +575,12 @@ pub struct MeshRebuildStats {
     pub mesh_artifacts_received: usize,
     pub mesh_artifacts_rejected: usize,
     pub mesh_cache_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshRetryState {
+    attempts: u32,
+    next_retry_frame: u64,
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -870,6 +882,9 @@ pub(crate) enum ChunkMeshArtifact {
         chunk_origin_world: Vec3,
         dispatch_ms: f32,
     },
+    Failed {
+        reason: String,
+    },
     Skipped,
 }
 
@@ -915,6 +930,14 @@ impl ChunkMeshArtifact {
                 Vec3::ZERO,
                 Vec3::ZERO,
             ),
+            Self::Failed { .. } => (
+                &[],
+                &[],
+                DrawIndirectArgs::default(),
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Vec3::ZERO,
+            ),
         }
     }
 }
@@ -932,9 +955,12 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
             crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
         }
         #[cfg(feature = "gpu-compute")]
-        MeshPipelineBackend::Gpu => run_chunk_job_on_worker(job)
-            .map(|output| output.mesh_artifact)
-            .expect("gpu meshing worker failed; cpu fallback is disabled"),
+        MeshPipelineBackend::Gpu => match run_chunk_job_on_worker(job) {
+            Ok(output) => output.mesh_artifact,
+            Err(err) => ChunkMeshArtifact::Failed {
+                reason: format!("{err:#}"),
+            },
+        },
     }
 }
 
@@ -960,6 +986,14 @@ impl BackgroundMeshQueue {
                     log::info!("[mesh-worker] picked job chunk={:?}", job.coord);
 
                     let artifact = build_mesh_artifact(mesh_backend, &job);
+                    if let ChunkMeshArtifact::Failed { reason } = &artifact {
+                        log::warn!(
+                            "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
+                            job.coord,
+                            job.lod,
+                            reason.lines().next().unwrap_or("unknown")
+                        );
+                    }
                     let result = MeshResult {
                         coord: job.coord,
                         lod: job.lod,
@@ -1338,6 +1372,8 @@ impl Renderer {
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
+            mesh_retry_state: HashMap::new(),
+            mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
@@ -1423,6 +1459,8 @@ impl Renderer {
         lod_radii: LodRadii,
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
+        self.mesh_rebuild_frame_index = self.mesh_rebuild_frame_index.saturating_add(1);
+        self.process_mesh_retry_backoff(player_chunk, chunk_priority_scores);
         let lod_radii = lod_radii.normalized();
         self.near_lod_distance = lod_radii.near as f32 + 0.5;
         for coord in store.take_urgent_dirty_chunks() {
@@ -1666,7 +1704,7 @@ impl Renderer {
         let uploaded = 0usize;
         let total_latency_ms = 0.0f32;
         let mut remesh_coords = Vec::new();
-        let mut skipped_coords = Vec::new();
+        let mut retry_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
@@ -1680,7 +1718,20 @@ impl Renderer {
 
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
             if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
-                skipped_coords.push(result.coord);
+                stats.gpu_job_skipped += 1;
+                retry_coords.push(result.coord);
+                continue;
+            }
+
+            if let ChunkMeshArtifact::Failed { reason } = &result.artifact {
+                stats.gpu_job_failures += 1;
+                log::warn!(
+                    "[mesh] dropping failed artifact chunk={:?} lod={:?} error={}",
+                    result.coord,
+                    result.lod,
+                    reason.lines().next().unwrap_or("unknown")
+                );
+                retry_coords.push(result.coord);
                 continue;
             }
 
@@ -1711,6 +1762,7 @@ impl Renderer {
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
+                self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
 
                 #[cfg(feature = "legacy_gpu_artifact_upload")]
@@ -1762,7 +1814,10 @@ impl Renderer {
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
-        for coord in skipped_coords.into_iter().chain(remesh_coords) {
+        for coord in retry_coords {
+            self.schedule_mesh_retry(coord);
+        }
+        for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
 
@@ -1829,6 +1884,8 @@ impl Renderer {
         self.mesh_versions.clear();
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
+        self.mesh_retry_state.clear();
+        self.mesh_rebuild_frame_index = 0;
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
         // Keep frustum checks in world space; use GPU mesh metadata.
@@ -1998,6 +2055,37 @@ impl Renderer {
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
         if self.pending_lod_remesh.insert(coord) {
+            self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
+    }
+
+    fn schedule_mesh_retry(&mut self, coord: ChunkCoord) {
+        let state = self.mesh_retry_state.entry(coord).or_default();
+        if state.attempts >= MESH_RETRY_MAX_ATTEMPTS {
+            return;
+        }
+        state.attempts += 1;
+        let exp = state.attempts.saturating_sub(1).min(8);
+        let backoff_frames = MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
+        state.next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
+    }
+
+    fn process_mesh_retry_backoff(
+        &mut self,
+        player_chunk: ChunkCoord,
+        chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+    ) {
+        let mut ready = Vec::new();
+        self.mesh_retry_state.retain(|coord, state| {
+            if state.attempts >= MESH_RETRY_MAX_ATTEMPTS {
+                return false;
+            }
+            if state.next_retry_frame <= self.mesh_rebuild_frame_index {
+                ready.push(*coord);
+            }
+            true
+        });
+        for coord in ready {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
     }
