@@ -950,6 +950,10 @@ struct BackgroundMeshQueue {
 
 fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> ChunkMeshArtifact {
     match mesh_backend {
+        MeshPipelineBackend::Disabled => {
+            let _ = job;
+            ChunkMeshArtifact::Skipped
+        }
         #[cfg(feature = "cpu_meshing_debug")]
         MeshPipelineBackend::Cpu => {
             crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
@@ -1043,7 +1047,10 @@ impl BackgroundMeshQueue {
 }
 
 impl Renderer {
-    pub async fn new(window: &'static winit::window::Window) -> anyhow::Result<Self> {
+    pub async fn new(
+        window: &'static winit::window::Window,
+        require_gpu_meshing: bool,
+    ) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window)?;
@@ -1139,19 +1146,42 @@ impl Renderer {
                 );
             }
         } else {
+            #[cfg(feature = "gpu-compute")]
+            {
+                let required_storage_size = required_storage_buffer_binding_size_bytes();
+                log::warn!(
+                    "gpu meshing unavailable: required_storage_size={}B, storage_buffers_per_shader_stage(required={} adapter={} requested={} device={}), storage_buffer_binding_size(required={} adapter={} requested={} device={}), max_buffer_size(required={} adapter={} requested={} device={})",
+                    required_storage_size,
+                    COMPUTE_STORAGE_BINDING_COUNT,
+                    adapter_limits.max_storage_buffers_per_shader_stage,
+                    requested_limits.max_storage_buffers_per_shader_stage,
+                    device_limits.max_storage_buffers_per_shader_stage,
+                    required_storage_size,
+                    adapter_limits.max_storage_buffer_binding_size,
+                    requested_limits.max_storage_buffer_binding_size,
+                    device_limits.max_storage_buffer_binding_size,
+                    required_storage_size,
+                    adapter_limits.max_buffer_size,
+                    requested_limits.max_buffer_size,
+                    device_limits.max_buffer_size,
+                );
+            }
+
+            #[cfg(not(feature = "gpu-compute"))]
+            {
+                log::warn!(
+                    "gpu meshing unavailable: `gpu-compute` feature is disabled in this build"
+                );
+            }
+
+            if require_gpu_meshing {
+                anyhow::bail!(
+                    "gpu meshing is required (--require-gpu-meshing), but adapter/runtime does not satisfy gpu-compute requirements"
+                );
+            }
+
             #[cfg(feature = "cpu_meshing_debug")]
             {
-                #[cfg(feature = "gpu-compute")]
-                {
-                    let required_storage_size = required_storage_buffer_binding_size_bytes();
-                    log::warn!(
-                        "gpu compute unsupported; falling back to cpu debug path (required_storage_size={}B adapter-max-binding={}B requested-max-binding={}B device-max-binding={}B)",
-                        required_storage_size,
-                        adapter_limits.max_storage_buffer_binding_size,
-                        requested_limits.max_storage_buffer_binding_size,
-                        device_limits.max_storage_buffer_binding_size
-                    );
-                }
                 log::warn!(
                     "mesh backend selected: cpu debug path (adapter/runtime does not satisfy gpu-compute requirements)"
                 );
@@ -1159,20 +1189,10 @@ impl Renderer {
             }
             #[cfg(not(feature = "cpu_meshing_debug"))]
             {
-                #[cfg(feature = "gpu-compute")]
-                {
-                    let required_storage_size = required_storage_buffer_binding_size_bytes();
-                    log::error!(
-                        "gpu compute unsupported; bailing out (required_storage_size={}B adapter-max-binding={}B requested-max-binding={}B device-max-binding={}B)",
-                        required_storage_size,
-                        adapter_limits.max_storage_buffer_binding_size,
-                        requested_limits.max_storage_buffer_binding_size,
-                        device_limits.max_storage_buffer_binding_size
-                    );
-                }
-                anyhow::bail!(
-                    "gpu meshing is required at runtime, but adapter/runtime does not satisfy gpu-compute requirements"
+                log::warn!(
+                    "mesh backend selected: disabled (render-only mode with empty meshes; app remains running)"
                 );
+                MeshPipelineBackend::Disabled
             }
         };
         let caps = surface.get_capabilities(&adapter);
