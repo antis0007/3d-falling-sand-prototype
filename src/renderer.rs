@@ -948,21 +948,25 @@ impl BackgroundMeshQueue {
                     let Ok(job) = job else {
                         break;
                     };
+                    log::info!("[mesh-worker] picked job chunk={:?}", job.coord);
 
                     let artifact = build_mesh_artifact(mesh_backend, &job);
-                    if worker_tx
-                        .send(MeshResult {
-                            coord: job.coord,
-                            lod: job.lod,
-                            version: job.version,
-                            queued_at: job.queued_at,
-                            artifact,
-                            urgent: job.urgent,
-                        })
-                        .is_err()
-                    {
+                    let result = MeshResult {
+                        coord: job.coord,
+                        lod: job.lod,
+                        version: job.version,
+                        queued_at: job.queued_at,
+                        artifact,
+                        urgent: job.urgent,
+                    };
+                    log::info!(
+                        "[mesh-worker] sending result chunk={:?}",
+                        result.coord
+                    );
+                    if worker_tx.send(result).is_err() {
                         break;
                     }
+                    log::info!("[mesh-worker] send completed chunk={:?}", job.coord);
                 })
                 .expect("spawn mesh worker");
         }
@@ -975,6 +979,11 @@ impl BackgroundMeshQueue {
     }
 
     fn try_submit(&mut self, job: MeshJob) -> Result<(), TrySendError<MeshJob>> {
+        log::info!(
+            "[mesh] submit job chunk={:?} version={}",
+            job.coord,
+            job.version
+        );
         match self.tx.try_send(job) {
             Ok(()) => {
                 self.inflight += 1;
@@ -1509,6 +1518,10 @@ impl Renderer {
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
         while let Ok(result) = self.mesh_queue.try_recv() {
+            log::info!(
+                "[renderer] received mesh result chunk={:?}",
+                result.coord
+            );
             self.completed_meshes.push(result);
         }
 
