@@ -854,7 +854,7 @@ pub(crate) enum ChunkMeshArtifact {
         lod: u8,
         verts: Vec<Vertex>,
         inds: Vec<u32>,
-        indirect: DrawIndirectArgs,
+        gpu_draw_command: [u32; 5],
         aabb_min: Vec3,
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
@@ -886,7 +886,6 @@ impl ChunkMeshArtifact {
             Self::Gpu {
                 verts,
                 inds,
-                indirect,
                 aabb_min,
                 aabb_max,
                 chunk_origin_world,
@@ -894,7 +893,7 @@ impl ChunkMeshArtifact {
             } => (
                 verts,
                 inds,
-                *indirect,
+                DrawIndirectArgs::default(),
                 *aabb_min,
                 *aabb_max,
                 *chunk_origin_world,
@@ -1587,7 +1586,7 @@ impl Renderer {
                 readback_bytes,
                 aabb_min,
                 aabb_max,
-                indirect,
+                gpu_draw_command,
                 chunk_origin_world,
                 ..
             } = &result.artifact
@@ -1604,7 +1603,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: indirect.index_count,
+                        index_count: gpu_draw_command[0],
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
@@ -1619,7 +1618,7 @@ impl Renderer {
                     page_index.0 as u64 * indices_per_page * std::mem::size_of::<u32>() as u64;
                 let draw_offset = *draw_indirect_index as u64
                     * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-                let (verts, inds, indirect, ..) = result.artifact.geometry();
+                let (verts, inds, _indirect, ..) = result.artifact.geometry();
                 if !verts.is_empty() {
                     self.queue.write_buffer(
                         &self.global_gpu_vertex_buffer,
@@ -1634,17 +1633,10 @@ impl Renderer {
                         bytemuck::cast_slice(inds),
                     );
                 }
-                let indexed_indirect = DrawIndexedIndirectCommand {
-                    index_count: indirect.index_count,
-                    instance_count: indirect.instance_count,
-                    first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
-                    base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
-                    first_instance: 0,
-                };
                 self.queue.write_buffer(
                     &self.global_gpu_draw_indirect_buffer,
                     draw_offset,
-                    bytemuck::bytes_of(&indexed_indirect),
+                    bytemuck::cast_slice(gpu_draw_command),
                 );
                 continue;
             }
