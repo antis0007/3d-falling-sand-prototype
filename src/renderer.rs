@@ -865,12 +865,10 @@ pub(crate) enum ChunkMeshArtifact {
         lod: u8,
         verts: Vec<Vertex>,
         inds: Vec<u32>,
-        gpu_draw_command: [u32; 5],
         aabb_min: Vec3,
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
         dispatch_ms: f32,
-        readback_bytes: u64,
     },
     Skipped,
 }
@@ -1446,26 +1444,6 @@ impl Renderer {
 
         for job in urgent_jobs.drain(..) {
             let lod = job.lod;
-            let queued_at = job.queued_at;
-            if self.mesh_queue.inflight == 0 {
-                let artifact = build_mesh_artifact(self.mesh_backend, &job);
-                self.completed_meshes.push(MeshResult {
-                    coord: job.coord,
-                    lod,
-                    version: job.version,
-                    queued_at,
-                    artifact,
-                    urgent: true,
-                });
-                stats.mesh_count += 1;
-                match lod {
-                    ChunkLod::Near => stats.near_mesh_count += 1,
-                    ChunkLod::Mid => stats.mid_mesh_count += 1,
-                    ChunkLod::Far => stats.far_mesh_count += 1,
-                    ChunkLod::Ultra => stats.ultra_mesh_count += 1,
-                }
-                continue;
-            }
             match self.mesh_queue.try_submit(job) {
                 Ok(()) => {
                     stats.mesh_count += 1;
@@ -1477,22 +1455,8 @@ impl Renderer {
                     }
                 }
                 Err(TrySendError::Full(job)) => {
-                    let artifact = build_mesh_artifact(self.mesh_backend, &job);
-                    self.completed_meshes.push(MeshResult {
-                        coord: job.coord,
-                        lod,
-                        version: job.version,
-                        queued_at,
-                        artifact,
-                        urgent: job.urgent,
-                    });
-                    stats.mesh_count += 1;
-                    match lod {
-                        ChunkLod::Near => stats.near_mesh_count += 1,
-                        ChunkLod::Mid => stats.mid_mesh_count += 1,
-                        ChunkLod::Far => stats.far_mesh_count += 1,
-                        ChunkLod::Ultra => stats.ultra_mesh_count += 1,
-                    }
+                    self.enqueue_urgent_mesh_chunk(job.coord);
+                    break;
                 }
                 Err(TrySendError::Disconnected(_)) => break,
             }
@@ -1702,6 +1666,7 @@ impl Renderer {
         let uploaded = 0usize;
         let total_latency_ms = 0.0f32;
         let mut remesh_coords = Vec::new();
+        let mut skipped_coords = Vec::new();
         for result in self.completed_meshes.drain(..) {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
@@ -1715,6 +1680,7 @@ impl Renderer {
 
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
             if matches!(result.artifact, ChunkMeshArtifact::Skipped) {
+                skipped_coords.push(result.coord);
                 continue;
             }
 
@@ -1724,17 +1690,14 @@ impl Renderer {
                 draw_indirect_index,
                 lod,
                 dispatch_ms,
-                readback_bytes,
                 aabb_min,
                 aabb_max,
-                gpu_draw_command,
                 chunk_origin_world,
                 ..
             } = &result.artifact
             {
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
-                stats.gpu_readback_bytes += *readback_bytes;
                 self.visible_gpu_chunks.insert(
                     result.coord,
                     GpuChunkDraw {
@@ -1744,7 +1707,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: gpu_draw_command[0],
+                        index_count: 0,
                     },
                 );
                 self.mesh_versions.insert(result.coord, result.version);
@@ -1776,10 +1739,17 @@ impl Renderer {
                             bytemuck::cast_slice(inds),
                         );
                     }
+                    let draw_command = DrawIndexedIndirectCommand {
+                        index_count: inds.len() as u32,
+                        instance_count: 1,
+                        first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
+                        base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
+                        first_instance: 0,
+                    };
                     self.queue.write_buffer(
                         &self.global_gpu_draw_indirect_buffer,
                         draw_offset,
-                        bytemuck::cast_slice(gpu_draw_command),
+                        bytemuck::bytes_of(&draw_command),
                     );
                 }
                 continue;
@@ -1792,7 +1762,7 @@ impl Renderer {
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
-        for coord in remesh_coords {
+        for coord in skipped_coords.into_iter().chain(remesh_coords) {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
 
