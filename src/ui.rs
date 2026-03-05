@@ -36,6 +36,9 @@ pub struct ProfilerStats {
     pub mesh_upload_count: usize,
     pub mesh_upload_bytes: usize,
     pub mesh_upload_latency_ms: f32,
+    pub mesh_gpu_adopt_count: usize,
+    pub mesh_gpu_adopt_latency_ms: f32,
+    pub mesh_gpu_visible_count: usize,
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
@@ -693,10 +696,16 @@ pub fn draw(
                     ui_state.profiler.auto_tune_dirty_pressure,
                 ));
                 ui.monospace(format!(
-                    "mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
+                    "cpu mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
                     ui_state.profiler.mesh_upload_count,
                     ui_state.profiler.mesh_upload_bytes,
                     ui_state.profiler.mesh_upload_latency_ms,
+                ));
+                ui.monospace(format!(
+                    "gpu mesh adoption: {} chunks | avg adoption latency {:.2} ms | visible {}",
+                    ui_state.profiler.mesh_gpu_adopt_count,
+                    ui_state.profiler.mesh_gpu_adopt_latency_ms,
+                    ui_state.profiler.mesh_gpu_visible_count,
                 ));
                 });
 

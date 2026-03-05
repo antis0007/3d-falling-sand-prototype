@@ -581,6 +581,9 @@ pub struct MeshRebuildStats {
     pub ultra_mesh_count: usize,
     pub gpu_mesh_jobs: usize,
     pub gpu_dispatch_ms: f32,
+    pub gpu_mesh_adopted_count: usize,
+    pub gpu_mesh_adoption_latency_ms: f32,
+    pub gpu_mesh_visible_count: usize,
     pub gpu_job_failures: usize,
     pub gpu_job_timeouts: usize,
     pub gpu_job_skipped: usize,
@@ -1856,9 +1859,10 @@ impl Renderer {
             }
         }
 
-        let bytes_uploaded = 0usize;
-        let uploaded = 0usize;
-        let total_latency_ms = 0.0f32;
+        let mut bytes_uploaded = 0usize;
+        let mut uploaded = 0usize;
+        let mut total_latency_ms = 0.0f32;
+        let mut gpu_adoption_latency_ms_total = 0.0f32;
         let mut remesh_coords = Vec::new();
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_coords = Vec::new();
@@ -1930,12 +1934,16 @@ impl Renderer {
                     remesh_coords.push(result.coord);
                     continue;
                 }
+                let resolved_index_count = (*index_count).max(1);
+                let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
                 // For GPU meshing, the indirect draw buffer is authoritative.
                 // Do not infer metadata from the numeric value; GPU artifacts
                 // always carry no CPU-resolved index count.
-                let resolved_index_count = None;
+                // let resolved_index_count = None;
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
+                stats.gpu_mesh_adopted_count += 1;
+                gpu_adoption_latency_ms_total += adoption_latency_ms;
                 self.visible_gpu_chunks.insert(
                     result.coord,
                     GpuChunkDraw {
@@ -1951,6 +1959,7 @@ impl Renderer {
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
+                total_latency_ms += adoption_latency_ms;
 
                 #[cfg(feature = "legacy_gpu_artifact_upload")]
                 {
@@ -2118,6 +2127,9 @@ impl Renderer {
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
+                uploaded += 1;
+                bytes_uploaded += (vertex_bytes + index_bytes) as usize;
+                total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
                 continue;
             }
 
@@ -2147,10 +2159,14 @@ impl Renderer {
         } else {
             0.0
         };
+        stats.gpu_mesh_adoption_latency_ms = if stats.gpu_mesh_adopted_count > 0 {
+            gpu_adoption_latency_ms_total / stats.gpu_mesh_adopted_count as f32
+        } else {
+            0.0
+        };
         stats.allocator_bytes_allocated = 0;
         stats.allocator_bytes_reused = 0;
         stats.allocator_realloc_count = 0;
-        stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.dirty_backlog = self.dirty_queues.total_len();
         stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
         stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
@@ -2170,6 +2186,8 @@ impl Renderer {
             self.lod_selection.remove(&coord);
             self.pending_lod_remesh.remove(&coord);
         }
+        stats.mesh_cache_entries = self.visible_gpu_chunks.len();
+        stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
 
         let tracked_coords: Vec<ChunkCoord> = self.visible_gpu_chunks.keys().copied().collect();
         let mut lod_changes = Vec::new();
