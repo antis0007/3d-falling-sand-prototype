@@ -1,8 +1,17 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
 const EMPTY: u32 = 0u;
-const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME;
-const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME * 6u;
+const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME * 24u;
+const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u32 = CHUNK_VOLUME * 36u;
+const FACE_MASK_POS_X: u32 = 1u << 0u;
+const FACE_MASK_NEG_X: u32 = 1u << 1u;
+const FACE_MASK_POS_Y: u32 = 1u << 2u;
+const FACE_MASK_NEG_Y: u32 = 1u << 3u;
+const FACE_MASK_POS_Z: u32 = 1u << 4u;
+const FACE_MASK_NEG_Z: u32 = 1u << 5u;
+const MAX_FACES_PER_PAGE: u32 = min(GPU_MESH_VERTEX_CAPACITY_PER_PAGE / 4u, GPU_MESH_INDEX_CAPACITY_PER_PAGE / 6u);
+const SCAN_WORKGROUP_SIZE: u32 = 128u;
+const SCAN_VOXELS_PER_THREAD: u32 = CHUNK_VOLUME / SCAN_WORKGROUP_SIZE;
 
 struct FrameParams {
     page_index: u32,
@@ -45,6 +54,8 @@ struct ChunkMeshMeta {
 @group(0) @binding(6) var<storage, read> frame_params: array<FrameParams>;
 @group(0) @binding(7) var<storage, read_write> face_count: array<u32>;
 @group(0) @binding(8) var<storage, read_write> mesh_meta_buffer: array<ChunkMeshMeta>;
+
+var<workgroup> scan_chunk_offsets: array<u32, SCAN_WORKGROUP_SIZE>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
     return page * (CHUNK_VOLUME * 2u) + state * CHUNK_VOLUME;
@@ -144,7 +155,7 @@ fn write_face_quad(
     chunk_index_buffer[global_index_offset + 5u] = local_vertex_offset + 3u;
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(128)
 fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
     let voxel_idx = gid.x;
     if (voxel_idx >= CHUNK_VOLUME) { return; }
@@ -163,40 +174,64 @@ fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let p = vec3<i32>(unpack(voxel_idx));
-    var exposed_faces = 0u;
-    for (var d = 0u; d < 6u; d = d + 1u) {
-        if (voxel_at(src_off, p + neighbor_dir(d)) == EMPTY) {
-            exposed_faces = exposed_faces + 1u;
+    var mask = 0u;
+    if (voxel_at(src_off, p + neighbor_dir(0u)) == EMPTY) { mask = mask | FACE_MASK_POS_X; }
+    if (voxel_at(src_off, p + neighbor_dir(1u)) == EMPTY) { mask = mask | FACE_MASK_NEG_X; }
+    if (voxel_at(src_off, p + neighbor_dir(2u)) == EMPTY) { mask = mask | FACE_MASK_POS_Y; }
+    if (voxel_at(src_off, p + neighbor_dir(3u)) == EMPTY) { mask = mask | FACE_MASK_NEG_Y; }
+    if (voxel_at(src_off, p + neighbor_dir(4u)) == EMPTY) { mask = mask | FACE_MASK_POS_Z; }
+    if (voxel_at(src_off, p + neighbor_dir(5u)) == EMPTY) { mask = mask | FACE_MASK_NEG_Z; }
+    face_mask[voxel_idx] = mask;
+}
+
+@compute @workgroup_size(128)
+fn prefix_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let chunk_start = tid * SCAN_VOXELS_PER_THREAD;
+    let chunk_end = chunk_start + SCAN_VOXELS_PER_THREAD;
+
+    var local_sum = 0u;
+    for (var i = chunk_start; i < chunk_end; i = i + 1u) {
+        local_sum = local_sum + countOneBits(face_mask[i]);
+    }
+    scan_chunk_offsets[tid] = local_sum;
+    workgroupBarrier();
+
+    if (tid == 0u) {
+        var running = 0u;
+        for (var t = 0u; t < SCAN_WORKGROUP_SIZE; t = t + 1u) {
+            let chunk_faces = scan_chunk_offsets[t];
+            scan_chunk_offsets[t] = running;
+            running = running + chunk_faces;
         }
+        face_count[0u] = min(running, MAX_FACES_PER_PAGE);
     }
-    face_mask[voxel_idx] = exposed_faces;
+    workgroupBarrier();
+
+    var write_offset = scan_chunk_offsets[tid];
+    for (var i = chunk_start; i < chunk_end; i = i + 1u) {
+        face_offset[i] = write_offset;
+        write_offset = write_offset + countOneBits(face_mask[i]);
+    }
 }
 
-@compute @workgroup_size(64)
-fn prefix_scan(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x != 0u) { return; }
-
-    var running = 0u;
-    for (var i = 0u; i < CHUNK_VOLUME; i = i + 1u) {
-        face_offset[i] = running;
-        running = running + face_mask[i];
-    }
-    face_count[0u] = running;
-}
-
-@compute @workgroup_size(64)
+@compute @workgroup_size(128)
 fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     let voxel_idx = gid.x;
     if (voxel_idx >= CHUNK_VOLUME) { return; }
 
     let params = frame_params[0u];
-    let src_off = atlas_state_offset(params.page_index, (params.state_index + 1u) & 1u);
     if (voxel_idx >= params.voxel_count) { return; }
 
+    let page = params.page_index;
+    let src_off = atlas_state_offset(page, (params.state_index + 1u) & 1u);
     let id = atlas_voxels[src_off + voxel_idx];
     if (id == EMPTY) { return; }
 
-    let page = params.page_index;
+    let mask = face_mask[voxel_idx];
+    if (mask == 0u) { return; }
+
+    let total_faces = face_count[0u];
     let vertex_base = page * GPU_MESH_VERTEX_CAPACITY_PER_PAGE;
     let index_base = page * GPU_MESH_INDEX_CAPACITY_PER_PAGE;
     let p = vec3<i32>(unpack(voxel_idx));
@@ -204,8 +239,12 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var write_face = face_offset[voxel_idx];
     for (var d = 0u; d < 6u; d = d + 1u) {
-        if (voxel_at(src_off, p + neighbor_dir(d)) != EMPTY) {
+        let face_bit = 1u << d;
+        if ((mask & face_bit) == 0u) {
             continue;
+        }
+        if (write_face >= total_faces) {
+            break;
         }
 
         let local_vertex_offset = write_face * 4u;
@@ -222,7 +261,6 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if (voxel_idx == 0u) {
-        let total_faces = face_count[0u];
         draw_indirect_buffer[page].index_count = total_faces * 6u;
         draw_indirect_buffer[page].instance_count = 1u;
         draw_indirect_buffer[page].first_index = index_base;

@@ -27,9 +27,9 @@ const MAC_TOTAL_COUNT: usize = MAC_U_COUNT + MAC_V_COUNT + MAC_W_COUNT;
 #[cfg(feature = "gpu-compute")]
 pub(crate) const COMPUTE_STORAGE_BINDING_COUNT: u32 = 13;
 #[cfg(feature = "gpu-compute")]
-const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = CHUNK_VOLUME as u64;
+const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 24;
 #[cfg(feature = "gpu-compute")]
-const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 6;
+const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 36;
 
 #[cfg(feature = "gpu-compute")]
 const fn atlas_voxel_size_bytes() -> u64 {
@@ -889,7 +889,7 @@ impl GpuComputeRuntime {
             .queue
             .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&page_params));
 
-        let groups = (CHUNK_VOLUME as u32).div_ceil(64);
+        let groups = (CHUNK_VOLUME as u32).div_ceil(128);
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

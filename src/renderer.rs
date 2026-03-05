@@ -1341,8 +1341,10 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
         let page_capacity = gpu_page_capacity() as u64;
-        let verts_per_page = (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
-        let indices_per_page = verts_per_page * 6;
+        let verts_per_page =
+            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 24;
+        let indices_per_page =
+            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 36;
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
             size: page_capacity * verts_per_page * std::mem::size_of::<Vertex>() as u64,
@@ -1898,8 +1900,9 @@ impl Renderer {
                 #[cfg(feature = "legacy_gpu_artifact_upload")]
                 {
                     let verts_per_page =
-                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
-                    let indices_per_page = verts_per_page * 6;
+                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 24;
+                    let indices_per_page =
+                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 36;
                     let vertex_offset =
                         page_index.0 as u64 * verts_per_page * std::mem::size_of::<Vertex>() as u64;
                     let index_offset =
