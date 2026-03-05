@@ -962,10 +962,14 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
         MeshPipelineBackend::Gpu => match run_chunk_job_on_worker(job) {
             Ok(output) => output.mesh_artifact,
             Err(err) => ChunkMeshArtifact::Failed {
-                reason: format!("{err:#}"),
+                reason: format!("chunk={:?} lod={:?}: {err:#}", job.coord, job.lod),
             },
         },
     }
+}
+
+fn short_error_message(reason: &str) -> &str {
+    reason.lines().next().unwrap_or("unknown")
 }
 
 impl BackgroundMeshQueue {
@@ -995,7 +999,7 @@ impl BackgroundMeshQueue {
                             "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
                             job.coord,
                             job.lod,
-                            reason.lines().next().unwrap_or("unknown")
+                            short_error_message(reason)
                         );
                     }
                     let result = MeshResult {
@@ -1749,7 +1753,7 @@ impl Renderer {
                     "[mesh] dropping failed artifact chunk={:?} lod={:?} error={}",
                     result.coord,
                     result.lod,
-                    reason.lines().next().unwrap_or("unknown")
+                    short_error_message(reason)
                 );
                 retry_coords.push(result.coord);
                 continue;
