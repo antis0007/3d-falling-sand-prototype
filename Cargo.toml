@@ -10,6 +10,7 @@ gpu-compute = []
 legacy-world-sim = []
 cpu_meshing_debug = []
 gpu_meshing_experimental = []
+legacy_gpu_artifact_upload = []
 
 [dependencies]
 anyhow = "1"
