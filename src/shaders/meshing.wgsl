@@ -11,7 +11,7 @@ const FACE_MASK_POS_Z: u32 = 1u << 4u;
 const FACE_MASK_NEG_Z: u32 = 1u << 5u;
 const MAX_FACES_PER_PAGE: u32 = min(GPU_MESH_VERTEX_CAPACITY_PER_PAGE / 4u, GPU_MESH_INDEX_CAPACITY_PER_PAGE / 6u);
 const SCAN_WORKGROUP_SIZE: u32 = 128u;
-const SCAN_VOXELS_PER_THREAD: u32 = CHUNK_VOLUME / SCAN_WORKGROUP_SIZE;
+const SCAN_VOXELS_PER_THREAD: u32 = (CHUNK_VOLUME + SCAN_WORKGROUP_SIZE - 1u) / SCAN_WORKGROUP_SIZE;
 
 struct FrameParams {
     page_index: u32,
@@ -188,30 +188,57 @@ fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn prefix_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
     let tid = lid.x;
     let chunk_start = tid * SCAN_VOXELS_PER_THREAD;
-    let chunk_end = chunk_start + SCAN_VOXELS_PER_THREAD;
+    let chunk_end = min(chunk_start + SCAN_VOXELS_PER_THREAD, CHUNK_VOLUME);
 
     var local_sum = 0u;
     for (var i = chunk_start; i < chunk_end; i = i + 1u) {
-        local_sum = local_sum + countOneBits(face_mask[i]);
+        let local_mask = face_mask[i];
+        let local_faces = countOneBits(local_mask);
+        local_sum = local_sum + local_faces;
     }
     scan_chunk_offsets[tid] = local_sum;
     workgroupBarrier();
 
-    if (tid == 0u) {
-        var running = 0u;
-        for (var t = 0u; t < SCAN_WORKGROUP_SIZE; t = t + 1u) {
-            let chunk_faces = scan_chunk_offsets[t];
-            scan_chunk_offsets[t] = running;
-            running = running + chunk_faces;
+    // Blelloch upsweep
+    var offset = 1u;
+    for (var d = SCAN_WORKGROUP_SIZE >> 1u; d > 0u; d = d >> 1u) {
+        if (tid < d) {
+            let ai = offset * (2u * tid + 1u) - 1u;
+            let bi = offset * (2u * tid + 2u) - 1u;
+            scan_chunk_offsets[bi] = scan_chunk_offsets[bi] + scan_chunk_offsets[ai];
         }
-        face_count[0u] = min(running, MAX_FACES_PER_PAGE);
+        offset = offset << 1u;
+        workgroupBarrier();
+    }
+
+    if (tid == 0u) {
+        let total = scan_chunk_offsets[SCAN_WORKGROUP_SIZE - 1u];
+        face_count[0u] = min(total, MAX_FACES_PER_PAGE);
+        scan_chunk_offsets[SCAN_WORKGROUP_SIZE - 1u] = 0u;
     }
     workgroupBarrier();
 
+    // Blelloch downsweep
+    for (var d = 1u; d < SCAN_WORKGROUP_SIZE; d = d << 1u) {
+        offset = offset >> 1u;
+        if (tid < d) {
+            let ai = offset * (2u * tid + 1u) - 1u;
+            let bi = offset * (2u * tid + 2u) - 1u;
+            let t = scan_chunk_offsets[ai];
+            scan_chunk_offsets[ai] = scan_chunk_offsets[bi];
+            scan_chunk_offsets[bi] = scan_chunk_offsets[bi] + t;
+        }
+        workgroupBarrier();
+    }
+
     var write_offset = scan_chunk_offsets[tid];
     for (var i = chunk_start; i < chunk_end; i = i + 1u) {
-        face_offset[i] = write_offset;
-        write_offset = write_offset + countOneBits(face_mask[i]);
+        let clamped_write_offset = min(write_offset, MAX_FACES_PER_PAGE);
+        face_offset[i] = clamped_write_offset;
+
+        let local_mask = face_mask[i];
+        let local_faces = countOneBits(local_mask);
+        write_offset = min(write_offset + local_faces, MAX_FACES_PER_PAGE);
     }
 }
 
@@ -238,25 +265,41 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = vec3<f32>(vec3<u32>(p));
 
     var write_face = face_offset[voxel_idx];
-    for (var d = 0u; d < 6u; d = d + 1u) {
-        let face_bit = 1u << d;
-        if ((mask & face_bit) == 0u) {
-            continue;
-        }
-        if (write_face >= total_faces) {
-            break;
-        }
 
+    if ((mask & FACE_MASK_POS_X) != 0u && write_face < total_faces) {
         let local_vertex_offset = write_face * 4u;
         let local_index_offset = write_face * 6u;
-        write_face_quad(
-            d,
-            base,
-            id,
-            vertex_base + local_vertex_offset,
-            index_base + local_index_offset,
-            local_vertex_offset,
-        );
+        write_face_quad(0u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
+        write_face = write_face + 1u;
+    }
+    if ((mask & FACE_MASK_NEG_X) != 0u && write_face < total_faces) {
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(1u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
+        write_face = write_face + 1u;
+    }
+    if ((mask & FACE_MASK_POS_Y) != 0u && write_face < total_faces) {
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(2u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
+        write_face = write_face + 1u;
+    }
+    if ((mask & FACE_MASK_NEG_Y) != 0u && write_face < total_faces) {
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(3u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
+        write_face = write_face + 1u;
+    }
+    if ((mask & FACE_MASK_POS_Z) != 0u && write_face < total_faces) {
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(4u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
+        write_face = write_face + 1u;
+    }
+    if ((mask & FACE_MASK_NEG_Z) != 0u && write_face < total_faces) {
+        let local_vertex_offset = write_face * 4u;
+        let local_index_offset = write_face * 6u;
+        write_face_quad(5u, base, id, vertex_base + local_vertex_offset, index_base + local_index_offset, local_vertex_offset);
         write_face = write_face + 1u;
     }
 
