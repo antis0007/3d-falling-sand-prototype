@@ -248,7 +248,7 @@ impl ChunkPageAtlas {
                 let fence = self.page_fences.get(page).copied().unwrap_or_default();
                 fence.last_completed >= fence.last_submitted
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
@@ -1521,17 +1521,15 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         // GPU meshing path
         #[cfg(feature = "gpu_meshing_experimental")]
-        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = (
-            Vec::new(),
-            Vec::new(),
-            glam::Vec3::ZERO,
-            glam::Vec3::ZERO,
-            glam::Vec3::new(
+        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = {
+            let min = glam::Vec3::new(
                 job.coord.x as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
                 job.coord.y as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
                 job.coord.z as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
-            ),
-        );
+            );
+            let extent = glam::Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+            (Vec::new(), Vec::new(), min, min + extent, min)
+        };
 
         Ok(ComputedChunkArtifacts {
             simulation_diagnostics: diagnostics,
