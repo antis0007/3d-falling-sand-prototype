@@ -1971,12 +1971,8 @@ impl Renderer {
             }
         }
 
-        let job_priority = |coord: ChunkCoord| {
-            chunk_priority_scores
-                .get(&coord)
-                .copied()
-                .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
-        };
+        let job_priority =
+            |coord: ChunkCoord| urgent_job_priority(coord, player_chunk, chunk_priority_scores);
 
         let mut urgent_jobs = Vec::new();
         near_jobs.retain(|job| {
@@ -2008,8 +2004,18 @@ impl Renderer {
             true
         });
 
-        urgent_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
-        for job in urgent_jobs.drain(..) {
+        urgent_jobs.sort_by(|a, b| {
+            job_priority(a.coord)
+                .total_cmp(&job_priority(b.coord))
+                .then_with(|| {
+                    chunk_chebyshev_dist(player_chunk, b.coord)
+                        .cmp(&chunk_chebyshev_dist(player_chunk, a.coord))
+                })
+                .then_with(|| a.coord.x.cmp(&b.coord.x))
+                .then_with(|| a.coord.y.cmp(&b.coord.y))
+                .then_with(|| a.coord.z.cmp(&b.coord.z))
+        });
+        while let Some(job) = urgent_jobs.pop() {
             if self.inflight_mesh_chunks.contains(&job.coord) {
                 self.enqueue_urgent_mesh_chunk(job.coord);
                 continue;
@@ -3303,10 +3309,24 @@ fn dirty_coord_priority(
     player_chunk: ChunkCoord,
     chunk_priority_scores: &HashMap<ChunkCoord, f32>,
 ) -> f32 {
-    chunk_priority_scores
+    urgent_job_priority(coord, player_chunk, chunk_priority_scores)
+}
+
+fn urgent_job_priority(
+    coord: ChunkCoord,
+    player_chunk: ChunkCoord,
+    chunk_priority_scores: &HashMap<ChunkCoord, f32>,
+) -> f32 {
+    let fallback = 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32);
+    let priority = chunk_priority_scores
         .get(&coord)
         .copied()
-        .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
+        .unwrap_or(fallback);
+    if priority.is_finite() {
+        priority
+    } else {
+        fallback
+    }
 }
 
 fn build_chunk_snapshot(
@@ -4562,6 +4582,123 @@ mod tests {
         assert!(
             dirty_coord_priority(near, player, &scores)
                 > dirty_coord_priority(far, player, &scores)
+        );
+    }
+
+    #[test]
+    fn urgent_submission_prefers_higher_generation_priority() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let high = ChunkCoord { x: 12, y: 0, z: 0 };
+        let low = ChunkCoord { x: 1, y: 0, z: 0 };
+        let mut scores = HashMap::new();
+        scores.insert(high, 0.95);
+        scores.insert(low, 0.10);
+
+        let snapshot = build_chunk_snapshot(
+            &ChunkStore::new(),
+            coord(),
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+
+        let mut jobs = vec![
+            MeshJob {
+                coord: low,
+                lod: ChunkLod::Near,
+                version: 0,
+                queued_at: Instant::now(),
+                snapshot: snapshot.clone(),
+                greedy: false,
+                urgent: true,
+            },
+            MeshJob {
+                coord: high,
+                lod: ChunkLod::Near,
+                version: 0,
+                queued_at: Instant::now(),
+                snapshot: snapshot.clone(),
+                greedy: false,
+                urgent: true,
+            },
+        ];
+
+        jobs.sort_by(|a, b| {
+            urgent_job_priority(a.coord, player, &scores)
+                .total_cmp(&urgent_job_priority(b.coord, player, &scores))
+                .then_with(|| {
+                    chunk_chebyshev_dist(player, b.coord)
+                        .cmp(&chunk_chebyshev_dist(player, a.coord))
+                })
+                .then_with(|| a.coord.x.cmp(&b.coord.x))
+                .then_with(|| a.coord.y.cmp(&b.coord.y))
+                .then_with(|| a.coord.z.cmp(&b.coord.z))
+        });
+        jobs.reverse();
+
+        let order: Vec<ChunkCoord> = jobs.drain(..).map(|job| job.coord).collect();
+        assert_eq!(order, vec![high, low]);
+    }
+
+    #[test]
+    fn urgent_submission_tie_break_prefers_closer_chunks() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near = ChunkCoord { x: 1, y: 0, z: 0 };
+        let far = ChunkCoord { x: 4, y: 0, z: 0 };
+        let scores = HashMap::from([(near, 0.5), (far, 0.5)]);
+
+        let snapshot = build_chunk_snapshot(
+            &ChunkStore::new(),
+            coord(),
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+
+        let mut jobs = vec![
+            MeshJob {
+                coord: far,
+                lod: ChunkLod::Near,
+                version: 0,
+                queued_at: Instant::now(),
+                snapshot: snapshot.clone(),
+                greedy: false,
+                urgent: true,
+            },
+            MeshJob {
+                coord: near,
+                lod: ChunkLod::Near,
+                version: 0,
+                queued_at: Instant::now(),
+                snapshot: snapshot.clone(),
+                greedy: false,
+                urgent: true,
+            },
+        ];
+
+        jobs.sort_by(|a, b| {
+            urgent_job_priority(a.coord, player, &scores)
+                .total_cmp(&urgent_job_priority(b.coord, player, &scores))
+                .then_with(|| {
+                    chunk_chebyshev_dist(player, b.coord)
+                        .cmp(&chunk_chebyshev_dist(player, a.coord))
+                })
+                .then_with(|| a.coord.x.cmp(&b.coord.x))
+                .then_with(|| a.coord.y.cmp(&b.coord.y))
+                .then_with(|| a.coord.z.cmp(&b.coord.z))
+        });
+        jobs.reverse();
+
+        assert_eq!(jobs.drain(..).next().map(|job| job.coord), Some(near));
+    }
+
+    #[test]
+    fn urgent_priority_non_finite_scores_fall_back_to_distance() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near = ChunkCoord { x: 1, y: 0, z: 0 };
+        let far = ChunkCoord { x: 8, y: 0, z: 0 };
+        let mut scores = HashMap::new();
+        scores.insert(near, f32::NAN);
+        scores.insert(far, f32::NAN);
+
+        assert!(
+            urgent_job_priority(near, player, &scores) > urgent_job_priority(far, player, &scores)
         );
     }
 
