@@ -627,6 +627,7 @@ pub struct MeshRebuildStats {
     pub upload_bytes: usize,
     pub upload_latency_ms: f32,
     pub stale_drop_count: usize,
+    pub stale_drop_retry_enqueued: usize,
     pub age_drop_count: usize,
     pub pressure_drop_count: usize,
     pub dirty_queue_drop_count: usize,
@@ -747,6 +748,29 @@ struct MeshRetryState {
 enum MeshRetryKind {
     Failed,
     Skipped(MeshSkipReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleArtifactRetryPolicy {
+    Urgent,
+    Dirty,
+}
+
+fn stale_artifact_retry_policy(
+    result_version: u64,
+    voxel_version: u64,
+    lod: ChunkLod,
+    urgent: bool,
+) -> Option<StaleArtifactRetryPolicy> {
+    if result_version.saturating_add(1) >= voxel_version {
+        return None;
+    }
+
+    if urgent || matches!(lod, ChunkLod::Near | ChunkLod::Mid) {
+        Some(StaleArtifactRetryPolicy::Urgent)
+    } else {
+        Some(StaleArtifactRetryPolicy::Dirty)
+    }
 }
 
 const COMPLETED_MESH_BACKLOG_THRESHOLD: usize = 256;
@@ -2031,7 +2055,9 @@ impl Renderer {
                     stats.gpu_dispatch_ms += dispatch_start.elapsed().as_secs_f32() * 1000.0;
                 }
                 Err(err) => {
-                    log::warn!("[mesh] renderer-side gpu dispatch failed before mesh adoption: {err:#}");
+                    log::warn!(
+                        "[mesh] renderer-side gpu dispatch failed before mesh adoption: {err:#}"
+                    );
                 }
             }
         }
@@ -2099,12 +2125,21 @@ impl Renderer {
         for result in completed_results {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
-            // FIX 5: never upload stale geometry; requeue and skip this artifact.
-            if result.version.saturating_add(1) < voxel_version {
+            // Never upload stale geometry; schedule a retry and skip this artifact.
+            if let Some(retry_policy) = stale_artifact_retry_policy(
+                result.version,
+                voxel_version,
+                result.lod,
+                result.urgent,
+            ) {
                 stats.stale_drop_count += 1;
                 stats.mesh_artifacts_rejected += 1;
-                if voxel_version == result.version {
-                    remesh_coords.push(result.coord);
+                stats.stale_drop_retry_enqueued += 1;
+                match retry_policy {
+                    StaleArtifactRetryPolicy::Urgent => {
+                        self.enqueue_urgent_mesh_chunk(result.coord)
+                    }
+                    StaleArtifactRetryPolicy::Dirty => remesh_coords.push(result.coord),
                 }
                 continue;
             }
@@ -4534,6 +4569,33 @@ mod tests {
             .all(|x| *x >= 0.0 && *x <= CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE));
     }
 
+    #[test]
+    fn stale_artifacts_are_always_marked_for_retry() {
+        assert_eq!(
+            stale_artifact_retry_policy(2, 5, ChunkLod::Near, false),
+            Some(StaleArtifactRetryPolicy::Urgent)
+        );
+        assert_eq!(
+            stale_artifact_retry_policy(1, 4, ChunkLod::Far, false),
+            Some(StaleArtifactRetryPolicy::Dirty)
+        );
+        assert_eq!(
+            stale_artifact_retry_policy(3, 6, ChunkLod::Ultra, true),
+            Some(StaleArtifactRetryPolicy::Urgent)
+        );
+    }
+
+    #[test]
+    fn stale_retry_policy_allows_adoption_once_versions_catch_up() {
+        assert_eq!(
+            stale_artifact_retry_policy(4, 5, ChunkLod::Far, false),
+            None
+        );
+        assert_eq!(
+            stale_artifact_retry_policy(5, 5, ChunkLod::Far, false),
+            None
+        );
+    }
     #[test]
     fn adjacent_chunk_bounds_are_world_space_and_contiguous() {
         let store = ChunkStore::new();

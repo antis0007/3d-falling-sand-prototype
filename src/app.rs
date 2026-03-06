@@ -2119,6 +2119,8 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.gpu_compute_chunks_completed = 0;
                         ui.profiler.gpu_compute_chunks_per_sec = 0.0;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
+                        ui.profiler.mesh_stale_drop_retry_enqueued =
+                            mesh_stats.stale_drop_retry_enqueued;
                         ui.profiler.dirty_urgent_depth = mesh_stats.dirty_urgent_depth;
                         ui.profiler.dirty_near_depth = mesh_stats.dirty_near_depth;
                         ui.profiler.dirty_normal_depth = mesh_stats.dirty_normal_depth;
