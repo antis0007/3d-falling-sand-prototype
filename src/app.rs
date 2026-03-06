@@ -2085,9 +2085,9 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.evict_count = evict_count;
                         ui.profiler.mesh_ms = mesh_stats.total_ms;
                         ui.profiler.mesh_count = mesh_stats.mesh_count;
-                        let total_mesh_jobs = mesh_stats.mesh_count.max(1) as f32;
+                        let total_received = mesh_stats.mesh_artifacts_received.max(1) as f32;
                         ui.profiler.gpu_mesh_adoption_pct =
-                            (mesh_stats.gpu_mesh_jobs as f32 / total_mesh_jobs) * 100.0;
+                            (mesh_stats.gpu_mesh_adopted_count as f32 / total_received) * 100.0;
                         ui.profiler.cpu_meshing_ms = (mesh_stats.total_ms - mesh_stats.gpu_dispatch_ms).max(0.0);
                         ui.profiler.gpu_meshing_dispatch_ms = mesh_stats.gpu_dispatch_ms;
                         ui.profiler.gpu_readback_bytes_frame = mesh_stats.gpu_readback_bytes;

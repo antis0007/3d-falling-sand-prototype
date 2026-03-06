@@ -603,6 +603,8 @@ pub struct Renderer {
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
+    pending_gpu_results: HashMap<ChunkCoord, MeshResult>,
+    mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
     zero_index_retry_state: HashMap<ChunkCoord, ZeroIndexRetryState>,
@@ -731,6 +733,13 @@ pub struct MeshRebuildStats {
     pub resident_stale_cached: usize,
     pub resident_fallback: usize,
     pub resident_unknown: usize,
+    pub mesh_reject_no_longer_desired: usize,
+    pub mesh_slot_allocation_failures: usize,
+    pub mesh_pending_finalize: usize,
+    pub mesh_waiting_on_fence: usize,
+    pub mesh_dropped_before_drawable: usize,
+    pub mesh_last_good_retained: usize,
+    pub mesh_visible_logical_not_drawable: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1097,6 +1106,19 @@ struct MeshResult {
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeshLifecycleState {
+    Requested,
+    Meshing,
+    ResultReady,
+    AwaitingPage,
+    AwaitingFinalize,
+    Drawable,
+    Superseded,
+    Rejected,
+    Evicted,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1782,6 +1804,8 @@ impl Renderer {
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
             inflight_mesh_chunks: HashSet::new(),
+            pending_gpu_results: HashMap::new(),
+            mesh_lifecycle: HashMap::new(),
             mesh_retry_state: HashMap::new(),
             startup_mesh_seed_state: HashMap::new(),
             zero_index_retry_state: HashMap::new(),
@@ -2186,8 +2210,13 @@ impl Renderer {
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
+            self.mesh_lifecycle
+                .insert(result.coord, MeshLifecycleState::ResultReady);
             self.completed_meshes.push(result);
         }
+
+        self.completed_meshes
+            .extend(self.pending_gpu_results.drain().map(|(_, result)| result));
 
         self.completed_meshes.sort_by(|a, b| {
             job_priority(b.coord)
@@ -2245,7 +2274,34 @@ impl Renderer {
         let completed_results: Vec<MeshResult> = self.completed_meshes.drain(..).collect();
         for result in completed_results {
             stats.mesh_artifacts_received += 1;
+            let backend = Self::mesh_result_backend_label(&result);
+            let (index_count, vertex_count) = Self::mesh_result_index_vertex_counts(&result);
+            let desired = chunk_priority_scores.contains_key(&result.coord)
+                || self.visible_gpu_chunks.contains_key(&result.coord);
+            let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
             let voxel_version = store.chunk_voxel_version(result.coord);
+            log::debug!(
+                "[mesh-flow] recv chunk={:?} backend={} lod={:?} version={} store_version={} desired={} prior_mesh={} index_count={} vertex_count={}",
+                result.coord,
+                backend,
+                result.lod,
+                result.version,
+                voxel_version,
+                desired,
+                had_prior_mesh,
+                index_count,
+                vertex_count,
+            );
+            if !desired {
+                stats.mesh_artifacts_rejected += 1;
+                stats.mesh_reject_no_longer_desired += 1;
+                if had_prior_mesh {
+                    stats.mesh_last_good_retained += 1;
+                }
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::Rejected);
+                continue;
+            }
             // Never upload stale geometry; schedule a retry and skip this artifact.
             if let Some(retry_policy) = stale_artifact_retry_policy(
                 result.version,
@@ -2285,6 +2341,7 @@ impl Renderer {
 
                 if matches!(reason, MeshSkipReason::MeshSlotCapacitySaturated { .. }) {
                     stats.gpu_mesh_slot_alloc_failed += 1;
+                    stats.mesh_slot_allocation_failures += 1;
                     Self::record_rebuild_outcome(
                         &mut stats,
                         RebuildOutcome::SkippedNoArtifactCapacity,
@@ -2322,6 +2379,11 @@ impl Renderer {
                     self.sampled_outcome_trace(&result, outcome, None, None, None, None);
                 }
 
+                if had_prior_mesh {
+                    stats.mesh_last_good_retained += 1;
+                }
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::Rejected);
                 skipped_retry_chunks.push((result.coord, *reason));
                 continue;
             }
@@ -2339,6 +2401,11 @@ impl Renderer {
                 );
                 stats.mesh_artifacts_rejected += 1;
                 stats.mesh_reject_failed += 1;
+                if had_prior_mesh {
+                    stats.mesh_last_good_retained += 1;
+                }
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::Rejected);
                 failed_retry_coords.push(result.coord);
                 continue;
             }
@@ -2365,6 +2432,8 @@ impl Renderer {
                     );
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_invalid_page += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
                     Self::record_rebuild_outcome(
                         &mut stats,
                         RebuildOutcome::SkippedInvalidPageMapping,
@@ -2385,7 +2454,11 @@ impl Renderer {
                 if matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
                     && !gpu_page_ready_for_adoption(*page_index)
                 {
-                    self.completed_meshes.push(result);
+                    stats.mesh_waiting_on_fence += 1;
+                    stats.mesh_pending_finalize += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
+                    self.pending_gpu_results.insert(result.coord, result);
                     continue;
                 }
 
@@ -2404,6 +2477,8 @@ impl Renderer {
 
                     self.zero_index_retry_state.remove(&result.coord);
                     stats.mesh_artifacts_rejected += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
                     stats.mesh_reject_zero_index += 1;
                     let reason = if startup_zero_geometry {
                         let seed_state = self.mark_startup_seed_zero_seen(result.coord);
@@ -2498,6 +2573,8 @@ impl Renderer {
                 );
 
                 self.mesh_versions.insert(result.coord, result.version);
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::Drawable);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
                 Self::record_rebuild_outcome(&mut stats, RebuildOutcome::GpuAdopted);
@@ -2587,6 +2664,8 @@ impl Renderer {
                 );
 
                 self.mesh_versions.insert(result.coord, result.version);
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::Drawable);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
                 Self::record_rebuild_outcome(&mut stats, RebuildOutcome::CpuUploaded);
@@ -2613,7 +2692,12 @@ impl Renderer {
             );
             stats.mesh_artifacts_rejected += 1;
             stats.mesh_reject_unhandled += 1;
-            self.release_draw_slot_mapping(result.coord);
+            stats.mesh_dropped_before_drawable += 1;
+            if had_prior_mesh {
+                stats.mesh_last_good_retained += 1;
+            }
+            self.mesh_lifecycle
+                .insert(result.coord, MeshLifecycleState::Rejected);
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
@@ -2678,6 +2762,14 @@ impl Renderer {
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
         stats.flow_rejected = stats.mesh_artifacts_rejected;
+        stats.mesh_visible_logical_not_drawable = self
+            .mesh_lifecycle
+            .iter()
+            .filter(|(coord, state)| {
+                matches!(state, MeshLifecycleState::AwaitingFinalize)
+                    && !self.visible_gpu_chunks.contains_key(coord)
+            })
+            .count();
         for draw in self.visible_gpu_chunks.values() {
             match draw.draw_source {
                 DrawSource::GpuArtifact => stats.resident_gpu_artifact += 1,
@@ -2747,6 +2839,8 @@ impl Renderer {
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
         self.inflight_mesh_chunks.clear();
+        self.pending_gpu_results.clear();
+        self.mesh_lifecycle.clear();
         self.mesh_retry_state.clear();
         self.startup_mesh_seed_state.clear();
         self.zero_index_retry_state.clear();
@@ -2847,6 +2941,8 @@ impl Renderer {
             if !matches!(old.draw_source, DrawSource::GpuArtifact) {
                 self.free_mesh_slots.push(old.draw_indirect_index);
             }
+            self.mesh_lifecycle
+                .insert(coord, MeshLifecycleState::Evicted);
         }
     }
 
@@ -2855,9 +2951,32 @@ impl Renderer {
         if let Some(previous_coord) = self.visible_slots.insert(draw.draw_indirect_index, coord) {
             if previous_coord != coord {
                 self.release_draw_slot_mapping(previous_coord);
+                self.mesh_lifecycle
+                    .insert(previous_coord, MeshLifecycleState::Superseded);
             }
         }
         self.visible_gpu_chunks.insert(coord, draw);
+        self.mesh_lifecycle
+            .insert(coord, MeshLifecycleState::Drawable);
+    }
+
+    fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
+        match result.artifact {
+            ChunkMeshArtifact::Gpu { .. } => "gpu",
+            ChunkMeshArtifact::Cpu { .. } => "cpu",
+            ChunkMeshArtifact::Failed { .. } => "failed",
+            ChunkMeshArtifact::Skipped { .. } => "skipped",
+        }
+    }
+
+    fn mesh_result_index_vertex_counts(result: &MeshResult) -> (u32, u32) {
+        match &result.artifact {
+            ChunkMeshArtifact::Gpu {
+                index_count, verts, ..
+            } => (*index_count, verts.len() as u32),
+            ChunkMeshArtifact::Cpu { inds, verts, .. } => (inds.len() as u32, verts.len() as u32),
+            _ => (0, 0),
+        }
     }
 
     fn record_rebuild_outcome(stats: &mut MeshRebuildStats, outcome: RebuildOutcome) {
@@ -3000,6 +3119,8 @@ impl Renderer {
         match self.mesh_queue.try_submit(job) {
             Ok(()) => {
                 self.inflight_mesh_chunks.insert(coord);
+                self.mesh_lifecycle
+                    .insert(coord, MeshLifecycleState::Meshing);
                 stats.mesh_count += 1;
                 match lod {
                     ChunkLod::Near => stats.near_mesh_count += 1,
@@ -3026,6 +3147,8 @@ impl Renderer {
         if self.urgent_mesh_set.insert(coord) {
             self.urgent_mesh_queue.push_back(coord);
         }
+        self.mesh_lifecycle
+            .insert(coord, MeshLifecycleState::Requested);
         self.pending_lod_remesh.remove(&coord);
         self.dirty_queues.remove_coord(coord);
     }
@@ -3112,6 +3235,8 @@ impl Renderer {
         }
         let tier = Self::classify_dirty_tier(coord, player_chunk, chunk_priority_scores);
         self.dirty_queues.queue_coord(coord, tier);
+        self.mesh_lifecycle
+            .insert(coord, MeshLifecycleState::Requested);
     }
 
     fn enqueue_lod_remesh(
