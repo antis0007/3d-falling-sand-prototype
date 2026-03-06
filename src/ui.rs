@@ -39,6 +39,9 @@ pub struct ProfilerStats {
     pub mesh_gpu_adopt_count: usize,
     pub mesh_gpu_adopt_latency_ms: f32,
     pub mesh_gpu_visible_count: usize,
+    pub mesh_gpu_visible_slot_min: i32,
+    pub mesh_gpu_visible_slot_max: i32,
+    pub mesh_gpu_visible_slot_holes: usize,
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
@@ -706,6 +709,12 @@ pub fn draw(
                     ui_state.profiler.mesh_gpu_adopt_count,
                     ui_state.profiler.mesh_gpu_adopt_latency_ms,
                     ui_state.profiler.mesh_gpu_visible_count,
+                ));
+                ui.monospace(format!(
+                    "gpu indirect slots min/max/holes: {}/{}/{}",
+                    ui_state.profiler.mesh_gpu_visible_slot_min,
+                    ui_state.profiler.mesh_gpu_visible_slot_max,
+                    ui_state.profiler.mesh_gpu_visible_slot_holes,
                 ));
                 });
 
