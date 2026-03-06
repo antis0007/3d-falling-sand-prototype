@@ -19,7 +19,6 @@ struct GpuEdit {
 @group(0) @binding(6) var<uniform> params: FluidSimParams;
 @group(0) @binding(7) var<storage, read> edits: array<GpuEdit>;
 
-const EMPTY: u32 = 0u;
 
 fn in_range(i: u32) -> bool {
     return i < params.cell_count;

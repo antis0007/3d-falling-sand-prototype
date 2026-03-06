@@ -1,8 +1,6 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
 
-const EMPTY: u32 = 0u;
-
 const FACE_MASK_POS_X: u32 = 1u << 0u;
 const FACE_MASK_NEG_X: u32 = 1u << 1u;
 const FACE_MASK_POS_Y: u32 = 1u << 2u;
