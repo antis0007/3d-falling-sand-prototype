@@ -26,7 +26,7 @@ struct FrameParams {
 
 struct GpuVertex {
     position: vec3<f32>,
-    material_id: u32,
+    color: u32,
 };
 
 struct DrawIndexedIndirectArgs {
@@ -93,7 +93,7 @@ fn voxel_at(base_off: u32, p: vec3<i32>) -> u32 {
 fn write_face_quad(
     dir: u32,
     base: vec3<f32>,
-    material_id: u32,
+    color: u32,
     global_vertex_offset: u32,
     global_index_offset: u32,
 ) {
@@ -116,10 +116,10 @@ fn write_face_quad(
     let v2 = global_vertex_offset + 2u;
     let v3 = global_vertex_offset + 3u;
 
-    chunk_vertex_buffer[v0] = GpuVertex(c0, material_id);
-    chunk_vertex_buffer[v1] = GpuVertex(c1, material_id);
-    chunk_vertex_buffer[v2] = GpuVertex(c2, material_id);
-    chunk_vertex_buffer[v3] = GpuVertex(c3, material_id);
+    chunk_vertex_buffer[v0] = GpuVertex(c0, color);
+    chunk_vertex_buffer[v1] = GpuVertex(c1, color);
+    chunk_vertex_buffer[v2] = GpuVertex(c2, color);
+    chunk_vertex_buffer[v3] = GpuVertex(c3, color);
 
     chunk_index_buffer[global_index_offset + 0u] = v0;
     chunk_index_buffer[global_index_offset + 1u] = v1;
@@ -127,6 +127,41 @@ fn write_face_quad(
     chunk_index_buffer[global_index_offset + 3u] = v0;
     chunk_index_buffer[global_index_offset + 4u] = v2;
     chunk_index_buffer[global_index_offset + 5u] = v3;
+}
+
+fn pack_rgba8(r: u32, g: u32, b: u32, a: u32) -> u32 {
+    return (r & 0xffu) | ((g & 0xffu) << 8u) | ((b & 0xffu) << 16u) | ((a & 0xffu) << 24u);
+}
+
+fn material_color(material_id: u32) -> u32 {
+    // Match renderer::Vertex::desc location(1) = Unorm8x4 with visible alpha for solid voxels.
+    switch material_id {
+        case 1u: { return pack_rgba8(120u, 120u, 120u, 255u); } // Stone
+        case 2u: { return pack_rgba8(122u, 81u, 46u, 255u); } // Wood
+        case 3u: { return pack_rgba8(194u, 178u, 128u, 255u); } // Sand
+        case 4u: { return pack_rgba8(230u, 235u, 240u, 255u); } // Snow
+        case WATER: { return pack_rgba8(64u, 120u, 220u, 255u); }
+        case LAVA: { return pack_rgba8(230u, 100u, 30u, 255u); }
+        case ACID: { return pack_rgba8(60u, 220u, 90u, 255u); }
+        case SMOKE: { return pack_rgba8(120u, 120u, 120u, 255u); }
+        case STEAM: { return pack_rgba8(190u, 190u, 210u, 255u); }
+        case 10u: { return pack_rgba8(112u, 128u, 140u, 255u); } // Steel
+        case FIRE_GAS: { return pack_rgba8(255u, 155u, 72u, 255u); }
+        case TORCH: { return pack_rgba8(255u, 184u, 96u, 255u); }
+        case EMBER_HOT: { return pack_rgba8(255u, 105u, 38u, 255u); }
+        case EMBER_WARM: { return pack_rgba8(168u, 76u, 52u, 255u); }
+        case EMBER_ASH: { return pack_rgba8(90u, 84u, 84u, 255u); }
+        case DIRT: { return pack_rgba8(121u, 88u, 56u, 255u); }
+        case TURF: { return pack_rgba8(96u, 186u, 88u, 255u); }
+        case BUSH: { return pack_rgba8(74u, 156u, 70u, 255u); }
+        case GRASS: { return pack_rgba8(96u, 186u, 88u, 255u); }
+        case PLANT: { return pack_rgba8(94u, 186u, 72u, 255u); }
+        case WEED: { return pack_rgba8(78u, 146u, 62u, 255u); }
+        case TREE_SEED: { return pack_rgba8(142u, 92u, 52u, 255u); }
+        case LEAVES: { return pack_rgba8(70u, 156u, 66u, 255u); }
+        case DEAD_LEAF: { return pack_rgba8(170u, 114u, 60u, 255u); }
+        default: { return pack_rgba8(255u, 0u, 255u, 255u); }
+    }
 }
 
 @compute @workgroup_size(128)
@@ -250,7 +285,7 @@ fn emit_mesh(
         let vo = write_face * 4u;
         let io = write_face * 6u;
 
-        write_face_quad(dir, base, id, vertex_base + vo, index_base + io);
+        write_face_quad(dir, base, material_color(id), vertex_base + vo, index_base + io);
 
         write_face = write_face + 1u;
     }
