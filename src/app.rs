@@ -2107,6 +2107,13 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_flow_adopted = mesh_stats.flow_adopted;
                         ui.profiler.mesh_flow_uploaded = mesh_stats.flow_uploaded;
                         ui.profiler.mesh_flow_rejected = mesh_stats.flow_rejected;
+                        ui.profiler.mesh_pending_total = mesh_stats.mesh_pending_total;
+                        ui.profiler.mesh_pending_promoted_to_drawable =
+                            mesh_stats.mesh_pending_promoted_to_drawable;
+                        ui.profiler.mesh_pending_waiting_on_fence =
+                            mesh_stats.mesh_waiting_on_fence;
+                        ui.profiler.mesh_pending_superseded = mesh_stats.mesh_pending_superseded;
+                        ui.profiler.mesh_pending_rejected = mesh_stats.mesh_pending_rejected;
                         ui.profiler.mesh_reject_stale = mesh_stats.mesh_reject_stale;
                         ui.profiler.mesh_reject_invalid_page = mesh_stats.mesh_reject_invalid_page;
                         ui.profiler.mesh_reject_zero_index = mesh_stats.mesh_reject_zero_index;
