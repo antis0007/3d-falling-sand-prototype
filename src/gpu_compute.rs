@@ -669,6 +669,21 @@ pub struct ReadyGpuMeshResult {
 }
 
 #[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+pub enum ReadyGpuMeshFinalizeStatus {
+    ReadyAndValid,
+    DroppedStaleVersion,
+    DroppedInvalidMapping,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+pub struct ReadyGpuMeshFinalizeEvent {
+    pub result: ReadyGpuMeshResult,
+    pub status: ReadyGpuMeshFinalizeStatus,
+}
+
+#[cfg(feature = "gpu-compute")]
 #[derive(Clone)]
 pub struct GpuChunkTask {
     pub coord: ChunkCoord,
@@ -1772,7 +1787,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
 }
 
 #[cfg(feature = "gpu-compute")]
-pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshResult> {
+pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEvent> {
     let Some(Ok(state)) = WORKER_STATE
         .get()
         .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
@@ -1796,21 +1811,8 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshResult> {
             continue;
         };
 
-        if atlas.version_for_chunk.get(&coord).copied() != Some(pending.version) {
-            continue;
-        }
-        if atlas.page_for_chunk.get(&coord).copied() != Some(pending.page_index) {
-            continue;
-        }
-        let Some(mesh_slice) = atlas.mesh_slice_for_chunk.get(&coord).copied() else {
-            continue;
-        };
-        if mesh_slice.slot_index != pending.draw_indirect_index {
-            continue;
-        }
-
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(coord);
-        out.push(ReadyGpuMeshResult {
+        let result = ReadyGpuMeshResult {
             coord,
             version: pending.version,
             page_index: pending.page_index,
@@ -1819,6 +1821,32 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshResult> {
             aabb_min,
             aabb_max,
             chunk_origin_world,
+        };
+
+        if atlas.version_for_chunk.get(&coord).copied() != Some(pending.version) {
+            out.push(ReadyGpuMeshFinalizeEvent {
+                result,
+                status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
+            });
+            continue;
+        }
+        if atlas.page_for_chunk.get(&coord).copied() != Some(pending.page_index)
+            || atlas
+                .mesh_slice_for_chunk
+                .get(&coord)
+                .copied()
+                .map(|slice| slice.slot_index)
+                != Some(pending.draw_indirect_index)
+        {
+            out.push(ReadyGpuMeshFinalizeEvent {
+                result,
+                status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
+            });
+            continue;
+        }
+        out.push(ReadyGpuMeshFinalizeEvent {
+            result,
+            status: ReadyGpuMeshFinalizeStatus::ReadyAndValid,
         });
     }
     out
