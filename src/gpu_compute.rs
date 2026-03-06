@@ -1468,6 +1468,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         } else {
             raw_active_frontier_count
         };
+        let ran_simulation = active_frontier_count > 0 || !edit_commands.is_empty();
 
         let jacobi_iterations = if startup_seeding_mode {
             STARTUP_JACOBI_ITERATIONS
@@ -1497,7 +1498,11 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let diagnostics = ChunkSimulationDiagnostics::default();
 
-        let next_state = current_state ^ 1;
+        let next_state = if ran_simulation {
+            current_state ^ 1
+        } else {
+            current_state
+        };
 
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
@@ -1643,7 +1648,12 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
             active_frontier_count: task.frontier_count,
             simulation_tick: task.simulation_tick,
         };
-        let meshing_state = task.current_state ^ 1;
+        let ran_simulation = task.frontier_count > 0 || !task.edit_commands.is_empty();
+        let meshing_state = if ran_simulation {
+            task.current_state ^ 1
+        } else {
+            task.current_state
+        };
 
         // Ensure page initialization happens before compute passes
         if task.startup_seeding_mode {
