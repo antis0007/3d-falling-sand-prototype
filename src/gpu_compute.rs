@@ -1541,14 +1541,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         // GPU meshing path
         #[cfg(feature = "gpu_meshing_experimental")]
-        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) = {
-            let min = glam::Vec3::new(
-                job.coord.x as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
-                job.coord.y as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
-                job.coord.z as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
-            );
-            let extent = glam::Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
-            (Vec::new(), Vec::new(), min, min + extent, min)
+        let (estimated_index_count, aabb_min, aabb_max, chunk_origin_world) = {
+            // Keep renderer culling bounds and telemetry consistent with the
+            // same authoritative snapshot geometry contract used by CPU meshing.
+            let (_, inds, aabb_min, aabb_max, chunk_origin_world) =
+                mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
+            (inds.len() as u32, aabb_min, aabb_max, chunk_origin_world)
         };
 
         Ok(ComputedChunkArtifacts {
@@ -1560,12 +1558,13 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         ChunkMeshArtifact::Gpu {
                             page_index,
                             draw_indirect_index: mesh_slice.slot_index,
-                            // Completion token for non-blocking renderer adoption.
-                            // Real draw args are still sourced from the GPU indirect buffer.
-                            index_count: 1,
+                            // Renderer/UI telemetry consumes this value. Derive it
+                            // from authoritative snapshot meshing instead of a
+                            // placeholder token to avoid "indices == chunks" stats.
+                            index_count: estimated_index_count,
                             lod: job.lod as u8,
-                            verts,
-                            inds,
+                            verts: Vec::new(),
+                            inds: Vec::new(),
                             aabb_min,
                             aabb_max,
                             chunk_origin_world,

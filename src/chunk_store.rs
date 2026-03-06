@@ -432,46 +432,55 @@ impl ChunkStore {
             .or_insert_with(DirtyVoxelSet::with_capacity)
             .activate(idx);
         self.dirty_chunks.insert(chunk_coord);
+        self.urgent_dirty_chunks.insert(chunk_coord);
         self.modified_chunks.insert(chunk_coord);
+        log::trace!(
+            "[dirty] voxel edit chunk={:?} local=({}, {}, {}) material={}",
+            chunk_coord,
+            x,
+            y,
+            z,
+            material
+        );
 
         let last = (CHUNK_SIZE_VOXELS - 1) as usize;
         if x == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x - 1,
                 y: chunk_coord.y,
                 z: chunk_coord.z,
             });
         }
         if x == last {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x + 1,
                 y: chunk_coord.y,
                 z: chunk_coord.z,
             });
         }
         if y == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x,
                 y: chunk_coord.y - 1,
                 z: chunk_coord.z,
             });
         }
         if y == last {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x,
                 y: chunk_coord.y + 1,
                 z: chunk_coord.z,
             });
         }
         if z == 0 {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x,
                 y: chunk_coord.y,
                 z: chunk_coord.z - 1,
             });
         }
         if z == last {
-            self.mark_neighbor_dirty(ChunkCoord {
+            self.mark_neighbor_dirty_urgent(ChunkCoord {
                 x: chunk_coord.x,
                 y: chunk_coord.y,
                 z: chunk_coord.z + 1,
@@ -760,8 +769,20 @@ impl ChunkStore {
     }
 
     fn mark_neighbor_dirty(&mut self, coord: ChunkCoord) {
+        self.mark_neighbor_dirty_with_priority(coord, false);
+    }
+
+    fn mark_neighbor_dirty_urgent(&mut self, coord: ChunkCoord) {
+        self.mark_neighbor_dirty_with_priority(coord, true);
+    }
+
+    fn mark_neighbor_dirty_with_priority(&mut self, coord: ChunkCoord, urgent: bool) {
         if self.chunk_exists(coord) {
             self.dirty_chunks.insert(coord);
+            if urgent {
+                self.urgent_dirty_chunks.insert(coord);
+            }
+            log::trace!("[dirty] neighbor chunk={:?} urgent={}", coord, urgent);
         } else {
             self.deferred_dirty_on_load.insert(coord);
         }

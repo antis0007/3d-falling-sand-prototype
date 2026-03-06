@@ -3,8 +3,8 @@
 //! - **Authoritative input:** meshing consumes a [`ChunkSnapshot`] built from
 //!   [`ChunkStore`] via `build_chunk_snapshot`, so workers never read mutable
 //!   world state directly.
-//! - **Vertex coordinate space:** GPU meshing emits **world-space** vertex
-//!   positions in meters (scaled by [`VOXEL_SIZE`]).
+//! - **Vertex coordinate space:** both CPU and GPU meshing emit
+//!   **world-space** vertex positions in meters (scaled by [`VOXEL_SIZE`]).
 //! - **Chunk transform ownership:** chunk origins are authored in world space
 //!   and consumed by the meshing compute shader via `chunk_origin_buffer`.
 //! - **Floating-origin contract:** renderer APIs accept **world-space camera
@@ -580,6 +580,7 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
+    visible_slots: HashMap<u32, ChunkCoord>,
     free_mesh_slots: Vec<u32>,
     global_gpu_vertex_buffer: Arc<wgpu::Buffer>,
     global_gpu_index_buffer: Arc<wgpu::Buffer>,
@@ -1759,6 +1760,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             visible_gpu_chunks: HashMap::new(),
+            visible_slots: HashMap::new(),
             free_mesh_slots: (0..mesh_pool_slot_capacity() as u32).collect(),
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
@@ -1831,6 +1833,9 @@ impl Renderer {
         let world_camera_pos = camera_world_position(camera);
         let mut stats = CullStats::default();
         for (&coord, draw) in &self.visible_gpu_chunks {
+            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+                continue;
+            }
             let selected_lod = self
                 .lod_selection
                 .get(&coord)
@@ -2476,7 +2481,7 @@ impl Renderer {
 
                 let slot = *draw_indirect_index;
 
-                self.visible_gpu_chunks.insert(
+                self.adopt_visible_chunk_draw(
                     result.coord,
                     GpuChunkDraw {
                         page_index: *page_index,
@@ -2567,7 +2572,7 @@ impl Renderer {
                     bytemuck::bytes_of(&draw_command),
                 );
 
-                self.visible_gpu_chunks.insert(
+                self.adopt_visible_chunk_draw(
                     result.coord,
                     GpuChunkDraw {
                         page_index: GpuPageIndex(slot),
@@ -2608,7 +2613,7 @@ impl Renderer {
             );
             stats.mesh_artifacts_rejected += 1;
             stats.mesh_reject_unhandled += 1;
-            self.visible_gpu_chunks.remove(&result.coord);
+            self.release_draw_slot_mapping(result.coord);
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
@@ -2655,9 +2660,7 @@ impl Renderer {
         }
 
         for coord in drop_keys {
-            if let Some(old) = self.visible_gpu_chunks.remove(&coord) {
-                self.free_mesh_slots.push(old.draw_indirect_index);
-            }
+            self.release_draw_slot_mapping(coord);
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
@@ -2684,18 +2687,18 @@ impl Renderer {
                 DrawSource::Unknown => stats.resident_unknown += 1,
             }
         }
-        if self.visible_gpu_chunks.is_empty() {
+        if self.visible_slots.is_empty() {
             stats.gpu_mesh_visible_slot_min = -1;
             stats.gpu_mesh_visible_slot_max = -1;
             stats.gpu_mesh_visible_slot_holes = 0;
         } else {
             let mut min_slot = u32::MAX;
             let mut max_slot = 0u32;
-            for draw in self.visible_gpu_chunks.values() {
-                min_slot = min_slot.min(draw.draw_indirect_index);
-                max_slot = max_slot.max(draw.draw_indirect_index);
+            for slot in self.visible_slots.keys().copied() {
+                min_slot = min_slot.min(slot);
+                max_slot = max_slot.max(slot);
             }
-            let occupied = self.visible_gpu_chunks.len();
+            let occupied = self.visible_slots.len();
             let span = (max_slot - min_slot + 1) as usize;
             stats.gpu_mesh_visible_slot_min = min_slot as i32;
             stats.gpu_mesh_visible_slot_max = max_slot as i32;
@@ -2725,6 +2728,7 @@ impl Renderer {
 
     pub fn clear_mesh_cache(&mut self) {
         self.visible_gpu_chunks.clear();
+        self.visible_slots.clear();
         self.free_mesh_slots.clear();
         self.free_mesh_slots.extend(0..mesh_pool_slot_capacity());
         self.dirty_queues.clear();
@@ -2752,7 +2756,10 @@ impl Renderer {
         // Keep frustum checks in world space; use GPU mesh metadata.
         let vp_world = camera.view_proj();
         let mut stats = MeshDrawStats::default();
-        for draw in self.visible_gpu_chunks.values() {
+        for (&coord, draw) in &self.visible_gpu_chunks {
+            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+                continue;
+            }
             if aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max) {
                 stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
             }
@@ -2802,8 +2809,12 @@ impl Renderer {
             );
             let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
             let mut draw_stats = MeshDrawStats::default();
+            let mut drawn_slots = HashSet::with_capacity(self.visible_slots.len());
             if self.supports_multi_draw_indirect {
                 for draw in self.visible_gpu_chunks.values() {
+                    if !drawn_slots.insert(draw.draw_indirect_index) {
+                        continue;
+                    }
                     draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
                     pass.draw_indexed_indirect(
                         &self.global_gpu_draw_indirect_buffer,
@@ -2812,6 +2823,9 @@ impl Renderer {
                 }
             } else {
                 for draw in self.visible_gpu_chunks.values() {
+                    if !drawn_slots.insert(draw.draw_indirect_index) {
+                        continue;
+                    }
                     draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
                     pass.draw_indexed_indirect(
                         &self.global_gpu_draw_indirect_buffer,
@@ -2825,6 +2839,27 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn release_draw_slot_mapping(&mut self, coord: ChunkCoord) {
+        if let Some(old) = self.visible_gpu_chunks.remove(&coord) {
+            if self.visible_slots.get(&old.draw_indirect_index) == Some(&coord) {
+                self.visible_slots.remove(&old.draw_indirect_index);
+            }
+            if !matches!(old.draw_source, DrawSource::GpuArtifact) {
+                self.free_mesh_slots.push(old.draw_indirect_index);
+            }
+        }
+    }
+
+    fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) {
+        self.release_draw_slot_mapping(coord);
+        if let Some(previous_coord) = self.visible_slots.insert(draw.draw_indirect_index, coord) {
+            if previous_coord != coord {
+                self.release_draw_slot_mapping(previous_coord);
+            }
+        }
+        self.visible_gpu_chunks.insert(coord, draw);
+    }
+
     fn record_rebuild_outcome(stats: &mut MeshRebuildStats, outcome: RebuildOutcome) {
         match outcome {
             RebuildOutcome::GpuAdopted => stats.outcome_gpu_adopted += 1,
