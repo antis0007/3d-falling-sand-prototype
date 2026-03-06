@@ -569,7 +569,6 @@ impl ChunkStreaming {
 
         let try_schedule = |streaming: &mut Self, coord: ChunkCoord| -> bool {
             let lifecycle = streaming.chunk_lifecycle.entry(coord).or_default();
-            lifecycle.last_visible_frame = frame_index;
 
             if streaming.resident.contains(&coord)
                 || streaming.dispatched_generate.contains(&coord)
@@ -872,6 +871,22 @@ impl ChunkStreaming {
         self.clear();
     }
 
+    pub fn mark_visible(&mut self, coord: ChunkCoord, frame_index: u64) {
+        self.chunk_lifecycle
+            .entry(coord)
+            .or_default()
+            .last_visible_frame = frame_index;
+    }
+
+    pub fn mark_visible_batch<I>(&mut self, coords: I, frame_index: u64)
+    where
+        I: IntoIterator<Item = ChunkCoord>,
+    {
+        for coord in coords {
+            self.mark_visible(coord, frame_index);
+        }
+    }
+
     pub fn last_visible_frames(&self) -> HashMap<ChunkCoord, u64> {
         self.chunk_lifecycle
             .iter()
@@ -1155,6 +1170,26 @@ mod tests {
 
         assert!(streaming.scheduled_generate.contains(&coord));
         assert_eq!(streaming.next_generation_job(), Some(coord));
+    }
+
+    #[test]
+    fn recently_visible_chunk_lingers_before_eviction_when_not_desired() {
+        let mut streaming = ChunkStreaming::new(1);
+        let c = ChunkCoord { x: 2, y: 0, z: 0 };
+        streaming.eviction_linger_frames = 0;
+        streaming.boundary_eviction_linger_frames = 5;
+        streaming.max_evict_schedule_per_update = 8;
+        streaming.resident.insert(c);
+
+        streaming.mark_visible(c, 10);
+
+        streaming.update(&[], &HashSet::new(), c, 11);
+        streaming.update(&[], &HashSet::new(), c, 12);
+        streaming.update(&[], &HashSet::new(), c, 14);
+        assert_eq!(streaming.pending_evict_count(), 0);
+
+        streaming.update(&[], &HashSet::new(), c, 16);
+        assert_eq!(streaming.pending_evict_count(), 1);
     }
 
     #[test]

@@ -1885,6 +1885,47 @@ impl Renderer {
         stats
     }
 
+    pub fn cull_visible_chunks(&self, camera: &Camera) -> Vec<ChunkCoord> {
+        let vp_world = camera.view_proj();
+        let world_camera_pos = camera_world_position(camera);
+        let mut visible = Vec::new();
+        for (&coord, draw) in &self.visible_gpu_chunks {
+            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+                continue;
+            }
+            let selected_lod = self
+                .lod_selection
+                .get(&coord)
+                .copied()
+                .unwrap_or(ChunkLod::Near);
+            let draw_lod = match draw.lod {
+                0 => ChunkLod::Near,
+                1 => ChunkLod::Mid,
+                2 => ChunkLod::Far,
+                _ => ChunkLod::Ultra,
+            };
+            if draw_lod != selected_lod {
+                continue;
+            }
+            if self.settings.frustum_culling
+                && !aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max)
+            {
+                continue;
+            }
+            if !passes_screen_space_cull(
+                world_camera_pos,
+                draw_lod,
+                draw.world_aabb_min,
+                draw.world_aabb_max,
+                self.size.height,
+            ) {
+                continue;
+            }
+            visible.push(coord);
+        }
+        visible
+    }
+
     /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
     ///
     /// IMPORTANT: This relies on `store.take_dirty_chunks()` returning + clearing the store's dirty set.
