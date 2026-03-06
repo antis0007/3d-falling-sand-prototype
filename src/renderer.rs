@@ -604,6 +604,8 @@ pub struct Renderer {
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     pending_gpu_results: HashMap<(ChunkCoord, u64), PendingGpuMeshResult>,
+    terminal_superseded_total: usize,
+    terminal_evicted_total: usize,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
@@ -738,6 +740,12 @@ pub struct MeshRebuildStats {
     pub mesh_pending_finalize: usize,
     pub mesh_pending_promoted_to_drawable: usize,
     pub mesh_waiting_on_fence: usize,
+    pub drawable_resident_total: usize,
+    pub newly_drawable_this_frame: usize,
+    pub pending_finalize_total: usize,
+    pub waiting_on_fence_total: usize,
+    pub terminal_superseded_total: usize,
+    pub terminal_evicted_total: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
     pub mesh_dropped_before_drawable: usize,
@@ -1101,6 +1109,7 @@ struct MeshResult {
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
+    from_pending_finalize: bool,
 }
 
 struct PendingGpuMeshResult {
@@ -1368,6 +1377,7 @@ impl BackgroundMeshQueue {
                         queued_at: job.queued_at,
                         artifact,
                         urgent: job.urgent,
+                        from_pending_finalize: false,
                     };
                     log::info!("[mesh-worker] sending result chunk={:?}", result.coord);
                     if worker_tx.send(result).is_err() {
@@ -1824,6 +1834,8 @@ impl Renderer {
             pending_lod_remesh: HashSet::new(),
             inflight_mesh_chunks: HashSet::new(),
             pending_gpu_results: HashMap::new(),
+            terminal_superseded_total: 0,
+            terminal_evicted_total: 0,
             mesh_lifecycle: HashMap::new(),
             mesh_retry_state: HashMap::new(),
             startup_mesh_seed_state: HashMap::new(),
@@ -1869,8 +1881,15 @@ impl Renderer {
         self.origin_voxel = new_origin;
     }
 
-    fn draw_is_current_owner(&self, coord: ChunkCoord, draw: &GpuChunkDraw) -> bool {
-        self.visible_slots.get(&draw.draw_indirect_index) == Some(&coord)
+    fn draw_slot_is_owned_or_free(&self, coord: ChunkCoord, draw: &GpuChunkDraw) -> bool {
+        match self.visible_slots.get(&draw.draw_indirect_index).copied() {
+            None => true,
+            Some(owner) => owner == coord,
+        }
+    }
+
+    fn draw_meets_resident_invariant(&self, coord: ChunkCoord, draw: &GpuChunkDraw) -> bool {
+        self.draw_slot_is_owned_or_free(coord, draw) && draw_is_drawable(draw)
     }
 
     fn should_render_draw(
@@ -1897,7 +1916,7 @@ impl Renderer {
         };
         let mut stats = CullStats::default();
         for (&coord, draw) in &self.visible_gpu_chunks {
-            if !self.draw_is_current_owner(coord, draw) {
+            if !self.draw_meets_resident_invariant(coord, draw) {
                 continue;
             }
             let selected_lod = self
@@ -2509,15 +2528,14 @@ impl Renderer {
                 stats.mesh_pending_finalize += 1;
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
-                self.pending_gpu_results
-                    .insert(
-                        (result.coord, result.version),
-                        PendingGpuMeshResult {
-                            result,
-                            first_seen_frame: self.mesh_rebuild_frame_index,
-                            first_seen_completed_index: completed_index,
-                        },
-                    );
+                self.pending_gpu_results.insert(
+                    (result.coord, result.version),
+                    PendingGpuMeshResult {
+                        result,
+                        first_seen_frame: self.mesh_rebuild_frame_index,
+                        first_seen_completed_index: completed_index,
+                    },
+                );
                 continue;
             }
 
@@ -2623,7 +2641,7 @@ impl Renderer {
 
                 let slot = *draw_indirect_index;
 
-                self.adopt_visible_chunk_draw(
+                let adopted = self.adopt_visible_chunk_draw(
                     result.coord,
                     GpuChunkDraw {
                         page_index: *page_index,
@@ -2636,11 +2654,22 @@ impl Renderer {
                         index_count: Some(resolved_index_count),
                     },
                 );
+                if !adopted {
+                    stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_unhandled += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
+                    skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
+                    continue;
+                }
 
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Drawable);
                 self.mesh_retry_state.remove(&result.coord);
+                if result.from_pending_finalize {
+                    pending_promoted_to_drawable += 1;
+                }
                 store.mark_chunk_meshed(result.coord);
                 Self::record_rebuild_outcome(&mut stats, RebuildOutcome::GpuAdopted);
                 self.sampled_outcome_trace(
@@ -2714,7 +2743,7 @@ impl Renderer {
                     bytemuck::bytes_of(&draw_command),
                 );
 
-                self.adopt_visible_chunk_draw(
+                let adopted = self.adopt_visible_chunk_draw(
                     result.coord,
                     GpuChunkDraw {
                         page_index: GpuPageIndex(slot),
@@ -2727,6 +2756,15 @@ impl Renderer {
                         index_count: Some(resolved_index_count),
                     },
                 );
+                if !adopted {
+                    self.free_mesh_slots.push(slot);
+                    stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_unhandled += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
+                    skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
+                    continue;
+                }
 
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_lifecycle
@@ -2857,6 +2895,12 @@ impl Renderer {
         stats.mesh_pending_promoted_to_drawable = pending_promoted_to_drawable;
         stats.mesh_pending_superseded = pending_superseded;
         stats.mesh_pending_rejected = pending_rejected;
+        stats.drawable_resident_total = self.visible_gpu_chunks.len();
+        stats.newly_drawable_this_frame = pending_promoted_to_drawable;
+        stats.pending_finalize_total = self.pending_gpu_results.len();
+        stats.waiting_on_fence_total = stats.mesh_waiting_on_fence;
+        stats.terminal_superseded_total = self.terminal_superseded_total;
+        stats.terminal_evicted_total = self.terminal_evicted_total;
 
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
@@ -2940,6 +2984,8 @@ impl Renderer {
         self.pending_lod_remesh.clear();
         self.inflight_mesh_chunks.clear();
         self.pending_gpu_results.clear();
+        self.terminal_superseded_total = 0;
+        self.terminal_evicted_total = 0;
         self.mesh_lifecycle.clear();
         self.mesh_retry_state.clear();
         self.startup_mesh_seed_state.clear();
@@ -2950,7 +2996,7 @@ impl Renderer {
         let vp_world = camera.view_proj();
         let mut stats = MeshDrawStats::default();
         for (&coord, draw) in &self.visible_gpu_chunks {
-            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+            if !self.draw_meets_resident_invariant(coord, draw) {
                 continue;
             }
             if aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max) {
@@ -3041,6 +3087,7 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
+                pending.result.from_pending_finalize = true;
                 pending.result.artifact = ChunkMeshArtifact::GpuReady {
                     page_index: ready.result.page_index,
                     draw_indirect_index: ready.result.draw_indirect_index,
@@ -3056,6 +3103,7 @@ impl Renderer {
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
+                self.terminal_superseded_total += 1;
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
                 self.mesh_lifecycle
@@ -3074,21 +3122,27 @@ impl Renderer {
             }
             self.mesh_lifecycle
                 .insert(coord, MeshLifecycleState::Evicted);
+            self.terminal_evicted_total += 1;
         }
     }
 
-    fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) {
+    fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) -> bool {
+        if !self.draw_meets_resident_invariant(coord, &draw) {
+            return false;
+        }
         self.release_draw_slot_mapping(coord);
         if let Some(previous_coord) = self.visible_slots.insert(draw.draw_indirect_index, coord) {
             if previous_coord != coord {
                 self.release_draw_slot_mapping(previous_coord);
                 self.mesh_lifecycle
                     .insert(previous_coord, MeshLifecycleState::Superseded);
+                self.terminal_superseded_total += 1;
             }
         }
         self.visible_gpu_chunks.insert(coord, draw);
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
+        true
     }
 
     fn read_draw_indexed_indirect_command(
