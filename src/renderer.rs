@@ -14,9 +14,9 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
-    dispatch_gpu_chunk_tasks_on_renderer, gpu_page_ready_for_adoption,
-    initialize_gpu_compute_worker, run_chunk_job_on_worker, update_gpu_page_fences_on_renderer,
-    DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend, SharedMeshBuffers,
+    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
+    take_ready_gpu_mesh_results_on_renderer, update_gpu_page_fences_on_renderer, DrawIndirectArgs,
+    GpuComputeRuntime, MeshPipelineBackend, SharedMeshBuffers,
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
@@ -1169,13 +1169,19 @@ pub(crate) enum ChunkMeshArtifact {
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
     },
-    Gpu {
+    GpuPending {
         page_index: GpuPageIndex,
         draw_indirect_index: u32,
-        index_count: u32,
         lod: u8,
-        verts: Vec<Vertex>,
-        inds: Vec<u32>,
+        aabb_min: Vec3,
+        aabb_max: Vec3,
+        chunk_origin_world: Vec3,
+    },
+    GpuReady {
+        page_index: GpuPageIndex,
+        draw_indirect_index: u32,
+        lod: u8,
+        index_count: u32,
         aabb_min: Vec3,
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
@@ -1224,16 +1230,20 @@ impl ChunkMeshArtifact {
                 *aabb_max,
                 *chunk_origin_world,
             ),
-            Self::Gpu {
-                verts,
-                inds,
+            Self::GpuPending {
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+                ..
+            }
+            | Self::GpuReady {
                 aabb_min,
                 aabb_max,
                 chunk_origin_world,
                 ..
             } => (
-                verts,
-                inds,
+                &[],
+                &[],
                 DrawIndirectArgs::default(),
                 *aabb_min,
                 *aabb_max,
@@ -2254,8 +2264,27 @@ impl Renderer {
             self.completed_meshes.push(result);
         }
 
-        self.completed_meshes
-            .extend(self.pending_gpu_results.drain().map(|(_, result)| result));
+        #[cfg(feature = "gpu-compute")]
+        if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+            for ready in take_ready_gpu_mesh_results_on_renderer() {
+                if let Some(mut pending) = self.pending_gpu_results.remove(&ready.coord) {
+                    if pending.version != ready.version {
+                        continue;
+                    }
+                    pending.artifact = ChunkMeshArtifact::GpuReady {
+                        page_index: ready.page_index,
+                        draw_indirect_index: ready.draw_indirect_index,
+                        lod: ready.lod,
+                        index_count: 0,
+                        aabb_min: ready.aabb_min,
+                        aabb_max: ready.aabb_max,
+                        chunk_origin_world: ready.chunk_origin_world,
+                        dispatch_ms: 0.0,
+                    };
+                    self.completed_meshes.push(pending);
+                }
+            }
+        }
 
         self.completed_meshes.sort_by(|a, b| {
             job_priority(b.coord)
@@ -2441,9 +2470,15 @@ impl Renderer {
                 failed_retry_coords.push(result.coord);
                 continue;
             }
+            if let ChunkMeshArtifact::GpuPending { .. } = &result.artifact {
+                stats.mesh_pending_finalize += 1;
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
+                self.pending_gpu_results.insert(result.coord, result);
+                continue;
+            }
 
-            #[allow(irrefutable_let_patterns)]
-            if let ChunkMeshArtifact::Gpu {
+            if let ChunkMeshArtifact::GpuReady {
                 page_index,
                 draw_indirect_index,
                 lod,
@@ -2451,7 +2486,6 @@ impl Renderer {
                 aabb_min,
                 aabb_max,
                 chunk_origin_world,
-                index_count,
                 ..
             } = &result.artifact
             {
@@ -2475,22 +2509,10 @@ impl Renderer {
                         RebuildOutcome::SkippedInvalidPageMapping,
                         Some(*page_index),
                         Some(*draw_indirect_index),
-                        Some(*index_count),
+                        None,
                         None,
                     );
                     remesh_coords.push(result.coord);
-                    continue;
-                }
-
-                #[cfg(feature = "gpu-compute")]
-                if matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
-                    && !gpu_page_ready_for_adoption(*page_index)
-                {
-                    stats.mesh_waiting_on_fence += 1;
-                    stats.mesh_pending_finalize += 1;
-                    self.mesh_lifecycle
-                        .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
-                    self.pending_gpu_results.insert(result.coord, result);
                     continue;
                 }
 
@@ -2508,7 +2530,7 @@ impl Renderer {
                             RebuildOutcome::SkippedAdoptionRejected,
                             Some(*page_index),
                             Some(*draw_indirect_index),
-                            Some(*index_count),
+                            None,
                             Some("authoritative_indirect_readback_failed"),
                         );
                         log::warn!(
@@ -2543,19 +2565,6 @@ impl Renderer {
                     skipped_retry_chunks
                         .push((result.coord, MeshSkipReason::SparseIndirectUndrawable));
                     continue;
-                } else {
-                    let recovery_state = self.mark_startup_seed_recovered(result.coord);
-                    if let Some(seed_state) = recovery_state {
-                        self.sampled_startup_seed_trace(
-                            result.coord,
-                            *page_index,
-                            *draw_indirect_index,
-                            seed_state.first_zero_at,
-                            seed_state.recovered_nonzero_at,
-                            resolved_index_count,
-                            "startup_seed_recovered_nonzero",
-                        );
-                    }
                 }
 
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
@@ -2566,9 +2575,6 @@ impl Renderer {
 
                 gpu_adoption_latency_ms_total += adoption_latency_ms;
 
-                let world_min = *aabb_min;
-                let world_max = *aabb_max;
-
                 let slot = *draw_indirect_index;
 
                 self.adopt_visible_chunk_draw(
@@ -2578,11 +2584,9 @@ impl Renderer {
                         draw_indirect_index: slot,
                         lod: *lod,
                         origin: *chunk_origin_world,
-                        world_aabb_min: world_min,
-                        world_aabb_max: world_max,
+                        world_aabb_min: *aabb_min,
+                        world_aabb_max: *aabb_max,
                         draw_source: DrawSource::GpuArtifact,
-
-                        // GPU meshes already wrote indirect args
                         index_count: Some(resolved_index_count),
                     },
                 );
@@ -2599,7 +2603,7 @@ impl Renderer {
                     Some(*page_index),
                     Some(slot),
                     Some(resolved_index_count),
-                    Some("pending"),
+                    Some("ready"),
                 );
 
                 total_latency_ms += adoption_latency_ms;
@@ -3020,7 +3024,7 @@ impl Renderer {
 
     fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
         match result.artifact {
-            ChunkMeshArtifact::Gpu { .. } => "gpu",
+            ChunkMeshArtifact::GpuPending { .. } | ChunkMeshArtifact::GpuReady { .. } => "gpu",
             ChunkMeshArtifact::Cpu { .. } => "cpu",
             ChunkMeshArtifact::Failed { .. } => "failed",
             ChunkMeshArtifact::Skipped { .. } => "skipped",
@@ -3029,9 +3033,7 @@ impl Renderer {
 
     fn mesh_result_index_vertex_counts(result: &MeshResult) -> (u32, u32) {
         match &result.artifact {
-            ChunkMeshArtifact::Gpu {
-                index_count, verts, ..
-            } => (*index_count, verts.len() as u32),
+            ChunkMeshArtifact::GpuReady { index_count, .. } => (*index_count, 0),
             ChunkMeshArtifact::Cpu { inds, verts, .. } => (inds.len() as u32, verts.len() as u32),
             _ => (0, 0),
         }
