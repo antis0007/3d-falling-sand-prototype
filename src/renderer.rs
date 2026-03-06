@@ -2479,8 +2479,19 @@ impl Renderer {
                     );
                 } else {
                     self.zero_index_retry_state.remove(&result.coord);
-                    let recovery_state = self.mark_startup_seed_recovered(result.coord);
-                    if let Some(seed_state) = recovery_state {
+                    //INVESTIGATE REINTEGRATING THIS CODE AT A LATER DATE (TODO!)
+                    //let recovery_state = self.mark_startup_seed_recovered(result.coord);
+                    //if let Some(seed_state) = recovery_state {
+                    stats.mesh_artifacts_rejected += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
+                    stats.mesh_reject_zero_index += 1;
+                    let reason = if startup_zero_geometry {
+                        let seed_state = self.mark_startup_seed_zero_seen(result.coord);
+                        Self::record_rebuild_outcome(
+                            &mut stats,
+                            RebuildOutcome::SkippedStartupZeroGeometry,
+                        );
                         self.sampled_startup_seed_trace(
                             result.coord,
                             *page_index,
