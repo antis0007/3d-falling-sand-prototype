@@ -635,6 +635,9 @@ pub struct MeshRebuildStats {
     pub gpu_mesh_adopted_count: usize,
     pub gpu_mesh_adoption_latency_ms: f32,
     pub gpu_mesh_visible_count: usize,
+    pub gpu_mesh_visible_slot_min: i32,
+    pub gpu_mesh_visible_slot_max: i32,
+    pub gpu_mesh_visible_slot_holes: usize,
     pub gpu_job_failures: usize,
     pub gpu_job_timeouts: usize,
     pub gpu_job_skipped: usize,
@@ -2202,6 +2205,23 @@ impl Renderer {
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
+        if self.visible_gpu_chunks.is_empty() {
+            stats.gpu_mesh_visible_slot_min = -1;
+            stats.gpu_mesh_visible_slot_max = -1;
+            stats.gpu_mesh_visible_slot_holes = 0;
+        } else {
+            let mut min_slot = u32::MAX;
+            let mut max_slot = 0u32;
+            for draw in self.visible_gpu_chunks.values() {
+                min_slot = min_slot.min(draw.draw_indirect_index);
+                max_slot = max_slot.max(draw.draw_indirect_index);
+            }
+            let occupied = self.visible_gpu_chunks.len();
+            let span = (max_slot - min_slot + 1) as usize;
+            stats.gpu_mesh_visible_slot_min = min_slot as i32;
+            stats.gpu_mesh_visible_slot_max = max_slot as i32;
+            stats.gpu_mesh_visible_slot_holes = span.saturating_sub(occupied);
+        }
 
         let tracked_coords: Vec<ChunkCoord> = self.visible_gpu_chunks.keys().copied().collect();
         let mut lod_changes = Vec::new();
@@ -2296,14 +2316,15 @@ impl Renderer {
                 self.global_gpu_index_buffer.slice(..),
                 wgpu::IndexFormat::Uint32,
             );
+            let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
             if self.supports_multi_draw_indirect {
-                pass.multi_draw_indexed_indirect(
-                    &self.global_gpu_draw_indirect_buffer,
-                    0,
-                    draw_count as u32,
-                );
+                for draw in self.visible_gpu_chunks.values() {
+                    pass.draw_indexed_indirect(
+                        &self.global_gpu_draw_indirect_buffer,
+                        draw.draw_indirect_index as u64 * stride,
+                    );
+                }
             } else {
-                let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
                 for draw in self.visible_gpu_chunks.values() {
                     pass.draw_indexed_indirect(
                         &self.global_gpu_draw_indirect_buffer,

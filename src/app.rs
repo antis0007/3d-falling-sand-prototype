@@ -2100,6 +2100,9 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_gpu_adopt_count = mesh_stats.gpu_mesh_adopted_count;
                         ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
                         ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;
+                        ui.profiler.mesh_gpu_visible_slot_min = mesh_stats.gpu_mesh_visible_slot_min;
+                        ui.profiler.mesh_gpu_visible_slot_max = mesh_stats.gpu_mesh_visible_slot_max;
+                        ui.profiler.mesh_gpu_visible_slot_holes = mesh_stats.gpu_mesh_visible_slot_holes;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
                         // GPU compute profiler snapshot isn't exported; keep these stable defaults.
                         ui.profiler.gpu_compute_dispatch_ms = 0.0;
