@@ -472,53 +472,6 @@ impl LodRadii {
         self
     }
 }
-fn read_gpu_draw_indirect_command(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    indirect_buffer: &wgpu::Buffer,
-    slot: usize,
-) -> DrawIndexedIndirectCommand {
-    use std::sync::mpsc::channel;
-
-    let command_size = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-    let offset = slot as u64 * command_size;
-
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("read_indirect_staging"),
-        size: command_size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("read_indirect_encoder"),
-    });
-
-    encoder.copy_buffer_to_buffer(indirect_buffer, offset, &staging, 0, command_size);
-
-    queue.submit(Some(encoder.finish()));
-
-    let slice = staging.slice(..);
-    let (tx, rx) = channel();
-
-    slice.map_async(wgpu::MapMode::Read, move |v| {
-        tx.send(v).ok();
-    });
-
-    device.poll(wgpu::Maintain::Wait);
-
-    rx.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-
-    let cmd = *bytemuck::from_bytes::<DrawIndexedIndirectCommand>(&data);
-
-    drop(data);
-    staging.unmap();
-
-    cmd
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct LodMeshingBudgets {
     pub near: usize,
@@ -566,6 +519,7 @@ pub struct Renderer {
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
+    zero_index_retry_state: HashMap<ChunkCoord, ZeroIndexRetryState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
 
@@ -662,6 +616,12 @@ pub struct MeshRebuildStats {
     pub allocator_realloc_count: usize,
     pub mesh_artifacts_received: usize,
     pub mesh_artifacts_rejected: usize,
+    pub mesh_reject_stale: usize,
+    pub mesh_reject_invalid_page: usize,
+    pub mesh_reject_zero_index: usize,
+    pub mesh_reject_failed: usize,
+    pub mesh_reject_unhandled: usize,
+    pub mesh_zero_index_soft_retries: usize,
     pub mesh_cache_entries: usize,
     pub outcome_gpu_adopted: usize,
     pub outcome_cpu_uploaded: usize,
@@ -748,6 +708,14 @@ struct MeshRetryState {
     skipped_attempts: u32,
     skipped_next_retry_frame: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ZeroIndexRetryState {
+    attempts: u32,
+    next_retry_frame: u64,
+}
+
+const ZERO_INDEX_ADOPTION_RETRY_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Copy)]
 enum MeshRetryKind {
@@ -1729,6 +1697,7 @@ impl Renderer {
             inflight_mesh_chunks: HashSet::new(),
             mesh_retry_state: HashMap::new(),
             startup_mesh_seed_state: HashMap::new(),
+            zero_index_retry_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
@@ -2147,6 +2116,7 @@ impl Renderer {
             ) {
                 stats.stale_drop_count += 1;
                 stats.mesh_artifacts_rejected += 1;
+                stats.mesh_reject_stale += 1;
                 stats.stale_drop_retry_enqueued += 1;
                 match retry_policy {
                     StaleArtifactRetryPolicy::Urgent => {
@@ -2155,6 +2125,13 @@ impl Renderer {
                     StaleArtifactRetryPolicy::Dirty => remesh_coords.push(result.coord),
                 }
                 continue;
+            }
+
+            if let Some(zero_index_retry) = self.zero_index_retry_state.get(&result.coord) {
+                if zero_index_retry.next_retry_frame > self.mesh_rebuild_frame_index {
+                    self.completed_meshes.push(result);
+                    continue;
+                }
             }
 
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
@@ -2221,6 +2198,8 @@ impl Renderer {
                     result.lod,
                     short_error_message(reason)
                 );
+                stats.mesh_artifacts_rejected += 1;
+                stats.mesh_reject_failed += 1;
                 failed_retry_coords.push(result.coord);
                 continue;
             }
@@ -2246,6 +2225,7 @@ impl Renderer {
                         gpu_page_capacity()
                     );
                     stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_invalid_page += 1;
                     Self::record_rebuild_outcome(
                         &mut stats,
                         RebuildOutcome::SkippedInvalidPageMapping,
@@ -2270,53 +2250,22 @@ impl Renderer {
                     continue;
                 }
 
-                let mut resolved_index_count = *index_count;
-                if resolved_index_count == 0 {
-                    let draw = read_gpu_draw_indirect_command(
-                        &self.device,
-                        &self.queue,
-                        &self.global_gpu_draw_indirect_buffer,
-                        *draw_indirect_index as usize,
-                    );
-                    resolved_index_count = draw.index_count;
-
-                    #[cfg(feature = "gpu-compute")]
-                    if resolved_index_count == 0
-                        && matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
-                    {
-                        let dispatch_budget = std::time::Duration::from_secs_f32(
-                            GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS / 1000.0,
-                        );
-                        match dispatch_gpu_chunk_tasks_on_renderer(1, dispatch_budget) {
-                            Ok(dispatch_stats) => {
-                                stats.gpu_dispatch_enqueue_submit_ms +=
-                                    dispatch_stats.enqueue_submit_ms;
-                                stats.gpu_dispatch_wait_sync_ms += dispatch_stats.wait_sync_ms;
-                                stats.gpu_dispatch_tasks_submitted +=
-                                    dispatch_stats.tasks_submitted;
-                                stats.gpu_dispatch_ms +=
-                                    dispatch_stats.enqueue_submit_ms + dispatch_stats.wait_sync_ms;
-                            }
-                            Err(err) => {
-                                log::warn!(
-                                    "[mesh] late renderer-side gpu dispatch failed during adoption for chunk={:?}: {err:#}",
-                                    result.coord
-                                );
-                            }
-                        }
-                        let retried_draw = read_gpu_draw_indirect_command(
-                            &self.device,
-                            &self.queue,
-                            &self.global_gpu_draw_indirect_buffer,
-                            *draw_indirect_index as usize,
-                        );
-                        resolved_index_count = retried_draw.index_count;
-                    }
-                }
+                let resolved_index_count = *index_count;
 
                 if resolved_index_count == 0 {
-                    stats.mesh_artifacts_rejected += 1;
                     let startup_zero_geometry = self.is_startup_zero_geometry(result.coord);
+                    let retry = self.zero_index_retry_state.entry(result.coord).or_default();
+                    if retry.attempts < ZERO_INDEX_ADOPTION_RETRY_MAX_ATTEMPTS {
+                        retry.attempts = retry.attempts.saturating_add(1);
+                        retry.next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(1);
+                        stats.mesh_zero_index_soft_retries += 1;
+                        self.completed_meshes.push(result);
+                        continue;
+                    }
+
+                    self.zero_index_retry_state.remove(&result.coord);
+                    stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_zero_index += 1;
                     let reason = if startup_zero_geometry {
                         let seed_state = self.mark_startup_seed_zero_seen(result.coord);
                         Self::record_rebuild_outcome(
@@ -2355,7 +2304,7 @@ impl Renderer {
                         Some(if startup_zero_geometry {
                             "startup_zero_geometry"
                         } else {
-                            "frustum_unknown"
+                            "non_blocking_zero_index"
                         }),
                     );
                     if startup_zero_geometry {
@@ -2365,6 +2314,7 @@ impl Renderer {
                     }
                     continue;
                 }
+                self.zero_index_retry_state.remove(&result.coord);
 
                 let recovery_state = self.mark_startup_seed_recovered(result.coord);
                 if let Some(seed_state) = recovery_state {
@@ -2523,6 +2473,7 @@ impl Renderer {
                 result.coord
             );
             stats.mesh_artifacts_rejected += 1;
+            stats.mesh_reject_unhandled += 1;
             self.visible_gpu_chunks.remove(&result.coord);
             self.pending_lod_remesh.remove(&result.coord);
             continue;
@@ -2660,6 +2611,7 @@ impl Renderer {
         self.inflight_mesh_chunks.clear();
         self.mesh_retry_state.clear();
         self.startup_mesh_seed_state.clear();
+        self.zero_index_retry_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {

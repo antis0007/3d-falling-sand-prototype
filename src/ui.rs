@@ -46,6 +46,12 @@ pub struct ProfilerStats {
     pub mesh_flow_adopted: usize,
     pub mesh_flow_uploaded: usize,
     pub mesh_flow_rejected: usize,
+    pub mesh_reject_stale: usize,
+    pub mesh_reject_invalid_page: usize,
+    pub mesh_reject_zero_index: usize,
+    pub mesh_reject_failed: usize,
+    pub mesh_reject_unhandled: usize,
+    pub mesh_zero_index_soft_retries: usize,
     pub mesh_resident_gpu_artifact: usize,
     pub mesh_resident_cpu_uploaded: usize,
     pub mesh_resident_stale_cached: usize,
@@ -746,6 +752,15 @@ pub fn draw(
                     ui_state.profiler.mesh_flow_adopted,
                     ui_state.profiler.mesh_flow_uploaded,
                     ui_state.profiler.mesh_flow_rejected,
+                ));
+                ui.monospace(format!(
+                    "reject reasons stale/invalid-page/zero-index/failed/unhandled | zero-index soft-retries: {}/{}/{}/{}/{} | {}",
+                    ui_state.profiler.mesh_reject_stale,
+                    ui_state.profiler.mesh_reject_invalid_page,
+                    ui_state.profiler.mesh_reject_zero_index,
+                    ui_state.profiler.mesh_reject_failed,
+                    ui_state.profiler.mesh_reject_unhandled,
+                    ui_state.profiler.mesh_zero_index_soft_retries,
                 ));
                 ui.monospace(format!(
                     "resident chunks gpu/cpu/stale/fallback/unknown: {}/{}/{}/{}/{}",
