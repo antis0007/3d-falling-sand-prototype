@@ -480,6 +480,91 @@ pub struct LodMeshingBudgets {
     pub ultra: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SubmissionTier {
+    Near,
+    Mid,
+    Far,
+    Ultra,
+}
+
+fn compute_effective_lod_submission_budgets(
+    mesh_budget: usize,
+    lod_budgets: LodMeshingBudgets,
+    pending: [usize; 4],
+) -> [usize; 4] {
+    if mesh_budget == 0 {
+        return [0; 4];
+    }
+
+    let configured = [
+        lod_budgets.near,
+        lod_budgets.mid,
+        lod_budgets.far,
+        lod_budgets.ultra,
+    ];
+    let configured_total: usize = configured.iter().sum();
+    let pending_total: usize = pending.iter().sum();
+    if pending_total == 0 {
+        return [0; 4];
+    }
+
+    let mut effective = [0usize; 4];
+    for i in 0..4 {
+        if pending[i] == 0 {
+            continue;
+        }
+
+        let cfg_share = if configured_total > 0 {
+            (mesh_budget.saturating_mul(configured[i]) + configured_total - 1) / configured_total
+        } else {
+            0
+        };
+        let pending_share =
+            (mesh_budget.saturating_mul(pending[i]) + pending_total - 1) / pending_total;
+        let blended_share = (cfg_share + pending_share).div_ceil(2);
+        effective[i] = blended_share.max(1).min(pending[i]);
+    }
+
+    let mut total_effective: usize = effective.iter().sum();
+    while total_effective > mesh_budget {
+        let mut reduced = false;
+        for i in 0..4 {
+            if total_effective <= mesh_budget {
+                break;
+            }
+            let min_floor = usize::from(pending[i] > 0);
+            if effective[i] > min_floor {
+                effective[i] -= 1;
+                total_effective -= 1;
+                reduced = true;
+            }
+        }
+        if !reduced {
+            break;
+        }
+    }
+
+    while total_effective < mesh_budget {
+        let mut expanded = false;
+        for i in 0..4 {
+            if total_effective >= mesh_budget {
+                break;
+            }
+            if effective[i] < pending[i] {
+                effective[i] += 1;
+                total_effective += 1;
+                expanded = true;
+            }
+        }
+        if !expanded {
+            break;
+        }
+    }
+
+    effective
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: Arc<wgpu::Device>,
@@ -1951,13 +2036,17 @@ impl Renderer {
         } else {
             1
         };
-        let far_budget = (lod_budgets.far / far_scale).max(usize::from(!far_jobs.is_empty()));
-        let ultra_budget = (lod_budgets.ultra / far_scale)
-            .max(usize::from(!ultra_jobs.is_empty() && far_scale == 1));
+        let adjusted_lod_budgets = LodMeshingBudgets {
+            near: lod_budgets.near,
+            mid: lod_budgets.mid,
+            far: (lod_budgets.far / far_scale).max(usize::from(!far_jobs.is_empty())),
+            ultra: (lod_budgets.ultra / far_scale)
+                .max(usize::from(!ultra_jobs.is_empty() && far_scale == 1)),
+        };
 
         let sustained_pressure = far_pressure > 2048;
         if sustained_pressure {
-            let far_keep = far_budget.min(2);
+            let far_keep = adjusted_lod_budgets.far.min(2);
             if far_jobs.len() > far_keep {
                 stats.pressure_drop_count += far_jobs.len() - far_keep;
                 far_jobs.truncate(far_keep);
@@ -1968,43 +2057,82 @@ impl Renderer {
             }
         }
 
+        let pending_counts = [
+            near_jobs.len(),
+            mid_jobs.len(),
+            far_jobs.len(),
+            ultra_jobs.len(),
+        ];
+        let mut effective_budgets = compute_effective_lod_submission_budgets(
+            mesh_budget,
+            adjusted_lod_budgets,
+            pending_counts,
+        );
+
         let mut submitted = 0usize;
-        let mut submit_from =
-            |jobs: &mut Vec<MeshJob>, budget: usize, stats: &mut MeshRebuildStats| {
-                let mut taken = 0usize;
-                while taken < budget && submitted < mesh_budget {
-                    let Some(job) = jobs.pop() else {
+        let mut stalled_tiers = [false; 4];
+        let mut tier_cursor = 0usize;
+        let tier_order = [
+            SubmissionTier::Near,
+            SubmissionTier::Mid,
+            SubmissionTier::Far,
+            SubmissionTier::Ultra,
+        ];
+        while submitted < mesh_budget {
+            let mut attempted_any = false;
+            let mut progress_made = false;
+
+            for offset in 0..tier_order.len() {
+                let tier_idx = (tier_cursor + offset) % tier_order.len();
+                if effective_budgets[tier_idx] == 0 || stalled_tiers[tier_idx] {
+                    continue;
+                }
+
+                attempted_any = true;
+                let jobs = match tier_order[tier_idx] {
+                    SubmissionTier::Near => &mut near_jobs,
+                    SubmissionTier::Mid => &mut mid_jobs,
+                    SubmissionTier::Far => &mut far_jobs,
+                    SubmissionTier::Ultra => &mut ultra_jobs,
+                };
+
+                let Some(job) = jobs.pop() else {
+                    effective_budgets[tier_idx] = 0;
+                    continue;
+                };
+
+                if self.inflight_mesh_chunks.contains(&job.coord) {
+                    self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                    effective_budgets[tier_idx] = effective_budgets[tier_idx].saturating_sub(1);
+                    progress_made = true;
+                    tier_cursor = (tier_idx + 1) % tier_order.len();
+                    break;
+                }
+
+                match self.submit_mesh_job(job.clone(), &mut stats) {
+                    Ok(()) => {
+                        self.inflight_mesh_chunks.insert(job.coord);
+                        effective_budgets[tier_idx] = effective_budgets[tier_idx].saturating_sub(1);
+                        submitted += 1;
+                        progress_made = true;
+                        tier_cursor = (tier_idx + 1) % tier_order.len();
                         break;
-                    };
-
-                    if self.inflight_mesh_chunks.contains(&job.coord) {
-                        self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
-                        continue;
                     }
-
-                    match self.submit_mesh_job(job.clone(), stats) {
-                        Ok(()) => {
-                            self.inflight_mesh_chunks.insert(job.coord);
-                            taken += 1;
-                            submitted += 1;
-                        }
-                        Err(TrySendError::Full(job)) => {
-                            jobs.push(job);
-                            break;
-                        }
-                        Err(TrySendError::Disconnected(_)) => break,
+                    Err(TrySendError::Full(job)) => {
+                        jobs.push(job);
+                        stalled_tiers[tier_idx] = true;
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        effective_budgets.fill(0);
+                        break;
                     }
                 }
-            };
+            }
 
-        submit_from(
-            &mut near_jobs,
-            lod_budgets.near.min(mesh_budget),
-            &mut stats,
-        );
-        submit_from(&mut mid_jobs, lod_budgets.mid.min(mesh_budget), &mut stats);
-        submit_from(&mut far_jobs, far_budget.min(mesh_budget), &mut stats);
-        submit_from(&mut ultra_jobs, ultra_budget.min(mesh_budget), &mut stats);
+            if !attempted_any || !progress_made {
+                break;
+            }
+        }
 
         for job in near_jobs
             .into_iter()
@@ -4463,6 +4591,25 @@ mod tests {
             elapsed
         );
     }
+
+    #[test]
+    fn lod_submission_scheduler_guarantees_far_and_ultra_progress_under_backlog() {
+        let mesh_budget = 8;
+        let lod_budgets = LodMeshingBudgets {
+            near: 6,
+            mid: 3,
+            far: 1,
+            ultra: 1,
+        };
+        let pending = [64, 48, 40, 24];
+
+        let effective = compute_effective_lod_submission_budgets(mesh_budget, lod_budgets, pending);
+
+        assert!(effective[2] >= 1, "far tier should retain throughput");
+        assert!(effective[3] >= 1, "ultra tier should retain throughput");
+        assert!(effective.iter().sum::<usize>() <= mesh_budget);
+    }
+
     #[test]
     fn lod_selection_uses_ultra_tier_with_hysteresis() {
         let radii = LodRadii {
