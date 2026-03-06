@@ -14,9 +14,9 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
-    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
-    update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
-    SharedMeshBuffers,
+    dispatch_gpu_chunk_tasks_on_renderer, gpu_page_ready_for_adoption,
+    initialize_gpu_compute_worker, run_chunk_job_on_worker, update_gpu_page_fences_on_renderer,
+    DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend, SharedMeshBuffers,
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
@@ -48,6 +48,8 @@ const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
 const MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS: u32 = 3;
 const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
 const OUTCOME_TRACE_SAMPLES_PER_SECOND: u32 = 6;
+const GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME: usize = 64;
+const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 1.0;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -641,6 +643,9 @@ pub struct MeshRebuildStats {
     pub ultra_mesh_count: usize,
     pub gpu_mesh_jobs: usize,
     pub gpu_dispatch_ms: f32,
+    pub gpu_dispatch_enqueue_submit_ms: f32,
+    pub gpu_dispatch_wait_sync_ms: f32,
+    pub gpu_dispatch_tasks_submitted: usize,
     pub gpu_mesh_adopted_count: usize,
     pub gpu_mesh_adoption_latency_ms: f32,
     pub gpu_mesh_visible_count: usize,
@@ -2049,10 +2054,18 @@ impl Renderer {
 
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
-            let dispatch_start = Instant::now();
-            match dispatch_gpu_chunk_tasks_on_renderer(256) {
-                Ok(_) => {
-                    stats.gpu_dispatch_ms += dispatch_start.elapsed().as_secs_f32() * 1000.0;
+            let dispatch_budget =
+                std::time::Duration::from_secs_f32(GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS / 1000.0);
+            match dispatch_gpu_chunk_tasks_on_renderer(
+                GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME,
+                dispatch_budget,
+            ) {
+                Ok(dispatch_stats) => {
+                    stats.gpu_dispatch_enqueue_submit_ms += dispatch_stats.enqueue_submit_ms;
+                    stats.gpu_dispatch_wait_sync_ms += dispatch_stats.wait_sync_ms;
+                    stats.gpu_dispatch_tasks_submitted += dispatch_stats.tasks_submitted;
+                    stats.gpu_dispatch_ms +=
+                        dispatch_stats.enqueue_submit_ms + dispatch_stats.wait_sync_ms;
                 }
                 Err(err) => {
                     log::warn!(
@@ -2249,6 +2262,14 @@ impl Renderer {
                     continue;
                 }
 
+                #[cfg(feature = "gpu-compute")]
+                if matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
+                    && !gpu_page_ready_for_adoption(*page_index)
+                {
+                    self.completed_meshes.push(result);
+                    continue;
+                }
+
                 let mut resolved_index_count = *index_count;
                 if resolved_index_count == 0 {
                     let draw = read_gpu_draw_indirect_command(
@@ -2263,20 +2284,33 @@ impl Renderer {
                     if resolved_index_count == 0
                         && matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
                     {
-                        if let Err(err) = dispatch_gpu_chunk_tasks_on_renderer(256) {
-                            log::warn!(
-                                "[mesh] late renderer-side gpu dispatch failed during adoption for chunk={:?}: {err:#}",
-                                result.coord
-                            );
-                        } else {
-                            let retried_draw = read_gpu_draw_indirect_command(
-                                &self.device,
-                                &self.queue,
-                                &self.global_gpu_draw_indirect_buffer,
-                                *draw_indirect_index as usize,
-                            );
-                            resolved_index_count = retried_draw.index_count;
+                        let dispatch_budget = std::time::Duration::from_secs_f32(
+                            GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS / 1000.0,
+                        );
+                        match dispatch_gpu_chunk_tasks_on_renderer(1, dispatch_budget) {
+                            Ok(dispatch_stats) => {
+                                stats.gpu_dispatch_enqueue_submit_ms +=
+                                    dispatch_stats.enqueue_submit_ms;
+                                stats.gpu_dispatch_wait_sync_ms += dispatch_stats.wait_sync_ms;
+                                stats.gpu_dispatch_tasks_submitted +=
+                                    dispatch_stats.tasks_submitted;
+                                stats.gpu_dispatch_ms +=
+                                    dispatch_stats.enqueue_submit_ms + dispatch_stats.wait_sync_ms;
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "[mesh] late renderer-side gpu dispatch failed during adoption for chunk={:?}: {err:#}",
+                                    result.coord
+                                );
+                            }
                         }
+                        let retried_draw = read_gpu_draw_indirect_command(
+                            &self.device,
+                            &self.queue,
+                            &self.global_gpu_draw_indirect_buffer,
+                            *draw_indirect_index as usize,
+                        );
+                        resolved_index_count = retried_draw.index_count;
                     }
                 }
 
