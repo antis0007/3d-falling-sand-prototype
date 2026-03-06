@@ -1605,25 +1605,30 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+        let face_entries_per_slot =
+            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+        let face_mask_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_offset_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_count_bytes = page_capacity * std::mem::size_of::<u32>() as u64;
         let global_gpu_face_mask_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu face mask buffer"),
-            size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
-                * std::mem::size_of::<u32>() as u64,
+            size: face_mask_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
         let global_gpu_face_offset_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global gpu face offset buffer"),
-                size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
-                    * std::mem::size_of::<u32>() as u64,
+                size: face_offset_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         let global_gpu_face_count_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global gpu face count buffer"),
-                size: std::mem::size_of::<u32>() as u64,
+                size: face_count_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
