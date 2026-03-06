@@ -2173,7 +2173,7 @@ impl Renderer {
         }
 
         while let Ok(result) = self.mesh_queue.try_recv() {
-            log::info!("[renderer] received mesh result chunk={:?}", result.coord);
+            log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
             self.completed_meshes.push(result);
         }
