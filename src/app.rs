@@ -2281,6 +2281,10 @@ pub async fn run() -> anyhow::Result<()> {
                         let draw_stats = renderer.mesh_draw_stats(&cam);
                         ui.set_draw_stats(&draw_stats);
                         let cull_stats = renderer.cull_stats(&cam);
+                        streaming.mark_visible_batch(
+                            renderer.cull_visible_chunks(&cam),
+                            frame_counter,
+                        );
                         ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
                         ui.profiler.frustum_culled_chunks = cull_stats.frustum_culled;
                         ui.profiler.missing_in_radius = cached_desired
