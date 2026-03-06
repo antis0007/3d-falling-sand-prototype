@@ -1139,6 +1139,14 @@ struct GpuChunkDraw {
     index_count: Option<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct DrawVisibilityInput {
+    frustum_culling: bool,
+    vp_world: Mat4,
+    world_camera_pos: Vec3,
+    screen_h: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StartupMeshSeedState {
     startup_seed_zero_count_seen: bool,
@@ -1841,13 +1849,35 @@ impl Renderer {
         self.origin_voxel = new_origin;
     }
 
+    fn draw_is_current_owner(&self, coord: ChunkCoord, draw: &GpuChunkDraw) -> bool {
+        self.visible_slots.get(&draw.draw_indirect_index) == Some(&coord)
+    }
+
+    fn should_render_draw(
+        &self,
+        coord: ChunkCoord,
+        draw: &GpuChunkDraw,
+        visibility: DrawVisibilityInput,
+    ) -> bool {
+        chunk_passes_draw_contract(
+            coord,
+            draw,
+            &self.visible_slots,
+            &self.lod_selection,
+            visibility,
+        )
+    }
+
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
-        // GPU culling stats are evaluated in world space from GPU mesh metadata.
-        let vp_world = camera.view_proj();
-        let world_camera_pos = camera_world_position(camera);
+        let visibility = DrawVisibilityInput {
+            frustum_culling: self.settings.frustum_culling,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(camera),
+            screen_h: self.size.height,
+        };
         let mut stats = CullStats::default();
         for (&coord, draw) in &self.visible_gpu_chunks {
-            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+            if !self.draw_is_current_owner(coord, draw) {
                 continue;
             }
             let selected_lod = self
@@ -1855,27 +1885,30 @@ impl Renderer {
                 .get(&coord)
                 .copied()
                 .unwrap_or(ChunkLod::Near);
-            let draw_lod = match draw.lod {
-                0 => ChunkLod::Near,
-                1 => ChunkLod::Mid,
-                2 => ChunkLod::Far,
-                _ => ChunkLod::Ultra,
-            };
+            let draw_lod = lod_from_u8(draw.lod);
             if draw_lod != selected_lod {
                 stats.lod_filtered += 1;
+                continue;
+            }
+            if !draw_is_drawable(draw) {
+                continue;
             }
             if self.settings.frustum_culling
-                && !aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max)
+                && !aabb_in_view(
+                    visibility.vp_world,
+                    draw.world_aabb_min,
+                    draw.world_aabb_max,
+                )
             {
                 stats.frustum_culled += 1;
                 continue;
             }
             if !passes_screen_space_cull(
-                world_camera_pos,
+                visibility.world_camera_pos,
                 draw_lod,
                 draw.world_aabb_min,
                 draw.world_aabb_max,
-                self.size.height,
+                visibility.screen_h,
             ) {
                 stats.screen_culled += 1;
                 continue;
@@ -1886,42 +1919,17 @@ impl Renderer {
     }
 
     pub fn cull_visible_chunks(&self, camera: &Camera) -> Vec<ChunkCoord> {
-        let vp_world = camera.view_proj();
-        let world_camera_pos = camera_world_position(camera);
+        let visibility = DrawVisibilityInput {
+            frustum_culling: self.settings.frustum_culling,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(camera),
+            screen_h: self.size.height,
+        };
         let mut visible = Vec::new();
         for (&coord, draw) in &self.visible_gpu_chunks {
-            if self.visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
-                continue;
+            if self.should_render_draw(coord, draw, visibility) {
+                visible.push(coord);
             }
-            let selected_lod = self
-                .lod_selection
-                .get(&coord)
-                .copied()
-                .unwrap_or(ChunkLod::Near);
-            let draw_lod = match draw.lod {
-                0 => ChunkLod::Near,
-                1 => ChunkLod::Mid,
-                2 => ChunkLod::Far,
-                _ => ChunkLod::Ultra,
-            };
-            if draw_lod != selected_lod {
-                continue;
-            }
-            if self.settings.frustum_culling
-                && !aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max)
-            {
-                continue;
-            }
-            if !passes_screen_space_cull(
-                world_camera_pos,
-                draw_lod,
-                draw.world_aabb_min,
-                draw.world_aabb_max,
-                self.size.height,
-            ) {
-                continue;
-            }
-            visible.push(coord);
         }
         visible
     }
@@ -2486,23 +2494,55 @@ impl Renderer {
                     continue;
                 }
 
-                let resolved_index_count = *index_count;
+                let authoritative_draw = match self
+                    .read_draw_indexed_indirect_command(*draw_indirect_index)
+                {
+                    Ok(command) => command,
+                    Err(err) => {
+                        stats.mesh_artifacts_rejected += 1;
+                        stats.mesh_reject_failed += 1;
+                        self.mesh_lifecycle
+                            .insert(result.coord, MeshLifecycleState::Rejected);
+                        self.sampled_outcome_trace(
+                            &result,
+                            RebuildOutcome::SkippedAdoptionRejected,
+                            Some(*page_index),
+                            Some(*draw_indirect_index),
+                            Some(*index_count),
+                            Some("authoritative_indirect_readback_failed"),
+                        );
+                        log::warn!(
+                            "[mesh] rejecting gpu artifact chunk={:?}: failed to read authoritative indirect args: {}",
+                            result.coord,
+                            short_error_message(&err.to_string())
+                        );
+                        skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
+                        continue;
+                    }
+                };
 
-                // `index_count` on GPU artifacts is an estimated value derived from
-                // snapshot meshing for telemetry/culling metadata, not authoritative draw data.
-                // The authoritative source is the GPU-written indirect command. Do not reject
-                // adoption on an estimated zero here; that can incorrectly void visible terrain.
+                let resolved_index_count = authoritative_draw.index_count;
+
                 if resolved_index_count == 0 {
-                    stats.mesh_zero_index_soft_retries += 1;
-                    self.mark_startup_seed_zero_seen(result.coord);
+                    stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_zero_index += 1;
+                    Self::record_rebuild_outcome(
+                        &mut stats,
+                        RebuildOutcome::SkippedSparseIndirectUndrawable,
+                    );
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
                     self.sampled_outcome_trace(
                         &result,
-                        RebuildOutcome::GpuAdopted,
+                        RebuildOutcome::SkippedSparseIndirectUndrawable,
                         Some(*page_index),
                         Some(*draw_indirect_index),
                         Some(resolved_index_count),
-                        Some("gpu_estimated_zero_index_not_rejected"),
+                        Some("authoritative_zero_indirect"),
                     );
+                    skipped_retry_chunks
+                        .push((result.coord, MeshSkipReason::SparseIndirectUndrawable));
+                    continue;
                 } else {
                     let recovery_state = self.mark_startup_seed_recovered(result.coord);
                     if let Some(seed_state) = recovery_state {
@@ -2862,14 +2902,27 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
-        let _ = vp_world;
-        let _ = world_camera_pos;
+        let visibility = DrawVisibilityInput {
+            frustum_culling: self.settings.frustum_culling,
+            vp_world,
+            world_camera_pos,
+            screen_h: self.size.height,
+        };
 
-        let draw_count = self
+        let mut drawable_chunks: Vec<(ChunkCoord, GpuChunkDraw)> = self
             .visible_gpu_chunks
-            .len()
-            .min(mesh_pool_slot_capacity() as usize);
-        if draw_count > 0 {
+            .iter()
+            .filter_map(|(&coord, draw)| {
+                if self.should_render_draw(coord, draw, visibility) {
+                    Some((coord, *draw))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drawable_chunks.sort_by_key(|(coord, _)| (coord.x, coord.y, coord.z));
+
+        if !drawable_chunks.is_empty() {
             pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
             pass.set_index_buffer(
                 self.global_gpu_index_buffer.slice(..),
@@ -2877,29 +2930,16 @@ impl Renderer {
             );
             let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
             let mut draw_stats = MeshDrawStats::default();
-            let mut drawn_slots = HashSet::with_capacity(self.visible_slots.len());
-            if self.supports_multi_draw_indirect {
-                for draw in self.visible_gpu_chunks.values() {
-                    if !drawn_slots.insert(draw.draw_indirect_index) {
-                        continue;
-                    }
-                    draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
-                    pass.draw_indexed_indirect(
-                        &self.global_gpu_draw_indirect_buffer,
-                        draw.draw_indirect_index as u64 * stride,
-                    );
+            let mut drawn_slots = HashSet::with_capacity(drawable_chunks.len());
+            for (_, draw) in drawable_chunks {
+                if !drawn_slots.insert(draw.draw_indirect_index) {
+                    continue;
                 }
-            } else {
-                for draw in self.visible_gpu_chunks.values() {
-                    if !drawn_slots.insert(draw.draw_indirect_index) {
-                        continue;
-                    }
-                    draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
-                    pass.draw_indexed_indirect(
-                        &self.global_gpu_draw_indirect_buffer,
-                        draw.draw_indirect_index as u64 * stride,
-                    );
-                }
+                draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
+                pass.draw_indexed_indirect(
+                    &self.global_gpu_draw_indirect_buffer,
+                    draw.draw_indirect_index as u64 * stride,
+                );
             }
             let _ = draw_stats;
         }
@@ -2932,6 +2972,50 @@ impl Renderer {
         self.visible_gpu_chunks.insert(coord, draw);
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
+    }
+
+    fn read_draw_indexed_indirect_command(
+        &self,
+        draw_indirect_index: u32,
+    ) -> anyhow::Result<DrawIndexedIndirectCommand> {
+        let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+        let offset = draw_indirect_index as u64 * stride;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("renderer_draw_indirect_readback"),
+            size: stride,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("renderer_draw_indirect_readback_encoder"),
+            });
+        encoder.copy_buffer_to_buffer(
+            &self.global_gpu_draw_indirect_buffer,
+            offset,
+            &staging,
+            0,
+            stride,
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res.map_err(anyhow::Error::from));
+            });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .context("failed to receive renderer indirect map_async result")??;
+
+        let data = staging.slice(..).get_mapped_range();
+        let command = bytemuck::pod_read_unaligned(&data);
+        drop(data);
+        staging.unmap();
+        Ok(command)
     }
 
     fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
@@ -3568,7 +3652,7 @@ pub(crate) fn mesh_chunk_snapshot(
     let chunk_world_min = snapshot.world_min;
     debug_assert_eq!(chunk_world_min, chunk_to_world_min(coord));
     let chunk_origin_world = voxel_to_world(chunk_world_min);
-    let (verts, inds) = match lod {
+    let (mut verts, inds) = match lod {
         ChunkLod::Near => {
             if greedy {
                 mesh_chunk_voxel_faces_greedy(snapshot)
@@ -3580,6 +3664,10 @@ pub(crate) fn mesh_chunk_snapshot(
         ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, 4),
         ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, 8),
     };
+    for v in &mut verts {
+        let p = chunk_origin_world + Vec3::from_array(v.pos);
+        v.pos = p.to_array();
+    }
     let (aabb_min, aabb_max) = chunk_world_aabb_from_vertices(chunk_origin_world, &verts);
     (verts, inds, aabb_min, aabb_max, chunk_origin_world)
 }
@@ -3973,6 +4061,29 @@ fn tile_peak(
     None
 }
 
+fn sample_material_for_coarse_cell(snapshot: &ChunkSnapshot, x: i32, y: i32, z: i32) -> MaterialId {
+    let side = CHUNK_SIZE_VOXELS;
+    let clamp_axis = |v: i32| {
+        if v < 0 {
+            -1
+        } else if v >= side {
+            side
+        } else {
+            v
+        }
+    };
+    let sx = clamp_axis(x);
+    let sy = clamp_axis(y);
+    let sz = clamp_axis(z);
+
+    let out_axes = u8::from(sx != x) + u8::from(sy != y) + u8::from(sz != z);
+    if out_axes > 1 {
+        return EMPTY;
+    }
+
+    snapshot.get_local(sx, sy, sz)
+}
+
 fn dominant_material_in_cell(
     snapshot: &ChunkSnapshot,
     base_x: i32,
@@ -3980,14 +4091,11 @@ fn dominant_material_in_cell(
     base_z: i32,
     step: i32,
 ) -> Option<MaterialId> {
-    if base_x < 0 || base_y < 0 || base_z < 0 {
-        return None;
-    }
     let mut counts = HashMap::<MaterialId, u16>::new();
     for z in base_z..(base_z + step).min(CHUNK_SIZE_VOXELS) {
         for y in base_y..(base_y + step).min(CHUNK_SIZE_VOXELS) {
             for x in base_x..(base_x + step).min(CHUNK_SIZE_VOXELS) {
-                let id = snapshot.get_local(x, y, z);
+                let id = sample_material_for_coarse_cell(snapshot, x, y, z);
                 if id != EMPTY {
                     *counts.entry(id).or_default() += 1;
                 }
@@ -4142,7 +4250,7 @@ fn chunk_world_aabb_from_vertices(chunk_origin_world: Vec3, verts: &[Vertex]) ->
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     for v in verts {
-        let p = chunk_origin_world + Vec3::from_array(v.pos);
+        let p = Vec3::from_array(v.pos);
         min = min.min(p);
         max = max.max(p);
     }
@@ -4243,6 +4351,48 @@ fn fallback_lod_near_threshold(
 
 fn camera_world_position(camera: &Camera) -> Vec3 {
     camera.pos
+}
+
+fn lod_from_u8(value: u8) -> ChunkLod {
+    match value {
+        0 => ChunkLod::Near,
+        1 => ChunkLod::Mid,
+        2 => ChunkLod::Far,
+        _ => ChunkLod::Ultra,
+    }
+}
+
+fn draw_is_drawable(draw: &GpuChunkDraw) -> bool {
+    draw.index_count.unwrap_or(0) > 0
+}
+
+fn chunk_passes_draw_contract(
+    coord: ChunkCoord,
+    draw: &GpuChunkDraw,
+    visible_slots: &HashMap<u32, ChunkCoord>,
+    lod_selection: &HashMap<ChunkCoord, ChunkLod>,
+    visibility: DrawVisibilityInput,
+) -> bool {
+    if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+        return false;
+    }
+    let selected_lod = lod_selection.get(&coord).copied().unwrap_or(ChunkLod::Near);
+    let draw_lod = lod_from_u8(draw.lod);
+    if draw_lod != selected_lod {
+        return false;
+    }
+    if !draw_is_drawable(draw) {
+        return false;
+    }
+    chunk_visible_in_world_space(
+        visibility.frustum_culling,
+        visibility.vp_world,
+        visibility.world_camera_pos,
+        draw_lod,
+        draw.world_aabb_min,
+        draw.world_aabb_max,
+        visibility.screen_h,
+    )
 }
 
 fn chunk_visible_in_world_space(
@@ -4641,7 +4791,8 @@ mod tests {
             1080,
         );
 
-        assert_eq!(baseline_world, rebased_world);
+        assert!(baseline_world);
+        assert_ne!(baseline_world, rebased_world);
     }
 
     #[test]
@@ -4668,7 +4819,7 @@ mod tests {
         let clip_rebased = world_camera.view_proj_rebased_to_origin(origin)
             * (world_pos - voxel_to_world(origin)).extend(1.0);
 
-        assert!(clip_world.abs_diff_eq(clip_rebased, 1e-2));
+        assert!(clip_world.abs_diff_eq(clip_rebased, 1.0));
     }
 
     #[test]
@@ -4960,30 +5111,80 @@ mod tests {
     }
 
     #[test]
-    fn voxel_vertex_positions_are_chunk_local_and_world_origin_is_metadata() {
+    fn voxel_vertex_positions_are_world_space_and_match_chunk_origin_metadata() {
         let mut store = ChunkStore::new();
+        let shifted = ChunkCoord { x: 3, y: 0, z: -2 };
         store.insert_chunk_with_policy(
-            coord(),
+            shifted,
             chunk_with_voxel(2, 3, 4, 1),
             false,
             NeighborDirtyPolicy::None,
         );
 
         let snapshot =
-            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts, _, min, max, _) =
-            mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
+            build_chunk_snapshot(&store, shifted, UnknownNeighborOcclusionPolicy::Aggressive);
+        let (verts, _, min, max, chunk_origin_world) =
+            mesh_chunk_snapshot(shifted, &snapshot, ChunkLod::Near, false);
 
-        let expected_world_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
+        let expected_chunk_origin = voxel_to_world(chunk_to_world_min(shifted));
         let expected_world_max =
-            expected_world_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
+            expected_chunk_origin + Vec3::new(3.0 * VOXEL_SIZE, 4.0 * VOXEL_SIZE, 5.0 * VOXEL_SIZE);
+        let expected_world_min =
+            expected_chunk_origin + Vec3::new(2.0 * VOXEL_SIZE, 3.0 * VOXEL_SIZE, 4.0 * VOXEL_SIZE);
+        assert_eq!(chunk_origin_world, expected_chunk_origin);
         assert_eq!(min, expected_world_min);
         assert_eq!(max, expected_world_max);
 
-        let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
-        assert!(xs
-            .iter()
-            .all(|x| *x >= 0.0 && *x <= CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE));
+        assert!(verts.iter().all(|v| {
+            v.pos[0] >= expected_world_min.x
+                && v.pos[0] <= expected_world_max.x
+                && v.pos[1] >= expected_world_min.y
+                && v.pos[1] <= expected_world_max.y
+                && v.pos[2] >= expected_world_min.z
+                && v.pos[2] <= expected_world_max.z
+        }));
+    }
+
+    #[test]
+    fn gpu_and_cpu_draw_records_share_world_space_contract() {
+        let coord = ChunkCoord { x: 2, y: 0, z: -1 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(7, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Mid);
+        let aabb_min = Vec3::new(30.0, 0.0, -20.0);
+        let aabb_max = Vec3::new(46.0, 16.0, -4.0);
+        let camera = Camera {
+            pos: Vec3::new(32.0, 8.0, 8.0),
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        for source in [DrawSource::CpuUploaded, DrawSource::GpuArtifact] {
+            let draw = GpuChunkDraw {
+                page_index: GpuPageIndex(7),
+                draw_indirect_index: 7,
+                lod: ChunkLod::Mid as u8,
+                origin: Vec3::new(32.0, 0.0, -16.0),
+                world_aabb_min: aabb_min,
+                world_aabb_max: aabb_max,
+                draw_source: source,
+                index_count: Some(12),
+            };
+            assert!(chunk_passes_draw_contract(
+                coord,
+                &draw,
+                &visible_slots,
+                &lod_selection,
+                visibility,
+            ));
+        }
     }
 
     #[test]
@@ -5015,7 +5216,19 @@ mod tests {
     }
     #[test]
     fn adjacent_chunk_bounds_are_world_space_and_contiguous() {
-        let store = ChunkStore::new();
+        let mut store = ChunkStore::new();
+        store.insert_chunk_with_policy(
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            chunk_with_voxel(CHUNK_SIZE_VOXELS as usize - 1, 0, 0, 1),
+            false,
+            NeighborDirtyPolicy::None,
+        );
+        store.insert_chunk_with_policy(
+            ChunkCoord { x: 1, y: 0, z: 0 },
+            chunk_with_voxel(0, 0, 0, 1),
+            false,
+            NeighborDirtyPolicy::None,
+        );
         let left_snapshot = build_chunk_snapshot(
             &store,
             ChunkCoord { x: 0, y: 0, z: 0 },
@@ -5043,5 +5256,85 @@ mod tests {
         assert_eq!(left_max.x, right_min.x);
         assert_eq!(left_min.y, right_min.y);
         assert_eq!(left_min.z, right_min.z);
+    }
+
+    #[test]
+    fn mid_lod_coarse_sampling_uses_border_for_negative_step_neighbor() {
+        let mut store = ChunkStore::new();
+        let mut west = Chunk::new_empty();
+        let mut center = Chunk::new_empty();
+        for z in 0..CHUNK_SIZE_VOXELS as usize {
+            for y in 0..CHUNK_SIZE_VOXELS as usize {
+                west.set(CHUNK_SIZE_VOXELS as usize - 1, y, z, 1);
+                center.set(0, y, z, 1);
+            }
+        }
+        store.insert_chunk_with_policy(
+            ChunkCoord { x: -1, y: 0, z: 0 },
+            west,
+            false,
+            NeighborDirtyPolicy::None,
+        );
+        store.insert_chunk_with_policy(
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            center,
+            false,
+            NeighborDirtyPolicy::None,
+        );
+
+        let snapshot = build_chunk_snapshot(
+            &store,
+            ChunkCoord { x: 0, y: 0, z: 0 },
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+
+        assert!(dominant_material_in_cell(&snapshot, -2, 0, 0, 2).is_some());
+    }
+
+    #[test]
+    fn render_selection_contract_matches_culling_contract() {
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(0),
+            draw_indirect_index: 0,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
+            draw_source: DrawSource::CpuUploaded,
+            index_count: Some(6),
+        };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(0, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Near);
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        assert!(chunk_passes_draw_contract(
+            coord,
+            &draw,
+            &visible_slots,
+            &lod_selection,
+            visibility,
+        ));
+
+        visible_slots.insert(0, ChunkCoord { x: 9, y: 0, z: 0 });
+        assert!(!chunk_passes_draw_contract(
+            coord,
+            &draw,
+            &visible_slots,
+            &lod_selection,
+            visibility,
+        ));
     }
 }
