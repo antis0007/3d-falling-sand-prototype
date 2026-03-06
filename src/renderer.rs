@@ -563,6 +563,7 @@ pub struct Renderer {
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
+    startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
 
@@ -570,6 +571,9 @@ pub struct Renderer {
     completed_meshes: Vec<MeshResult>,
     outcome_trace_window_start: Instant,
     outcome_trace_emitted: u32,
+    startup_seed_trace_window_start: Instant,
+    startup_seed_trace_emitted: u32,
+    startup_epoch: Instant,
     origin_voxel: VoxelCoord,
 
     pub day: bool,
@@ -656,12 +660,16 @@ pub struct MeshRebuildStats {
     pub outcome_gpu_adopted: usize,
     pub outcome_cpu_uploaded: usize,
     pub outcome_skipped_zero_geometry: usize,
+    pub outcome_skipped_startup_zero_geometry: usize,
     pub outcome_skipped_no_artifact_capacity: usize,
     pub outcome_skipped_invalid_page_mapping: usize,
     pub outcome_skipped_missing_voxel_state: usize,
     pub outcome_skipped_adoption_rejected: usize,
     pub outcome_skipped_sparse_indirect_undrawable: usize,
     pub outcome_skipped_backend_contract_mismatch: usize,
+    pub startup_seed_zero_count_seen: usize,
+    pub startup_seed_recovered_nonzero: usize,
+    pub startup_zero_near_retry_enqueued: usize,
     pub flow_received: usize,
     pub flow_adopted: usize,
     pub flow_uploaded: usize,
@@ -1013,6 +1021,7 @@ enum RebuildOutcome {
     GpuAdopted,
     CpuUploaded,
     SkippedZeroGeometry,
+    SkippedStartupZeroGeometry,
     SkippedNoArtifactCapacity,
     SkippedInvalidPageMapping,
     SkippedMissingVoxelState,
@@ -1032,6 +1041,14 @@ struct GpuChunkDraw {
     draw_source: DrawSource,
     // Optional debug metadata only; indirect draw args remain authoritative.
     index_count: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StartupMeshSeedState {
+    startup_seed_zero_count_seen: bool,
+    startup_seed_recovered_nonzero: bool,
+    first_zero_at: Option<Instant>,
+    recovered_nonzero_at: Option<Instant>,
 }
 
 const GPU_MESH_VERTEX_CAPACITY_PER_SLOT: u64 =
@@ -1077,6 +1094,7 @@ pub(crate) enum MeshSkipReason {
         in_flight_fences: u32,
     },
     ZeroGeometry,
+    StartupZeroGeometry,
     InvalidPageMapping,
     MissingVoxelState,
     AdoptionRejected,
@@ -1676,12 +1694,16 @@ impl Renderer {
             pending_lod_remesh: HashSet::new(),
             inflight_mesh_chunks: HashSet::new(),
             mesh_retry_state: HashMap::new(),
+            startup_mesh_seed_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
             outcome_trace_window_start: Instant::now(),
             outcome_trace_emitted: 0,
+            startup_seed_trace_window_start: Instant::now(),
+            startup_seed_trace_emitted: 0,
+            startup_epoch: Instant::now(),
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
             day: true,
             mesh_backend,
@@ -2096,6 +2118,9 @@ impl Renderer {
                 } else {
                     let outcome = match reason {
                         MeshSkipReason::ZeroGeometry => RebuildOutcome::SkippedZeroGeometry,
+                        MeshSkipReason::StartupZeroGeometry => {
+                            RebuildOutcome::SkippedStartupZeroGeometry
+                        }
                         MeshSkipReason::InvalidPageMapping => {
                             RebuildOutcome::SkippedInvalidPageMapping
                         }
@@ -2184,17 +2209,67 @@ impl Renderer {
 
                 if resolved_index_count == 0 {
                     stats.mesh_artifacts_rejected += 1;
-                    Self::record_rebuild_outcome(&mut stats, RebuildOutcome::SkippedZeroGeometry);
+                    let startup_zero_geometry = self.is_startup_zero_geometry(result.coord);
+                    let reason = if startup_zero_geometry {
+                        let seed_state = self.mark_startup_seed_zero_seen(result.coord);
+                        Self::record_rebuild_outcome(
+                            &mut stats,
+                            RebuildOutcome::SkippedStartupZeroGeometry,
+                        );
+                        self.sampled_startup_seed_trace(
+                            result.coord,
+                            *page_index,
+                            *draw_indirect_index,
+                            seed_state.first_zero_at,
+                            seed_state.recovered_nonzero_at,
+                            resolved_index_count,
+                            "startup_zero_geometry",
+                        );
+                        self.dirty_queues.queue_coord(result.coord, DirtyTier::Near);
+                        stats.startup_zero_near_retry_enqueued += 1;
+                        MeshSkipReason::StartupZeroGeometry
+                    } else {
+                        Self::record_rebuild_outcome(
+                            &mut stats,
+                            RebuildOutcome::SkippedZeroGeometry,
+                        );
+                        MeshSkipReason::ZeroGeometry
+                    };
                     self.sampled_outcome_trace(
                         &result,
-                        RebuildOutcome::SkippedZeroGeometry,
+                        if startup_zero_geometry {
+                            RebuildOutcome::SkippedStartupZeroGeometry
+                        } else {
+                            RebuildOutcome::SkippedZeroGeometry
+                        },
                         Some(*page_index),
                         Some(*draw_indirect_index),
                         Some(resolved_index_count),
-                        Some("frustum_unknown"),
+                        Some(if startup_zero_geometry {
+                            "startup_zero_geometry"
+                        } else {
+                            "frustum_unknown"
+                        }),
                     );
-                    skipped_retry_chunks.push((result.coord, MeshSkipReason::ZeroGeometry));
+                    if startup_zero_geometry {
+                        self.mesh_retry_state.remove(&result.coord);
+                    } else {
+                        skipped_retry_chunks.push((result.coord, reason));
+                    }
                     continue;
+                }
+
+                let recovery_state = self.mark_startup_seed_recovered(result.coord);
+                if let Some(seed_state) = recovery_state {
+                    self.sampled_startup_seed_trace(
+                        result.coord,
+                        *page_index,
+                        *draw_indirect_index,
+                        seed_state.first_zero_at,
+                        seed_state.recovered_nonzero_at,
+                        resolved_index_count,
+                        "startup_seed_recovered_nonzero",
+                    );
                 }
 
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
@@ -2394,6 +2469,16 @@ impl Renderer {
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
+        stats.startup_seed_zero_count_seen = self
+            .startup_mesh_seed_state
+            .values()
+            .filter(|state| state.startup_seed_zero_count_seen)
+            .count();
+        stats.startup_seed_recovered_nonzero = self
+            .startup_mesh_seed_state
+            .values()
+            .filter(|state| state.startup_seed_recovered_nonzero)
+            .count();
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
@@ -2459,11 +2544,15 @@ impl Renderer {
         self.completed_meshes.clear();
         self.outcome_trace_window_start = Instant::now();
         self.outcome_trace_emitted = 0;
+        self.startup_seed_trace_window_start = Instant::now();
+        self.startup_seed_trace_emitted = 0;
+        self.startup_epoch = Instant::now();
         self.mesh_versions.clear();
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
         self.inflight_mesh_chunks.clear();
         self.mesh_retry_state.clear();
+        self.startup_mesh_seed_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {
@@ -2548,6 +2637,9 @@ impl Renderer {
             RebuildOutcome::GpuAdopted => stats.outcome_gpu_adopted += 1,
             RebuildOutcome::CpuUploaded => stats.outcome_cpu_uploaded += 1,
             RebuildOutcome::SkippedZeroGeometry => stats.outcome_skipped_zero_geometry += 1,
+            RebuildOutcome::SkippedStartupZeroGeometry => {
+                stats.outcome_skipped_startup_zero_geometry += 1
+            }
             RebuildOutcome::SkippedNoArtifactCapacity => {
                 stats.outcome_skipped_no_artifact_capacity += 1
             }
@@ -2594,6 +2686,72 @@ impl Renderer {
             index_count,
             cull_result,
             outcome
+        );
+    }
+
+    fn is_startup_zero_geometry(&self, coord: ChunkCoord) -> bool {
+        let startup_window_frames = 180;
+        self.mesh_rebuild_frame_index <= startup_window_frames
+            && !self.visible_gpu_chunks.contains_key(&coord)
+    }
+
+    fn mark_startup_seed_zero_seen(&mut self, coord: ChunkCoord) -> StartupMeshSeedState {
+        let state = self.startup_mesh_seed_state.entry(coord).or_default();
+        if !state.startup_seed_zero_count_seen {
+            state.startup_seed_zero_count_seen = true;
+            state.first_zero_at = Some(Instant::now());
+        }
+        *state
+    }
+
+    fn mark_startup_seed_recovered(&mut self, coord: ChunkCoord) -> Option<StartupMeshSeedState> {
+        let state = self.startup_mesh_seed_state.get_mut(&coord)?;
+        if state.startup_seed_zero_count_seen && !state.startup_seed_recovered_nonzero {
+            state.startup_seed_recovered_nonzero = true;
+            state.recovered_nonzero_at = Some(Instant::now());
+            return Some(*state);
+        }
+        None
+    }
+
+    fn sampled_startup_seed_trace(
+        &mut self,
+        coord: ChunkCoord,
+        page_index: GpuPageIndex,
+        slot_index: u32,
+        first_zero_at: Option<Instant>,
+        recovered_nonzero_at: Option<Instant>,
+        index_count: u32,
+        event: &'static str,
+    ) {
+        if self.startup_seed_trace_window_start.elapsed().as_secs_f32() >= 1.0 {
+            self.startup_seed_trace_window_start = Instant::now();
+            self.startup_seed_trace_emitted = 0;
+        }
+        if self.startup_seed_trace_emitted >= OUTCOME_TRACE_SAMPLES_PER_SECOND {
+            return;
+        }
+        self.startup_seed_trace_emitted += 1;
+
+        let first_zero_ms = first_zero_at.map(|ts| {
+            ts.saturating_duration_since(self.startup_epoch)
+                .as_secs_f32()
+                * 1000.0
+        });
+        let recovered_ms = recovered_nonzero_at.map(|ts| {
+            ts.saturating_duration_since(self.startup_epoch)
+                .as_secs_f32()
+                * 1000.0
+        });
+        log::info!(
+            "[mesh-startup-seed] event={} coord={:?} page={} slot={} first_zero_ms={:?} recovered_ms={:?} index_count={}",
+            event,
+            coord,
+            page_index.0,
+            slot_index,
+            first_zero_ms,
+            recovered_ms,
+            index_count
         );
     }
 

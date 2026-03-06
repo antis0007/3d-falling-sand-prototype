@@ -67,6 +67,10 @@ pub struct ProfilerStats {
     pub mesh_gpu_job_failure_count: usize,
     pub mesh_gpu_job_timeout_count: usize,
     pub mesh_gpu_job_skipped_count: usize,
+    pub mesh_outcome_startup_zero_geometry_count: usize,
+    pub mesh_startup_seed_zero_count_seen: usize,
+    pub mesh_startup_seed_recovered_nonzero: usize,
+    pub mesh_startup_zero_near_retry_enqueued: usize,
     pub dirty_queue_drop_count: usize,
     pub dirty_urgent_depth: usize,
     pub dirty_near_depth: usize,
@@ -676,6 +680,13 @@ pub fn draw(
                     ui_state.profiler.mesh_ms,
                     ui_state.profiler.mesh_count,
                     ui_state.profiler.dirty_backlog
+                ));
+                ui.monospace(format!(
+                    "startup zero suppression outcomes: {} | zero seen/recovered: {}/{} | immediate near retries: {}",
+                    ui_state.profiler.mesh_outcome_startup_zero_geometry_count,
+                    ui_state.profiler.mesh_startup_seed_zero_count_seen,
+                    ui_state.profiler.mesh_startup_seed_recovered_nonzero,
+                    ui_state.profiler.mesh_startup_zero_near_retry_enqueued,
                 ));
                 ui.monospace(format!(
                     "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {} | gpu failures/timeouts/skips: {}/{}/{} | dirty queue drops: {}",
