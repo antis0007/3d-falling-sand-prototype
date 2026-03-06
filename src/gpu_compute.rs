@@ -598,6 +598,8 @@ static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_DISPATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
+static GPU_STARTUP_ZERO_FRONTIER_MESH_RUNS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
 #[cfg(feature = "gpu-compute")]
@@ -1424,7 +1426,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let high_edit_volume = edit_commands.len() > HIGH_EDIT_VOLUME_THRESHOLD;
         let startup_seeding_mode = page_was_reassigned;
-        let pressure_relief_mode = startup_seeding_mode || high_edit_volume;
+        let pressure_relief_mode = high_edit_volume;
 
         let active_frontier_count = if pressure_relief_mode {
             raw_active_frontier_count.min(SAFE_ACTIVE_FRONTIER_LIMIT)
@@ -1517,8 +1519,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             dispatch_ms: 0.0,
                         }
                     } else {
-                        let _ =
-                            GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
+                        let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
 
                         log::debug!(
                             "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted (slot_capacity={}, in_flight_fences={})",
@@ -1594,11 +1595,9 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
             }
 
             if !active.is_empty() {
-                state.queue.write_buffer(
-                    &scratch.active_tiles,
-                    0,
-                    bytemuck::cast_slice(&active),
-                );
+                state
+                    .queue
+                    .write_buffer(&scratch.active_tiles, 0, bytemuck::cast_slice(&active));
             }
         }
 
@@ -1614,11 +1613,12 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
 
         // Ensure page initialization happens before compute passes
         if task.startup_seeding_mode {
-            let mut encoder = state.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor {
-                    label: Some("gpu_page_clear"),
-                },
-            );
+            let mut encoder =
+                state
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("gpu_page_clear"),
+                    });
 
             clear_page_buffers(&mut encoder, &state, task.page_index);
 
@@ -1626,7 +1626,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
         }
 
         // Run simulation kernel
-        if !task.startup_seeding_mode && task.frontier_count > 0 {
+        if task.frontier_count > 0 || !task.edit_commands.is_empty() {
             state.runtime.run_active_frontier(
                 &state,
                 scratch,
@@ -1643,6 +1643,17 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
         #[cfg(feature = "gpu_meshing_experimental")]
         {
             if let Some(mesh_slice) = task.mesh_slice {
+                if task.startup_seeding_mode && task.frontier_count == 0 {
+                    let runs =
+                        GPU_STARTUP_ZERO_FRONTIER_MESH_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::debug!(
+                        "[mesh] startup seeding ran meshing with empty frontier for {:?} (runs={}, edit_commands={})",
+                        task.coord,
+                        runs,
+                        task.edit_commands.len(),
+                    );
+                }
+
                 state.runtime.run_meshing_dispatch(
                     &state,
                     scratch,
@@ -1652,6 +1663,34 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
                     0,
                     mesh_slice,
                 )?;
+
+                if task.startup_seeding_mode
+                    && !task.edit_commands.is_empty()
+                    && task.coord.x.abs() <= 1
+                    && task.coord.y.abs() <= 1
+                    && task.coord.z.abs() <= 1
+                {
+                    let draw = read_gpu_draw_indexed_indirect(
+                        &state.device,
+                        &state.queue,
+                        &state.draw_indirect_buffer,
+                        mesh_slice.slot_index as usize,
+                    )?;
+                    if draw.index_count == 0 {
+                        log::warn!(
+                            "[mesh] startup seeding produced zero index_count for near non-empty chunk {:?} on first upload (slot={})",
+                            task.coord,
+                            mesh_slice.slot_index,
+                        );
+                    } else {
+                        log::debug!(
+                            "[mesh] startup seeding validated indirect index_count={} for near chunk {:?} (slot={})",
+                            draw.index_count,
+                            task.coord,
+                            mesh_slice.slot_index,
+                        );
+                    }
+                }
             }
         }
 
@@ -1671,6 +1710,48 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
     }
 
     Ok(dispatched)
+}
+
+#[cfg(all(feature = "gpu-compute", feature = "gpu_meshing_experimental"))]
+fn read_gpu_draw_indexed_indirect(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    indirect_buffer: &wgpu::Buffer,
+    slot: usize,
+) -> anyhow::Result<DrawIndexedIndirectArgs> {
+    use std::sync::mpsc::channel;
+
+    let args_size = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+    let offset = slot as u64 * args_size;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("startup_indirect_readback_staging"),
+        size: args_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("startup_indirect_readback_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(indirect_buffer, offset, &staging, 0, args_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = channel();
+    slice.map_async(wgpu::MapMode::Read, move |v| {
+        tx.send(v).ok();
+    });
+    device.poll(wgpu::Maintain::Wait);
+
+    rx.recv()
+        .context("failed waiting for startup indirect readback")??;
+
+    let data = slice.get_mapped_range();
+    let args = *bytemuck::from_bytes::<DrawIndexedIndirectArgs>(&data);
+    drop(data);
+    staging.unmap();
+    Ok(args)
 }
 #[cfg(feature = "gpu-compute")]
 pub fn update_gpu_page_fences_on_renderer() {
