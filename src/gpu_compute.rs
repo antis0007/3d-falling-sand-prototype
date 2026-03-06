@@ -1560,9 +1560,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         ChunkMeshArtifact::Gpu {
                             page_index,
                             draw_indirect_index: mesh_slice.slot_index,
-                            // GPU meshing writes the real index count into the indirect buffer.
-                            // Leave this neutral so the renderer does not treat it as CPU geometry.
-                            index_count: 0,
+                            // Completion token for non-blocking renderer adoption.
+                            // Real draw args are still sourced from the GPU indirect buffer.
+                            index_count: 1,
                             lod: job.lod as u8,
                             verts,
                             inds,
