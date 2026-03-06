@@ -53,6 +53,7 @@ struct ChunkMeshMeta {
 @group(0) @binding(6) var<storage, read> frame_params: array<FrameParams>;
 @group(0) @binding(7) var<storage, read_write> face_count: array<u32>;
 @group(0) @binding(8) var<storage, read_write> mesh_meta_buffer: array<ChunkMeshMeta>;
+@group(0) @binding(9) var<storage, read> chunk_origin_buffer: array<vec4<f32>>;
 
 fn atlas_state_offset(page: u32, state: u32) -> u32 {
     return page * (CHUNK_VOLUME * 2u) + state * CHUNK_VOLUME;
@@ -93,7 +94,8 @@ fn voxel_at(base_off: u32, p: vec3<i32>) -> u32 {
 fn write_face_quad(
     dir: u32,
     base: vec3<f32>,
-    color: u32,
+    chunk_origin: vec3<f32>,
+    material_id: u32,
     global_vertex_offset: u32,
     global_index_offset: u32,
 ) {
@@ -116,10 +118,10 @@ fn write_face_quad(
     let v2 = global_vertex_offset + 2u;
     let v3 = global_vertex_offset + 3u;
 
-    chunk_vertex_buffer[v0] = GpuVertex(c0, color);
-    chunk_vertex_buffer[v1] = GpuVertex(c1, color);
-    chunk_vertex_buffer[v2] = GpuVertex(c2, color);
-    chunk_vertex_buffer[v3] = GpuVertex(c3, color);
+    chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0, material_id);
+    chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1, material_id);
+    chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2, material_id);
+    chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3, material_id);
 
     chunk_index_buffer[global_index_offset + 0u] = v0;
     chunk_index_buffer[global_index_offset + 1u] = v1;
@@ -246,6 +248,7 @@ fn emit_mesh(
     let index_base = mesh_meta.index_offset;
 
     let total_faces = face_count[page];
+    let chunk_origin = chunk_origin_buffer[page].xyz;
 
     // --- always write draw command ---
     if (lid.x == 0u) {
@@ -285,7 +288,7 @@ fn emit_mesh(
         let vo = write_face * 4u;
         let io = write_face * 6u;
 
-        write_face_quad(dir, base, material_color(id), vertex_base + vo, index_base + io);
+        write_face_quad(dir, base, chunk_origin, id, vertex_base + vo, index_base + io);
 
         write_face = write_face + 1u;
     }
