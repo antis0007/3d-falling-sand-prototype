@@ -95,7 +95,7 @@ fn write_face_quad(
     dir: u32,
     base: vec3<f32>,
     chunk_origin: vec3<f32>,
-    color: u32,
+    material_id: u32,
     global_vertex_offset: u32,
     global_index_offset: u32,
 ) {
@@ -118,10 +118,10 @@ fn write_face_quad(
     let v2 = global_vertex_offset + 2u;
     let v3 = global_vertex_offset + 3u;
 
-    chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0, color);
-    chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1, color);
-    chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2, color);
-    chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3, color);
+    chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0, material_id);
+    chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1, material_id);
+    chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2, material_id);
+    chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3, material_id);
 
     chunk_index_buffer[global_index_offset + 0u] = v0;
     chunk_index_buffer[global_index_offset + 1u] = v1;
