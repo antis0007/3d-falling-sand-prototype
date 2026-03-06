@@ -486,18 +486,11 @@ fn read_gpu_draw_indirect_command(
         mapped_at_creation: false,
     });
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read_indirect_encoder"),
-        });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("read_indirect_encoder"),
+    });
 
-    encoder.copy_buffer_to_buffer(
-        indirect_buffer,
-        offset,
-        &staging,
-        0,
-        command_size,
-    );
+    encoder.copy_buffer_to_buffer(indirect_buffer, offset, &staging, 0, command_size);
 
     queue.submit(Some(encoder.finish()));
 
@@ -1426,7 +1419,7 @@ impl Renderer {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -2150,7 +2143,7 @@ impl Renderer {
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
-        
+
         for coord in failed_retry_coords {
             self.schedule_mesh_retry(coord, MeshRetryKind::Failed);
         }
@@ -2220,7 +2213,7 @@ impl Renderer {
         }
         stats
     }
-    
+
     pub fn clear_mesh_cache(&mut self) {
         self.visible_gpu_chunks.clear();
         self.free_mesh_slots.clear();
@@ -2295,10 +2288,10 @@ impl Renderer {
             );
             if self.supports_multi_draw_indirect {
                 pass.multi_draw_indexed_indirect(
-                &self.global_gpu_draw_indirect_buffer,
-                0,
-                draw_count as u32,
-            );
+                    &self.global_gpu_draw_indirect_buffer,
+                    0,
+                    draw_count as u32,
+                );
             } else {
                 let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
                 for draw in self.visible_gpu_chunks.values() {
