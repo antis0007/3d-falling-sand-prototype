@@ -4646,7 +4646,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_neighbor_treated_as_empty_for_boundary_faces_in_aggressive_mode() {
+    fn missing_neighbors_keep_boundary_faces_visible_in_default_mode() {
         let mut store = ChunkStore::new();
         store.insert_chunk_with_policy(
             coord(),
@@ -4655,10 +4655,21 @@ mod tests {
             NeighborDirtyPolicy::None,
         );
 
-        let no_neighbor =
+        let aggressive_snapshot =
             build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_a, _, _, _, _) =
-            mesh_chunk_snapshot(coord(), &no_neighbor, ChunkLod::Near, false);
+        let conservative_snapshot = build_chunk_snapshot(
+            &store,
+            coord(),
+            UnknownNeighborOcclusionPolicy::Conservative,
+        );
+
+        let (aggressive_verts, _, _, _, _) =
+            mesh_chunk_snapshot(coord(), &aggressive_snapshot, ChunkLod::Near, false);
+        let (conservative_verts, _, _, _, _) =
+            mesh_chunk_snapshot(coord(), &conservative_snapshot, ChunkLod::Near, false);
+
+        assert_eq!(aggressive_verts.len(), 24);
+        assert_eq!(conservative_verts.len(), 20);
 
         store.insert_chunk_with_policy(
             ChunkCoord { x: 1, y: 0, z: 0 },
@@ -4666,13 +4677,21 @@ mod tests {
             false,
             NeighborDirtyPolicy::None,
         );
-        let with_neighbor =
+        let aggressive_with_neighbor =
             build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_b, _, _, _, _) =
-            mesh_chunk_snapshot(coord(), &with_neighbor, ChunkLod::Near, false);
+        let conservative_with_neighbor = build_chunk_snapshot(
+            &store,
+            coord(),
+            UnknownNeighborOcclusionPolicy::Conservative,
+        );
 
-        assert_eq!(verts_a.len(), 24);
-        assert_eq!(verts_b.len(), 24);
+        let (aggressive_neighbor_verts, _, _, _, _) =
+            mesh_chunk_snapshot(coord(), &aggressive_with_neighbor, ChunkLod::Near, false);
+        let (conservative_neighbor_verts, _, _, _, _) =
+            mesh_chunk_snapshot(coord(), &conservative_with_neighbor, ChunkLod::Near, false);
+
+        assert_eq!(aggressive_neighbor_verts.len(), 24);
+        assert_eq!(conservative_neighbor_verts.len(), 24);
     }
 
     #[test]

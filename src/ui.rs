@@ -409,7 +409,7 @@ impl Default for UiState {
             profiler: ProfilerStats::default(),
             renderer_frustum_culling: true,
             renderer_greedy_meshing: true,
-            renderer_conservative_neighbors: true,
+            renderer_conservative_neighbors: false,
             show_chunk_overlay: false,
             startup_backend_label: "unknown".to_string(),
             startup_required_limits: "n/a".to_string(),
@@ -913,6 +913,9 @@ pub fn draw(
                 ui.checkbox(
                     &mut ui_state.renderer_conservative_neighbors,
                     "Unknown neighbors occlude (conservative)",
+                )
+                .on_hover_text(
+                    "Conservative mode can hide boundary surfaces until adjacent chunks stream in.",
                 );
                 ui.monospace(format!(
                     "meshing last/max: {:.2}/{:.2}",
@@ -1944,6 +1947,12 @@ fn fallback_tool_texture(color: [u8; 4]) -> egui::ColorImage {
 #[cfg(test)]
 mod tests {
     use super::UiState;
+
+    #[test]
+    fn conservative_neighbor_occlusion_is_disabled_by_default() {
+        let ui = UiState::default();
+        assert!(!ui.renderer_conservative_neighbors);
+    }
 
     #[test]
     fn biome_hint_transitions_default_known_then_stale() {
