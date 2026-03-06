@@ -734,8 +734,12 @@ pub struct MeshRebuildStats {
     pub resident_unknown: usize,
     pub mesh_reject_no_longer_desired: usize,
     pub mesh_slot_allocation_failures: usize,
+    pub mesh_pending_total: usize,
     pub mesh_pending_finalize: usize,
+    pub mesh_pending_promoted_to_drawable: usize,
     pub mesh_waiting_on_fence: usize,
+    pub mesh_pending_superseded: usize,
+    pub mesh_pending_rejected: usize,
     pub mesh_dropped_before_drawable: usize,
     pub mesh_last_good_retained: usize,
     pub mesh_visible_logical_not_drawable: usize,
@@ -1097,6 +1101,12 @@ struct MeshResult {
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
+}
+
+struct PendingGpuMeshResult {
+    result: MeshResult,
+    first_seen_frame: u64,
+    first_seen_completed_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2256,6 +2266,10 @@ impl Renderer {
             }
         }
 
+        let mut pending_promoted_to_drawable = 0usize;
+        let mut pending_superseded = 0usize;
+        let mut pending_rejected = 0usize;
+
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
@@ -2325,13 +2339,32 @@ impl Renderer {
         let mut skipped_retry_chunks = Vec::new();
         let completed_meshes_depth = self.completed_meshes.len();
         let completed_results: Vec<MeshResult> = self.completed_meshes.drain(..).collect();
-        for result in completed_results {
+        for (completed_index, result) in completed_results.into_iter().enumerate() {
+            if let ChunkMeshArtifact::GpuPending { .. } = &result.artifact {
+                stats.mesh_pending_finalize += 1;
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
+                self.pending_gpu_results.insert(
+                    result.coord,
+                    PendingGpuMeshResult {
+                        result,
+                        first_seen_frame: self.mesh_rebuild_frame_index,
+                        first_seen_completed_index: completed_index,
+                    },
+                );
+                continue;
+            }
+
             stats.mesh_artifacts_received += 1;
             let backend = Self::mesh_result_backend_label(&result);
             let (index_count, vertex_count) = Self::mesh_result_index_vertex_counts(&result);
             let desired = chunk_priority_scores.contains_key(&result.coord)
                 || self.visible_gpu_chunks.contains_key(&result.coord);
             let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
+            let pending_replaced = self.pending_gpu_results.remove(&result.coord).is_some();
+            if pending_replaced {
+                pending_superseded += 1;
+            }
             let voxel_version = store.chunk_voxel_version(result.coord);
             log::debug!(
                 "[mesh-flow] recv chunk={:?} backend={} lod={:?} version={} store_version={} desired={} prior_mesh={} index_count={} vertex_count={}",
@@ -2348,6 +2381,9 @@ impl Renderer {
             if !desired {
                 stats.mesh_artifacts_rejected += 1;
                 stats.mesh_reject_no_longer_desired += 1;
+                if pending_replaced {
+                    pending_rejected += 1;
+                }
                 if had_prior_mesh {
                     stats.mesh_last_good_retained += 1;
                 }
@@ -2365,6 +2401,9 @@ impl Renderer {
                 stats.stale_drop_count += 1;
                 stats.mesh_artifacts_rejected += 1;
                 stats.mesh_reject_stale += 1;
+                if pending_replaced {
+                    pending_rejected += 1;
+                }
                 stats.stale_drop_retry_enqueued += 1;
                 match retry_policy {
                     StaleArtifactRetryPolicy::Urgent => {
@@ -2378,6 +2417,9 @@ impl Renderer {
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
             if let ChunkMeshArtifact::Skipped { reason } = &result.artifact {
                 stats.gpu_job_skipped += 1;
+                if pending_replaced {
+                    pending_rejected += 1;
+                }
 
                 log::warn!(
                     "[mesh] skipped chunk={:?} reason={:?}",
@@ -2436,6 +2478,9 @@ impl Renderer {
 
             if let ChunkMeshArtifact::Failed { reason } = &result.artifact {
                 stats.gpu_job_failures += 1;
+                if pending_replaced {
+                    pending_rejected += 1;
+                }
                 if is_gpu_timeout_reason(reason) {
                     stats.gpu_job_timeouts += 1;
                 }
@@ -2484,6 +2529,9 @@ impl Renderer {
                     );
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_invalid_page += 1;
+                    if pending_replaced {
+                        pending_rejected += 1;
+                    }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
                     Self::record_rebuild_outcome(
@@ -2697,6 +2745,9 @@ impl Renderer {
             );
             stats.mesh_artifacts_rejected += 1;
             stats.mesh_reject_unhandled += 1;
+            if pending_replaced {
+                pending_rejected += 1;
+            }
             stats.mesh_dropped_before_drawable += 1;
             if had_prior_mesh {
                 stats.mesh_last_good_retained += 1;
@@ -2763,6 +2814,38 @@ impl Renderer {
             .values()
             .filter(|state| state.startup_seed_recovered_nonzero)
             .count();
+        let mut oldest_pending: Option<(u64, usize, ChunkCoord)> = None;
+        for (coord, pending) in &self.pending_gpu_results {
+            let age_frames = self
+                .mesh_rebuild_frame_index
+                .saturating_sub(pending.first_seen_frame);
+            stats.mesh_waiting_on_fence += 1;
+            oldest_pending = match oldest_pending {
+                Some((old_age, old_idx, old_coord)) if old_age > age_frames => {
+                    Some((old_age, old_idx, old_coord))
+                }
+                Some((old_age, old_idx, old_coord))
+                    if old_age == age_frames && old_idx <= pending.first_seen_completed_index =>
+                {
+                    Some((old_age, old_idx, old_coord))
+                }
+                _ => Some((age_frames, pending.first_seen_completed_index, *coord)),
+            };
+        }
+        if let Some((age_frames, first_seen_completed_index, coord)) = oldest_pending {
+            log::trace!(
+                "[mesh-flow] pending oldest chunk={:?} age_frames={} first_seen_completed_index={}",
+                coord,
+                age_frames,
+                first_seen_completed_index
+            );
+        }
+        stats.mesh_pending_total = self.pending_gpu_results.len();
+        stats.mesh_pending_finalize = stats.mesh_pending_total;
+        stats.mesh_pending_promoted_to_drawable = pending_promoted_to_drawable;
+        stats.mesh_pending_superseded = pending_superseded;
+        stats.mesh_pending_rejected = pending_rejected;
+
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;

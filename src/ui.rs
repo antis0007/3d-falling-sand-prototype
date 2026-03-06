@@ -46,6 +46,11 @@ pub struct ProfilerStats {
     pub mesh_flow_adopted: usize,
     pub mesh_flow_uploaded: usize,
     pub mesh_flow_rejected: usize,
+    pub mesh_pending_total: usize,
+    pub mesh_pending_promoted_to_drawable: usize,
+    pub mesh_pending_waiting_on_fence: usize,
+    pub mesh_pending_superseded: usize,
+    pub mesh_pending_rejected: usize,
     pub mesh_reject_stale: usize,
     pub mesh_reject_invalid_page: usize,
     pub mesh_reject_zero_index: usize,
@@ -752,6 +757,14 @@ pub fn draw(
                     ui_state.profiler.mesh_flow_adopted,
                     ui_state.profiler.mesh_flow_uploaded,
                     ui_state.profiler.mesh_flow_rejected,
+                ));
+                ui.monospace(format!(
+                    "pending lifecycle total/promoted/waiting/superseded/rejected: {}/{}/{}/{}/{}",
+                    ui_state.profiler.mesh_pending_total,
+                    ui_state.profiler.mesh_pending_promoted_to_drawable,
+                    ui_state.profiler.mesh_pending_waiting_on_fence,
+                    ui_state.profiler.mesh_pending_superseded,
+                    ui_state.profiler.mesh_pending_rejected,
                 ));
                 ui.monospace(format!(
                     "reject reasons stale/invalid-page/zero-index/failed/unhandled | zero-index soft-retries: {}/{}/{}/{}/{} | {}",
