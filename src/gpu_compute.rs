@@ -940,9 +940,9 @@ impl GpuComputeRuntime {
         neighbor_pages: [u32; 6],
     ) -> anyhow::Result<()> {
         let t0 = Instant::now();
-        let frontier_len = sim_job
-            .active_frontier_count
-            .min(sim_job.materials.len() as u32);
+        // `SimulationJob::materials` is intentionally empty on the renderer dispatch path
+        // to avoid per-dispatch CHUNK_VOLUME host allocations. Clamp by chunk volume directly.
+        let frontier_len = sim_job.active_frontier_count.min(CHUNK_VOLUME as u32);
 
         if !edit_commands.is_empty() {
             state.queue.write_buffer(
@@ -1883,7 +1883,9 @@ fn device_page_params(
 ) -> [FrameParams; 1] {
     [FrameParams {
         page_index: page_index.0,
-        voxel_count: sim_job.materials.len() as u32,
+        // Renderer-side GPU dispatch does not populate `SimulationJob::materials`.
+        // Always use full chunk volume for shader bounds/loops.
+        voxel_count: CHUNK_VOLUME as u32,
         frontier_len,
         simulation_tick: sim_job.simulation_tick,
         state_index,
