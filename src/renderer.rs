@@ -3,13 +3,14 @@
 //! - **Authoritative input:** meshing consumes a [`ChunkSnapshot`] built from
 //!   [`ChunkStore`] via `build_chunk_snapshot`, so workers never read mutable
 //!   world state directly.
-//! - **Vertex coordinate space:** all meshing emits chunk-local positions
-//!   (scaled by [`VOXEL_SIZE`]), independent of world placement.
-//! - **Chunk transform ownership:** chunk mesh vertices are authored in world
-//!   space and submitted from shared GPU mesh buffers.
+//! - **Vertex coordinate space:** GPU meshing emits **world-space** vertex
+//!   positions in meters (scaled by [`VOXEL_SIZE`]).
+//! - **Chunk transform ownership:** chunk origins are authored in world space
+//!   and consumed by the meshing compute shader via `chunk_origin_buffer`.
 //! - **Floating-origin contract:** renderer APIs accept **world-space camera
 //!   coordinates**. The renderer then derives both world-space culling and
-//!   render-space projection from that one source of truth.
+//!   render-space projection from that one source of truth. The render shader
+//!   subtracts `world_origin_offset` exactly once.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{

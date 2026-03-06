@@ -1,5 +1,6 @@
 const CHUNK_SIDE: u32 = 32u;
 const CHUNK_VOLUME: u32 = CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE;
+const VOXEL_SIZE: f32 = 0.5;
 
 const FACE_MASK_POS_X: u32 = 1u << 0u;
 const FACE_MASK_NEG_X: u32 = 1u << 1u;
@@ -9,6 +10,8 @@ const FACE_MASK_POS_Z: u32 = 1u << 4u;
 const FACE_MASK_NEG_Z: u32 = 1u << 5u;
 
 const MAX_FACES_PER_PAGE: u32 = GPU_MAX_FACES_PER_PAGE;
+const DEBUG_COLOR_OVERRIDE_ENABLED: bool = true;
+const DEBUG_COLOR_OVERRIDE_PAGE: u32 = 0u;
 
 struct FrameParams {
     page_index: u32,
@@ -93,7 +96,7 @@ fn write_face_quad(
     dir: u32,
     base: vec3<f32>,
     chunk_origin: vec3<f32>,
-    material_id: u32,
+    color: u32,
     global_vertex_offset: u32,
     global_index_offset: u32,
 ) {
@@ -116,10 +119,10 @@ fn write_face_quad(
     let v2 = global_vertex_offset + 2u;
     let v3 = global_vertex_offset + 3u;
 
-    chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0, material_id);
-    chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1, material_id);
-    chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2, material_id);
-    chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3, material_id);
+    chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0 * VOXEL_SIZE, color);
+    chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1 * VOXEL_SIZE, color);
+    chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2 * VOXEL_SIZE, color);
+    chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3 * VOXEL_SIZE, color);
 
     chunk_index_buffer[global_index_offset + 0u] = v0;
     chunk_index_buffer[global_index_offset + 1u] = v1;
@@ -162,6 +165,16 @@ fn material_color(material_id: u32) -> u32 {
         case DEAD_LEAF: { return pack_rgba8(170u, 114u, 60u, 255u); }
         default: { return pack_rgba8(255u, 0u, 255u, 255u); }
     }
+}
+
+fn debug_override_color(page: u32, dir: u32, material_id: u32) -> u32 {
+    if (DEBUG_COLOR_OVERRIDE_ENABLED && page == DEBUG_COLOR_OVERRIDE_PAGE) {
+        if ((dir & 1u) == 0u) {
+            return pack_rgba8(255u, 0u, 255u, 255u);
+        }
+        return pack_rgba8(0u, 255u, 0u, 255u);
+    }
+    return material_color(material_id);
 }
 
 @compute @workgroup_size(128)
@@ -286,7 +299,8 @@ fn emit_mesh(
         let vo = write_face * 4u;
         let io = write_face * 6u;
 
-        write_face_quad(dir, base, chunk_origin, id, vertex_base + vo, index_base + io);
+        let color = debug_override_color(page, dir, id);
+        write_face_quad(dir, base, chunk_origin, color, vertex_base + vo, index_base + io);
 
         write_face = write_face + 1u;
     }
