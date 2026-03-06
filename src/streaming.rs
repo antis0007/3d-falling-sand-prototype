@@ -104,11 +104,11 @@ pub struct VisibilityContext {
     pub camera_pos_chunks: Vec3,
     pub cone_inner_cos: f32,
     pub cone_outer_cos: f32,
-    /// Optional frustum planes in the same **chunk-space** basis as `camera_pos_chunks`.
+    /// Optional frustum planes in **absolute chunk-space** (`ax + by + cz + d = 0`).
     ///
-    /// Plane equations are evaluated against vectors relative to `camera_pos_chunks` and
-    /// chunk centers derived from integer chunk coordinates. Supplying world-space planes
-    /// here can silently skew streaming priorities.
+    /// The point tested against each plane is the absolute chunk center (`coord + 0.5`),
+    /// not camera-relative. Keep these planes in the same chunk-space basis used to build
+    /// chunk centers; do not pass camera-relative or world-meter planes.
     pub frustum_planes: Option<[Vec4; 6]>,
 }
 
@@ -278,7 +278,7 @@ impl ChunkStreaming {
         let mut weighted = Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
         let view_dir = view_dir.normalize_or_zero();
         let velocity_dir = player_velocity.normalize_or_zero();
-        let (cone_inner_cos, cone_outer_cos, frustum_planes_chunk_space, camera_pos_chunk_space) =
+        let (cone_inner_cos, cone_outer_cos, frustum_planes_chunk_space, _camera_pos_chunk_space) =
             visibility
                 .map(|ctx| {
                     Self::debug_validate_visibility_context(player_chunk, ctx, far_radius, ry);
@@ -330,14 +330,10 @@ impl ChunkStreaming {
                     coord.y as f32 + 0.5,
                     coord.z as f32 + 0.5,
                 );
-                let camera_to_chunk_center_chunk_space =
-                    chunk_center_chunk_space - camera_pos_chunk_space;
                 let radius = 0.866_025_4;
                 let mut min_margin = f32::INFINITY;
                 for plane_chunk_space in planes_chunk_space {
-                    let margin = plane_chunk_space
-                        .truncate()
-                        .dot(camera_to_chunk_center_chunk_space)
+                    let margin = plane_chunk_space.truncate().dot(chunk_center_chunk_space)
                         + plane_chunk_space.w;
                     min_margin = min_margin.min(margin);
                 }
@@ -1296,7 +1292,7 @@ mod tests {
         let mid_radius = 1;
         let far_radius = Some(2);
 
-        // Plane normal points +X in camera-relative chunk-space.
+        // Plane normal points +X in absolute chunk-space.
         let include_target = super::VisibilityContext {
             camera_pos_chunks: Vec3::ZERO,
             cone_inner_cos: 1.0,
@@ -1310,11 +1306,17 @@ mod tests {
             frustum_planes: Some([glam::vec4(1.0, 0.0, 0.0, -5.0); 6]),
         };
 
+        let base_visibility = super::VisibilityContext {
+            camera_pos_chunks: Vec3::ZERO,
+            cone_inner_cos: 1.0,
+            cone_outer_cos: 1.0,
+            frustum_planes: None,
+        };
         let base = ChunkStreaming::desired_set(
             player,
             Vec3::ZERO,
             Vec3::ZERO,
-            None,
+            Some(&base_visibility),
             near_radius,
             mid_radius,
             far_radius,
@@ -1360,7 +1362,80 @@ mod tests {
         let boosted_score = boosted.generation_scores[&target];
         let culled_score = culled.generation_scores[&target];
 
-        assert!(boosted_score > base_score);
+        assert!(boosted_score > culled_score);
         assert!(base_score > culled_score);
+    }
+
+    #[test]
+    fn desired_set_frustum_inclusion_is_translation_invariant_in_chunk_space() {
+        let near_radius = 0;
+        let mid_radius = 1;
+        let far_radius = Some(2);
+        let target_offset = ChunkCoord { x: 2, y: 0, z: 0 };
+
+        let run = |player: ChunkCoord, target: ChunkCoord, camera_pos_chunks: Vec3| {
+            let visibility = super::VisibilityContext {
+                camera_pos_chunks,
+                cone_inner_cos: 1.0,
+                cone_outer_cos: 1.0,
+                // Absolute chunk-space plane x >= target_center_x - 0.1, so target is inside.
+                frustum_planes: Some(
+                    [glam::vec4(1.0, 0.0, 0.0, -(target.x as f32 + 0.5 - 0.1)); 6],
+                ),
+            };
+
+            let desired = ChunkStreaming::desired_set(
+                player,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Some(&visibility),
+                near_radius,
+                mid_radius,
+                far_radius,
+                far_radius,
+                0,
+                64,
+                64,
+                &HashMap::new(),
+                0,
+            );
+
+            desired.generation_scores[&target]
+        };
+
+        let player_a = ChunkCoord { x: 0, y: 0, z: 0 };
+        let target_a = ChunkCoord {
+            x: player_a.x + target_offset.x,
+            y: player_a.y + target_offset.y,
+            z: player_a.z + target_offset.z,
+        };
+        let score_a = run(player_a, target_a, Vec3::new(0.25, 0.0, 0.0));
+
+        let translation = ChunkCoord {
+            x: 40,
+            y: -7,
+            z: 19,
+        };
+        let player_b = ChunkCoord {
+            x: player_a.x + translation.x,
+            y: player_a.y + translation.y,
+            z: player_a.z + translation.z,
+        };
+        let target_b = ChunkCoord {
+            x: player_b.x + target_offset.x,
+            y: player_b.y + target_offset.y,
+            z: player_b.z + target_offset.z,
+        };
+        let score_b = run(
+            player_b,
+            target_b,
+            Vec3::new(
+                player_b.x as f32 + 0.25,
+                player_b.y as f32,
+                player_b.z as f32,
+            ),
+        );
+
+        assert!((score_a - score_b).abs() < 1.0e-6);
     }
 }
