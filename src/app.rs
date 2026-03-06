@@ -2103,6 +2103,15 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_gpu_visible_slot_min = mesh_stats.gpu_mesh_visible_slot_min;
                         ui.profiler.mesh_gpu_visible_slot_max = mesh_stats.gpu_mesh_visible_slot_max;
                         ui.profiler.mesh_gpu_visible_slot_holes = mesh_stats.gpu_mesh_visible_slot_holes;
+                        ui.profiler.mesh_flow_received = mesh_stats.flow_received;
+                        ui.profiler.mesh_flow_adopted = mesh_stats.flow_adopted;
+                        ui.profiler.mesh_flow_uploaded = mesh_stats.flow_uploaded;
+                        ui.profiler.mesh_flow_rejected = mesh_stats.flow_rejected;
+                        ui.profiler.mesh_resident_gpu_artifact = mesh_stats.resident_gpu_artifact;
+                        ui.profiler.mesh_resident_cpu_uploaded = mesh_stats.resident_cpu_uploaded;
+                        ui.profiler.mesh_resident_stale_cached = mesh_stats.resident_stale_cached;
+                        ui.profiler.mesh_resident_fallback = mesh_stats.resident_fallback;
+                        ui.profiler.mesh_resident_unknown = mesh_stats.resident_unknown;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
                         // GPU compute profiler snapshot isn't exported; keep these stable defaults.
                         ui.profiler.gpu_compute_dispatch_ms = 0.0;
@@ -2252,8 +2261,8 @@ pub async fn run() -> anyhow::Result<()> {
                             aspect: renderer.config.width as f32
                                 / renderer.config.height.max(1) as f32,
                         };
-                        let (chunks_drawn, total_indices) = renderer.mesh_draw_stats(&cam);
-                        ui.set_draw_stats(chunks_drawn, total_indices);
+                        let draw_stats = renderer.mesh_draw_stats(&cam);
+                        ui.set_draw_stats(&draw_stats);
                         let cull_stats = renderer.cull_stats(&cam);
                         ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
                         ui.profiler.frustum_culled_chunks = cull_stats.frustum_culled;
