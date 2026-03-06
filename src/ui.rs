@@ -42,6 +42,25 @@ pub struct ProfilerStats {
     pub mesh_gpu_visible_slot_min: i32,
     pub mesh_gpu_visible_slot_max: i32,
     pub mesh_gpu_visible_slot_holes: usize,
+    pub mesh_flow_received: usize,
+    pub mesh_flow_adopted: usize,
+    pub mesh_flow_uploaded: usize,
+    pub mesh_flow_rejected: usize,
+    pub mesh_resident_gpu_artifact: usize,
+    pub mesh_resident_cpu_uploaded: usize,
+    pub mesh_resident_stale_cached: usize,
+    pub mesh_resident_fallback: usize,
+    pub mesh_resident_unknown: usize,
+    pub mesh_drawn_gpu_artifact_chunks: usize,
+    pub mesh_drawn_gpu_artifact_indices: u64,
+    pub mesh_drawn_cpu_uploaded_chunks: usize,
+    pub mesh_drawn_cpu_uploaded_indices: u64,
+    pub mesh_drawn_stale_cached_chunks: usize,
+    pub mesh_drawn_stale_cached_indices: u64,
+    pub mesh_drawn_fallback_chunks: usize,
+    pub mesh_drawn_fallback_indices: u64,
+    pub mesh_drawn_unknown_chunks: usize,
+    pub mesh_drawn_unknown_indices: u64,
     pub mesh_stale_drop_count: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
@@ -281,9 +300,19 @@ impl UiState {
         }
     }
 
-    pub fn set_draw_stats(&mut self, chunks_drawn: usize, total_indices: u64) {
-        self.chunks_drawn = chunks_drawn;
-        self.total_indices = total_indices;
+    pub fn set_draw_stats(&mut self, draw_stats: &crate::renderer::MeshDrawStats) {
+        self.chunks_drawn = draw_stats.chunks_drawn;
+        self.total_indices = draw_stats.total_indices;
+        self.profiler.mesh_drawn_gpu_artifact_chunks = draw_stats.drawn_gpu_artifact_chunks;
+        self.profiler.mesh_drawn_gpu_artifact_indices = draw_stats.drawn_gpu_artifact_indices;
+        self.profiler.mesh_drawn_cpu_uploaded_chunks = draw_stats.drawn_cpu_uploaded_chunks;
+        self.profiler.mesh_drawn_cpu_uploaded_indices = draw_stats.drawn_cpu_uploaded_indices;
+        self.profiler.mesh_drawn_stale_cached_chunks = draw_stats.drawn_stale_cached_chunks;
+        self.profiler.mesh_drawn_stale_cached_indices = draw_stats.drawn_stale_cached_indices;
+        self.profiler.mesh_drawn_fallback_chunks = draw_stats.drawn_fallback_chunks;
+        self.profiler.mesh_drawn_fallback_indices = draw_stats.drawn_fallback_indices;
+        self.profiler.mesh_drawn_unknown_chunks = draw_stats.drawn_unknown_chunks;
+        self.profiler.mesh_drawn_unknown_indices = draw_stats.drawn_unknown_indices;
     }
 
     pub fn set_biome_hint(&mut self, biome_name: &str, world_x: i32, world_z: i32) {
@@ -699,16 +728,19 @@ pub fn draw(
                     ui_state.profiler.auto_tune_dirty_pressure,
                 ));
                 ui.monospace(format!(
-                    "cpu mesh uploads: {} chunks | {} bytes | avg latency {:.2} ms",
-                    ui_state.profiler.mesh_upload_count,
-                    ui_state.profiler.mesh_upload_bytes,
-                    ui_state.profiler.mesh_upload_latency_ms,
+                    "flow this frame recv/adopt/upload/reject: {}/{}/{}/{}",
+                    ui_state.profiler.mesh_flow_received,
+                    ui_state.profiler.mesh_flow_adopted,
+                    ui_state.profiler.mesh_flow_uploaded,
+                    ui_state.profiler.mesh_flow_rejected,
                 ));
                 ui.monospace(format!(
-                    "gpu mesh adoption: {} chunks | avg adoption latency {:.2} ms | visible {}",
-                    ui_state.profiler.mesh_gpu_adopt_count,
-                    ui_state.profiler.mesh_gpu_adopt_latency_ms,
-                    ui_state.profiler.mesh_gpu_visible_count,
+                    "resident chunks gpu/cpu/stale/fallback/unknown: {}/{}/{}/{}/{}",
+                    ui_state.profiler.mesh_resident_gpu_artifact,
+                    ui_state.profiler.mesh_resident_cpu_uploaded,
+                    ui_state.profiler.mesh_resident_stale_cached,
+                    ui_state.profiler.mesh_resident_fallback,
+                    ui_state.profiler.mesh_resident_unknown,
                 ));
                 ui.monospace(format!(
                     "gpu indirect slots min/max/holes: {}/{}/{}",
@@ -802,6 +834,22 @@ pub fn draw(
                 ui.monospace(format!(
                     "chunks_drawn: {} | total_indices: {}",
                     ui_state.chunks_drawn, ui_state.total_indices
+                ));
+                ui.monospace(format!(
+                    "drawn this frame gpu/cpu/stale/fallback/unknown chunks: {}/{}/{}/{}/{}",
+                    ui_state.profiler.mesh_drawn_gpu_artifact_chunks,
+                    ui_state.profiler.mesh_drawn_cpu_uploaded_chunks,
+                    ui_state.profiler.mesh_drawn_stale_cached_chunks,
+                    ui_state.profiler.mesh_drawn_fallback_chunks,
+                    ui_state.profiler.mesh_drawn_unknown_chunks,
+                ));
+                ui.monospace(format!(
+                    "drawn this frame gpu/cpu/stale/fallback/unknown indices: {}/{}/{}/{}/{}",
+                    ui_state.profiler.mesh_drawn_gpu_artifact_indices,
+                    ui_state.profiler.mesh_drawn_cpu_uploaded_indices,
+                    ui_state.profiler.mesh_drawn_stale_cached_indices,
+                    ui_state.profiler.mesh_drawn_fallback_indices,
+                    ui_state.profiler.mesh_drawn_unknown_indices,
                 ));
                 ui.monospace(format!(
                     "culled: {} (frustum {})",

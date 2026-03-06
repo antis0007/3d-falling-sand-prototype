@@ -661,6 +661,69 @@ pub struct MeshRebuildStats {
     pub outcome_skipped_adoption_rejected: usize,
     pub outcome_skipped_sparse_indirect_undrawable: usize,
     pub outcome_skipped_backend_contract_mismatch: usize,
+    pub flow_received: usize,
+    pub flow_adopted: usize,
+    pub flow_uploaded: usize,
+    pub flow_rejected: usize,
+    pub resident_gpu_artifact: usize,
+    pub resident_cpu_uploaded: usize,
+    pub resident_stale_cached: usize,
+    pub resident_fallback: usize,
+    pub resident_unknown: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawSource {
+    GpuArtifact,
+    CpuUploaded,
+    StaleCached,
+    Fallback,
+    Unknown,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct MeshDrawStats {
+    pub chunks_drawn: usize,
+    pub total_indices: u64,
+    pub drawn_gpu_artifact_chunks: usize,
+    pub drawn_gpu_artifact_indices: u64,
+    pub drawn_cpu_uploaded_chunks: usize,
+    pub drawn_cpu_uploaded_indices: u64,
+    pub drawn_stale_cached_chunks: usize,
+    pub drawn_stale_cached_indices: u64,
+    pub drawn_fallback_chunks: usize,
+    pub drawn_fallback_indices: u64,
+    pub drawn_unknown_chunks: usize,
+    pub drawn_unknown_indices: u64,
+}
+
+impl MeshDrawStats {
+    fn record_draw(&mut self, source: DrawSource, index_count: u64) {
+        self.chunks_drawn += 1;
+        self.total_indices += index_count;
+        match source {
+            DrawSource::GpuArtifact => {
+                self.drawn_gpu_artifact_chunks += 1;
+                self.drawn_gpu_artifact_indices += index_count;
+            }
+            DrawSource::CpuUploaded => {
+                self.drawn_cpu_uploaded_chunks += 1;
+                self.drawn_cpu_uploaded_indices += index_count;
+            }
+            DrawSource::StaleCached => {
+                self.drawn_stale_cached_chunks += 1;
+                self.drawn_stale_cached_indices += index_count;
+            }
+            DrawSource::Fallback => {
+                self.drawn_fallback_chunks += 1;
+                self.drawn_fallback_indices += index_count;
+            }
+            DrawSource::Unknown => {
+                self.drawn_unknown_chunks += 1;
+                self.drawn_unknown_indices += index_count;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -965,6 +1028,7 @@ struct GpuChunkDraw {
     origin: Vec3,
     world_aabb_min: Vec3,
     world_aabb_max: Vec3,
+    draw_source: DrawSource,
     // Optional debug metadata only; indirect draw args remain authoritative.
     index_count: Option<u32>,
 }
@@ -2037,9 +2101,7 @@ impl Renderer {
                         MeshSkipReason::MissingVoxelState => {
                             RebuildOutcome::SkippedMissingVoxelState
                         }
-                        MeshSkipReason::AdoptionRejected => {
-                            RebuildOutcome::SkippedAdoptionRejected
-                        }
+                        MeshSkipReason::AdoptionRejected => RebuildOutcome::SkippedAdoptionRejected,
                         MeshSkipReason::SparseIndirectUndrawable => {
                             RebuildOutcome::SkippedSparseIndirectUndrawable
                         }
@@ -2156,6 +2218,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: world_min,
                         world_aabb_max: world_max,
+                        draw_source: DrawSource::GpuArtifact,
 
                         // GPU meshes already wrote indirect args
                         index_count: Some(resolved_index_count),
@@ -2246,6 +2309,7 @@ impl Renderer {
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
+                        draw_source: DrawSource::CpuUploaded,
                         index_count: Some(resolved_index_count),
                     },
                 );
@@ -2329,6 +2393,19 @@ impl Renderer {
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
+        stats.flow_received = stats.mesh_artifacts_received;
+        stats.flow_adopted = stats.gpu_mesh_adopted_count;
+        stats.flow_uploaded = stats.upload_count;
+        stats.flow_rejected = stats.mesh_artifacts_rejected;
+        for draw in self.visible_gpu_chunks.values() {
+            match draw.draw_source {
+                DrawSource::GpuArtifact => stats.resident_gpu_artifact += 1,
+                DrawSource::CpuUploaded => stats.resident_cpu_uploaded += 1,
+                DrawSource::StaleCached => stats.resident_stale_cached += 1,
+                DrawSource::Fallback => stats.resident_fallback += 1,
+                DrawSource::Unknown => stats.resident_unknown += 1,
+            }
+        }
         if self.visible_gpu_chunks.is_empty() {
             stats.gpu_mesh_visible_slot_min = -1;
             stats.gpu_mesh_visible_slot_max = -1;
@@ -2388,18 +2465,16 @@ impl Renderer {
         self.mesh_retry_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
-    pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
+    pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {
         // Keep frustum checks in world space; use GPU mesh metadata.
         let vp_world = camera.view_proj();
-        let mut chunks = 0usize;
-        let mut inds = 0u64;
+        let mut stats = MeshDrawStats::default();
         for draw in self.visible_gpu_chunks.values() {
             if aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max) {
-                chunks += 1;
-                inds += draw.index_count.unwrap_or(0) as u64;
+                stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
             }
         }
-        (chunks, inds)
+        stats
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
@@ -2443,8 +2518,10 @@ impl Renderer {
                 wgpu::IndexFormat::Uint32,
             );
             let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+            let mut draw_stats = MeshDrawStats::default();
             if self.supports_multi_draw_indirect {
                 for draw in self.visible_gpu_chunks.values() {
+                    draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
                     pass.draw_indexed_indirect(
                         &self.global_gpu_draw_indirect_buffer,
                         draw.draw_indirect_index as u64 * stride,
@@ -2452,12 +2529,14 @@ impl Renderer {
                 }
             } else {
                 for draw in self.visible_gpu_chunks.values() {
+                    draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
                     pass.draw_indexed_indirect(
                         &self.global_gpu_draw_indirect_buffer,
                         draw.draw_indirect_index as u64 * stride,
                     );
                 }
             }
+            let _ = draw_stats;
         }
     }
 }
@@ -2477,9 +2556,7 @@ impl Renderer {
             RebuildOutcome::SkippedMissingVoxelState => {
                 stats.outcome_skipped_missing_voxel_state += 1
             }
-            RebuildOutcome::SkippedAdoptionRejected => {
-                stats.outcome_skipped_adoption_rejected += 1
-            }
+            RebuildOutcome::SkippedAdoptionRejected => stats.outcome_skipped_adoption_rejected += 1,
             RebuildOutcome::SkippedSparseIndirectUndrawable => {
                 stats.outcome_skipped_sparse_indirect_undrawable += 1
             }
