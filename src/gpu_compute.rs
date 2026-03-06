@@ -16,6 +16,7 @@ use std::time::Instant;
 #[cfg(feature = "gpu-compute")]
 const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
+const CHUNK_SIDE_I32: i32 = 32;
 #[cfg(feature = "gpu-compute")]
 const MAC_U_COUNT: usize = (32 + 1) * 32 * 32;
 #[cfg(feature = "gpu-compute")]
@@ -1688,6 +1689,8 @@ struct FrameParams {
     active_tile_budget: u32,
     jacobi_iterations: u32,
     jacobi_iteration: u32,
+    chunk_world_min_voxels: [i32; 3],
+    _chunk_world_min_pad: u32,
     cell_size: f32,
     max_velocity: f32,
     velocity_damping: f32,
@@ -1716,6 +1719,12 @@ fn device_page_params(
         active_tile_budget: frontier_len,
         jacobi_iterations: runtime_config.max_jacobi_iterations,
         jacobi_iteration,
+        chunk_world_min_voxels: [
+            sim_job.chunk_coord.x * CHUNK_SIDE_I32,
+            sim_job.chunk_coord.y * CHUNK_SIDE_I32,
+            sim_job.chunk_coord.z * CHUNK_SIDE_I32,
+        ],
+        _chunk_world_min_pad: 0,
         cell_size: runtime_config.cell_size,
         max_velocity: runtime_config.cfl_velocity_clamp,
         velocity_damping: runtime_config.velocity_damping,

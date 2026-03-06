@@ -23,6 +23,14 @@ struct FrameParams {
     active_tile_budget: u32,
     jacobi_iterations: u32,
     jacobi_iteration: u32,
+    chunk_world_min_voxels: vec3<i32>,
+    _chunk_world_min_pad: u32,
+    cell_size: f32,
+    max_velocity: f32,
+    velocity_damping: f32,
+    viscosity: f32,
+    neighbor_pages: array<u32, 6>,
+    _pad: array<u32, 2>,
 };
 
 struct GpuVertex {
@@ -263,7 +271,8 @@ fn emit_mesh(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vertex_base = mesh_meta.vertex_offset;
     let index_base = mesh_meta.index_offset;
     let p = vec3<i32>(unpack(voxel_idx));
-    let base = vec3<f32>(vec3<u32>(p));
+    let world_voxel = vec3<f32>(params.chunk_world_min_voxels + p);
+    let base = world_voxel * 0.5;
 
     var write_face = face_offset[voxel_idx];
 
