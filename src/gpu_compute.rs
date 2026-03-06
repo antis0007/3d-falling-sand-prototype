@@ -1570,7 +1570,11 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
             clear_page_buffers(&mut encoder, &state, task.page_index);
         }
         state.queue.submit(Some(encoder.finish()));
-        if !task.startup_seeding_mode && task.frontier_count > 0 {
+        // Startup seeding still needs an active-frontier pass so edited voxels are
+        // written back after page clears. Skipping this pass leaves freshly
+        // reassigned pages empty, which then produces zero-geometry meshing
+        // artifacts that get rejected during renderer adoption.
+        if task.frontier_count > 0 {
             state.runtime.run_active_frontier(
                 &state,
                 scratch,
