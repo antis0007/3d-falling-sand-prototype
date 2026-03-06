@@ -21,8 +21,8 @@ use crate::gpu_compute::{
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
     gpu_page_capacity, mesh_pool_slot_capacity, required_storage_buffer_binding_size_bytes,
-    COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
-    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    ReadyGpuMeshFinalizeEvent, ReadyGpuMeshFinalizeStatus, COMPUTE_STORAGE_BINDING_COUNT,
+    GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -603,7 +603,7 @@ pub struct Renderer {
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
-    pending_gpu_results: HashMap<ChunkCoord, MeshResult>,
+    pending_gpu_results: HashMap<(ChunkCoord, u64), MeshResult>,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
@@ -2267,22 +2267,7 @@ impl Renderer {
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
             for ready in take_ready_gpu_mesh_results_on_renderer() {
-                if let Some(mut pending) = self.pending_gpu_results.remove(&ready.coord) {
-                    if pending.version != ready.version {
-                        continue;
-                    }
-                    pending.artifact = ChunkMeshArtifact::GpuReady {
-                        page_index: ready.page_index,
-                        draw_indirect_index: ready.draw_indirect_index,
-                        lod: ready.lod,
-                        index_count: 0,
-                        aabb_min: ready.aabb_min,
-                        aabb_max: ready.aabb_max,
-                        chunk_origin_world: ready.chunk_origin_world,
-                        dispatch_ms: 0.0,
-                    };
-                    self.completed_meshes.push(pending);
-                }
+                self.finalize_pending_gpu_result(ready);
             }
         }
 
@@ -2474,7 +2459,8 @@ impl Renderer {
                 stats.mesh_pending_finalize += 1;
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
-                self.pending_gpu_results.insert(result.coord, result);
+                self.pending_gpu_results
+                    .insert((result.coord, result.version), result);
                 continue;
             }
 
@@ -2951,6 +2937,38 @@ impl Renderer {
 }
 
 impl Renderer {
+    #[cfg(feature = "gpu-compute")]
+    fn finalize_pending_gpu_result(&mut self, ready: ReadyGpuMeshFinalizeEvent) {
+        let key = (ready.result.coord, ready.result.version);
+        let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
+            return;
+        };
+
+        match ready.status {
+            ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
+                pending.artifact = ChunkMeshArtifact::GpuReady {
+                    page_index: ready.result.page_index,
+                    draw_indirect_index: ready.result.draw_indirect_index,
+                    lod: ready.result.lod,
+                    index_count: 0,
+                    aabb_min: ready.result.aabb_min,
+                    aabb_max: ready.result.aabb_max,
+                    chunk_origin_world: ready.result.chunk_origin_world,
+                    dispatch_ms: 0.0,
+                };
+                self.completed_meshes.push(pending);
+            }
+            ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
+                self.mesh_lifecycle
+                    .insert(ready.result.coord, MeshLifecycleState::Superseded);
+            }
+            ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
+                self.mesh_lifecycle
+                    .insert(ready.result.coord, MeshLifecycleState::Rejected);
+            }
+        }
+    }
+
     fn release_draw_slot_mapping(&mut self, coord: ChunkCoord) {
         if let Some(old) = self.visible_gpu_chunks.remove(&coord) {
             if self.visible_slots.get(&old.draw_indirect_index) == Some(&coord) {
