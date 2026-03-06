@@ -1643,6 +1643,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
             active_frontier_count: task.frontier_count,
             simulation_tick: task.simulation_tick,
         };
+        let meshing_state = task.current_state ^ 1;
 
         // Ensure page initialization happens before compute passes
         if task.startup_seeding_mode {
@@ -1692,7 +1693,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
                     scratch,
                     &sim_job,
                     task.page_index,
-                    task.current_state,
+                    meshing_state,
                     0,
                     mesh_slice,
                 )?;
@@ -1711,16 +1712,59 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(max_tasks: usize) -> anyhow::Result<
                     )?;
                     if draw.index_count == 0 {
                         log::warn!(
-                            "[mesh] startup seeding produced zero index_count for near non-empty chunk {:?} on first upload (slot={})",
+                            "[mesh] startup seeding produced zero index_count for chunk {:?} page={} slot={} current_state={} meshing_state={}; scheduling immediate meshing retry after voxel edits completion",
                             task.coord,
+                            task.page_index.0,
                             mesh_slice.slot_index,
+                            task.current_state,
+                            meshing_state,
                         );
+
+                        state.runtime.run_meshing_dispatch(
+                            &state,
+                            scratch,
+                            &sim_job,
+                            task.page_index,
+                            meshing_state,
+                            0,
+                            mesh_slice,
+                        )?;
+
+                        let retry_draw = read_gpu_draw_indexed_indirect(
+                            &state.device,
+                            &state.queue,
+                            &state.draw_indirect_buffer,
+                            mesh_slice.slot_index as usize,
+                        )?;
+                        if retry_draw.index_count == 0 {
+                            log::warn!(
+                                "[mesh] startup seeding retry still zero for chunk {:?} page={} slot={} current_state={} meshing_state={}",
+                                task.coord,
+                                task.page_index.0,
+                                mesh_slice.slot_index,
+                                task.current_state,
+                                meshing_state,
+                            );
+                        } else {
+                            log::debug!(
+                                "[mesh] startup seeding retry produced index_count={} for chunk {:?} page={} slot={} current_state={} meshing_state={}",
+                                retry_draw.index_count,
+                                task.coord,
+                                task.page_index.0,
+                                mesh_slice.slot_index,
+                                task.current_state,
+                                meshing_state,
+                            );
+                        }
                     } else {
                         log::debug!(
-                            "[mesh] startup seeding validated indirect index_count={} for near chunk {:?} (slot={})",
+                            "[mesh] startup seeding validated indirect index_count={} for chunk {:?} page={} slot={} current_state={} meshing_state={}",
                             draw.index_count,
                             task.coord,
+                            task.page_index.0,
                             mesh_slice.slot_index,
+                            task.current_state,
+                            meshing_state,
                         );
                     }
                 }
