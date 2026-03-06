@@ -62,6 +62,7 @@ pub struct ProfilerStats {
     pub mesh_drawn_unknown_chunks: usize,
     pub mesh_drawn_unknown_indices: u64,
     pub mesh_stale_drop_count: usize,
+    pub mesh_stale_drop_retry_enqueued: usize,
     pub mesh_age_drop_count: usize,
     pub mesh_pressure_drop_count: usize,
     pub mesh_gpu_job_failure_count: usize,
@@ -689,10 +690,11 @@ pub fn draw(
                     ui_state.profiler.mesh_startup_zero_near_retry_enqueued,
                 ));
                 ui.monospace(format!(
-                    "mesh queue/completed: {}/{} | stale drops: {} | age drops: {} | pressure drops: {} | gpu failures/timeouts/skips: {}/{}/{} | dirty queue drops: {}",
+                    "mesh queue/completed: {}/{} | stale drops/retries: {}/{} | age drops: {} | pressure drops: {} | gpu failures/timeouts/skips: {}/{}/{} | dirty queue drops: {}",
                     ui_state.profiler.mesh_queue_depth,
                     ui_state.profiler.mesh_completed_depth,
                     ui_state.profiler.mesh_stale_drop_count,
+                    ui_state.profiler.mesh_stale_drop_retry_enqueued,
                     ui_state.profiler.mesh_age_drop_count,
                     ui_state.profiler.mesh_pressure_drop_count,
                     ui_state.profiler.mesh_gpu_job_failure_count,
