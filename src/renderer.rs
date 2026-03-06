@@ -1605,25 +1605,30 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+        let face_entries_per_slot =
+            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+        let face_mask_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_offset_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_count_bytes = page_capacity * std::mem::size_of::<u32>() as u64;
         let global_gpu_face_mask_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu face mask buffer"),
-            size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
-                * std::mem::size_of::<u32>() as u64,
+            size: face_mask_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
         let global_gpu_face_offset_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global gpu face offset buffer"),
-                size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
-                    * std::mem::size_of::<u32>() as u64,
+                size: face_offset_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         let global_gpu_face_count_buffer =
             Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("global gpu face count buffer"),
-                size: std::mem::size_of::<u32>() as u64,
+                size: face_count_bytes,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
@@ -2218,6 +2223,26 @@ impl Renderer {
                         *draw_indirect_index as usize,
                     );
                     resolved_index_count = draw.index_count;
+
+                    #[cfg(feature = "gpu-compute")]
+                    if resolved_index_count == 0
+                        && matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
+                    {
+                        if let Err(err) = dispatch_gpu_chunk_tasks_on_renderer(256) {
+                            log::warn!(
+                                "[mesh] late renderer-side gpu dispatch failed during adoption for chunk={:?}: {err:#}",
+                                result.coord
+                            );
+                        } else {
+                            let retried_draw = read_gpu_draw_indirect_command(
+                                &self.device,
+                                &self.queue,
+                                &self.global_gpu_draw_indirect_buffer,
+                                *draw_indirect_index as usize,
+                            );
+                            resolved_index_count = retried_draw.index_count;
+                        }
+                    }
                 }
 
                 if resolved_index_count == 0 {
