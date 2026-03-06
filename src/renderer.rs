@@ -2018,6 +2018,19 @@ impl Renderer {
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
+        #[cfg(feature = "gpu-compute")]
+        if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+            let dispatch_start = Instant::now();
+            match dispatch_gpu_chunk_tasks_on_renderer(256) {
+                Ok(_) => {
+                    stats.gpu_dispatch_ms += dispatch_start.elapsed().as_secs_f32() * 1000.0;
+                }
+                Err(err) => {
+                    log::warn!("[mesh] renderer-side gpu dispatch failed before mesh adoption: {err:#}");
+                }
+            }
+        }
+
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::info!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
@@ -2205,6 +2218,26 @@ impl Renderer {
                         *draw_indirect_index as usize,
                     );
                     resolved_index_count = draw.index_count;
+
+                    #[cfg(feature = "gpu-compute")]
+                    if resolved_index_count == 0
+                        && matches!(self.mesh_backend, MeshPipelineBackend::Gpu)
+                    {
+                        if let Err(err) = dispatch_gpu_chunk_tasks_on_renderer(256) {
+                            log::warn!(
+                                "[mesh] late renderer-side gpu dispatch failed during adoption for chunk={:?}: {err:#}",
+                                result.coord
+                            );
+                        } else {
+                            let retried_draw = read_gpu_draw_indirect_command(
+                                &self.device,
+                                &self.queue,
+                                &self.global_gpu_draw_indirect_buffer,
+                                *draw_indirect_index as usize,
+                            );
+                            resolved_index_count = retried_draw.index_count;
+                        }
+                    }
                 }
 
                 if resolved_index_count == 0 {
@@ -2778,19 +2811,6 @@ impl Renderer {
                     ChunkLod::Mid => stats.mid_mesh_count += 1,
                     ChunkLod::Far => stats.far_mesh_count += 1,
                     ChunkLod::Ultra => stats.ultra_mesh_count += 1,
-                }
-                #[cfg(feature = "gpu-compute")]
-                if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
-                    let dispatch_start = Instant::now();
-                    match dispatch_gpu_chunk_tasks_on_renderer(32) {
-                        Ok(_) => {
-                            stats.gpu_dispatch_ms +=
-                                dispatch_start.elapsed().as_secs_f32() * 1000.0;
-                        }
-                        Err(err) => {
-                            log::warn!("[mesh] renderer-side gpu dispatch failed after job submit: {err:#}");
-                        }
-                    }
                 }
                 Ok(())
             }
