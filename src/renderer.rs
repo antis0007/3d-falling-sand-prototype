@@ -603,7 +603,7 @@ pub struct Renderer {
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
-    pending_gpu_results: HashMap<(ChunkCoord, u64), MeshResult>,
+    pending_gpu_results: HashMap<(ChunkCoord, u64), PendingGpuMeshResult>,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
@@ -2345,7 +2345,7 @@ impl Renderer {
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
                 self.pending_gpu_results.insert(
-                    result.coord,
+                    (result.coord, result.version),
                     PendingGpuMeshResult {
                         result,
                         first_seen_frame: self.mesh_rebuild_frame_index,
@@ -2361,7 +2361,12 @@ impl Renderer {
             let desired = chunk_priority_scores.contains_key(&result.coord)
                 || self.visible_gpu_chunks.contains_key(&result.coord);
             let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
-            let pending_replaced = self.pending_gpu_results.remove(&result.coord).is_some();
+            let pending_replaced = {
+                let previous_len = self.pending_gpu_results.len();
+                self.pending_gpu_results
+                    .retain(|(coord, _), _| *coord != result.coord);
+                previous_len != self.pending_gpu_results.len()
+            };
             if pending_replaced {
                 pending_superseded += 1;
             }
@@ -2505,7 +2510,14 @@ impl Renderer {
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
                 self.pending_gpu_results
-                    .insert((result.coord, result.version), result);
+                    .insert(
+                        (result.coord, result.version),
+                        PendingGpuMeshResult {
+                            result,
+                            first_seen_frame: self.mesh_rebuild_frame_index,
+                            first_seen_completed_index: completed_index,
+                        },
+                    );
                 continue;
             }
 
@@ -2815,7 +2827,7 @@ impl Renderer {
             .filter(|state| state.startup_seed_recovered_nonzero)
             .count();
         let mut oldest_pending: Option<(u64, usize, ChunkCoord)> = None;
-        for (coord, pending) in &self.pending_gpu_results {
+        for ((coord, _), pending) in &self.pending_gpu_results {
             let age_frames = self
                 .mesh_rebuild_frame_index
                 .saturating_sub(pending.first_seen_frame);
@@ -3029,7 +3041,7 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
-                pending.artifact = ChunkMeshArtifact::GpuReady {
+                pending.result.artifact = ChunkMeshArtifact::GpuReady {
                     page_index: ready.result.page_index,
                     draw_indirect_index: ready.result.draw_indirect_index,
                     lod: ready.result.lod,
@@ -3039,7 +3051,7 @@ impl Renderer {
                     chunk_origin_world: ready.result.chunk_origin_world,
                     dispatch_ms: 0.0,
                 };
-                self.completed_meshes.push(pending);
+                self.completed_meshes.push(pending.result);
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
                 self.mesh_lifecycle
