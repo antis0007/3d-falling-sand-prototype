@@ -3,10 +3,10 @@
 //! - **Authoritative input:** meshing consumes a [`ChunkSnapshot`] built from
 //!   [`ChunkStore`] via `build_chunk_snapshot`, so workers never read mutable
 //!   world state directly.
-//! - **Vertex coordinate space:** all meshing emits chunk-local positions
-//!   (scaled by [`VOXEL_SIZE`]), independent of world placement.
-//! - **Chunk transform ownership:** chunk mesh vertices are authored in world
-//!   space and submitted from shared GPU mesh buffers.
+//! - **Vertex coordinate space:** (FIXED) vertices are uploaded as **world-space**
+//!   positions, then the shader subtracts `world_origin_offset` for floating origin.
+//! - **Chunk transform ownership:** chunk origins are not an instance buffer; we
+//!   bake chunk origin into vertex positions at mesh build time.
 //! - **Floating-origin contract:** renderer APIs accept **world-space camera
 //!   coordinates**. The renderer then derives both world-space culling and
 //!   render-space projection from that one source of truth.
@@ -15,13 +15,9 @@ use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
     dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
     update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
-    SharedMeshBuffers,
-};
-#[cfg(feature = "gpu-compute")]
-use crate::gpu_compute::{
-    gpu_page_capacity, mesh_pool_slot_capacity, required_storage_buffer_binding_size_bytes,
-    COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
-    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    SharedMeshBuffers, COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES, gpu_page_capacity, mesh_pool_slot_capacity,
+    required_storage_buffer_binding_size_bytes,
 };
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
@@ -41,11 +37,15 @@ use winit::dpi::PhysicalSize;
 pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
+
 const MESH_RETRY_MAX_ATTEMPTS: u32 = 6;
 const MESH_RETRY_BASE_BACKOFF_FRAMES: u64 = 2;
 const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
 const MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS: u32 = 3;
 const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
+
+const GPU_DISPATCH_MAX_TASKS_PER_FRAME: u32 = 256;
+
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -299,10 +299,6 @@ struct MeshAllocatorTelemetry {
 
 pub struct Camera {
     /// Camera position in **world space**.
-    ///
-    /// Renderer APIs (`render_world`, `cull_stats`, `mesh_draw_stats`) expect
-    /// this to be absolute world coordinates. Floating-origin rebasing is
-    /// handled internally by [`Renderer`] using `origin_voxel`.
     pub pos: Vec3,
     pub dir: Vec3,
     pub aspect: f32,
@@ -469,6 +465,29 @@ impl LodRadii {
     }
 }
 
+// Slot layout helpers (matches GLOBAL_MESH_* sizes + mesh_pool_slot_capacity()).
+fn slot_capacity_u64() -> u64 {
+    mesh_pool_slot_capacity() as u64
+}
+fn vertex_bytes_per_slot() -> u64 {
+    (GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / slot_capacity_u64()).max(1)
+}
+fn index_bytes_per_slot() -> u64 {
+    (GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / slot_capacity_u64()).max(1)
+}
+fn vertex_capacity_per_slot() -> u64 {
+    vertex_bytes_per_slot() / std::mem::size_of::<Vertex>() as u64
+}
+fn index_capacity_per_slot() -> u64 {
+    index_bytes_per_slot() / std::mem::size_of::<u32>() as u64
+}
+fn vertex_offset_bytes(slot: u32) -> u64 {
+    slot as u64 * vertex_bytes_per_slot()
+}
+fn index_offset_bytes(slot: u32) -> u64 {
+    slot as u64 * index_bytes_per_slot()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LodMeshingBudgets {
     pub near: usize,
@@ -492,6 +511,7 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
+    free_mesh_slots: Vec<u32>,
     global_gpu_vertex_buffer: Arc<wgpu::Buffer>,
     global_gpu_index_buffer: Arc<wgpu::Buffer>,
     global_gpu_draw_indirect_buffer: Arc<wgpu::Buffer>,
@@ -512,6 +532,9 @@ pub struct Renderer {
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
+    // If we allocated a NEW slot for this coord (coord not previously visible),
+    // remember it so we can safely return it to the free list on Failed/Skipped/Stale.
+    inflight_mesh_slots: HashMap<ChunkCoord, u32>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
@@ -870,6 +893,9 @@ pub(crate) struct MeshJob {
     pub(crate) snapshot: ChunkSnapshot,
     pub(crate) greedy: bool,
     pub(crate) urgent: bool,
+    /// Renderer-owned slot (0..mesh_pool_slot_capacity).
+    /// GPU backend must write geometry for this chunk into this slot.
+    pub(crate) mesh_slot: u32,
 }
 
 struct MeshResult {
@@ -879,6 +905,7 @@ struct MeshResult {
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
+    mesh_slot: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -893,11 +920,6 @@ struct GpuChunkDraw {
     index_count: Option<u32>,
 }
 
-const GPU_MESH_VERTEX_CAPACITY_PER_SLOT: u64 =
-    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 24;
-const GPU_MESH_INDEX_CAPACITY_PER_SLOT: u64 =
-    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 36;
-
 pub(crate) enum ChunkMeshArtifact {
     Cpu {
         verts: Vec<Vertex>,
@@ -907,13 +929,11 @@ pub(crate) enum ChunkMeshArtifact {
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
     },
+    // GPU artifact carries ONLY metadata; renderer owns slot + indirect command.
     Gpu {
         page_index: GpuPageIndex,
-        draw_indirect_index: u32,
         index_count: u32,
         lod: u8,
-        verts: Vec<Vertex>,
-        inds: Vec<u32>,
         aabb_min: Vec3,
         aabb_max: Vec3,
         chunk_origin_world: Vec3,
@@ -955,20 +975,14 @@ impl ChunkMeshArtifact {
                 *aabb_max,
                 *chunk_origin_world,
             ),
-            Self::Gpu {
-                verts,
-                inds,
-                aabb_min,
-                aabb_max,
-                chunk_origin_world,
-                ..
-            } => (
-                verts,
-                inds,
+            // GPU path does not ship CPU geometry.
+            Self::Gpu { .. } => (
+                &[],
+                &[],
                 DrawIndirectArgs::default(),
-                *aabb_min,
-                *aabb_max,
-                *chunk_origin_world,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                Vec3::ZERO,
             ),
             Self::Skipped { .. } => (
                 &[],
@@ -1007,7 +1021,6 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
         MeshPipelineBackend::Cpu => {
             crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
         }
-        #[cfg(feature = "gpu-compute")]
         MeshPipelineBackend::Gpu => match run_chunk_job_on_worker(job) {
             Ok(output) => output.mesh_artifact,
             Err(err) => ChunkMeshArtifact::Failed {
@@ -1029,49 +1042,47 @@ impl BackgroundMeshQueue {
     fn new(worker_count: usize, queue_bound: usize, mesh_backend: MeshPipelineBackend) -> Self {
         let (tx, job_rx) = sync_channel::<MeshJob>(queue_bound);
         let (result_tx, rx) = sync_channel::<MeshResult>(queue_bound);
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+
+        // Fan-out dispatcher (FIX 4): no Arc<Mutex<Receiver>>::recv() serialization.
+        let mut worker_txs: Vec<SyncSender<MeshJob>> = Vec::with_capacity(worker_count);
 
         for i in 0..worker_count {
-            let worker_rx = std::sync::Arc::clone(&job_rx);
+            let (wtx, wrx) = sync_channel::<MeshJob>(queue_bound.max(8).min(64));
+            worker_txs.push(wtx);
+
             let worker_tx = result_tx.clone();
             thread::Builder::new()
                 .name(format!("mesh-worker-{i}"))
                 .spawn(move || loop {
-                    let job = {
-                        let lock = worker_rx.lock().expect("mesh worker rx lock");
-                        lock.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    log::info!("[mesh-worker] picked job chunk={:?}", job.coord);
+                    let Ok(job) = wrx.recv() else { break };
 
-                    let artifact = catch_unwind(AssertUnwindSafe(|| {
-                        build_mesh_artifact(mesh_backend, &job)
-                    }))
-                    .unwrap_or_else(|panic_payload| {
-                        let panic_reason = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        ChunkMeshArtifact::Failed {
-                            reason: format!(
-                                "chunk={:?} lod={:?}: worker panic while building mesh artifact: {}",
-                                job.coord, job.lod, panic_reason
-                            ),
-                        }
-                    });
+                    let artifact = catch_unwind(AssertUnwindSafe(|| build_mesh_artifact(mesh_backend, &job)))
+                        .unwrap_or_else(|panic_payload| {
+                            let panic_reason = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            ChunkMeshArtifact::Failed {
+                                reason: format!(
+                                    "chunk={:?} lod={:?}: worker panic while building mesh artifact: {}",
+                                    job.coord, job.lod, panic_reason
+                                ),
+                            }
+                        });
+
                     if let ChunkMeshArtifact::Failed { reason } = &artifact {
                         log::warn!(
-                            "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
+                            "[mesh-worker] job failed chunk={:?} lod={:?} slot={} error={}",
                             job.coord,
                             job.lod,
+                            job.mesh_slot,
                             short_error_message(reason)
                         );
                     }
+
                     let result = MeshResult {
                         coord: job.coord,
                         lod: job.lod,
@@ -1079,29 +1090,45 @@ impl BackgroundMeshQueue {
                         queued_at: job.queued_at,
                         artifact,
                         urgent: job.urgent,
+                        mesh_slot: job.mesh_slot,
                     };
-                    log::info!("[mesh-worker] sending result chunk={:?}", result.coord);
+
                     if worker_tx.send(result).is_err() {
                         break;
                     }
-                    log::info!("[mesh-worker] send completed chunk={:?}", job.coord);
                 })
                 .expect("spawn mesh worker");
         }
 
-        Self {
-            tx,
-            rx,
-            inflight: 0,
-        }
+        thread::Builder::new()
+            .name("mesh-dispatch".to_string())
+            .spawn(move || {
+                let mut rr = 0usize;
+                let mut txs = worker_txs;
+                while let Ok(mut job) = job_rx.recv() {
+                    loop {
+                        if txs.is_empty() {
+                            return;
+                        }
+                        let idx = rr % txs.len();
+                        rr = rr.wrapping_add(1);
+                        match txs[idx].send(job) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::SendError(j)) => {
+                                txs.swap_remove(idx);
+                                job = j;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn mesh dispatcher");
+
+        Self { tx, rx, inflight: 0 }
     }
 
     fn try_submit(&mut self, job: MeshJob) -> Result<(), TrySendError<MeshJob>> {
-        log::info!(
-            "[mesh] submit job chunk={:?} version={}",
-            job.coord,
-            job.version
-        );
         match self.tx.try_send(job) {
             Ok(()) => {
                 self.inflight += 1;
@@ -1118,6 +1145,12 @@ impl BackgroundMeshQueue {
         }
         result
     }
+}
+
+fn clear_draw_indirect_buffer(queue: &wgpu::Queue, indirect: &wgpu::Buffer) {
+    let slots = mesh_pool_slot_capacity() as usize;
+    let zeros = vec![DrawIndexedIndirectCommand::default(); slots];
+    queue.write_buffer(indirect, 0, bytemuck::cast_slice(&zeros));
 }
 
 impl Renderer {
@@ -1146,13 +1179,16 @@ impl Renderer {
         let supports_multi_draw_indirect =
             enabled_features.contains(wgpu::Features::MULTI_DRAW_INDIRECT);
 
-        let mut requested_limits = wgpu::Limits::default();
-        #[cfg(feature = "gpu-compute")]
+        let mut requested_limits = adapter_limits.clone();
+
+        // If gpu-compute is enabled, request enough storage capacity for the compute bindings.
         {
             let required_storage_size = required_storage_buffer_binding_size_bytes();
+
             let requested_storage_buffers = requested_limits
                 .max_storage_buffers_per_shader_stage
                 .max(COMPUTE_STORAGE_BINDING_COUNT);
+
             requested_limits.max_storage_buffers_per_shader_stage =
                 requested_storage_buffers.min(adapter_limits.max_storage_buffers_per_shader_stage);
 
@@ -1160,6 +1196,7 @@ impl Renderer {
                 .max_storage_buffer_binding_size
                 .max(required_storage_size as u32)
                 .min(adapter_limits.max_storage_buffer_binding_size);
+
             requested_limits.max_buffer_size = requested_limits
                 .max_buffer_size
                 .max(required_storage_size)
@@ -1175,15 +1212,6 @@ impl Renderer {
                 adapter_limits.max_storage_buffer_binding_size,
                 requested_limits.max_buffer_size,
                 adapter_limits.max_buffer_size,
-            );
-        }
-
-        #[cfg(not(feature = "gpu-compute"))]
-        {
-            log::info!(
-                "device limits: storage-buffers-per-stage requested={} adapter-supported={}",
-                requested_limits.max_storage_buffers_per_shader_stage,
-                adapter_limits.max_storage_buffers_per_shader_stage,
             );
         }
 
@@ -1206,30 +1234,19 @@ impl Renderer {
 
         let device_limits = device.limits();
         let required_limits_summary = {
-            #[cfg(feature = "gpu-compute")]
-            {
-                let required_storage_size = required_storage_buffer_binding_size_bytes();
-                format!(
-                    "storage_buffers/stage req={} requested={} device={} | storage_binding req={}B requested={}B device={}B | max_buffer req={}B requested={}B device={}B",
-                    COMPUTE_STORAGE_BINDING_COUNT,
-                    requested_limits.max_storage_buffers_per_shader_stage,
-                    device_limits.max_storage_buffers_per_shader_stage,
-                    required_storage_size,
-                    requested_limits.max_storage_buffer_binding_size,
-                    device_limits.max_storage_buffer_binding_size,
-                    required_storage_size,
-                    requested_limits.max_buffer_size,
-                    device_limits.max_buffer_size,
-                )
-            }
-            #[cfg(not(feature = "gpu-compute"))]
-            {
-                format!(
-                    "storage_buffers/stage requested={} device={}",
-                    requested_limits.max_storage_buffers_per_shader_stage,
-                    device_limits.max_storage_buffers_per_shader_stage,
-                )
-            }
+            let required_storage_size = required_storage_buffer_binding_size_bytes();
+            format!(
+                "storage_buffers/stage req={} requested={} device={} | storage_binding req={}B requested={}B device={}B | max_buffer req={}B requested={}B device={}B",
+                COMPUTE_STORAGE_BINDING_COUNT,
+                requested_limits.max_storage_buffers_per_shader_stage,
+                device_limits.max_storage_buffers_per_shader_stage,
+                required_storage_size,
+                requested_limits.max_storage_buffer_binding_size,
+                device_limits.max_storage_buffer_binding_size,
+                required_storage_size,
+                requested_limits.max_buffer_size,
+                device_limits.max_buffer_size,
+            )
         };
         let adapter_limits_summary = format!(
             "storage_buffers/stage adapter={} | storage_binding adapter={}B | max_buffer adapter={}B",
@@ -1242,60 +1259,18 @@ impl Renderer {
             log::warn!("mesh backend selected: disabled (explicit CLI override)");
             (MeshPipelineBackend::Disabled, None)
         } else if GpuComputeRuntime::runtime_supported(&adapter, &device_limits) {
-            #[cfg(feature = "gpu-compute")]
-            {
-                log::info!(
-                    "mesh backend selected: gpu-compute (adapter supports compute pipelines, page_capacity={})",
-                    gpu_page_capacity()
-                );
-                (MeshPipelineBackend::Gpu, None)
-            }
-            #[cfg(not(feature = "gpu-compute"))]
-            {
-                anyhow::bail!(
-                    "gpu meshing is required at runtime, but `gpu-compute` feature is disabled"
-                );
-            }
+            log::info!("mesh backend selected: gpu-compute");
+            (MeshPipelineBackend::Gpu, None)
         } else {
-            #[cfg(feature = "gpu-compute")]
-            {
-                let required_storage_size = required_storage_buffer_binding_size_bytes();
-                log::warn!(
-                    "gpu meshing unavailable: required_storage_size={}B, storage_buffers_per_shader_stage(required={} adapter={} requested={} device={}), storage_buffer_binding_size(required={} adapter={} requested={} device={}), max_buffer_size(required={} adapter={} requested={} device={})",
-                    required_storage_size,
-                    COMPUTE_STORAGE_BINDING_COUNT,
-                    adapter_limits.max_storage_buffers_per_shader_stage,
-                    requested_limits.max_storage_buffers_per_shader_stage,
-                    device_limits.max_storage_buffers_per_shader_stage,
-                    required_storage_size,
-                    adapter_limits.max_storage_buffer_binding_size,
-                    requested_limits.max_storage_buffer_binding_size,
-                    device_limits.max_storage_buffer_binding_size,
-                    required_storage_size,
-                    adapter_limits.max_buffer_size,
-                    requested_limits.max_buffer_size,
-                    device_limits.max_buffer_size,
-                );
-            }
-
-            #[cfg(not(feature = "gpu-compute"))]
-            {
-                log::warn!(
-                    "gpu meshing unavailable: `gpu-compute` feature is disabled in this build"
-                );
-            }
-
             if require_gpu_meshing {
                 anyhow::bail!(
                     "gpu meshing is required (--require-gpu-meshing), but adapter/runtime does not satisfy gpu-compute requirements"
                 );
             }
-
-            log::warn!(
-                "mesh backend selected: cpu fallback path (adapter/runtime does not satisfy gpu-compute requirements)"
-            );
+            log::warn!("mesh backend selected: cpu fallback path");
             (MeshPipelineBackend::Cpu, None)
         };
+
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
 
@@ -1388,8 +1363,10 @@ impl Renderer {
         });
 
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
+
         let page_capacity = gpu_page_capacity() as u64;
         let mesh_slot_capacity = mesh_pool_slot_capacity() as u64;
+
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
             size: GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
@@ -1452,19 +1429,16 @@ impl Renderer {
                 mapped_at_creation: false,
             }));
 
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+
+        // IMPORTANT (FIX 8 safety): ensure all indirect slots are zero-initialized.
+        clear_draw_indirect_buffer(&queue, &global_gpu_draw_indirect_buffer);
+
         debug_assert!(
             mesh_slot_capacity > 0,
             "mesh pool must support at least one slot"
         );
-        log::info!(
-            "gpu mesh pool initialized: vertex={} MiB index={} MiB slots={}",
-            GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / (1024 * 1024),
-            GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / (1024 * 1024),
-            mesh_slot_capacity
-        );
-
-        let device = Arc::new(device);
-        let queue = Arc::new(queue);
 
         if mesh_backend == MeshPipelineBackend::Gpu {
             initialize_gpu_compute_worker(
@@ -1495,6 +1469,8 @@ impl Renderer {
             depth_texture,
             depth_view,
             visible_gpu_chunks: HashMap::new(),
+            // Pop from end; reverse makes us allocate low slots first (dense range).
+            free_mesh_slots: (0..mesh_pool_slot_capacity() as u32).rev().collect(),
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
             global_gpu_draw_indirect_buffer,
@@ -1514,6 +1490,7 @@ impl Renderer {
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
             inflight_mesh_chunks: HashSet::new(),
+            inflight_mesh_slots: HashMap::new(),
             mesh_retry_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
@@ -1553,7 +1530,6 @@ impl Renderer {
     }
 
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
-        // GPU culling stats are evaluated in world space from GPU mesh metadata.
         let vp_world = camera.view_proj();
         let world_camera_pos = camera_world_position(camera);
         let mut stats = CullStats::default();
@@ -1593,10 +1569,6 @@ impl Renderer {
         stats
     }
 
-    /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
-    ///
-    /// IMPORTANT: This relies on `store.take_dirty_chunks()` returning + clearing the store's dirty set.
-
     pub fn rebuild_dirty_store_chunks(
         &mut self,
         store: &mut ChunkStore,
@@ -1609,37 +1581,54 @@ impl Renderer {
     ) -> MeshRebuildStats {
         self.mesh_rebuild_frame_index = self.mesh_rebuild_frame_index.saturating_add(1);
         self.process_mesh_retry_backoff(player_chunk, chunk_priority_scores);
+
+        let mut stats = MeshRebuildStats::default();
+
+        // Dispatch GPU once per frame (not per submit).
+        #[cfg(feature = "gpu-compute")]
+        if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+            let t0 = Instant::now();
+            if let Err(err) = dispatch_gpu_chunk_tasks_on_renderer(GPU_DISPATCH_MAX_TASKS_PER_FRAME) {
+                log::warn!("[mesh] renderer-side gpu dispatch failed: {err:#}");
+            } else {
+                stats.gpu_dispatch_ms += t0.elapsed().as_secs_f32() * 1000.0;
+            }
+        }
+
         let lod_radii = lod_radii.normalized();
         self.near_lod_distance = lod_radii.near as f32 + 0.5;
+
+        // Pull dirty sets from store.
         for coord in store.take_urgent_dirty_chunks() {
             self.enqueue_urgent_mesh_chunk(coord);
         }
         for coord in store.take_dirty_chunks() {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
-        let mut stats = MeshRebuildStats::default();
+
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
-        let mut near_jobs = Vec::new();
-        let mut mid_jobs = Vec::new();
-        let mut far_jobs = Vec::new();
-        let mut ultra_jobs = Vec::new();
+        // Build this frame’s candidate jobs.
         let mut frame_jobs: HashMap<ChunkCoord, MeshJob> = HashMap::new();
 
-        let mut urgent_jobs = self.pop_urgent_mesh_jobs(store, &mut stats, player_chunk, lod_radii);
-        for job in urgent_jobs.drain(..) {
+        // Urgent queue → jobs.
+        let urgent_frame_jobs = self.pop_urgent_mesh_jobs(store, &mut stats, player_chunk, lod_radii);
+        for job in urgent_frame_jobs {
             Self::enqueue_frame_job(&mut frame_jobs, job);
         }
 
+        // Snapshot budgeted pop.
         let chunk_snapshot_budget = mesh_budget.max(1);
         let mut snapshot_coords = self.pop_priority_dirty_chunks(
             chunk_snapshot_budget,
             player_chunk,
             chunk_priority_scores,
         );
+
         let snapshot_frame_start = Instant::now();
         let mut deferred_snapshot_coords = Vec::new();
+
         while let Some(coord) = snapshot_coords.pop() {
             let elapsed_ms = snapshot_frame_start.elapsed().as_secs_f32() * 1000.0;
             if elapsed_ms >= CHUNK_SNAPSHOT_BUILD_BUDGET_MS {
@@ -1649,18 +1638,17 @@ impl Renderer {
             }
 
             let t0 = Instant::now();
-            let snapshot =
-                build_chunk_snapshot(store, coord, self.settings.unknown_neighbor_policy);
+            let snapshot = build_chunk_snapshot(store, coord, self.settings.unknown_neighbor_policy);
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
             stats.total_ms += ms;
-            if ms > stats.max_ms {
-                stats.max_ms = ms;
-            }
+            stats.max_ms = stats.max_ms.max(ms);
 
             let prev = self.lod_selection.get(&coord).copied();
             let primary_lod = select_lod(coord, player_chunk, lod_radii, prev);
             let fallback_lod =
                 fallback_lod_near_threshold(coord, player_chunk, lod_radii, primary_lod);
+
+            let greedy = self.settings.greedy_meshing;
 
             let mut push_job = |lod: ChunkLod| {
                 let version = store.chunk_voxel_version(coord);
@@ -1672,22 +1660,29 @@ impl Renderer {
                         version,
                         queued_at: Instant::now(),
                         snapshot: snapshot.clone(),
-                        greedy: self.settings.greedy_meshing,
+                        greedy,
                         urgent: false,
+                        mesh_slot: u32::MAX,
                     },
                 );
             };
 
             push_job(primary_lod);
-
             if let Some(lod) = fallback_lod {
                 push_job(lod);
             }
         }
 
+        // Requeue deferred snapshots.
         for coord in deferred_snapshot_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
+
+        // Split by LOD.
+        let mut near_jobs: Vec<MeshJob> = Vec::new();
+        let mut mid_jobs: Vec<MeshJob> = Vec::new();
+        let mut far_jobs: Vec<MeshJob> = Vec::new();
+        let mut ultra_jobs: Vec<MeshJob> = Vec::new();
 
         for job in frame_jobs.into_values() {
             match job.lod {
@@ -1698,63 +1693,47 @@ impl Renderer {
             }
         }
 
-        let job_priority = |coord: ChunkCoord| {
-            chunk_priority_scores
-                .get(&coord)
-                .copied()
-                .unwrap_or_else(|| 1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32))
+        // Priority helper.
+        let job_priority = |coord: ChunkCoord| -> f32 {
+            chunk_priority_scores.get(&coord).copied().unwrap_or_else(|| {
+                1.0 / (1.0 + chunk_chebyshev_dist(player_chunk, coord) as f32)
+            })
         };
 
-        let mut urgent_jobs = Vec::new();
-        near_jobs.retain(|job| {
-            if job.urgent {
-                urgent_jobs.push(job.clone());
-                return false;
-            }
-            true
-        });
-        mid_jobs.retain(|job| {
-            if job.urgent {
-                urgent_jobs.push(job.clone());
-                return false;
-            }
-            true
-        });
-        far_jobs.retain(|job| {
-            if job.urgent {
-                urgent_jobs.push(job.clone());
-                return false;
-            }
-            true
-        });
-        ultra_jobs.retain(|job| {
-            if job.urgent {
-                urgent_jobs.push(job.clone());
-                return false;
-            }
-            true
-        });
+        // Extract urgent jobs.
+        let mut urgent_submit_jobs: Vec<MeshJob> = Vec::new();
+        near_jobs.retain(|j| if j.urgent { urgent_submit_jobs.push(j.clone()); false } else { true });
+        mid_jobs.retain(|j| if j.urgent { urgent_submit_jobs.push(j.clone()); false } else { true });
+        far_jobs.retain(|j| if j.urgent { urgent_submit_jobs.push(j.clone()); false } else { true });
+        ultra_jobs.retain(|j| if j.urgent { urgent_submit_jobs.push(j.clone()); false } else { true });
 
-        urgent_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
-        for job in urgent_jobs.drain(..) {
+        // Urgent: highest priority first.
+        urgent_submit_jobs.sort_by(|a, b| job_priority(b.coord).total_cmp(&job_priority(a.coord)));
+
+        for job in urgent_submit_jobs.drain(..) {
             if self.inflight_mesh_chunks.contains(&job.coord) {
                 self.enqueue_urgent_mesh_chunk(job.coord);
                 continue;
             }
             match self.submit_mesh_job(job, &mut stats) {
-                Ok(()) => {}
+                Ok(true) => {}
+                Ok(false) => {}
                 Err(TrySendError::Full(job)) => {
                     self.enqueue_urgent_mesh_chunk(job.coord);
+                    let _ = job;
                     break;
                 }
                 Err(TrySendError::Disconnected(_)) => break,
             }
         }
+
+        // Non-urgent: sort ascending; pop() from end => highest priority first.
         near_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         mid_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         far_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
         ultra_jobs.sort_by(|a, b| job_priority(a.coord).total_cmp(&job_priority(b.coord)));
 
+        // Pressure scaling for far/ultra.
         let far_pressure = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         let far_scale = if far_pressure > 4096 {
             4
@@ -1763,12 +1742,12 @@ impl Renderer {
         } else {
             1
         };
+
         let far_budget = (lod_budgets.far / far_scale).max(usize::from(!far_jobs.is_empty()));
         let ultra_budget = (lod_budgets.ultra / far_scale)
             .max(usize::from(!ultra_jobs.is_empty() && far_scale == 1));
 
-        let sustained_pressure = far_pressure > 2048;
-        if sustained_pressure {
+        if far_pressure > 2048 {
             let far_keep = far_budget.min(2);
             if far_jobs.len() > far_keep {
                 stats.pressure_drop_count += far_jobs.len() - far_keep;
@@ -1780,58 +1759,91 @@ impl Renderer {
             }
         }
 
+        // Submit loops (no closure capturing &mut self).
         let mut submitted = 0usize;
-        let mut submit_from =
-            |jobs: &mut Vec<MeshJob>, budget: usize, stats: &mut MeshRebuildStats| {
-                let mut taken = 0usize;
-                while taken < budget && submitted < mesh_budget {
-                    let Some(job) = jobs.pop() else {
-                        break;
-                    };
-                    if self.inflight_mesh_chunks.contains(&job.coord) {
-                        self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
-                        continue;
-                    }
-                    match self.submit_mesh_job(job, stats) {
-                        Ok(()) => {
-                            taken += 1;
-                            submitted += 1;
-                        }
-                        Err(TrySendError::Full(job)) => {
-                            jobs.push(job);
-                            break;
-                        }
-                        Err(TrySendError::Disconnected(_)) => break,
-                    }
-                }
-            };
 
-        submit_from(
-            &mut near_jobs,
-            lod_budgets.near.min(mesh_budget),
-            &mut stats,
-        );
-        submit_from(&mut mid_jobs, lod_budgets.mid.min(mesh_budget), &mut stats);
-        submit_from(&mut far_jobs, far_budget.min(mesh_budget), &mut stats);
-        submit_from(&mut ultra_jobs, ultra_budget.min(mesh_budget), &mut stats);
-
-        for job in near_jobs
-            .into_iter()
-            .chain(mid_jobs)
-            .chain(far_jobs)
-            .chain(ultra_jobs)
         {
-            self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+            let mut taken = 0usize;
+            while taken < lod_budgets.near.min(mesh_budget) && submitted < mesh_budget {
+                let Some(job) = near_jobs.pop() else { break };
+                if self.inflight_mesh_chunks.contains(&job.coord) {
+                    self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                    continue;
+                }
+                match self.submit_mesh_job(job, &mut stats) {
+                    Ok(true) => { taken += 1; submitted += 1; }
+                    Ok(false) => {}
+                    Err(TrySendError::Full(job)) => { near_jobs.push(job); break; }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
         }
+        {
+            let mut taken = 0usize;
+            while taken < lod_budgets.mid.min(mesh_budget) && submitted < mesh_budget {
+                let Some(job) = mid_jobs.pop() else { break };
+                if self.inflight_mesh_chunks.contains(&job.coord) {
+                    self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                    continue;
+                }
+                match self.submit_mesh_job(job, &mut stats) {
+                    Ok(true) => { taken += 1; submitted += 1; }
+                    Ok(false) => {}
+                    Err(TrySendError::Full(job)) => { mid_jobs.push(job); break; }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+        }
+        {
+            let mut taken = 0usize;
+            while taken < far_budget.min(mesh_budget) && submitted < mesh_budget {
+                let Some(job) = far_jobs.pop() else { break };
+                if self.inflight_mesh_chunks.contains(&job.coord) {
+                    self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                    continue;
+                }
+                match self.submit_mesh_job(job, &mut stats) {
+                    Ok(true) => { taken += 1; submitted += 1; }
+                    Ok(false) => {}
+                    Err(TrySendError::Full(job)) => { far_jobs.push(job); break; }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+        }
+        {
+            let mut taken = 0usize;
+            while taken < ultra_budget.min(mesh_budget) && submitted < mesh_budget {
+                let Some(job) = ultra_jobs.pop() else { break };
+                if self.inflight_mesh_chunks.contains(&job.coord) {
+                    self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+                    continue;
+                }
+                match self.submit_mesh_job(job, &mut stats) {
+                    Ok(true) => { taken += 1; submitted += 1; }
+                    Ok(false) => {}
+                    Err(TrySendError::Full(job)) => { ultra_jobs.push(job); break; }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+        }
+
+        // Requeue remaining if world advanced.
+        for job in near_jobs.into_iter().chain(mid_jobs).chain(far_jobs).chain(ultra_jobs) {
+            if store.chunk_voxel_version(job.coord) > *self.mesh_versions.get(&job.coord).unwrap_or(&0) {
+                self.enqueue_dirty_chunk(job.coord, player_chunk, chunk_priority_scores);
+            }
+        }
+
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
+        // Drain worker results.
         while let Ok(result) = self.mesh_queue.try_recv() {
-            log::info!("[renderer] received mesh result chunk={:?}", result.coord);
             self.inflight_mesh_chunks.remove(&result.coord);
             self.completed_meshes.push(result);
         }
 
+        // Sort completed for adoption.
         self.completed_meshes.sort_by(|a, b| {
             job_priority(b.coord)
                 .total_cmp(&job_priority(a.coord))
@@ -1842,67 +1854,82 @@ impl Renderer {
                 })
         });
 
+        // Backlog trimming (safe: no &mut self calls inside drain loop).
         if self.completed_meshes.len() > COMPLETED_MESH_BACKLOG_THRESHOLD {
             let mut low_priority_indices: Vec<usize> = self
                 .completed_meshes
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, result)| {
-                    (matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra) && !result.urgent)
-                        .then_some(idx)
+                .filter_map(|(idx, r)| {
+                    (matches!(r.lod, ChunkLod::Far | ChunkLod::Ultra) && !r.urgent).then_some(idx)
                 })
                 .collect();
+
             low_priority_indices.sort_by_key(|idx| self.completed_meshes[*idx].queued_at);
 
             let mut to_drop = self.completed_meshes.len() - COMPLETED_MESH_BACKLOG_THRESHOLD;
             let mut drop_mask = vec![false; self.completed_meshes.len()];
             for idx in low_priority_indices {
-                if to_drop == 0 {
-                    break;
-                }
+                if to_drop == 0 { break; }
                 drop_mask[idx] = true;
                 to_drop -= 1;
             }
 
-            if drop_mask.iter().any(|drop| *drop) {
+            if drop_mask.iter().any(|d| *d) {
                 let mut kept = Vec::with_capacity(self.completed_meshes.len());
-                for (idx, result) in self.completed_meshes.drain(..).enumerate() {
+                for (idx, r) in self.completed_meshes.drain(..).enumerate() {
                     if drop_mask[idx] {
                         stats.age_drop_count += 1;
                     } else {
-                        kept.push(result);
+                        kept.push(r);
                     }
                 }
                 self.completed_meshes = kept;
             }
         }
 
+        // === CRITICAL FIX: take completed_meshes out before iterating, so we can call &mut self inside ===
+        let completed_meshes_depth = self.completed_meshes.len();
+        let mut completed = std::mem::take(&mut self.completed_meshes);
+
+        // Adopt artifacts.
         let mut bytes_uploaded = 0usize;
         let mut uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
         let mut gpu_adoption_latency_ms_total = 0.0f32;
+
         let mut remesh_coords = Vec::new();
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_chunks = Vec::new();
-        let completed_meshes_depth = self.completed_meshes.len();
-        for result in self.completed_meshes.drain(..) {
+
+        for result in completed.drain(..) {
             stats.mesh_artifacts_received += 1;
+
+            let slot = result.mesh_slot;
+            let allocated_new_slot = self.inflight_mesh_slots.remove(&result.coord).is_some();
+            let had_existing_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
+
             let voxel_version = store.chunk_voxel_version(result.coord);
-            // FIX 5: never upload stale geometry; requeue and skip this artifact.
+
             if result.version.saturating_add(1) < voxel_version {
                 stats.stale_drop_count += 1;
                 stats.mesh_artifacts_rejected += 1;
                 remesh_coords.push(result.coord);
+                if allocated_new_slot && !had_existing_mesh {
+                    self.free_mesh_slot(slot);
+                }
                 continue;
             }
 
-            // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
-            if let ChunkMeshArtifact::Skipped { reason } = result.artifact {
+            if let ChunkMeshArtifact::Skipped { reason } = &result.artifact {
                 stats.gpu_job_skipped += 1;
                 if matches!(reason, MeshSkipReason::MeshSlotCapacitySaturated { .. }) {
                     stats.gpu_mesh_slot_alloc_failed += 1;
                 }
-                skipped_retry_chunks.push((result.coord, reason));
+                skipped_retry_chunks.push((result.coord, *reason));
+                if allocated_new_slot && !had_existing_mesh {
+                    self.free_mesh_slot(slot);
+                }
                 continue;
             }
 
@@ -1911,115 +1938,75 @@ impl Renderer {
                 if is_gpu_timeout_reason(reason) {
                     stats.gpu_job_timeouts += 1;
                 }
-                log::warn!(
-                    "[mesh] dropping failed artifact chunk={:?} lod={:?} error={}",
-                    result.coord,
-                    result.lod,
-                    short_error_message(reason)
-                );
                 failed_retry_coords.push(result.coord);
+                if allocated_new_slot && !had_existing_mesh {
+                    self.free_mesh_slot(slot);
+                }
                 continue;
             }
 
-            #[allow(irrefutable_let_patterns)]
             if let ChunkMeshArtifact::Gpu {
                 page_index,
-                draw_indirect_index,
-                index_count: _index_count,
                 lod,
                 dispatch_ms,
                 aabb_min,
                 aabb_max,
                 chunk_origin_world,
-                ..
+                index_count,
             } = &result.artifact
             {
                 if page_index.0 >= gpu_page_capacity() {
-                    log::warn!(
-                        "[mesh] rejecting gpu artifact chunk={:?}: page index {} out of range (capacity {})",
-                        result.coord,
-                        page_index.0,
-                        gpu_page_capacity()
-                    );
                     stats.mesh_artifacts_rejected += 1;
                     remesh_coords.push(result.coord);
+                    if allocated_new_slot && !had_existing_mesh {
+                        self.free_mesh_slot(slot);
+                    }
                     continue;
                 }
-                if *draw_indirect_index >= mesh_pool_slot_capacity() {
-                    log::warn!(
-                        "[mesh] rejecting gpu artifact chunk={:?}: draw index {} out of range (capacity {})",
-                        result.coord,
-                        draw_indirect_index,
-                        mesh_pool_slot_capacity()
-                    );
-                    stats.mesh_artifacts_rejected += 1;
-                    remesh_coords.push(result.coord);
-                    continue;
-                }
+
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
-                // For GPU meshing, the indirect draw buffer is authoritative.
-                // Do not infer metadata from GPU artifact placeholder counts.
+
                 stats.gpu_mesh_jobs += 1;
                 stats.gpu_dispatch_ms += *dispatch_ms;
                 stats.gpu_mesh_adopted_count += 1;
                 gpu_adoption_latency_ms_total += adoption_latency_ms;
+
+                let v_off = vertex_offset_bytes(slot);
+                let i_off = index_offset_bytes(slot);
+                let draw_off = slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+
+                let draw_command = DrawIndexedIndirectCommand {
+                    index_count: *index_count,
+                    instance_count: 1,
+                    first_index: (i_off / std::mem::size_of::<u32>() as u64) as u32,
+                    base_vertex: (v_off / std::mem::size_of::<Vertex>() as u64) as i32,
+                    first_instance: 0,
+                };
+
+                self.queue.write_buffer(
+                    &self.global_gpu_draw_indirect_buffer,
+                    draw_off,
+                    bytemuck::bytes_of(&draw_command),
+                );
+
                 self.visible_gpu_chunks.insert(
                     result.coord,
                     GpuChunkDraw {
                         page_index: *page_index,
-                        draw_indirect_index: *draw_indirect_index,
+                        draw_indirect_index: slot,
                         lod: *lod,
                         origin: *chunk_origin_world,
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
-                        index_count: None,
+                        index_count: Some(*index_count),
                     },
                 );
+
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
-                total_latency_ms += adoption_latency_ms;
 
-                #[cfg(feature = "legacy_gpu_artifact_upload")]
-                {
-                    let verts_per_page =
-                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 24;
-                    let indices_per_page =
-                        (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64 * 36;
-                    let vertex_offset =
-                        page_index.0 as u64 * verts_per_page * std::mem::size_of::<Vertex>() as u64;
-                    let index_offset =
-                        page_index.0 as u64 * indices_per_page * std::mem::size_of::<u32>() as u64;
-                    let draw_offset = *draw_indirect_index as u64
-                        * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-                    let (verts, inds, _indirect, ..) = result.artifact.geometry();
-                    if !verts.is_empty() {
-                        self.queue.write_buffer(
-                            &self.global_gpu_vertex_buffer,
-                            vertex_offset,
-                            bytemuck::cast_slice(verts),
-                        );
-                    }
-                    if !inds.is_empty() {
-                        self.queue.write_buffer(
-                            &self.global_gpu_index_buffer,
-                            index_offset,
-                            bytemuck::cast_slice(inds),
-                        );
-                    }
-                    let draw_command = DrawIndexedIndirectCommand {
-                        index_count: inds.len() as u32,
-                        instance_count: 1,
-                        first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
-                        base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
-                        first_instance: 0,
-                    };
-                    self.queue.write_buffer(
-                        &self.global_gpu_draw_indirect_buffer,
-                        draw_offset,
-                        bytemuck::bytes_of(&draw_command),
-                    );
-                }
+                total_latency_ms += adoption_latency_ms;
                 continue;
             }
 
@@ -2032,102 +2019,49 @@ impl Renderer {
                 chunk_origin_world,
             } = &result.artifact
             {
-                let mesh_slot_capacity = mesh_pool_slot_capacity();
-                if mesh_slot_capacity == 0 {
+                if verts.len() as u64 > vertex_capacity_per_slot()
+                    || inds.len() as u64 > index_capacity_per_slot()
+                {
                     stats.mesh_artifacts_rejected += 1;
                     remesh_coords.push(result.coord);
-                    continue;
-                }
-                let slot = if let Some(existing) = self.visible_gpu_chunks.get(&result.coord) {
-                    existing.draw_indirect_index
-                } else {
-                    let mut used_slots = HashSet::with_capacity(self.visible_gpu_chunks.len());
-                    for draw in self.visible_gpu_chunks.values() {
-                        used_slots.insert(draw.draw_indirect_index);
+                    if allocated_new_slot && !had_existing_mesh {
+                        self.free_mesh_slot(slot);
                     }
-                    let mut selected = None;
-                    for candidate in 0..mesh_slot_capacity {
-                        if !used_slots.contains(&candidate) {
-                            selected = Some(candidate);
-                            break;
-                        }
-                    }
-                    let Some(selected) = selected else {
-                        log::warn!(
-                            "[mesh] rejecting cpu artifact chunk={:?}: no free mesh slots (capacity {})",
-                            result.coord,
-                            mesh_slot_capacity
-                        );
-                        stats.mesh_artifacts_rejected += 1;
-                        remesh_coords.push(result.coord);
-                        continue;
-                    };
-                    selected
-                };
-                let vertex_capacity = GPU_MESH_VERTEX_CAPACITY_PER_SLOT as usize;
-                let index_capacity = GPU_MESH_INDEX_CAPACITY_PER_SLOT as usize;
-                if verts.len() > vertex_capacity || inds.len() > index_capacity {
-                    log::warn!(
-                        "[mesh] rejecting cpu artifact chunk={:?}: mesh exceeds slot capacity (verts {}/{}, inds {}/{})",
-                        result.coord,
-                        verts.len(),
-                        vertex_capacity,
-                        inds.len(),
-                        index_capacity
-                    );
-                    stats.mesh_artifacts_rejected += 1;
-                    remesh_coords.push(result.coord);
                     continue;
                 }
 
-                let vertex_offset = slot as u64
-                    * GPU_MESH_VERTEX_CAPACITY_PER_SLOT
-                    * std::mem::size_of::<Vertex>() as u64;
-                let index_offset = slot as u64
-                    * GPU_MESH_INDEX_CAPACITY_PER_SLOT
-                    * std::mem::size_of::<u32>() as u64;
-                let draw_offset =
-                    slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-                let vertex_bytes = verts.len() as u64 * std::mem::size_of::<Vertex>() as u64;
-                let index_bytes = inds.len() as u64 * std::mem::size_of::<u32>() as u64;
-                if vertex_offset + vertex_bytes > GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES
-                    || index_offset + index_bytes > GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES
-                {
-                    log::warn!(
-                        "[mesh] rejecting cpu artifact chunk={:?}: upload offsets exceed global mesh buffers",
-                        result.coord
-                    );
-                    stats.mesh_artifacts_rejected += 1;
-                    remesh_coords.push(result.coord);
-                    continue;
-                }
+                let v_off = vertex_offset_bytes(slot);
+                let i_off = index_offset_bytes(slot);
+                let draw_off = slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
 
                 if !verts.is_empty() {
                     self.queue.write_buffer(
                         &self.global_gpu_vertex_buffer,
-                        vertex_offset,
+                        v_off,
                         bytemuck::cast_slice(verts),
                     );
                 }
                 if !inds.is_empty() {
                     self.queue.write_buffer(
                         &self.global_gpu_index_buffer,
-                        index_offset,
+                        i_off,
                         bytemuck::cast_slice(inds),
                     );
                 }
 
                 let resolved_index_count = indirect.index_count.max(inds.len() as u32);
+
                 let draw_command = DrawIndexedIndirectCommand {
                     index_count: resolved_index_count,
                     instance_count: 1,
-                    first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
-                    base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
+                    first_index: (i_off / std::mem::size_of::<u32>() as u64) as u32,
+                    base_vertex: (v_off / std::mem::size_of::<Vertex>() as u64) as i32,
                     first_instance: 0,
                 };
+
                 self.queue.write_buffer(
                     &self.global_gpu_draw_indirect_buffer,
-                    draw_offset,
+                    draw_off,
                     bytemuck::bytes_of(&draw_command),
                 );
 
@@ -2143,24 +2077,27 @@ impl Renderer {
                         index_count: Some(resolved_index_count),
                     },
                 );
+
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
+
                 uploaded += 1;
-                bytes_uploaded += (vertex_bytes + index_bytes) as usize;
+                bytes_uploaded += verts.len() * std::mem::size_of::<Vertex>()
+                    + inds.len() * std::mem::size_of::<u32>();
                 total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
                 continue;
             }
 
-            log::warn!(
-                "[mesh] rejecting unhandled artifact variant for chunk={:?}",
-                result.coord
-            );
             stats.mesh_artifacts_rejected += 1;
-            self.visible_gpu_chunks.remove(&result.coord);
-            self.pending_lod_remesh.remove(&result.coord);
-            continue;
+            if allocated_new_slot && !had_existing_mesh {
+                self.free_mesh_slot(slot);
+            }
         }
+
+        // Put back the (now empty) vec to preserve capacity and avoid reallocs next frame.
+        self.completed_meshes = completed;
+
         for coord in failed_retry_coords {
             self.schedule_mesh_retry(coord, MeshRetryKind::Failed);
         }
@@ -2183,9 +2120,7 @@ impl Renderer {
         } else {
             0.0
         };
-        stats.allocator_bytes_allocated = 0;
-        stats.allocator_bytes_reused = 0;
-        stats.allocator_realloc_count = 0;
+
         stats.dirty_backlog = self.dirty_queues.total_len();
         stats.dirty_urgent_depth = self.dirty_queues.tier_len(DirtyTier::Urgent);
         stats.dirty_near_depth = self.dirty_queues.tier_len(DirtyTier::Near);
@@ -2194,20 +2129,24 @@ impl Renderer {
         stats.meshing_queue_depth = self.dirty_queues.total_len() + self.mesh_queue.inflight;
         stats.meshing_completed_depth = completed_meshes_depth;
 
-        let mut drop_keys = Vec::new();
-        for &coord in self.visible_gpu_chunks.keys() {
-            if chunk_distance(player_chunk, coord) > lod_radii.ultra as f32 {
-                drop_keys.push(coord);
+        // Distance eviction.
+        let drop_keys: Vec<ChunkCoord> = self
+            .visible_gpu_chunks
+            .keys()
+            .copied()
+            .filter(|&coord| chunk_distance(player_chunk, coord) > lod_radii.ultra as f32 + 8.0)
+            .collect();
+
+        for coord in drop_keys {
+            if let Some(old) = self.visible_gpu_chunks.remove(&coord) {
+                self.free_mesh_slot(old.draw_indirect_index);
             }
         }
-        for coord in drop_keys {
-            self.visible_gpu_chunks.remove(&coord);
-            self.lod_selection.remove(&coord);
-            self.pending_lod_remesh.remove(&coord);
-        }
+
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
 
+        // LOD remesh trigger.
         let tracked_coords: Vec<ChunkCoord> = self.visible_gpu_chunks.keys().copied().collect();
         let mut lod_changes = Vec::new();
         for coord in tracked_coords {
@@ -2226,10 +2165,26 @@ impl Renderer {
         for coord in lod_changes.into_iter().take(MAX_LOD_REMESH_PER_FRAME) {
             self.enqueue_lod_remesh(coord, player_chunk, chunk_priority_scores);
         }
+
         stats
     }
+    fn free_mesh_slot(&mut self, slot: u32) {
+        // Clear the indirect command so multi-draw over [0..max_slot] is safe (holes render nothing).
+        let zero = DrawIndexedIndirectCommand::default();
+        let draw_offset = slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+        self.queue.write_buffer(
+            &self.global_gpu_draw_indirect_buffer,
+            draw_offset,
+            bytemuck::bytes_of(&zero),
+        );
+        self.free_mesh_slots.push(slot);
+    }
+
     pub fn clear_mesh_cache(&mut self) {
         self.visible_gpu_chunks.clear();
+        self.free_mesh_slots.clear();
+        self.free_mesh_slots
+            .extend((0..mesh_pool_slot_capacity() as u32).rev());
         self.dirty_queues.clear();
         self.urgent_mesh_queue.clear();
         self.urgent_mesh_set.clear();
@@ -2241,38 +2196,34 @@ impl Renderer {
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
         self.inflight_mesh_chunks.clear();
+        self.inflight_mesh_slots.clear();
         self.mesh_retry_state.clear();
         self.mesh_rebuild_frame_index = 0;
+
+        clear_draw_indirect_buffer(&self.queue, &self.global_gpu_draw_indirect_buffer);
     }
+
     pub fn mesh_draw_stats(&self, camera: &Camera) -> (usize, u64) {
-        // Keep frustum checks in world space; use GPU mesh metadata.
         let vp_world = camera.view_proj();
         let mut chunks = 0usize;
         let mut inds = 0u64;
         for draw in self.visible_gpu_chunks.values() {
             if aabb_in_view(vp_world, draw.world_aabb_min, draw.world_aabb_max) {
                 chunks += 1;
-                if let Some(index_count) = draw.index_count {
-                    inds += u64::from(index_count);
-                }
+                inds += draw.index_count.unwrap_or(0) as u64;
             }
         }
         (chunks, inds)
     }
 
     pub fn render_world<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &Camera) {
-        self.device.poll(wgpu::Maintain::Poll);
-        #[cfg(feature = "gpu-compute")]
+        // FIX 9: do not poll inside render.
         update_gpu_page_fences_on_renderer();
+
         let vp_render = camera.view_proj_rebased_to_origin(self.origin_voxel);
-        // World-space culling uses world-space camera/AABBs.
-        // Draw uses rebased camera VP + shader world-origin subtraction.
         let vp_world = camera.view_proj();
         let world_camera_pos = camera_world_position(camera);
         let origin_offset_world = voxel_to_world(self.origin_voxel);
-
-        debug_assert!(camera.pos.is_finite());
-        debug_assert!(origin_offset_world.is_finite());
 
         self.queue.write_buffer(
             &self.cam_buf,
@@ -2287,36 +2238,85 @@ impl Renderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.cam_bg, &[]);
 
-        let _ = vp_world;
-        let _ = world_camera_pos;
+        // FIX 8: multi-draw must cover contiguous [0..N) commands.
+        // We draw [0..max_slot+1); holes are safe because freed slots are zeroed.
+        let max_slot_plus_one = self
+            .visible_gpu_chunks
+            .values()
+            .map(|d| d.draw_indirect_index as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let draw_count = max_slot_plus_one.min(mesh_pool_slot_capacity() as usize);
 
-        let draw_count = mesh_pool_slot_capacity();
-        if draw_count > 0 {
-            pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
-            pass.set_index_buffer(
-                self.global_gpu_index_buffer.slice(..),
-                wgpu::IndexFormat::Uint32,
-            );
-            if self.supports_multi_draw_indirect {
-                pass.multi_draw_indexed_indirect(
-                    &self.global_gpu_draw_indirect_buffer,
-                    0,
-                    draw_count,
-                );
-            } else {
-                let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-                for i in 0..draw_count {
-                    pass.draw_indexed_indirect(
-                        &self.global_gpu_draw_indirect_buffer,
-                        i as u64 * stride,
-                    );
+        if draw_count == 0 {
+            return;
+        }
+
+        pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
+        pass.set_index_buffer(
+            self.global_gpu_index_buffer.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+
+        if self.supports_multi_draw_indirect {
+            pass.multi_draw_indexed_indirect(&self.global_gpu_draw_indirect_buffer, 0, draw_count as u32);
+        } else {
+            let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
+            for draw in self.visible_gpu_chunks.values() {
+                // Optional per-draw culling for the non-multi-draw path.
+                let draw_lod = match draw.lod {
+                    0 => ChunkLod::Near,
+                    1 => ChunkLod::Mid,
+                    2 => ChunkLod::Far,
+                    _ => ChunkLod::Ultra,
+                };
+                if !chunk_visible_in_world_space(
+                    self.settings.frustum_culling,
+                    vp_world,
+                    world_camera_pos,
+                    draw_lod,
+                    draw.world_aabb_min,
+                    draw.world_aabb_max,
+                    self.size.height,
+                ) {
+                    continue;
                 }
+
+                pass.draw_indexed_indirect(
+                    &self.global_gpu_draw_indirect_buffer,
+                    draw.draw_indirect_index as u64 * stride,
+                );
             }
         }
     }
 }
 
 impl Renderer {
+    fn evict_one_mesh_slot_for_pressure(&mut self, player_chunk: ChunkCoord) -> bool {
+        // Evict the farthest visible chunk to free a slot.
+        let Some((&victim_coord, _)) = self
+            .visible_gpu_chunks
+            .iter()
+            .max_by(|(a, _), (b, _)| chunk_distance(player_chunk, **a).total_cmp(&chunk_distance(player_chunk, **b)))
+        else {
+            return false;
+        };
+
+        if let Some(old) = self.visible_gpu_chunks.remove(&victim_coord) {
+            // IMPORTANT: use your existing slot free routine (push into free list, zero command, etc).
+            self.free_mesh_slot(old.draw_indirect_index);
+            log::warn!(
+                "[mesh] slot pressure: evicted {:?} (slot={}) to free a mesh slot (visible={}, free={})",
+                victim_coord,
+                old.draw_indirect_index,
+                self.visible_gpu_chunks.len(),
+                self.free_mesh_slots.len(),
+            );
+            true
+        } else {
+            false
+        }
+    }
     fn should_replace_frame_job(candidate: &MeshJob, current: &MeshJob) -> bool {
         if candidate.urgent != current.urgent {
             return candidate.urgent;
@@ -2324,13 +2324,35 @@ impl Renderer {
         lod_rank(candidate.lod) < lod_rank(current.lod)
     }
 
+    /// Returns Ok(true) if submitted, Ok(false) if slot-saturated skip scheduled.
     fn submit_mesh_job(
         &mut self,
-        job: MeshJob,
+        mut job: MeshJob,
         stats: &mut MeshRebuildStats,
-    ) -> Result<(), TrySendError<MeshJob>> {
+    ) -> Result<bool, TrySendError<MeshJob>> {
         let coord = job.coord;
         let lod = job.lod;
+
+        // FIX 2/5: renderer owns slot allocation.
+        let slot = if let Some(draw) = self.visible_gpu_chunks.get(&coord) {
+            draw.draw_indirect_index
+        } else if let Some(slot) = self.free_mesh_slots.pop() {
+            self.inflight_mesh_slots.insert(coord, slot);
+            slot
+        } else {
+            stats.gpu_mesh_slot_alloc_failed += 1;
+            self.schedule_mesh_retry(
+                coord,
+                MeshRetryKind::Skipped(MeshSkipReason::MeshSlotCapacitySaturated {
+                    slot_capacity: mesh_pool_slot_capacity(),
+                    in_flight_fences: 0,
+                }),
+            );
+            return Ok(false);
+        };
+
+        job.mesh_slot = slot;
+
         match self.mesh_queue.try_submit(job) {
             Ok(()) => {
                 self.inflight_mesh_chunks.insert(coord);
@@ -2341,22 +2363,15 @@ impl Renderer {
                     ChunkLod::Far => stats.far_mesh_count += 1,
                     ChunkLod::Ultra => stats.ultra_mesh_count += 1,
                 }
-                #[cfg(feature = "gpu-compute")]
-                if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
-                    let dispatch_start = Instant::now();
-                    match dispatch_gpu_chunk_tasks_on_renderer(32) {
-                        Ok(_) => {
-                            stats.gpu_dispatch_ms +=
-                                dispatch_start.elapsed().as_secs_f32() * 1000.0;
-                        }
-                        Err(err) => {
-                            log::warn!("[mesh] renderer-side gpu dispatch failed after job submit: {err:#}");
-                        }
-                    }
-                }
-                Ok(())
+                Ok(true)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                // If the queue is full and we had allocated a new slot, return it.
+                if let Some(s) = self.inflight_mesh_slots.remove(&coord) {
+                    self.free_mesh_slot(s);
+                }
+                Err(err)
+            }
         }
     }
 
@@ -2412,6 +2427,7 @@ impl Renderer {
                 snapshot: snapshot.clone(),
                 greedy: self.settings.greedy_meshing,
                 urgent: true,
+                mesh_slot: u32::MAX,
             });
             if let Some(lod) = fallback_lod {
                 jobs.push(MeshJob {
@@ -2422,6 +2438,7 @@ impl Renderer {
                     snapshot: snapshot.clone(),
                     greedy: self.settings.greedy_meshing,
                     urgent: true,
+                    mesh_slot: u32::MAX,
                 });
             }
 
@@ -2473,31 +2490,35 @@ impl Renderer {
     }
 
     fn schedule_mesh_retry(&mut self, coord: ChunkCoord, kind: MeshRetryKind) {
+        let frame = self.mesh_rebuild_frame_index;
         let state = self.mesh_retry_state.entry(coord).or_default();
-        let (attempts, next_retry_frame) = match kind {
-            MeshRetryKind::Failed => (
-                &mut state.failed_attempts,
-                &mut state.failed_next_retry_frame,
-            ),
-            MeshRetryKind::Skipped(_) => (
-                &mut state.skipped_attempts,
-                &mut state.skipped_next_retry_frame,
-            ),
-        };
-        if *attempts >= MESH_RETRY_MAX_ATTEMPTS {
-            return;
-        }
-        *attempts += 1;
-        let backoff_frames = match kind {
+
+        match kind {
             MeshRetryKind::Failed => {
-                let exp = (*attempts).saturating_sub(1).min(8);
-                MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp)
+                if state.failed_attempts >= MESH_RETRY_MAX_ATTEMPTS {
+                    return;
+                }
+                state.failed_attempts += 1;
+
+                let exp = state.failed_attempts.saturating_sub(1).min(8);
+                let backoff_frames =
+                    MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
+
+                state.failed_next_retry_frame = frame.saturating_add(backoff_frames);
             }
+
             MeshRetryKind::Skipped(reason) => {
-                let exp = (*attempts).saturating_sub(1).min(6);
-                let raw = MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
+                if state.skipped_attempts >= MESH_RETRY_MAX_ATTEMPTS {
+                    return;
+                }
+                state.skipped_attempts += 1;
+
+                let exp = state.skipped_attempts.saturating_sub(1).min(6);
+                let raw =
+                    MESH_RETRY_BASE_BACKOFF_FRAMES.saturating_mul(1u64 << exp);
                 let bounded = raw.min(MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES);
-                if *attempts >= MESH_RETRY_SKIPPED_WARN_ATTEMPTS {
+
+                if state.skipped_attempts >= MESH_RETRY_SKIPPED_WARN_ATTEMPTS {
                     if let MeshSkipReason::MeshSlotCapacitySaturated {
                         slot_capacity,
                         in_flight_fences,
@@ -2505,16 +2526,16 @@ impl Renderer {
                     {
                         log::warn!(
                             "[mesh] repeated skipped retries chunk={coord:?} attempts={} slot_capacity={} in_flight_fences={}",
-                            *attempts,
+                            state.skipped_attempts,
                             slot_capacity,
                             in_flight_fences
                         );
                     }
                 }
-                bounded
+
+                state.skipped_next_retry_frame = frame.saturating_add(bounded);
             }
-        };
-        *next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
+        }
     }
 
     fn process_mesh_retry_backoff(
@@ -2522,31 +2543,44 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
-        let mut ready = Vec::new();
-        let mut urgent_boost = Vec::new();
-        self.mesh_retry_state.retain(|coord, state| {
+        let frame = self.mesh_rebuild_frame_index;
+
+        // Take to avoid borrow conflicts while we call other &mut self methods later.
+        let mut retry_map = std::mem::take(&mut self.mesh_retry_state);
+
+        let mut ready: Vec<ChunkCoord> = Vec::new();
+        let mut urgent_boost: Vec<ChunkCoord> = Vec::new();
+
+        retry_map.retain(|coord, state| {
             let failed_ready = state.failed_attempts < MESH_RETRY_MAX_ATTEMPTS
-                && state.failed_next_retry_frame <= self.mesh_rebuild_frame_index;
+                && state.failed_next_retry_frame <= frame;
             let skipped_ready = state.skipped_attempts < MESH_RETRY_MAX_ATTEMPTS
-                && state.skipped_next_retry_frame <= self.mesh_rebuild_frame_index;
+                && state.skipped_next_retry_frame <= frame;
+
             if failed_ready || skipped_ready {
                 ready.push(*coord);
             }
+
             if failed_ready {
                 state.failed_attempts = 0;
                 state.failed_next_retry_frame = u64::MAX;
             }
+
             if skipped_ready {
-                let skipped_attempts = state.skipped_attempts;
+                let attempts = state.skipped_attempts;
                 state.skipped_attempts = 0;
                 state.skipped_next_retry_frame = u64::MAX;
-                if skipped_attempts >= MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS {
+
+                if attempts >= MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS {
                     urgent_boost.push(*coord);
                 }
             }
 
             state.failed_attempts > 0 || state.skipped_attempts > 0
         });
+
+        self.mesh_retry_state = retry_map;
+
         for coord in urgent_boost {
             self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
         }
@@ -2808,7 +2842,9 @@ pub(crate) fn mesh_chunk_snapshot(
     let chunk_world_min = snapshot.world_min;
     debug_assert_eq!(chunk_world_min, chunk_to_world_min(coord));
     let chunk_origin_world = voxel_to_world(chunk_world_min);
-    let (verts, inds) = match lod {
+
+    // Build in chunk-local meters, then translate to world-space meters (FIXED).
+    let (mut verts, inds) = match lod {
         ChunkLod::Near => {
             if greedy {
                 mesh_chunk_voxel_faces_greedy(snapshot)
@@ -2820,9 +2856,17 @@ pub(crate) fn mesh_chunk_snapshot(
         ChunkLod::Far => mesh_chunk_coarse_solid(snapshot, 4),
         ChunkLod::Ultra => mesh_chunk_heightfield_proxy(snapshot, 8),
     };
-    let (aabb_min, aabb_max) = chunk_world_aabb_from_vertices(chunk_origin_world, &verts);
+
+    for v in &mut verts {
+        let p = Vec3::from_array(v.pos) + chunk_origin_world;
+        v.pos = p.to_array();
+    }
+
+    let (aabb_min, aabb_max) = world_aabb_from_vertices(&verts);
     (verts, inds, aabb_min, aabb_max, chunk_origin_world)
 }
+
+// -------- Meshing implementations (unchanged) --------
 
 fn mesh_chunk_voxel_faces(snapshot: &ChunkSnapshot, step: i32) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts = Vec::new();
@@ -3319,40 +3363,6 @@ fn add_box_faces(
     }
 }
 
-fn build_debug_aabb_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let side = CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
-    let c = [200, 32, 32, 100];
-    let corners = [
-        [0.0, 0.0, 0.0],
-        [side, 0.0, 0.0],
-        [side, side, 0.0],
-        [0.0, side, 0.0],
-        [0.0, 0.0, side],
-        [side, 0.0, side],
-        [side, side, side],
-        [0.0, side, side],
-    ];
-    let mut verts = Vec::with_capacity(corners.len());
-    for p in corners {
-        verts.push(Vertex { pos: p, color: c });
-    }
-    let inds = vec![
-        0, 1, 2, 0, 2, 3, // near
-        4, 6, 5, 4, 7, 6, // far
-        0, 4, 5, 0, 5, 1, // bottom
-        3, 2, 6, 3, 6, 7, // top
-        1, 5, 6, 1, 6, 2, // right
-        0, 3, 7, 0, 7, 4, // left
-    ];
-    (verts, inds)
-}
-
-fn draw_debug_aabb<'a>(pass: &mut wgpu::RenderPass<'a>, mesh: &'a ChunkMesh, _color: [u8; 4]) {
-    pass.set_vertex_buffer(0, mesh.debug_aabb_vb.slice(..));
-    pass.set_index_buffer(mesh.debug_aabb_ib.slice(..), wgpu::IndexFormat::Uint32);
-    pass.draw_indexed(0..mesh.debug_aabb_index_count, 0, 0..1);
-}
-
 fn chunk_chebyshev_dist(a: ChunkCoord, b: ChunkCoord) -> i32 {
     (a.x - b.x)
         .abs()
@@ -3367,22 +3377,14 @@ fn chunk_distance(a: ChunkCoord, b: ChunkCoord) -> f32 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-fn chunk_horizontal_distance_to_camera(coord: ChunkCoord, world_camera_pos: Vec3) -> f32 {
-    let chunk_world_min = voxel_to_world(chunk_to_world_min(coord));
-    let center = chunk_world_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE * 0.5);
-    let delta = center - world_camera_pos;
-    (delta.x.hypot(delta.z)) / (CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE)
-}
-
-fn chunk_world_aabb_from_vertices(chunk_origin_world: Vec3, verts: &[Vertex]) -> (Vec3, Vec3) {
+fn world_aabb_from_vertices(verts: &[Vertex]) -> (Vec3, Vec3) {
     if verts.is_empty() {
-        return (chunk_origin_world, chunk_origin_world);
+        return (Vec3::ZERO, Vec3::ZERO);
     }
-
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
     for v in verts {
-        let p = chunk_origin_world + Vec3::from_array(v.pos);
+        let p = Vec3::from_array(v.pos);
         min = min.min(p);
         max = max.max(p);
     }
@@ -3755,351 +3757,4 @@ fn aabb_in_view(vp: Mat4, min: Vec3, max: Vec3) -> bool {
         }
     }
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::chunk_store::{Chunk, NeighborDirtyPolicy};
-
-    fn coord() -> ChunkCoord {
-        ChunkCoord { x: 0, y: 0, z: 0 }
-    }
-
-    fn chunk_with_voxel(x: usize, y: usize, z: usize, id: MaterialId) -> Chunk {
-        let mut c = Chunk::new_empty();
-        c.set(x, y, z, id);
-        c
-    }
-
-    #[test]
-    fn frustum_culls_and_accepts_expected_aabbs() {
-        let camera = Camera {
-            pos: Vec3::new(0.0, 0.0, 0.0),
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let vp = camera.view_proj();
-
-        let visible_min = Vec3::new(-0.5, -0.5, -2.0);
-        let visible_max = Vec3::new(0.5, 0.5, -1.0);
-        assert!(aabb_in_view(vp, visible_min, visible_max));
-
-        let behind_camera_min = Vec3::new(-0.5, -0.5, 0.5);
-        let behind_camera_max = Vec3::new(0.5, 0.5, 1.5);
-        assert!(!aabb_in_view(vp, behind_camera_min, behind_camera_max));
-
-        let beyond_far_min = Vec3::new(-1.0, -1.0, -1300.0);
-        let beyond_far_max = Vec3::new(1.0, 1.0, -1250.0);
-        assert!(!aabb_in_view(vp, beyond_far_min, beyond_far_max));
-    }
-
-    #[test]
-    fn culling_visibility_with_zero_origin_is_consistent() {
-        let camera = Camera {
-            pos: Vec3::new(0.0, 0.0, 0.0),
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let world_min = Vec3::new(-1.0, -1.0, -6.0);
-        let world_max = Vec3::new(1.0, 1.0, -4.0);
-
-        let world_visible = chunk_visible_in_world_space(
-            true,
-            camera.view_proj(),
-            camera_world_position(&camera),
-            ChunkLod::Far,
-            world_min,
-            world_max,
-            1080,
-        );
-
-        assert!(world_visible);
-    }
-
-    #[test]
-    fn culling_visibility_with_large_non_zero_origin_is_consistent() {
-        let origin = VoxelCoord {
-            x: 4_000_000,
-            y: 1_500,
-            z: -3_250_000,
-        };
-        let origin_world = voxel_to_world(origin);
-        let camera = Camera {
-            pos: origin_world,
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let world_min = origin_world + Vec3::new(-1.0, -1.0, -16.0);
-        let world_max = origin_world + Vec3::new(1.0, 1.0, -8.0);
-
-        let world_visible = chunk_visible_in_world_space(
-            true,
-            camera.view_proj(),
-            camera_world_position(&camera),
-            ChunkLod::Ultra,
-            world_min,
-            world_max,
-            1080,
-        );
-
-        assert!(world_visible);
-    }
-
-    #[test]
-    fn cpu_culling_is_origin_invariant_for_same_world_relationship() {
-        let world_camera = Camera {
-            pos: Vec3::new(1_000_000.0, 0.0, -2_000_000.0),
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let origin = VoxelCoord {
-            x: (world_camera.pos.x / VOXEL_SIZE) as i32,
-            y: (world_camera.pos.y / VOXEL_SIZE) as i32,
-            z: (world_camera.pos.z / VOXEL_SIZE) as i32,
-        };
-
-        let world_min = world_camera.pos + Vec3::new(-2.0, -2.0, -20.0);
-        let world_max = world_camera.pos + Vec3::new(2.0, 2.0, -12.0);
-
-        let baseline_world = chunk_visible_in_world_space(
-            true,
-            world_camera.view_proj(),
-            world_camera.pos,
-            ChunkLod::Far,
-            world_min,
-            world_max,
-            1080,
-        );
-        let rebased_world = chunk_visible_in_world_space(
-            true,
-            world_camera.view_proj_rebased_to_origin(origin),
-            camera_world_position(&world_camera),
-            ChunkLod::Far,
-            world_min,
-            world_max,
-            1080,
-        );
-
-        assert_eq!(baseline_world, rebased_world);
-    }
-
-    #[test]
-    fn rebased_draw_transform_matches_world_space_projection() {
-        let origin = VoxelCoord {
-            x: 4_000_000,
-            y: 1_500,
-            z: -3_250_000,
-        };
-        let world_camera = Camera {
-            pos: voxel_to_world(origin) + Vec3::new(0.75, 1.0, 2.5),
-            dir: Vec3::new(0.0, -0.1, -1.0).normalize(),
-            aspect: 16.0 / 9.0,
-        };
-        let chunk_origin_world = voxel_to_world(VoxelCoord {
-            x: origin.x + 64,
-            y: origin.y + 32,
-            z: origin.z - 96,
-        });
-        let local_vertex = Vec3::new(3.0 * VOXEL_SIZE, 5.0 * VOXEL_SIZE, 2.0 * VOXEL_SIZE);
-        let world_pos = chunk_origin_world + local_vertex;
-
-        let clip_world = world_camera.view_proj() * world_pos.extend(1.0);
-        let clip_rebased = world_camera.view_proj_rebased_to_origin(origin)
-            * (world_pos - voxel_to_world(origin)).extend(1.0);
-
-        assert!(clip_world.abs_diff_eq(clip_rebased, 1e-2));
-    }
-
-    #[test]
-    fn screen_space_cull_uses_world_space_distances() {
-        let origin = VoxelCoord {
-            x: 4_000_000,
-            y: 0,
-            z: -2_000_000,
-        };
-        let world_origin = voxel_to_world(origin);
-        let world_camera = world_origin + Vec3::new(0.0, 0.0, 0.0);
-        let world_min = world_origin + Vec3::new(-2.0, -2.0, -24.0);
-        let world_max = world_origin + Vec3::new(2.0, 2.0, -16.0);
-
-        let consistent_world =
-            passes_screen_space_cull(world_camera, ChunkLod::Ultra, world_min, world_max, 1080);
-
-        // Intentionally incorrect mixed-space input (render-relative AABB with
-        // world-space camera). This should not match correct world-space culling.
-        let mixed_space = passes_screen_space_cull(
-            world_camera,
-            ChunkLod::Ultra,
-            world_min - world_origin,
-            world_max - world_origin,
-            1080,
-        );
-
-        assert!(consistent_world);
-        assert_ne!(consistent_world, mixed_space);
-    }
-
-    #[test]
-    fn dirty_priority_prefers_near_chunks() {
-        let player = ChunkCoord { x: 0, y: 0, z: 0 };
-        let near = ChunkCoord { x: 1, y: 0, z: 0 };
-        let far = ChunkCoord { x: 40, y: 0, z: 0 };
-        let scores = HashMap::new();
-
-        assert!(
-            dirty_coord_priority(near, player, &scores)
-                > dirty_coord_priority(far, player, &scores)
-        );
-    }
-
-    #[test]
-    fn dirty_backlog_sort_perf_guard() {
-        let player = ChunkCoord { x: 0, y: 0, z: 0 };
-        let mut backlog = Vec::with_capacity(20_000);
-        for i in 0..20_000 {
-            backlog.push(ChunkCoord {
-                x: i % 200,
-                y: (i / 200) % 10,
-                z: i / 2000,
-            });
-        }
-        let scores = HashMap::new();
-
-        let started = Instant::now();
-        backlog.sort_by(|a, b| {
-            dirty_coord_priority(*a, player, &scores)
-                .total_cmp(&dirty_coord_priority(*b, player, &scores))
-        });
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed.as_millis() < 750,
-            "backlog prioritization regressed: {:?}",
-            elapsed
-        );
-    }
-    #[test]
-    fn lod_selection_uses_ultra_tier_with_hysteresis() {
-        let radii = LodRadii {
-            near: 4,
-            mid: 8,
-            far: 12,
-            ultra: 20,
-            hysteresis: 2,
-        };
-        let player = ChunkCoord { x: 0, y: 0, z: 0 };
-
-        let near = select_lod(
-            ChunkCoord { x: 3, y: 0, z: 0 },
-            player,
-            radii,
-            Some(ChunkLod::Near),
-        );
-        let far = select_lod(
-            ChunkCoord { x: 11, y: 0, z: 0 },
-            player,
-            radii,
-            Some(ChunkLod::Far),
-        );
-        let ultra = select_lod(
-            ChunkCoord { x: 21, y: 0, z: 0 },
-            player,
-            radii,
-            Some(ChunkLod::Ultra),
-        );
-
-        assert_eq!(near, ChunkLod::Near);
-        assert_eq!(far, ChunkLod::Far);
-        assert_eq!(ultra, ChunkLod::Ultra);
-    }
-
-    #[test]
-    fn unknown_neighbor_treated_as_empty_for_boundary_faces_in_aggressive_mode() {
-        let mut store = ChunkStore::new();
-        store.insert_chunk_with_policy(
-            coord(),
-            chunk_with_voxel(CHUNK_SIZE_VOXELS as usize - 1, 2, 2, 1),
-            false,
-            NeighborDirtyPolicy::None,
-        );
-
-        let no_neighbor =
-            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_a, _, _, _, _) =
-            mesh_chunk_snapshot(coord(), &no_neighbor, ChunkLod::Near, false);
-
-        store.insert_chunk_with_policy(
-            ChunkCoord { x: 1, y: 0, z: 0 },
-            Chunk::new_empty(),
-            false,
-            NeighborDirtyPolicy::None,
-        );
-        let with_neighbor =
-            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts_b, _, _, _, _) =
-            mesh_chunk_snapshot(coord(), &with_neighbor, ChunkLod::Near, false);
-
-        assert_eq!(verts_a.len(), 24);
-        assert_eq!(verts_b.len(), 24);
-    }
-
-    #[test]
-    fn voxel_vertex_positions_are_chunk_local_and_world_origin_is_metadata() {
-        let mut store = ChunkStore::new();
-        store.insert_chunk_with_policy(
-            coord(),
-            chunk_with_voxel(2, 3, 4, 1),
-            false,
-            NeighborDirtyPolicy::None,
-        );
-
-        let snapshot =
-            build_chunk_snapshot(&store, coord(), UnknownNeighborOcclusionPolicy::Aggressive);
-        let (verts, _, min, max, _) =
-            mesh_chunk_snapshot(coord(), &snapshot, ChunkLod::Near, false);
-
-        let expected_world_min = voxel_to_world(VoxelCoord { x: 0, y: 0, z: 0 });
-        let expected_world_max =
-            expected_world_min + Vec3::splat(CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE);
-        assert_eq!(min, expected_world_min);
-        assert_eq!(max, expected_world_max);
-
-        let xs: Vec<f32> = verts.iter().map(|v| v.pos[0]).collect();
-        assert!(xs
-            .iter()
-            .all(|x| *x >= 0.0 && *x <= CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE));
-    }
-
-    #[test]
-    fn adjacent_chunk_bounds_are_world_space_and_contiguous() {
-        let store = ChunkStore::new();
-        let left_snapshot = build_chunk_snapshot(
-            &store,
-            ChunkCoord { x: 0, y: 0, z: 0 },
-            UnknownNeighborOcclusionPolicy::Aggressive,
-        );
-        let right_snapshot = build_chunk_snapshot(
-            &store,
-            ChunkCoord { x: 1, y: 0, z: 0 },
-            UnknownNeighborOcclusionPolicy::Aggressive,
-        );
-
-        let (_, _, left_min, left_max, _) = mesh_chunk_snapshot(
-            ChunkCoord { x: 0, y: 0, z: 0 },
-            &left_snapshot,
-            ChunkLod::Near,
-            false,
-        );
-        let (_, _, right_min, _, _) = mesh_chunk_snapshot(
-            ChunkCoord { x: 1, y: 0, z: 0 },
-            &right_snapshot,
-            ChunkLod::Near,
-            false,
-        );
-
-        assert_eq!(left_max.x, right_min.x);
-        assert_eq!(left_min.y, right_min.y);
-        assert_eq!(left_min.z, right_min.z);
-    }
 }

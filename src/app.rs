@@ -1,6 +1,5 @@
 use crate::chunk_store::ChunkStore;
 use crate::floating_origin::{FloatingOriginConfig, FloatingOriginState};
-use crate::gpu_compute::take_gpu_compute_profiler_snapshot;
 use crate::input::{FpsController, InputState};
 use crate::player::{camera_world_pos_from_blocks, grounded_eye_y_blocks};
 use crate::procgen::{apply_generated_chunk, biome_hint_at_world, generate_chunk};
@@ -683,11 +682,13 @@ pub async fn run() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut ui = UiState::default();
-    ui.startup_backend_label = renderer
-        .startup_diagnostics
-        .backend_selected
-        .label()
-        .to_string();
+    ui.startup_backend_label = match renderer.startup_diagnostics.backend_selected {
+        crate::gpu_compute::MeshPipelineBackend::Disabled => "disabled",
+        crate::gpu_compute::MeshPipelineBackend::Cpu => "cpu",
+        #[cfg(feature = "gpu-compute")]
+        crate::gpu_compute::MeshPipelineBackend::Gpu => "gpu",
+    }
+    .to_string();
     ui.startup_required_limits = renderer.startup_diagnostics.required_limits_summary.clone();
     ui.startup_adapter_limits = renderer.startup_diagnostics.adapter_limits_summary.clone();
     ui.startup_error_message = renderer.startup_diagnostics.startup_error.clone();
@@ -2100,11 +2101,11 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
                         ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
-                        let gpu_compute = take_gpu_compute_profiler_snapshot(now.elapsed().as_secs_f32());
-                        ui.profiler.gpu_compute_dispatch_ms = gpu_compute.dispatch_ms;
-                        ui.profiler.gpu_compute_bytes_transferred = gpu_compute.bytes_transferred;
-                        ui.profiler.gpu_compute_chunks_completed = gpu_compute.chunks_completed;
-                        ui.profiler.gpu_compute_chunks_per_sec = gpu_compute.chunks_per_sec;
+                        // GPU compute profiler snapshot isn't exported; keep these stable defaults.
+                        ui.profiler.gpu_compute_dispatch_ms = 0.0;
+                        ui.profiler.gpu_compute_bytes_transferred = 0;
+                        ui.profiler.gpu_compute_chunks_completed = 0;
+                        ui.profiler.gpu_compute_chunks_per_sec = 0.0;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
                         ui.profiler.dirty_urgent_depth = mesh_stats.dirty_urgent_depth;
                         ui.profiler.dirty_near_depth = mesh_stats.dirty_near_depth;
