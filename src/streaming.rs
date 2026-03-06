@@ -408,16 +408,24 @@ impl ChunkStreaming {
         });
 
         let mut generation_scores = HashMap::with_capacity(weighted.len());
+        let mut weighted_order = Vec::with_capacity(weighted.len());
         for (coord, score, ..) in weighted {
             generation_scores.insert(coord, score);
+            weighted_order.push(coord);
         }
 
-        let mut generation_order =
-            Vec::with_capacity(near.len() + mid.len() + far.len() + ultra.len());
-        generation_order.extend(near.iter().copied());
-        generation_order.extend(mid.iter().copied());
-        generation_order.extend(far.iter().copied());
-        generation_order.extend(ultra.iter().copied());
+        // Keep urgent/near chunks at the front while preserving weighted order within each class.
+        let mut generation_order = Vec::with_capacity(weighted_order.len());
+        for &coord in &weighted_order {
+            if near_set.contains(&coord) || is_urgent_chunk(player_chunk, coord) {
+                generation_order.push(coord);
+            }
+        }
+        for coord in weighted_order {
+            if !near_set.contains(&coord) && !is_urgent_chunk(player_chunk, coord) {
+                generation_order.push(coord);
+            }
+        }
 
         let mut resident_keep = HashSet::with_capacity(
             near.len()
@@ -1316,6 +1324,139 @@ mod tests {
         assert!(streaming.scheduled_generate.contains(&neighbor_a));
         assert!(streaming.scheduled_generate.contains(&neighbor_b));
         assert!(!streaming.scheduled_generate.contains(&high_y));
+    }
+
+    #[test]
+    fn desired_set_weighted_order_prioritizes_front_over_rear_at_equal_distance() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let front = ChunkCoord { x: 0, y: 0, z: 2 };
+        let rear = ChunkCoord { x: 0, y: 0, z: -2 };
+
+        let visibility = super::VisibilityContext {
+            camera_pos_chunks: Vec3::ZERO,
+            cone_inner_cos: 0.9,
+            cone_outer_cos: 0.0,
+            frustum_planes: Some([glam::vec4(0.0, 0.0, 1.0, -0.5); 6]),
+        };
+
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 1.0),
+            Some(&visibility),
+            0,
+            1,
+            Some(2),
+            Some(2),
+            0,
+            8,
+            8,
+            &HashMap::new(),
+            0,
+        );
+
+        let old_ring_only_order: Vec<_> = desired
+            .near
+            .iter()
+            .chain(desired.mid.iter())
+            .chain(desired.far.iter())
+            .chain(desired.ultra.iter())
+            .copied()
+            .collect();
+
+        let old_front_idx = old_ring_only_order
+            .iter()
+            .position(|coord| *coord == front)
+            .unwrap();
+        let old_rear_idx = old_ring_only_order
+            .iter()
+            .position(|coord| *coord == rear)
+            .unwrap();
+        let weighted_front_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == front)
+            .unwrap();
+        let weighted_rear_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == rear)
+            .unwrap();
+
+        assert!(old_rear_idx < old_front_idx);
+        assert!(weighted_front_idx < weighted_rear_idx);
+    }
+
+    #[test]
+    fn desired_set_resident_keep_mid_far_follow_weighted_visibility_order() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mid_front = ChunkCoord { x: 0, y: 0, z: 1 };
+        let mid_rear = ChunkCoord { x: 0, y: 0, z: -1 };
+        let far_front = ChunkCoord { x: 0, y: 0, z: 2 };
+        let far_rear = ChunkCoord { x: 0, y: 0, z: -2 };
+
+        let visibility = super::VisibilityContext {
+            camera_pos_chunks: Vec3::ZERO,
+            cone_inner_cos: 0.95,
+            cone_outer_cos: 0.0,
+            frustum_planes: Some([glam::vec4(0.0, 0.0, 1.0, -0.5); 6]),
+        };
+
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 1.0),
+            Some(&visibility),
+            0,
+            1,
+            Some(2),
+            Some(2),
+            0,
+            1,
+            1,
+            &HashMap::new(),
+            0,
+        );
+
+        let weighted_mid_pick = desired
+            .generation_order
+            .iter()
+            .copied()
+            .find(|coord| desired.mid.contains(coord))
+            .unwrap();
+        let weighted_far_pick = desired
+            .generation_order
+            .iter()
+            .copied()
+            .find(|coord| !desired.near.contains(coord) && !desired.mid.contains(coord))
+            .unwrap();
+
+        assert!(desired.resident_keep.contains(&weighted_mid_pick));
+        assert!(desired.resident_keep.contains(&weighted_far_pick));
+
+        let mid_front_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == mid_front)
+            .unwrap();
+        let mid_rear_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == mid_rear)
+            .unwrap();
+        let far_front_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == far_front)
+            .unwrap();
+        let far_rear_idx = desired
+            .generation_order
+            .iter()
+            .position(|coord| *coord == far_rear)
+            .unwrap();
+
+        assert!(mid_front_idx < mid_rear_idx);
+        assert!(far_front_idx < far_rear_idx);
     }
 
     #[test]
