@@ -1,6 +1,6 @@
 use crate::renderer::mesh_chunk_snapshot;
-use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason};
-use crate::types::{ChunkCoord, GpuPageIndex};
+use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason, VOXEL_SIZE};
+use crate::types::{ChunkCoord, GpuPageIndex, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
@@ -120,6 +120,7 @@ pub struct SharedMeshBuffers {
     pub draw_indirect_buffer: Arc<wgpu::Buffer>,
     pub page_indirect: Arc<wgpu::Buffer>,
     pub mesh_meta_buffer: Arc<wgpu::Buffer>,
+    pub chunk_origin_buffer: Arc<wgpu::Buffer>,
     pub face_mask_buffer: Arc<wgpu::Buffer>,
     pub face_offset_buffer: Arc<wgpu::Buffer>,
     pub face_count_buffer: Arc<wgpu::Buffer>,
@@ -150,6 +151,7 @@ struct MeshingBindResources<'a> {
     chunk_index_buffer: &'a wgpu::Buffer,
     draw_indirect_buffer: &'a wgpu::Buffer,
     mesh_meta_buffer: &'a wgpu::Buffer,
+    chunk_origin_buffer: &'a wgpu::Buffer,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -334,6 +336,7 @@ struct WorkerGpuState {
     chunk_index_buffer: Arc<wgpu::Buffer>,
     draw_indirect_buffer: Arc<wgpu::Buffer>,
     mesh_meta_buffer: Arc<wgpu::Buffer>,
+    chunk_origin_buffer: Arc<wgpu::Buffer>,
     face_mask_buffer: Arc<wgpu::Buffer>,
     face_offset_buffer: Arc<wgpu::Buffer>,
     face_count_buffer: Arc<wgpu::Buffer>,
@@ -505,6 +508,15 @@ fn clear_meshing_outputs_for_page(
         &state.mesh_meta_buffer,
         meta_offset,
         bytemuck::bytes_of(&zero_meta),
+    );
+
+    let zero_origin = [0.0f32; 4];
+    let origin_stride = std::mem::size_of::<[f32; 4]>() as u64;
+    let origin_offset = page_index.0 as u64 * origin_stride;
+    state.queue.write_buffer(
+        &state.chunk_origin_buffer,
+        origin_offset,
+        bytemuck::cast_slice(&zero_origin),
     );
 
     state.queue.write_buffer(
@@ -818,6 +830,7 @@ impl GpuComputeRuntime {
                 bgl_entry(6, true),
                 bgl_entry(7, false),
                 bgl_entry(8, false),
+                bgl_entry(9, true),
             ];
             let meshing_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("meshing compute bgl"),
@@ -1020,6 +1033,21 @@ impl GpuComputeRuntime {
             .queue
             .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&page_params));
 
+        let chunk_span_world = CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
+        let origin = [
+            sim_job.chunk_coord.x as f32 * chunk_span_world,
+            sim_job.chunk_coord.y as f32 * chunk_span_world,
+            sim_job.chunk_coord.z as f32 * chunk_span_world,
+            0.0,
+        ];
+        let origin_stride = std::mem::size_of::<[f32; 4]>() as u64;
+        let origin_offset = page_index.0 as u64 * origin_stride;
+        state.queue.write_buffer(
+            &state.chunk_origin_buffer,
+            origin_offset,
+            bytemuck::cast_slice(&origin),
+        );
+
         let groups = (CHUNK_VOLUME as u32).div_ceil(128);
         let mut encoder = state
             .device
@@ -1180,6 +1208,10 @@ impl GpuComputeRuntime {
                     binding: 8,
                     resource: resources.mesh_meta_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: resources.chunk_origin_buffer.as_entire_binding(),
+                },
             ],
         })
     }
@@ -1313,6 +1345,7 @@ pub fn initialize_gpu_compute_worker(
                 chunk_index_buffer: &shared_mesh_buffers.chunk_index_buffer,
                 draw_indirect_buffer: &shared_mesh_buffers.draw_indirect_buffer,
                 mesh_meta_buffer: &shared_mesh_buffers.mesh_meta_buffer,
+                chunk_origin_buffer: &shared_mesh_buffers.chunk_origin_buffer,
             },
         );
 
@@ -1331,6 +1364,7 @@ pub fn initialize_gpu_compute_worker(
             chunk_index_buffer: shared_mesh_buffers.chunk_index_buffer,
             draw_indirect_buffer: shared_mesh_buffers.draw_indirect_buffer,
             mesh_meta_buffer: shared_mesh_buffers.mesh_meta_buffer,
+            chunk_origin_buffer: shared_mesh_buffers.chunk_origin_buffer,
             face_mask_buffer: shared_mesh_buffers.face_mask_buffer,
             face_offset_buffer: shared_mesh_buffers.face_offset_buffer,
             face_count_buffer: shared_mesh_buffers.face_count_buffer,
@@ -1492,9 +1526,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             glam::Vec3::ZERO,
             glam::Vec3::ZERO,
             glam::Vec3::new(
-                job.coord.x as f32 * 32.0,
-                job.coord.y as f32 * 32.0,
-                job.coord.z as f32 * 32.0,
+                job.coord.x as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
+                job.coord.y as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
+                job.coord.z as f32 * CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE,
             ),
         );
 

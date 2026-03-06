@@ -486,18 +486,11 @@ fn read_gpu_draw_indirect_command(
         mapped_at_creation: false,
     });
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("read_indirect_encoder"),
-        });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("read_indirect_encoder"),
+    });
 
-    encoder.copy_buffer_to_buffer(
-        indirect_buffer,
-        offset,
-        &staging,
-        0,
-        command_size,
-    );
+    encoder.copy_buffer_to_buffer(indirect_buffer, offset, &staging, 0, command_size);
 
     queue.submit(Some(encoder.finish()));
 
@@ -551,6 +544,7 @@ pub struct Renderer {
     global_gpu_draw_indirect_buffer: Arc<wgpu::Buffer>,
     global_gpu_page_indirect_buffer: Arc<wgpu::Buffer>,
     global_gpu_mesh_meta_buffer: Arc<wgpu::Buffer>,
+    global_gpu_chunk_origin_buffer: Arc<wgpu::Buffer>,
     global_gpu_face_mask_buffer: Arc<wgpu::Buffer>,
     global_gpu_face_offset_buffer: Arc<wgpu::Buffer>,
     global_gpu_face_count_buffer: Arc<wgpu::Buffer>,
@@ -1487,6 +1481,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
+        let global_gpu_chunk_origin_buffer =
+            Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("global gpu chunk origin buffer"),
+                size: page_capacity * std::mem::size_of::<[f32; 4]>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
         let global_gpu_face_mask_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu face mask buffer"),
             size: (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64
@@ -1534,6 +1535,7 @@ impl Renderer {
                     draw_indirect_buffer: Arc::clone(&global_gpu_draw_indirect_buffer),
                     page_indirect: Arc::clone(&global_gpu_page_indirect_buffer),
                     mesh_meta_buffer: Arc::clone(&global_gpu_mesh_meta_buffer),
+                    chunk_origin_buffer: Arc::clone(&global_gpu_chunk_origin_buffer),
                     face_mask_buffer: Arc::clone(&global_gpu_face_mask_buffer),
                     face_offset_buffer: Arc::clone(&global_gpu_face_offset_buffer),
                     face_count_buffer: Arc::clone(&global_gpu_face_count_buffer),
@@ -1559,6 +1561,7 @@ impl Renderer {
             global_gpu_draw_indirect_buffer,
             global_gpu_page_indirect_buffer,
             global_gpu_mesh_meta_buffer,
+            global_gpu_chunk_origin_buffer,
             global_gpu_face_mask_buffer,
             global_gpu_face_offset_buffer,
             global_gpu_face_count_buffer,
@@ -2030,8 +2033,8 @@ impl Renderer {
 
                 gpu_adoption_latency_ms_total += adoption_latency_ms;
 
-                let world_min = *aabb_min + *chunk_origin_world;
-                let world_max = *aabb_max + *chunk_origin_world;
+                let world_min = *aabb_min;
+                let world_max = *aabb_max;
 
                 let slot = *draw_indirect_index;
 
@@ -2150,7 +2153,7 @@ impl Renderer {
             self.pending_lod_remesh.remove(&result.coord);
             continue;
         }
-        
+
         for coord in failed_retry_coords {
             self.schedule_mesh_retry(coord, MeshRetryKind::Failed);
         }
@@ -2220,7 +2223,7 @@ impl Renderer {
         }
         stats
     }
-    
+
     pub fn clear_mesh_cache(&mut self) {
         self.visible_gpu_chunks.clear();
         self.free_mesh_slots.clear();
@@ -2295,10 +2298,10 @@ impl Renderer {
             );
             if self.supports_multi_draw_indirect {
                 pass.multi_draw_indexed_indirect(
-                &self.global_gpu_draw_indirect_buffer,
-                0,
-                draw_count as u32,
-            );
+                    &self.global_gpu_draw_indirect_buffer,
+                    0,
+                    draw_count as u32,
+                );
             } else {
                 let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
                 for draw in self.visible_gpu_chunks.values() {
