@@ -794,7 +794,8 @@ impl GpuComputeRuntime {
             let max_faces = vertex_face_limit.min(index_face_limit);
             let generated_consts = format!("const GPU_MAX_FACES_PER_PAGE: u32 = {}u;", max_faces);
             let meshing_source = format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
+                generated_material_ids_wgsl,
                 generated_consts,
                 include_str!("shaders/meshing.wgsl")
             );
@@ -1913,8 +1914,12 @@ pub struct DrawIndirectArgs {
 #[repr(C)]
 pub struct GpuVertex {
     pub position: [f32; 3],
-    pub material_id: u32,
+    pub color: u32,
 }
+
+#[cfg(feature = "gpu-compute")]
+const _: [(); std::mem::size_of::<GpuVertex>()] =
+    [(); std::mem::size_of::<crate::renderer::Vertex>()];
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
