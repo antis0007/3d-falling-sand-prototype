@@ -810,8 +810,6 @@ struct ZeroIndexRetryState {
     next_retry_frame: u64,
 }
 
-const ZERO_INDEX_ADOPTION_RETRY_MAX_ATTEMPTS: u32 = 3;
-
 #[derive(Clone, Copy)]
 enum MeshRetryKind {
     Failed,
@@ -2464,18 +2462,26 @@ impl Renderer {
 
                 let resolved_index_count = *index_count;
 
+                // `index_count` on GPU artifacts is an estimated value derived from
+                // snapshot meshing for telemetry/culling metadata, not authoritative draw data.
+                // The authoritative source is the GPU-written indirect command. Do not reject
+                // adoption on an estimated zero here; that can incorrectly void visible terrain.
                 if resolved_index_count == 0 {
-                    let startup_zero_geometry = self.is_startup_zero_geometry(result.coord);
-                    let retry = self.zero_index_retry_state.entry(result.coord).or_default();
-                    if retry.attempts < ZERO_INDEX_ADOPTION_RETRY_MAX_ATTEMPTS {
-                        retry.attempts = retry.attempts.saturating_add(1);
-                        retry.next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(1);
-                        stats.mesh_zero_index_soft_retries += 1;
-                        self.completed_meshes.push(result);
-                        continue;
-                    }
-
+                    stats.mesh_zero_index_soft_retries += 1;
+                    self.mark_startup_seed_zero_seen(result.coord);
+                    self.sampled_outcome_trace(
+                        &result,
+                        RebuildOutcome::GpuAdopted,
+                        Some(*page_index),
+                        Some(*draw_indirect_index),
+                        Some(resolved_index_count),
+                        Some("gpu_estimated_zero_index_not_rejected"),
+                    );
+                } else {
                     self.zero_index_retry_state.remove(&result.coord);
+                    //INVESTIGATE REINTEGRATING THIS CODE AT A LATER DATE (TODO!)
+                    //let recovery_state = self.mark_startup_seed_recovered(result.coord);
+                    //if let Some(seed_state) = recovery_state {
                     stats.mesh_artifacts_rejected += 1;
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2493,54 +2499,9 @@ impl Renderer {
                             seed_state.first_zero_at,
                             seed_state.recovered_nonzero_at,
                             resolved_index_count,
-                            "startup_zero_geometry",
+                            "startup_seed_recovered_nonzero",
                         );
-                        self.dirty_queues.queue_coord(result.coord, DirtyTier::Near);
-                        stats.startup_zero_near_retry_enqueued += 1;
-                        MeshSkipReason::StartupZeroGeometry
-                    } else {
-                        Self::record_rebuild_outcome(
-                            &mut stats,
-                            RebuildOutcome::SkippedZeroGeometry,
-                        );
-                        MeshSkipReason::ZeroGeometry
-                    };
-                    self.sampled_outcome_trace(
-                        &result,
-                        if startup_zero_geometry {
-                            RebuildOutcome::SkippedStartupZeroGeometry
-                        } else {
-                            RebuildOutcome::SkippedZeroGeometry
-                        },
-                        Some(*page_index),
-                        Some(*draw_indirect_index),
-                        Some(resolved_index_count),
-                        Some(if startup_zero_geometry {
-                            "startup_zero_geometry"
-                        } else {
-                            "non_blocking_zero_index"
-                        }),
-                    );
-                    if startup_zero_geometry {
-                        self.mesh_retry_state.remove(&result.coord);
-                    } else {
-                        skipped_retry_chunks.push((result.coord, reason));
                     }
-                    continue;
-                }
-                self.zero_index_retry_state.remove(&result.coord);
-
-                let recovery_state = self.mark_startup_seed_recovered(result.coord);
-                if let Some(seed_state) = recovery_state {
-                    self.sampled_startup_seed_trace(
-                        result.coord,
-                        *page_index,
-                        *draw_indirect_index,
-                        seed_state.first_zero_at,
-                        seed_state.recovered_nonzero_at,
-                        resolved_index_count,
-                        "startup_seed_recovered_nonzero",
-                    );
                 }
 
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
@@ -3034,12 +2995,6 @@ impl Renderer {
             cull_result,
             outcome
         );
-    }
-
-    fn is_startup_zero_geometry(&self, coord: ChunkCoord) -> bool {
-        let startup_window_frames = 180;
-        self.mesh_rebuild_frame_index <= startup_window_frames
-            && !self.visible_gpu_chunks.contains_key(&coord)
     }
 
     fn mark_startup_seed_zero_seen(&mut self, coord: ChunkCoord) -> StartupMeshSeedState {
