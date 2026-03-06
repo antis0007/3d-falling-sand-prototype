@@ -46,6 +46,7 @@ const MESH_RETRY_BASE_BACKOFF_FRAMES: u64 = 2;
 const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
 const MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS: u32 = 3;
 const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
+const OUTCOME_TRACE_SAMPLES_PER_SECOND: u32 = 6;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -566,6 +567,8 @@ pub struct Renderer {
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
+    outcome_trace_window_start: Instant,
+    outcome_trace_emitted: u32,
     origin_voxel: VoxelCoord,
 
     pub day: bool,
@@ -649,6 +652,15 @@ pub struct MeshRebuildStats {
     pub mesh_artifacts_received: usize,
     pub mesh_artifacts_rejected: usize,
     pub mesh_cache_entries: usize,
+    pub outcome_gpu_adopted: usize,
+    pub outcome_cpu_uploaded: usize,
+    pub outcome_skipped_zero_geometry: usize,
+    pub outcome_skipped_no_artifact_capacity: usize,
+    pub outcome_skipped_invalid_page_mapping: usize,
+    pub outcome_skipped_missing_voxel_state: usize,
+    pub outcome_skipped_adoption_rejected: usize,
+    pub outcome_skipped_sparse_indirect_undrawable: usize,
+    pub outcome_skipped_backend_contract_mismatch: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -933,6 +945,19 @@ struct MeshResult {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum RebuildOutcome {
+    GpuAdopted,
+    CpuUploaded,
+    SkippedZeroGeometry,
+    SkippedNoArtifactCapacity,
+    SkippedInvalidPageMapping,
+    SkippedMissingVoxelState,
+    SkippedAdoptionRejected,
+    SkippedSparseIndirectUndrawable,
+    SkippedBackendContractMismatch,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct GpuChunkDraw {
     page_index: GpuPageIndex,
     draw_indirect_index: u32,
@@ -986,6 +1011,12 @@ pub(crate) enum MeshSkipReason {
         slot_capacity: u32,
         in_flight_fences: u32,
     },
+    ZeroGeometry,
+    InvalidPageMapping,
+    MissingVoxelState,
+    AdoptionRejected,
+    SparseIndirectUndrawable,
+    BackendContractMismatch,
 }
 
 impl ChunkMeshArtifact {
@@ -1584,6 +1615,8 @@ impl Renderer {
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
+            outcome_trace_window_start: Instant::now(),
+            outcome_trace_emitted: 0,
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
             day: true,
             mesh_backend,
@@ -1957,7 +1990,8 @@ impl Renderer {
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_chunks = Vec::new();
         let completed_meshes_depth = self.completed_meshes.len();
-        for result in self.completed_meshes.drain(..) {
+        let completed_results: Vec<MeshResult> = self.completed_meshes.drain(..).collect();
+        for result in completed_results {
             stats.mesh_artifacts_received += 1;
             let voxel_version = store.chunk_voxel_version(result.coord);
             // FIX 5: never upload stale geometry; requeue and skip this artifact.
@@ -1982,6 +2016,40 @@ impl Renderer {
 
                 if matches!(reason, MeshSkipReason::MeshSlotCapacitySaturated { .. }) {
                     stats.gpu_mesh_slot_alloc_failed += 1;
+                    Self::record_rebuild_outcome(
+                        &mut stats,
+                        RebuildOutcome::SkippedNoArtifactCapacity,
+                    );
+                    self.sampled_outcome_trace(
+                        &result,
+                        RebuildOutcome::SkippedNoArtifactCapacity,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                } else {
+                    let outcome = match reason {
+                        MeshSkipReason::ZeroGeometry => RebuildOutcome::SkippedZeroGeometry,
+                        MeshSkipReason::InvalidPageMapping => {
+                            RebuildOutcome::SkippedInvalidPageMapping
+                        }
+                        MeshSkipReason::MissingVoxelState => {
+                            RebuildOutcome::SkippedMissingVoxelState
+                        }
+                        MeshSkipReason::AdoptionRejected => {
+                            RebuildOutcome::SkippedAdoptionRejected
+                        }
+                        MeshSkipReason::SparseIndirectUndrawable => {
+                            RebuildOutcome::SkippedSparseIndirectUndrawable
+                        }
+                        MeshSkipReason::BackendContractMismatch => {
+                            RebuildOutcome::SkippedBackendContractMismatch
+                        }
+                        _ => RebuildOutcome::SkippedAdoptionRejected,
+                    };
+                    Self::record_rebuild_outcome(&mut stats, outcome);
+                    self.sampled_outcome_trace(&result, outcome, None, None, None, None);
                 }
 
                 skipped_retry_chunks.push((result.coord, *reason));
@@ -2024,7 +2092,45 @@ impl Renderer {
                         gpu_page_capacity()
                     );
                     stats.mesh_artifacts_rejected += 1;
+                    Self::record_rebuild_outcome(
+                        &mut stats,
+                        RebuildOutcome::SkippedInvalidPageMapping,
+                    );
+                    self.sampled_outcome_trace(
+                        &result,
+                        RebuildOutcome::SkippedInvalidPageMapping,
+                        Some(*page_index),
+                        Some(*draw_indirect_index),
+                        Some(*index_count),
+                        None,
+                    );
                     remesh_coords.push(result.coord);
+                    continue;
+                }
+
+                let mut resolved_index_count = *index_count;
+                if resolved_index_count == 0 {
+                    let draw = read_gpu_draw_indirect_command(
+                        &self.device,
+                        &self.queue,
+                        &self.global_gpu_draw_indirect_buffer,
+                        *draw_indirect_index as usize,
+                    );
+                    resolved_index_count = draw.index_count;
+                }
+
+                if resolved_index_count == 0 {
+                    stats.mesh_artifacts_rejected += 1;
+                    Self::record_rebuild_outcome(&mut stats, RebuildOutcome::SkippedZeroGeometry);
+                    self.sampled_outcome_trace(
+                        &result,
+                        RebuildOutcome::SkippedZeroGeometry,
+                        Some(*page_index),
+                        Some(*draw_indirect_index),
+                        Some(resolved_index_count),
+                        Some("frustum_unknown"),
+                    );
+                    skipped_retry_chunks.push((result.coord, MeshSkipReason::ZeroGeometry));
                     continue;
                 }
 
@@ -2052,13 +2158,22 @@ impl Renderer {
                         world_aabb_max: world_max,
 
                         // GPU meshes already wrote indirect args
-                        index_count: Some(*index_count),
+                        index_count: Some(resolved_index_count),
                     },
                 );
 
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
+                Self::record_rebuild_outcome(&mut stats, RebuildOutcome::GpuAdopted);
+                self.sampled_outcome_trace(
+                    &result,
+                    RebuildOutcome::GpuAdopted,
+                    Some(*page_index),
+                    Some(slot),
+                    Some(resolved_index_count),
+                    Some("pending"),
+                );
 
                 total_latency_ms += adoption_latency_ms;
 
@@ -2138,6 +2253,15 @@ impl Renderer {
                 self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_retry_state.remove(&result.coord);
                 store.mark_chunk_meshed(result.coord);
+                Self::record_rebuild_outcome(&mut stats, RebuildOutcome::CpuUploaded);
+                self.sampled_outcome_trace(
+                    &result,
+                    RebuildOutcome::CpuUploaded,
+                    Some(GpuPageIndex(slot)),
+                    Some(slot),
+                    Some(resolved_index_count),
+                    Some("pending"),
+                );
 
                 uploaded += 1;
                 bytes_uploaded += verts.len() * std::mem::size_of::<Vertex>()
@@ -2255,6 +2379,8 @@ impl Renderer {
         self.dirty_far_starve_frames = 0;
         self.dirty_fair_cursor = 0;
         self.completed_meshes.clear();
+        self.outcome_trace_window_start = Instant::now();
+        self.outcome_trace_emitted = 0;
         self.mesh_versions.clear();
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
@@ -2337,6 +2463,62 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn record_rebuild_outcome(stats: &mut MeshRebuildStats, outcome: RebuildOutcome) {
+        match outcome {
+            RebuildOutcome::GpuAdopted => stats.outcome_gpu_adopted += 1,
+            RebuildOutcome::CpuUploaded => stats.outcome_cpu_uploaded += 1,
+            RebuildOutcome::SkippedZeroGeometry => stats.outcome_skipped_zero_geometry += 1,
+            RebuildOutcome::SkippedNoArtifactCapacity => {
+                stats.outcome_skipped_no_artifact_capacity += 1
+            }
+            RebuildOutcome::SkippedInvalidPageMapping => {
+                stats.outcome_skipped_invalid_page_mapping += 1
+            }
+            RebuildOutcome::SkippedMissingVoxelState => {
+                stats.outcome_skipped_missing_voxel_state += 1
+            }
+            RebuildOutcome::SkippedAdoptionRejected => {
+                stats.outcome_skipped_adoption_rejected += 1
+            }
+            RebuildOutcome::SkippedSparseIndirectUndrawable => {
+                stats.outcome_skipped_sparse_indirect_undrawable += 1
+            }
+            RebuildOutcome::SkippedBackendContractMismatch => {
+                stats.outcome_skipped_backend_contract_mismatch += 1
+            }
+        }
+    }
+
+    fn sampled_outcome_trace(
+        &mut self,
+        result: &MeshResult,
+        outcome: RebuildOutcome,
+        page_index: Option<GpuPageIndex>,
+        slot_index: Option<u32>,
+        index_count: Option<u32>,
+        cull_result: Option<&'static str>,
+    ) {
+        if self.outcome_trace_window_start.elapsed().as_secs_f32() >= 1.0 {
+            self.outcome_trace_window_start = Instant::now();
+            self.outcome_trace_emitted = 0;
+        }
+        if self.outcome_trace_emitted >= OUTCOME_TRACE_SAMPLES_PER_SECOND {
+            return;
+        }
+        self.outcome_trace_emitted += 1;
+        log::info!(
+            "[mesh-trace] coord={:?} lod={:?} version={} page={:?} slot={:?} index_count={:?} cull={:?} outcome={:?}",
+            result.coord,
+            result.lod,
+            result.version,
+            page_index.map(|p| p.0),
+            slot_index,
+            index_count,
+            cull_result,
+            outcome
+        );
+    }
+
     fn should_replace_frame_job(candidate: &MeshJob, current: &MeshJob) -> bool {
         if candidate.urgent != current.urgent {
             return candidate.urgent;
