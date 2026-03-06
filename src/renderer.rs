@@ -607,7 +607,6 @@ pub struct Renderer {
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
-    zero_index_retry_state: HashMap<ChunkCoord, ZeroIndexRetryState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
 
@@ -802,12 +801,6 @@ struct MeshRetryState {
     failed_next_retry_frame: u64,
     skipped_attempts: u32,
     skipped_next_retry_frame: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ZeroIndexRetryState {
-    attempts: u32,
-    next_retry_frame: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1806,7 +1799,6 @@ impl Renderer {
             mesh_lifecycle: HashMap::new(),
             mesh_retry_state: HashMap::new(),
             startup_mesh_seed_state: HashMap::new(),
-            zero_index_retry_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
@@ -2320,13 +2312,6 @@ impl Renderer {
                 continue;
             }
 
-            if let Some(zero_index_retry) = self.zero_index_retry_state.get(&result.coord) {
-                if zero_index_retry.next_retry_frame > self.mesh_rebuild_frame_index {
-                    self.completed_meshes.push(result);
-                    continue;
-                }
-            }
-
             // FIX 1: `Skipped` means "leave current mesh untouched"; never evict cache entries.
             if let ChunkMeshArtifact::Skipped { reason } = &result.artifact {
                 stats.gpu_job_skipped += 1;
@@ -2478,20 +2463,8 @@ impl Renderer {
                         Some("gpu_estimated_zero_index_not_rejected"),
                     );
                 } else {
-                    self.zero_index_retry_state.remove(&result.coord);
-                    //INVESTIGATE REINTEGRATING THIS CODE AT A LATER DATE (TODO!)
-                    //let recovery_state = self.mark_startup_seed_recovered(result.coord);
-                    //if let Some(seed_state) = recovery_state {
-                    stats.mesh_artifacts_rejected += 1;
-                    self.mesh_lifecycle
-                        .insert(result.coord, MeshLifecycleState::Rejected);
-                    stats.mesh_reject_zero_index += 1;
-                    let reason = if startup_zero_geometry {
-                        let seed_state = self.mark_startup_seed_zero_seen(result.coord);
-                        Self::record_rebuild_outcome(
-                            &mut stats,
-                            RebuildOutcome::SkippedStartupZeroGeometry,
-                        );
+                    let recovery_state = self.mark_startup_seed_recovered(result.coord);
+                    if let Some(seed_state) = recovery_state {
                         self.sampled_startup_seed_trace(
                             result.coord,
                             *page_index,
@@ -2804,7 +2777,6 @@ impl Renderer {
         self.mesh_lifecycle.clear();
         self.mesh_retry_state.clear();
         self.startup_mesh_seed_state.clear();
-        self.zero_index_retry_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {
