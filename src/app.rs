@@ -2142,6 +2142,14 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_gpu_job_failure_count = mesh_stats.gpu_job_failures;
                         ui.profiler.mesh_gpu_job_timeout_count = mesh_stats.gpu_job_timeouts;
                         ui.profiler.mesh_gpu_job_skipped_count = mesh_stats.gpu_job_skipped;
+                        ui.profiler.mesh_outcome_startup_zero_geometry_count =
+                            mesh_stats.outcome_skipped_startup_zero_geometry;
+                        ui.profiler.mesh_startup_seed_zero_count_seen =
+                            mesh_stats.startup_seed_zero_count_seen;
+                        ui.profiler.mesh_startup_seed_recovered_nonzero =
+                            mesh_stats.startup_seed_recovered_nonzero;
+                        ui.profiler.mesh_startup_zero_near_retry_enqueued =
+                            mesh_stats.startup_zero_near_retry_enqueued;
                         ui.profiler.dirty_queue_drop_count = mesh_stats.dirty_queue_drop_count;
                         ui.profiler.gen_paused_by_worker_queue = gen_dispatch_paused;
                         ui.profiler.desired_budget_drop_count = last_desired_cap_stats.budget_dropped;
