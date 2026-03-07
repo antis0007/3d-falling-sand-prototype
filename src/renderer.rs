@@ -674,6 +674,8 @@ pub struct MeshRebuildStats {
     pub upload_count: usize,
     pub upload_bytes: usize,
     pub upload_latency_ms: f32,
+    pub upload_budget_hit_count: usize,
+    pub upload_budget_deferred_chunks: usize,
     pub stale_drop_count: usize,
     pub stale_drop_retry_enqueued: usize,
     pub age_drop_count: usize,
@@ -1999,7 +2001,7 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
         mesh_budget: usize,
-        _upload_byte_budget: usize,
+        upload_byte_budget: usize,
         lod_radii: LodRadii,
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
@@ -2366,6 +2368,7 @@ impl Renderer {
         }
 
         let mut bytes_uploaded = 0usize;
+        let mut upload_budget_hit = false;
         let mut uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
         let mut gpu_adoption_latency_ms_total = 0.0f32;
@@ -2661,6 +2664,19 @@ impl Renderer {
                 chunk_origin_world,
             } = &result.artifact
             {
+                let cpu_upload_bytes = verts.len() * std::mem::size_of::<Vertex>()
+                    + inds.len() * std::mem::size_of::<u32>()
+                    + std::mem::size_of::<DrawIndexedIndirectCommand>();
+                if bytes_uploaded.saturating_add(cpu_upload_bytes) > upload_byte_budget {
+                    if !upload_budget_hit {
+                        upload_budget_hit = true;
+                        stats.upload_budget_hit_count += 1;
+                    }
+                    stats.upload_budget_deferred_chunks += 1;
+                    remesh_coords.push(result.coord);
+                    continue;
+                }
+
                 let Some(slot) = self.free_mesh_slots.pop() else {
                     stats.mesh_artifacts_rejected += 1;
                     remesh_coords.push(result.coord);
@@ -2749,8 +2765,7 @@ impl Renderer {
                 );
 
                 uploaded += 1;
-                bytes_uploaded += verts.len() * std::mem::size_of::<Vertex>()
-                    + inds.len() * std::mem::size_of::<u32>();
+                bytes_uploaded += cpu_upload_bytes;
 
                 total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
 

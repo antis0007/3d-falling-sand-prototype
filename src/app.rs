@@ -2259,6 +2259,10 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_upload_count = mesh_stats.upload_count;
                         ui.profiler.mesh_upload_bytes = mesh_stats.upload_bytes;
                         ui.profiler.mesh_upload_latency_ms = mesh_stats.upload_latency_ms;
+                        ui.profiler.mesh_upload_budget_bytes = mesh_upload_budget;
+                        ui.profiler.mesh_upload_budget_hit_count = mesh_stats.upload_budget_hit_count;
+                        ui.profiler.mesh_upload_budget_deferred_chunks =
+                            mesh_stats.upload_budget_deferred_chunks;
                         ui.profiler.mesh_gpu_adopt_count = mesh_stats.gpu_mesh_adopted_count;
                         ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
                         ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;

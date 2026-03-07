@@ -36,6 +36,9 @@ pub struct ProfilerStats {
     pub mesh_upload_count: usize,
     pub mesh_upload_bytes: usize,
     pub mesh_upload_latency_ms: f32,
+    pub mesh_upload_budget_bytes: usize,
+    pub mesh_upload_budget_hit_count: usize,
+    pub mesh_upload_budget_deferred_chunks: usize,
     pub mesh_gpu_adopt_count: usize,
     pub mesh_gpu_adopt_latency_ms: f32,
     pub mesh_gpu_visible_count: usize,
@@ -757,6 +760,12 @@ pub fn draw(
                     ui_state.profiler.mesh_flow_adopted,
                     ui_state.profiler.mesh_flow_uploaded,
                     ui_state.profiler.mesh_flow_rejected,
+                ));
+                ui.monospace(format!(
+                    "cpu upload budget bytes/hits/deferred: {}/{}/{}",
+                    ui_state.profiler.mesh_upload_budget_bytes,
+                    ui_state.profiler.mesh_upload_budget_hit_count,
+                    ui_state.profiler.mesh_upload_budget_deferred_chunks,
                 ));
                 ui.monospace(format!(
                     "pending lifecycle total/promoted/waiting/superseded/rejected: {}/{}/{}/{}/{}",
