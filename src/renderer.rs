@@ -3106,12 +3106,18 @@ impl Renderer {
         }
     }
 
-    fn release_draw_slot_mapping(&mut self, coord: ChunkCoord) {
+    fn release_draw_slot_mapping_with_reserved_slot(
+        &mut self,
+        coord: ChunkCoord,
+        reserved_slot: Option<u32>,
+    ) {
         if let Some(old) = self.visible_gpu_chunks.remove(&coord) {
             if self.visible_slots.get(&old.draw_indirect_index) == Some(&coord) {
                 self.visible_slots.remove(&old.draw_indirect_index);
             }
-            if !matches!(old.draw_source, DrawSource::GpuArtifact) {
+            if !matches!(old.draw_source, DrawSource::GpuArtifact)
+                && reserved_slot != Some(old.draw_indirect_index)
+            {
                 self.free_mesh_slots.push(old.draw_indirect_index);
             }
             self.mesh_lifecycle
@@ -3120,20 +3126,31 @@ impl Renderer {
         }
     }
 
+    fn release_draw_slot_mapping(&mut self, coord: ChunkCoord) {
+        self.release_draw_slot_mapping_with_reserved_slot(coord, None);
+    }
+
     fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) -> bool {
-        if !self.draw_meets_resident_invariant(coord, &draw) {
+        if !draw_is_drawable(&draw) {
             return false;
         }
         self.release_draw_slot_mapping(coord);
         if let Some(previous_coord) = self.visible_slots.insert(draw.draw_indirect_index, coord) {
             if previous_coord != coord {
-                self.release_draw_slot_mapping(previous_coord);
+                self.release_draw_slot_mapping_with_reserved_slot(
+                    previous_coord,
+                    Some(draw.draw_indirect_index),
+                );
                 self.mesh_lifecycle
                     .insert(previous_coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
             }
         }
         self.visible_gpu_chunks.insert(coord, draw);
+        debug_assert!(visible_draw_mappings_are_bijective(
+            &self.visible_gpu_chunks,
+            &self.visible_slots,
+        ));
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
         true
@@ -4507,6 +4524,32 @@ fn lod_mismatch_grace_allows_draw(
     mesh_rebuild_frame_index.saturating_sub(first_pending_frame) <= LOD_MISMATCH_GRACE_MAX_FRAMES
 }
 
+fn visible_draw_mappings_are_bijective(
+    visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
+    visible_slots: &HashMap<u32, ChunkCoord>,
+) -> bool {
+    if visible_gpu_chunks.len() != visible_slots.len() {
+        return false;
+    }
+
+    for (&coord, draw) in visible_gpu_chunks {
+        if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+            return false;
+        }
+    }
+
+    for (&slot, &coord) in visible_slots {
+        let Some(draw) = visible_gpu_chunks.get(&coord) else {
+            return false;
+        };
+        if draw.draw_indirect_index != slot {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn chunk_passes_draw_contract(
     coord: ChunkCoord,
     draw: &GpuChunkDraw,
@@ -5403,6 +5446,85 @@ mod tests {
             1 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
         ));
     }
+    #[test]
+    fn visible_slot_supersession_replaces_previous_coord_mapping() {
+        let slot = 7;
+        let previous_coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let new_coord = ChunkCoord { x: 2, y: 0, z: 0 };
+
+        let previous_draw = GpuChunkDraw {
+            page_index: GpuPageIndex(slot),
+            draw_indirect_index: slot,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::new(16.0, 0.0, 0.0),
+            world_aabb_min: Vec3::new(16.0, 0.0, 0.0),
+            world_aabb_max: Vec3::new(32.0, 16.0, 16.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(24),
+        };
+        let new_draw = GpuChunkDraw {
+            page_index: GpuPageIndex(slot),
+            draw_indirect_index: slot,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::new(32.0, 0.0, 0.0),
+            world_aabb_min: Vec3::new(32.0, 0.0, 0.0),
+            world_aabb_max: Vec3::new(48.0, 16.0, 16.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(24),
+        };
+
+        let mut visible_gpu_chunks = HashMap::new();
+        visible_gpu_chunks.insert(previous_coord, previous_draw);
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(slot, previous_coord);
+
+        assert!(visible_draw_mappings_are_bijective(
+            &visible_gpu_chunks,
+            &visible_slots,
+        ));
+
+        let previous_coord_from_slot = visible_slots.insert(slot, new_coord);
+        assert_eq!(previous_coord_from_slot, Some(previous_coord));
+        visible_gpu_chunks.remove(&previous_coord);
+        visible_gpu_chunks.insert(new_coord, new_draw);
+
+        assert_eq!(visible_slots.get(&slot), Some(&new_coord));
+        assert!(!visible_gpu_chunks.contains_key(&previous_coord));
+        assert!(visible_draw_mappings_are_bijective(
+            &visible_gpu_chunks,
+            &visible_slots,
+        ));
+    }
+
+    #[test]
+    fn visible_slot_supersession_without_reverse_eviction_breaks_bijection() {
+        let slot = 3;
+        let previous_coord = ChunkCoord { x: 4, y: 0, z: 0 };
+        let new_coord = ChunkCoord { x: 5, y: 0, z: 0 };
+
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(slot),
+            draw_indirect_index: slot,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::new(0.0, 0.0, 0.0),
+            world_aabb_min: Vec3::ZERO,
+            world_aabb_max: Vec3::splat(16.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(12),
+        };
+
+        let mut visible_gpu_chunks = HashMap::new();
+        visible_gpu_chunks.insert(previous_coord, draw);
+        visible_gpu_chunks.insert(new_coord, draw);
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(slot, new_coord);
+
+        assert!(!visible_draw_mappings_are_bijective(
+            &visible_gpu_chunks,
+            &visible_slots,
+        ));
+    }
+
     #[test]
     fn stale_artifacts_are_always_marked_for_retry() {
         assert_eq!(
