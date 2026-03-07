@@ -816,10 +816,6 @@ impl DrawIndirectReadbackState {
         self.map_result_rx = Some(rx);
     }
 
-    fn has_data_for_submission(&self, submission_serial: u64) -> bool {
-        self.ready_serial >= submission_serial
-    }
-
     fn index_count_for_slot(&self, draw_indirect_index: u32) -> Option<u32> {
         self.cached_index_counts
             .get(draw_indirect_index as usize)
@@ -2327,20 +2323,18 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             continue;
         };
 
+        // Keep draw-indirect readback as a telemetry/back-compat path, but do not
+        // block finalize readiness on full-buffer snapshot availability.
         let index_count = {
             let readback = state
                 .draw_indirect_readback
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !readback.has_data_for_submission(pending.submission_serial) {
-                atlas.pending_mesh_finalize.insert(coord, pending);
-                continue;
-            }
             readback
                 .index_count_for_slot(pending.draw_indirect_index)
                 .unwrap_or_else(|| {
-                    log::warn!(
-                        "[gpu-mesh] missing draw indirect metadata for slot={}, chunk={:?}, serial={}",
+                    log::debug!(
+                        "[gpu-mesh] draw indirect metadata unavailable for slot={}, chunk={:?}, serial={} (finalizing without blocking)",
                         pending.draw_indirect_index,
                         coord,
                         pending.submission_serial
@@ -2357,7 +2351,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             version: pending.version,
             page_index: pending.page_index,
             draw_indirect_index: pending.draw_indirect_index,
-            index_count: 1,
+            index_count,
             lod: pending.lod,
             aabb_min,
             aabb_max,
