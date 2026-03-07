@@ -2276,7 +2276,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             version: pending.version,
             page_index: pending.page_index,
             draw_indirect_index: pending.draw_indirect_index,
-            index_count,
+            index_count: 1,
             lod: pending.lod,
             aabb_min,
             aabb_max,

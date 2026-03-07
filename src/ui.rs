@@ -41,6 +41,10 @@ pub struct ProfilerStats {
     pub mesh_upload_budget_deferred_chunks: usize,
     pub mesh_gpu_adopt_count: usize,
     pub mesh_gpu_adopt_latency_ms: f32,
+    pub mesh_gpu_dispatch_tasks_submitted: usize,
+    pub mesh_gpu_dispatch_task_budget: usize,
+    pub mesh_gpu_dispatch_queue_depth: usize,
+    pub mesh_gpu_dispatch_headroom: f32,
     pub mesh_gpu_visible_count: usize,
     pub mesh_gpu_visible_slot_min: i32,
     pub mesh_gpu_visible_slot_max: i32,
@@ -54,6 +58,7 @@ pub struct ProfilerStats {
     pub mesh_pending_waiting_on_fence: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
+    pub mesh_drawable_filtered_under_load: usize,
     pub mesh_reject_stale: usize,
     pub mesh_reject_invalid_page: usize,
     pub mesh_reject_zero_index: usize,
@@ -733,6 +738,18 @@ pub fn draw(
                     ui_state.profiler.mesh_gpu_job_timeout_count,
                     ui_state.profiler.mesh_gpu_job_skipped_count,
                     ui_state.profiler.dirty_queue_drop_count,
+                ));
+                ui.monospace(format!(
+                    "gpu dispatch submitted/budget: {}/{} | queue={} | headroom={:.2}",
+                    ui_state.profiler.mesh_gpu_dispatch_tasks_submitted,
+                    ui_state.profiler.mesh_gpu_dispatch_task_budget,
+                    ui_state.profiler.mesh_gpu_dispatch_queue_depth,
+                    ui_state.profiler.mesh_gpu_dispatch_headroom,
+                ));
+                ui.monospace(format!(
+                    "gpu adoption latency: {:.2} ms | drawable filtered/dropped under load: {}",
+                    ui_state.profiler.mesh_gpu_adopt_latency_ms,
+                    ui_state.profiler.mesh_drawable_filtered_under_load,
                 ));
                 ui.monospace(format!(
                     "dirty tier depth urgent/near/normal/far: {}/{}/{}/{}",

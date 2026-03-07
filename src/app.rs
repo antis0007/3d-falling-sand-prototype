@@ -37,9 +37,9 @@ const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
-const REMESH_JOB_BUDGET_PER_FRAME_BASE: usize = 24;
+const REMESH_JOB_BUDGET_PER_FRAME_BASE: usize = 32;
 const REMESH_JOB_BUDGET_PER_FRAME_MIN: usize = 16;
-const REMESH_JOB_BUDGET_PER_FRAME_MAX: usize = 96;
+const REMESH_JOB_BUDGET_PER_FRAME_MAX: usize = 160;
 const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
@@ -280,12 +280,12 @@ impl Default for StreamingTuning {
             lod_hysteresis: 1,
             base_apply_budget_items: 8,
             max_apply_budget_items: 48,
-            base_generate_drain_items: 24,
-            max_generate_drain_items: 96,
-            lod_budget_near: 8,
-            lod_budget_mid: 6,
-            lod_budget_far: 10,
-            lod_budget_ultra: 6,
+            base_generate_drain_items: 32,
+            max_generate_drain_items: 160,
+            lod_budget_near: 10,
+            lod_budget_mid: 8,
+            lod_budget_far: 12,
+            lod_budget_ultra: 8,
         }
     }
 }
@@ -471,7 +471,10 @@ fn compute_generation_pressure_model(
         total -= 1;
     }
 
-    let dispatch_budget = base_generate_drain_budget.max(PROTECTED_HIGH_PRIORITY_SLOTS);
+    let dispatch_budget = (((base_generate_drain_budget as f32) * (1.0 + pressure * 0.65)).round()
+        as usize)
+        .max(PROTECTED_HIGH_PRIORITY_SLOTS)
+        .min(effective_stream_tuning.max_generate_drain_items);
     let stable_near = queue_pressure < 0.4 && dispatch_budget > 2;
     let near_dispatch_budget = if stable_near {
         (dispatch_budget as f32 * 0.55).round() as usize
@@ -641,7 +644,7 @@ fn adaptive_remesh_job_budget(
 ) -> usize {
     let frame_headroom =
         ((FRAME_TIME_TARGET_MS - last_frame_ms) / FRAME_TIME_TARGET_MS).clamp(-1.0, 1.0);
-    let headroom_scale = (1.0 + frame_headroom * 0.45).clamp(0.7, 1.5);
+    let headroom_scale = (1.0 + frame_headroom * 0.5).clamp(0.7, 1.65);
     let dirty_pressure = ((dirty_backlog as f32 - DIRTY_BACKLOG_PRESSURE_START as f32)
         / (DIRTY_BACKLOG_PRESSURE_HIGH - DIRTY_BACKLOG_PRESSURE_START) as f32)
         .clamp(0.0, 1.0);
@@ -649,7 +652,7 @@ fn adaptive_remesh_job_budget(
         / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
         .clamp(0.0, 1.0);
     let visible_floor = (visible_chunks / 3).max(REMESH_JOB_BUDGET_PER_FRAME_BASE / 2);
-    let pressure_boost = 1.0 + dirty_pressure * 1.4 + queue_pressure * 1.1;
+    let pressure_boost = 1.0 + dirty_pressure * 1.6 + queue_pressure * 1.35;
 
     ((REMESH_JOB_BUDGET_PER_FRAME_BASE as f32 * headroom_scale * pressure_boost) as usize)
         .max(visible_floor)
@@ -2070,7 +2073,6 @@ pub async fn run() -> anyhow::Result<()> {
                                 format!("evict budget hit: remaining queue={}", streaming.pending_evict_count())
                             });
                         }
-
                         stream_debug = format!(
                             "Stream: resident={} near={} mid={} far={} scheduled={} dispatched={} gen_pending={} apply_queue={} gen_paused={} gen_pause_reason={} recv_progress={} player_chunk=({}, {}, {}) desired_recompute={} desired_cap[near/mid/far_drop]={}/{}/{} budget_drop={} radii[n/m/f/v]={}/{}/{}/{} lod_h={} budgets[gen/app]={}/{} lod_budgets[n/m/f]={}/{}/{} collision[freeze={} unknown_solid={} safety_voxels={}] world_origin_voxel=({}, {}, {}) player_world_voxel=({}, {}, {}) keys[F1/F2 gen, F3/F4 apply, F5 far+, F6/F7 near, F8/F9 mid, F10/F11 v, F12 lod-hyst]",
                             streaming.resident.len(),
@@ -2324,6 +2326,18 @@ pub async fn run() -> anyhow::Result<()> {
                                 ultra: effective_stream_tuning.lod_budget_ultra,
                             },
                         );
+                        ui.log_once_per_second("mesh_dispatch_pressure", now_secs, || {
+                            format!(
+                                "mesh dispatch submitted/budget={}/{} queue={} headroom={:.2} adopt_latency_ms={:.2} dropped_before_drawable={} filtered_drawable={}",
+                                mesh_stats.gpu_dispatch_tasks_submitted,
+                                mesh_stats.gpu_dispatch_task_budget,
+                                mesh_stats.gpu_dispatch_queue_depth,
+                                mesh_stats.gpu_dispatch_headroom,
+                                mesh_stats.gpu_mesh_adoption_latency_ms,
+                                mesh_stats.mesh_dropped_before_drawable,
+                                mesh_stats.mesh_drawable_filtered_under_load,
+                            )
+                        });
                         ui.set_mesh_timing(mesh_stats.max_ms);
                         ui.profiler.desired_ms = desired_ms;
                         ui.profiler.streaming_ms = streaming_ms;
@@ -2355,6 +2369,10 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.upload_budget_deferred_chunks;
                         ui.profiler.mesh_gpu_adopt_count = mesh_stats.gpu_mesh_adopted_count;
                         ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
+                        ui.profiler.mesh_gpu_dispatch_tasks_submitted = mesh_stats.gpu_dispatch_tasks_submitted;
+                        ui.profiler.mesh_gpu_dispatch_task_budget = mesh_stats.gpu_dispatch_task_budget;
+                        ui.profiler.mesh_gpu_dispatch_queue_depth = mesh_stats.gpu_dispatch_queue_depth;
+                        ui.profiler.mesh_gpu_dispatch_headroom = mesh_stats.gpu_dispatch_headroom;
                         ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;
                         ui.profiler.mesh_gpu_visible_slot_min = mesh_stats.gpu_mesh_visible_slot_min;
                         ui.profiler.mesh_gpu_visible_slot_max = mesh_stats.gpu_mesh_visible_slot_max;
@@ -2370,6 +2388,7 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.mesh_waiting_on_fence;
                         ui.profiler.mesh_pending_superseded = mesh_stats.mesh_pending_superseded;
                         ui.profiler.mesh_pending_rejected = mesh_stats.mesh_pending_rejected;
+                        ui.profiler.mesh_drawable_filtered_under_load = mesh_stats.mesh_drawable_filtered_under_load;
                         ui.profiler.mesh_reject_stale = mesh_stats.mesh_reject_stale;
                         ui.profiler.mesh_reject_invalid_page = mesh_stats.mesh_reject_invalid_page;
                         ui.profiler.mesh_reject_zero_index = mesh_stats.mesh_reject_zero_index;
@@ -3856,8 +3875,16 @@ mod tests {
     #[test]
     fn pressure_model_avoids_mid_far_starvation_when_near_stable() {
         let tuning = StreamingTuning::default();
-        let pressure = compute_generation_pressure_model(&tuning, 8, 4, 12, 16, 12, 24);
-        assert!(pressure.near_dispatch_budget < 24);
+        let pressure = compute_generation_pressure_model(
+            &tuning,
+            8,
+            4,
+            12,
+            16,
+            12,
+            tuning.base_generate_drain_items,
+        );
+        assert!(pressure.near_dispatch_budget < tuning.max_generate_drain_items);
         assert!(pressure.mid_dispatch_budget > 0);
         assert!(pressure.far_dispatch_budget > 0);
     }
