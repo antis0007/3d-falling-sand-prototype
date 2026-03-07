@@ -37,7 +37,9 @@ const RADIAL_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyE;
 const RADIAL_MENU_TOGGLE_LABEL: &str = "E";
 const TOOL_QUICK_MENU_TOGGLE_KEY: KeyCode = KeyCode::KeyQ;
 const TOOL_TEXTURES_DIR: &str = "assets/tools";
-const REMESH_JOB_BUDGET_PER_FRAME: usize = 24;
+const REMESH_JOB_BUDGET_PER_FRAME_BASE: usize = 24;
+const REMESH_JOB_BUDGET_PER_FRAME_MIN: usize = 16;
+const REMESH_JOB_BUDGET_PER_FRAME_MAX: usize = 96;
 const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
@@ -631,6 +633,43 @@ fn adaptive_mesh_upload_budget(last_frame_ms: f32, queue_pressure: usize) -> usi
     )
 }
 
+fn adaptive_remesh_job_budget(
+    last_frame_ms: f32,
+    dirty_backlog: usize,
+    meshing_queue_depth: usize,
+    visible_chunks: usize,
+) -> usize {
+    let frame_headroom =
+        ((FRAME_TIME_TARGET_MS - last_frame_ms) / FRAME_TIME_TARGET_MS).clamp(-1.0, 1.0);
+    let headroom_scale = (1.0 + frame_headroom * 0.45).clamp(0.7, 1.5);
+    let dirty_pressure = ((dirty_backlog as f32 - DIRTY_BACKLOG_PRESSURE_START as f32)
+        / (DIRTY_BACKLOG_PRESSURE_HIGH - DIRTY_BACKLOG_PRESSURE_START) as f32)
+        .clamp(0.0, 1.0);
+    let queue_pressure = ((meshing_queue_depth as f32 - MESH_BACKPRESSURE_START as f32)
+        / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+        .clamp(0.0, 1.0);
+    let visible_floor = (visible_chunks / 3).max(REMESH_JOB_BUDGET_PER_FRAME_BASE / 2);
+    let pressure_boost = 1.0 + dirty_pressure * 1.4 + queue_pressure * 1.1;
+
+    ((REMESH_JOB_BUDGET_PER_FRAME_BASE as f32 * headroom_scale * pressure_boost) as usize)
+        .max(visible_floor)
+        .clamp(
+            REMESH_JOB_BUDGET_PER_FRAME_MIN,
+            REMESH_JOB_BUDGET_PER_FRAME_MAX,
+        )
+}
+
+fn coord_in_frustum(coord: ChunkCoord, frustum_planes: &[Vec4; 6]) -> bool {
+    let center = Vec3::new(
+        coord.x as f32 + 0.5,
+        coord.y as f32 + 0.5,
+        coord.z as f32 + 0.5,
+    );
+    frustum_planes.iter().all(|plane| {
+        plane.x * center.x + plane.y * center.y + plane.z * center.z + plane.w >= -0.25
+    })
+}
+
 struct BackgroundGenerator {
     tx: SyncSender<GenJob>,
     rx: Receiver<GenResult>,
@@ -914,6 +953,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut prior_upload_latency_ms = 0.0f32;
     let mut gen_dispatch_paused = false;
     let mut gen_worker_inflight = 0usize;
+    let mut gen_request_count = 0usize;
     let mut last_desired_cap_stats = DesiredCapStats::default();
     let mut spawn_pending = true;
     let mut spawn_pending_reason = SpawnPendingReason::Searching;
@@ -1138,6 +1178,7 @@ pub async fn run() -> anyhow::Result<()> {
                         let cursor_should_unlock =
                             should_unlock_cursor(&ui, quick_menu_held, tab_palette_held);
                         let gameplay_blocked = cursor_should_unlock;
+                        gen_request_count = 0;
 
                         if spawn_pending {
                             if let Some(candidate) = find_safe_spawn_in_loaded_chunks(
@@ -1148,10 +1189,9 @@ pub async fn run() -> anyhow::Result<()> {
                                 let candidate_local =
                                     world_spawn_to_local_pos(candidate.voxel, origin_voxel);
                                 if is_spawn_collision_free(&store, candidate_local, origin_voxel) {
-                                    ctrl.position = candidate_local;
                                     let neighborhood_loaded = collision_neighborhood_loaded(
                                         &store,
-                                        ctrl.position,
+                                        candidate_local,
                                         origin_voxel,
                                         COLLISION_SAFETY_RADIUS_VOXELS,
                                     );
@@ -1162,6 +1202,7 @@ pub async fn run() -> anyhow::Result<()> {
                                         SpawnPendingReason::Searching
                                     };
                                     if !spawn_pending {
+                                        ctrl.position = candidate_local;
                                         spawn_fallback_cursor = None;
                                         last_player_chunk = None;
                                         cached_desired = DesiredChunks::default();
@@ -1180,8 +1221,24 @@ pub async fn run() -> anyhow::Result<()> {
                                 if let Some(cursor) = spawn_fallback_cursor {
                                     let cursor_local = world_spawn_to_local_pos(cursor, origin_voxel);
                                     if is_spawn_collision_free(&store, cursor_local, origin_voxel) {
-                                        ctrl.position = cursor_local;
-                                        spawn_pending_reason = SpawnPendingReason::UsingFallbackBand;
+                                        let neighborhood_loaded = collision_neighborhood_loaded(
+                                            &store,
+                                            cursor_local,
+                                            origin_voxel,
+                                            COLLISION_SAFETY_RADIUS_VOXELS,
+                                        );
+                                        spawn_pending = !neighborhood_loaded;
+                                        spawn_pending_reason = if spawn_pending {
+                                            SpawnPendingReason::UsingFallbackBand
+                                        } else {
+                                            SpawnPendingReason::Searching
+                                        };
+                                        if !spawn_pending {
+                                            ctrl.position = cursor_local;
+                                            last_player_chunk = None;
+                                            cached_desired = DesiredChunks::default();
+                                            cached_sim_region.clear();
+                                        }
                                     }
                                 }
                             }
@@ -1288,7 +1345,15 @@ pub async fn run() -> anyhow::Result<()> {
                                 } else if streaming.dispatch_generation_for_class(
                                     coord,
                                     class,
-                                    |coord| chunk_generator.try_request(coord, class, 0),
+                                    |coord| {
+                                        if chunk_generator.try_request(coord, class, 0) {
+                                            gen_request_count += 1;
+                                            gen_worker_inflight += 1;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    },
                                 ) {
                                     forced_local_requests += 1;
                                 }
@@ -1420,6 +1485,24 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             dv / crate::types::CHUNK_SIZE_VOXELS as f32
                         };
+                        let camera_pos_blocks_world = ctrl.position
+                            + Vec3::new(
+                                origin_voxel.x as f32,
+                                origin_voxel.y as f32,
+                                origin_voxel.z as f32,
+                            );
+                        let camera_pos_world =
+                            camera_world_pos_from_blocks(camera_pos_blocks_world, VOXEL_SIZE);
+                        let cam = Camera {
+                            pos: camera_pos_world,
+                            dir: look_dir,
+                            aspect: renderer.config.width as f32
+                                / renderer.config.height.max(1) as f32,
+                        };
+                        let visible_now = renderer.cull_visible_chunks(&cam);
+                        let visible_chunk_count = visible_now.len();
+                        streaming.mark_visible_batch(visible_now, frame_counter);
+
                         let visible_history = streaming.last_visible_frames();
                         if recompute_desired {
                             let mut reasons = Vec::with_capacity(3);
@@ -1435,26 +1518,14 @@ pub async fn run() -> anyhow::Result<()> {
                             desired_recompute_reason = reasons.join("|");
 
                             let chunk_size_meters = crate::types::CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
-                            let camera_pos_world = camera_world_pos_from_blocks(
-                                ctrl.position
-                                    + Vec3::new(
-                                        origin_voxel.x as f32,
-                                        origin_voxel.y as f32,
-                                        origin_voxel.z as f32,
-                                    ),
-                                VOXEL_SIZE,
-                            );
                             let camera_pos_chunks = camera_pos_world / chunk_size_meters;
-                            let chunk_camera = Camera {
-                                pos: camera_pos_chunks,
-                                dir: look_dir,
-                                aspect: renderer.config.width as f32 / renderer.config.height.max(1) as f32,
-                            };
+                            let chunk_space_vp = cam.view_proj()
+                                * Mat4::from_scale(Vec3::splat(chunk_size_meters));
                             let visibility_context = VisibilityContext {
                                 camera_pos_chunks,
                                 cone_inner_cos: (35.0f32).to_radians().cos(),
                                 cone_outer_cos: (75.0f32).to_radians().cos(),
-                                frustum_planes: Some(extract_frustum_planes(chunk_camera.view_proj())),
+                                frustum_planes: Some(extract_frustum_planes(chunk_space_vp)),
                             };
                             cached_desired = ChunkStreaming::desired_set(
                                 player_chunk,
@@ -1538,7 +1609,7 @@ pub async fn run() -> anyhow::Result<()> {
                             prior_meshing_queue_depth,
                             base_generate_drain_budget,
                         );
-                        streaming.max_generate_schedule_per_update = pressure_model.global_cap;
+                        streaming.max_generate_schedule_per_update = base_generate_drain_budget.max(PROTECTED_HIGH_PRIORITY_SLOTS);
                         let backpressure = if prior_mesh_backlog <= MESH_BACKPRESSURE_START {
                             0.0
                         } else {
@@ -1553,12 +1624,24 @@ pub async fn run() -> anyhow::Result<()> {
                         );
                         last_desired_cap_stats = desired_cap_stats;
                         if backpressure > 0.0 {
+                            let chunk_size_meters = crate::types::CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
+                            let frustum_planes = extract_frustum_planes(
+                                cam.view_proj() * Mat4::from_scale(Vec3::splat(chunk_size_meters)),
+                            );
                             let far_radius_cutoff = (effective_stream_tuning.mid_radius_xz as f32
                                 + (effective_stream_tuning.far_radius_xz
                                     - effective_stream_tuning.mid_radius_xz) as f32
                                     * (1.0 - backpressure))
                                 .round() as i32;
                             generation_priority.retain(|coord| {
+                                let ring_distance = chebyshev_from_player(player_chunk, *coord);
+                                if ring_distance <= effective_stream_tuning.mid_radius_xz {
+                                    return true;
+                                }
+                                let in_frustum = coord_in_frustum(*coord, &frustum_planes);
+                                if in_frustum {
+                                    return true;
+                                }
                                 let dx = (coord.x - player_chunk.x) as f32;
                                 let dz = (coord.z - player_chunk.z) as f32;
                                 (dx * dx + dz * dz).sqrt() <= far_radius_cutoff as f32
@@ -1597,7 +1680,6 @@ pub async fn run() -> anyhow::Result<()> {
                             gen_dispatch_paused = true;
                         }
 
-                        let mut gen_request_count = 0usize;
                         let mut dispatch_urgent = Vec::new();
                         let mut dispatch_near = Vec::new();
                         let mut dispatch_mid = Vec::new();
@@ -1737,6 +1819,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             } else {
                                 let mut mid_budget = generate_drain_budget.min(pressure_model.mid_dispatch_budget);
+                                let mut mid_sent = 0usize;
                                 for coord in dispatch_mid {
                                     if mid_budget == 0 {
                                         break;
@@ -1752,10 +1835,11 @@ pub async fn run() -> anyhow::Result<()> {
                                     ) {
                                         break;
                                     }
+                                    mid_sent += 1;
                                     mid_budget = mid_budget.saturating_sub(1);
                                 }
                                 let mut far_budget = generate_drain_budget
-                                    .saturating_sub(pressure_model.mid_dispatch_budget)
+                                    .saturating_sub(mid_sent)
                                     .min(pressure_model.far_dispatch_budget);
                                 for coord in dispatch_far {
                                     if far_budget == 0 {
@@ -2214,11 +2298,17 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.profiler.frame_ms,
                             prior_mesh_backlog,
                         );
+                        let remesh_job_budget = adaptive_remesh_job_budget(
+                            ui.profiler.frame_ms,
+                            prior_dirty_backlog,
+                            prior_meshing_queue_depth,
+                            visible_chunk_count,
+                        );
                         let mesh_stats = renderer.rebuild_dirty_store_chunks(
                             &mut store,
                             player_chunk,
                             &cached_desired.generation_scores,
-                            REMESH_JOB_BUDGET_PER_FRAME,
+                            remesh_job_budget,
                             mesh_upload_budget,
                             LodRadii {
                                 near: effective_stream_tuning.near_radius_xz,
@@ -2439,25 +2529,9 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                         }
 
-                        let camera_pos_blocks_world = ctrl.position
-                            + Vec3::new(
-                                origin_voxel.x as f32,
-                                origin_voxel.y as f32,
-                                origin_voxel.z as f32,
-                            );
-                        let cam = Camera {
-                            pos: camera_world_pos_from_blocks(camera_pos_blocks_world, VOXEL_SIZE),
-                            dir: ctrl.look_dir(),
-                            aspect: renderer.config.width as f32
-                                / renderer.config.height.max(1) as f32,
-                        };
                         let draw_stats = renderer.mesh_draw_stats(&cam);
                         ui.set_draw_stats(&draw_stats);
                         let cull_stats = renderer.cull_stats(&cam);
-                        streaming.mark_visible_batch(
-                            renderer.cull_visible_chunks(&cam),
-                            frame_counter,
-                        );
                         ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
                         ui.profiler.frustum_culled_chunks = cull_stats.frustum_culled;
                         ui.profiler.missing_in_radius = cached_desired
