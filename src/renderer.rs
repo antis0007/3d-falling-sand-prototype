@@ -3302,19 +3302,94 @@ impl Renderer {
         if !draw_is_drawable(&draw) {
             return false;
         }
-        self.release_draw_slot_mapping(coord);
-        if let Some(previous_coord) = self.visible_slots.insert(draw.draw_indirect_index, coord) {
+
+        let target_slot = draw.draw_indirect_index;
+        let previous_owner = self.visible_slots.get(&target_slot).copied();
+        let coord_old_slot = self
+            .visible_gpu_chunks
+            .get(&coord)
+            .map(|existing| existing.draw_indirect_index);
+
+        let target_slot_is_acquirable = match previous_owner {
+            None => true,
+            Some(owner) if owner == coord => true,
+            Some(owner) => {
+                self.visible_gpu_chunks
+                    .get(&owner)
+                    .map(|owner_draw| owner_draw.draw_indirect_index)
+                    == Some(target_slot)
+            }
+        };
+        let coord_old_slot_is_owned = match coord_old_slot {
+            None => true,
+            Some(old_slot) => self.visible_slots.get(&old_slot) == Some(&coord),
+        };
+
+        if !target_slot_is_acquirable || !coord_old_slot_is_owned {
+            log::warn!(
+                "[renderer] refusing draw adoption coord={:?} slot={} previous_owner={:?} coord_old_slot={:?} target_slot_is_acquirable={} coord_old_slot_is_owned={}",
+                coord,
+                target_slot,
+                previous_owner,
+                coord_old_slot,
+                target_slot_is_acquirable,
+                coord_old_slot_is_owned,
+            );
+            return false;
+        }
+
+        log::debug!(
+            "[renderer] adopting draw slot transition coord={:?} slot={} previous_owner={:?} new_owner={:?} coord_old_slot={:?}",
+            coord,
+            target_slot,
+            previous_owner,
+            coord,
+            coord_old_slot,
+        );
+
+        // Commit phase: install forward + reverse mapping first.
+        let replaced_draw = self.visible_gpu_chunks.insert(coord, draw);
+        let displaced_coord = self.visible_slots.insert(target_slot, coord);
+
+        // Release displaced owner of the target slot after commit.
+        if let Some(previous_coord) = displaced_coord {
             if previous_coord != coord {
                 self.release_draw_slot_mapping_with_reserved_slot(
                     previous_coord,
-                    Some(draw.draw_indirect_index),
+                    Some(target_slot),
                 );
                 self.mesh_lifecycle
                     .insert(previous_coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
             }
         }
-        self.visible_gpu_chunks.insert(coord, draw);
+
+        // Release coord's previous slot mapping after commit.
+        if let Some(previous_draw) = replaced_draw {
+            let previous_slot = previous_draw.draw_indirect_index;
+            if previous_slot != target_slot {
+                if self.visible_slots.get(&previous_slot) == Some(&coord) {
+                    self.visible_slots.remove(&previous_slot);
+                }
+                if !matches!(previous_draw.draw_source, DrawSource::GpuArtifact) {
+                    self.free_mesh_slots.push(previous_slot);
+                }
+            }
+        }
+
+        debug_assert_eq!(self.visible_slots.get(&target_slot), Some(&coord));
+        let bijective =
+            visible_draw_mappings_are_bijective(&self.visible_gpu_chunks, &self.visible_slots);
+        if !bijective {
+            log::error!(
+                "[renderer] visible mapping bijection violated after adoption coord={:?} slot={} previous_owner={:?} new_owner={:?} coord_old_slot={:?}",
+                coord,
+                target_slot,
+                previous_owner,
+                coord,
+                coord_old_slot,
+            );
+        }
         debug_assert!(visible_draw_mappings_are_bijective(
             &self.visible_gpu_chunks,
             &self.visible_slots,
