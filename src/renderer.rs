@@ -15,8 +15,9 @@
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
     dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
-    take_ready_gpu_mesh_results_on_renderer, update_gpu_page_fences_on_renderer, DrawIndirectArgs,
-    GpuComputeRuntime, MeshPipelineBackend, SharedMeshBuffers,
+    set_gpu_protected_chunks_on_renderer, take_ready_gpu_mesh_results_on_renderer,
+    update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
+    SharedMeshBuffers,
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
@@ -2280,6 +2281,15 @@ impl Renderer {
 
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
+            let protected_near: Vec<ChunkCoord> = self
+                .lod_selection
+                .iter()
+                .filter_map(|(&coord, &lod)| matches!(lod, ChunkLod::Near).then_some(coord))
+                .collect();
+            let protected_visible: Vec<ChunkCoord> =
+                self.visible_gpu_chunks.keys().copied().collect();
+            set_gpu_protected_chunks_on_renderer(&protected_near, &protected_visible);
+
             let dispatch_budget =
                 std::time::Duration::from_secs_f32(GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS / 1000.0);
             match dispatch_gpu_chunk_tasks_on_renderer(
