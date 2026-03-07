@@ -705,6 +705,15 @@ pub struct MeshRebuildStats {
     pub gpu_job_timeouts: usize,
     pub gpu_job_skipped: usize,
     pub gpu_mesh_slot_alloc_failed: usize,
+    pub gpu_mesh_slots_used: usize,
+    pub gpu_mesh_slot_capacity: usize,
+    pub gpu_mesh_slot_in_flight_fences: usize,
+    pub gpu_mesh_vertex_used: usize,
+    pub gpu_mesh_vertex_capacity: usize,
+    pub gpu_mesh_index_used: usize,
+    pub gpu_mesh_index_capacity: usize,
+    pub gpu_mesh_largest_free_vertex_span: usize,
+    pub gpu_mesh_largest_free_index_span: usize,
     pub gpu_readback_bytes: u64,
     pub allocator_bytes_allocated: usize,
     pub allocator_bytes_reused: usize,
@@ -1227,6 +1236,13 @@ pub(crate) enum MeshSkipReason {
     MeshSlotCapacitySaturated {
         slot_capacity: u32,
         in_flight_fences: u32,
+        slots_used: u32,
+        vertex_used: u32,
+        vertex_capacity: u32,
+        index_used: u32,
+        index_capacity: u32,
+        largest_free_vertex_span: u32,
+        largest_free_index_span: u32,
     },
     ZeroGeometry,
     StartupZeroGeometry,
@@ -2483,6 +2499,29 @@ impl Renderer {
                 if matches!(reason, MeshSkipReason::MeshSlotCapacitySaturated { .. }) {
                     stats.gpu_mesh_slot_alloc_failed += 1;
                     stats.mesh_slot_allocation_failures += 1;
+                    if let MeshSkipReason::MeshSlotCapacitySaturated {
+                        slot_capacity,
+                        in_flight_fences,
+                        slots_used,
+                        vertex_used,
+                        vertex_capacity,
+                        index_used,
+                        index_capacity,
+                        largest_free_vertex_span,
+                        largest_free_index_span,
+                    } = reason
+                    {
+                        stats.gpu_mesh_slot_capacity = *slot_capacity as usize;
+                        stats.gpu_mesh_slot_in_flight_fences = *in_flight_fences as usize;
+                        stats.gpu_mesh_slots_used = *slots_used as usize;
+                        stats.gpu_mesh_vertex_used = *vertex_used as usize;
+                        stats.gpu_mesh_vertex_capacity = *vertex_capacity as usize;
+                        stats.gpu_mesh_index_used = *index_used as usize;
+                        stats.gpu_mesh_index_capacity = *index_capacity as usize;
+                        stats.gpu_mesh_largest_free_vertex_span =
+                            *largest_free_vertex_span as usize;
+                        stats.gpu_mesh_largest_free_index_span = *largest_free_index_span as usize;
+                    }
                     Self::record_rebuild_outcome(
                         &mut stats,
                         RebuildOutcome::SkippedNoArtifactCapacity,
@@ -3496,13 +3535,27 @@ impl Renderer {
                     if let MeshSkipReason::MeshSlotCapacitySaturated {
                         slot_capacity,
                         in_flight_fences,
+                        slots_used,
+                        vertex_used,
+                        vertex_capacity,
+                        index_used,
+                        index_capacity,
+                        largest_free_vertex_span,
+                        largest_free_index_span,
                     } = reason
                     {
                         log::warn!(
-                            "[mesh] repeated skipped retries chunk={coord:?} attempts={} slot_capacity={} in_flight_fences={}",
+                            "[mesh] repeated skipped retries chunk={coord:?} attempts={} slots={}/{} in_flight_fences={} vertex={}/{} index={}/{} largest_free[v/i]={}/{}",
                             *attempts,
+                            slots_used,
                             slot_capacity,
-                            in_flight_fences
+                            in_flight_fences,
+                            vertex_used,
+                            vertex_capacity,
+                            index_used,
+                            index_capacity,
+                            largest_free_vertex_span,
+                            largest_free_index_span,
                         );
                     }
                 }

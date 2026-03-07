@@ -140,6 +140,15 @@ pub struct ProfilerStats {
     pub gpu_compute_bytes_transferred: u64,
     pub gpu_compute_chunks_per_sec: f32,
     pub gpu_compute_chunks_completed: u64,
+    pub gpu_mesh_slots_used: usize,
+    pub gpu_mesh_slot_capacity: usize,
+    pub gpu_mesh_slot_in_flight_fences: usize,
+    pub gpu_mesh_vertex_used: usize,
+    pub gpu_mesh_vertex_capacity: usize,
+    pub gpu_mesh_index_used: usize,
+    pub gpu_mesh_index_capacity: usize,
+    pub gpu_mesh_largest_free_vertex_span: usize,
+    pub gpu_mesh_largest_free_index_span: usize,
     pub gpu_mesh_adoption_pct: f32,
     pub gpu_meshing_dispatch_ms: f32,
     pub cpu_meshing_ms: f32,
@@ -943,6 +952,21 @@ pub fn draw(
                     ui_state.profiler.cpu_meshing_ms,
                     ui_state.profiler.gpu_meshing_dispatch_ms,
                     ui_state.profiler.gpu_readback_bytes_frame,
+                ));
+                ui.monospace(format!(
+                    "gpu mesh pool slots used/capacity: {}/{} | in-flight fences: {}",
+                    ui_state.profiler.gpu_mesh_slots_used,
+                    ui_state.profiler.gpu_mesh_slot_capacity,
+                    ui_state.profiler.gpu_mesh_slot_in_flight_fences,
+                ));
+                ui.monospace(format!(
+                    "gpu mesh pool vertex used/capacity: {}/{} | index used/capacity: {}/{} | largest free spans v/i: {}/{}",
+                    ui_state.profiler.gpu_mesh_vertex_used,
+                    ui_state.profiler.gpu_mesh_vertex_capacity,
+                    ui_state.profiler.gpu_mesh_index_used,
+                    ui_state.profiler.gpu_mesh_index_capacity,
+                    ui_state.profiler.gpu_mesh_largest_free_vertex_span,
+                    ui_state.profiler.gpu_mesh_largest_free_index_span,
                 ));
                 ui.separator();
                 ui.heading("Renderer Debug");
