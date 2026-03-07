@@ -162,6 +162,9 @@ struct ChunkPageAtlas {
     page_for_chunk: HashMap<ChunkCoord, GpuPageIndex>,
     chunk_for_page: HashMap<GpuPageIndex, ChunkCoord>,
     page_fences: HashMap<GpuPageIndex, PageFence>,
+    page_last_used: HashMap<GpuPageIndex, u64>,
+    page_usage_epoch: u64,
+    priority_hint_for_chunk: HashMap<ChunkCoord, PagePriorityHint>,
     version_for_chunk: HashMap<ChunkCoord, u64>,
     state_for_chunk: HashMap<ChunkCoord, u32>,
     frontier_len_for_chunk: HashMap<ChunkCoord, u32>,
@@ -175,6 +178,27 @@ struct ChunkPageAtlas {
     next_mesh_slot: u32,
     next_page: GpuPageIndex,
     pending_mesh_finalize: HashMap<ChunkCoord, PendingGpuMeshFinalize>,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PagePriorityHint {
+    #[default]
+    Far,
+    Near,
+    Visible,
+}
+
+#[cfg(feature = "gpu-compute")]
+impl PagePriorityHint {
+    fn eviction_rank(self) -> u8 {
+        match self {
+            // Lower rank is evicted earlier.
+            Self::Far => 0,
+            Self::Near => 1,
+            Self::Visible => 2,
+        }
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -194,6 +218,7 @@ impl ChunkPageAtlas {
         chunk: ChunkCoord,
     ) -> anyhow::Result<(GpuPageIndex, bool)> {
         if let Some(existing) = self.page_for_chunk.get(&chunk).copied() {
+            self.touch_page(existing);
             return Ok((existing, false));
         }
 
@@ -202,6 +227,7 @@ impl ChunkPageAtlas {
             self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
             self.page_for_chunk.insert(chunk, page);
             self.chunk_for_page.insert(page, chunk);
+            self.touch_page(page);
             return Ok((page, true));
         }
 
@@ -211,7 +237,31 @@ impl ChunkPageAtlas {
         self.evict_page(page);
         self.page_for_chunk.insert(chunk, page);
         self.chunk_for_page.insert(page, chunk);
+        self.touch_page(page);
         Ok((page, true))
+    }
+
+    fn touch_page(&mut self, page: GpuPageIndex) {
+        self.page_usage_epoch = self.page_usage_epoch.saturating_add(1);
+        self.page_last_used.insert(page, self.page_usage_epoch);
+    }
+
+    fn touch_chunk_page(&mut self, chunk: ChunkCoord) {
+        if let Some(page) = self.page_for_chunk.get(&chunk).copied() {
+            self.touch_page(page);
+        }
+    }
+
+    fn set_protected_chunks(&mut self, near_chunks: &[ChunkCoord], visible_chunks: &[ChunkCoord]) {
+        self.priority_hint_for_chunk.clear();
+        for &coord in near_chunks {
+            self.priority_hint_for_chunk
+                .insert(coord, PagePriorityHint::Near);
+        }
+        for &coord in visible_chunks {
+            self.priority_hint_for_chunk
+                .insert(coord, PagePriorityHint::Visible);
+        }
     }
 
     fn mesh_slice_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> Option<MeshBufferSlice> {
@@ -309,10 +359,28 @@ impl ChunkPageAtlas {
     }
 
     fn evictable_page(&self) -> Option<GpuPageIndex> {
-        self.chunk_for_page.keys().copied().find(|page| {
-            let fence = self.page_fences.get(page).copied().unwrap_or_default();
-            fence.last_completed >= fence.last_submitted
-        })
+        let mut selected: Option<(u8, u64, GpuPageIndex)> = None;
+        for &page in self.chunk_for_page.keys() {
+            let fence = self.page_fences.get(&page).copied().unwrap_or_default();
+            if fence.last_completed < fence.last_submitted {
+                continue;
+            }
+            let rank = self
+                .chunk_for_page
+                .get(&page)
+                .and_then(|chunk| self.priority_hint_for_chunk.get(chunk))
+                .copied()
+                .unwrap_or_default()
+                .eviction_rank();
+            let recency = self.page_last_used.get(&page).copied().unwrap_or(0);
+            let replace = selected
+                .map(|(cur_rank, cur_recency, _)| (rank, recency) < (cur_rank, cur_recency))
+                .unwrap_or(true);
+            if replace {
+                selected = Some((rank, recency, page));
+            }
+        }
+        selected.map(|(_, _, page)| page)
     }
 
     fn is_page_fence_complete(&self, page_index: GpuPageIndex) -> bool {
@@ -326,6 +394,22 @@ impl ChunkPageAtlas {
 
     fn evict_page(&mut self, page_index: GpuPageIndex) {
         if let Some(chunk) = self.chunk_for_page.remove(&page_index) {
+            match self
+                .priority_hint_for_chunk
+                .get(&chunk)
+                .copied()
+                .unwrap_or_default()
+            {
+                PagePriorityHint::Far => {
+                    let _ = GPU_EVICT_FAR_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                PagePriorityHint::Near => {
+                    let _ = GPU_EVICT_NEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                PagePriorityHint::Visible => {
+                    let _ = GPU_EVICT_VISIBLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.page_for_chunk.remove(&chunk);
             self.version_for_chunk.remove(&chunk);
             self.state_for_chunk.remove(&chunk);
@@ -338,7 +422,9 @@ impl ChunkPageAtlas {
                 self.mesh_slot_last_used.remove(&slice.slot_index);
             }
             self.pending_mesh_finalize.remove(&chunk);
+            self.priority_hint_for_chunk.remove(&chunk);
             self.page_fences.remove(&page_index);
+            self.page_last_used.remove(&page_index);
         }
     }
 }
@@ -616,6 +702,9 @@ pub struct GpuComputeProfilerSnapshot {
     pub chunks_completed: u64,
     pub frontier_cap_events: u64,
     pub mesh_slot_alloc_failed: u64,
+    pub evict_near_count: u64,
+    pub evict_visible_count: u64,
+    pub evict_far_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -629,6 +718,12 @@ static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_SLOT_ALLOC_FAILED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_EVICT_NEAR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_EVICT_VISIBLE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_EVICT_FAR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -761,6 +856,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
         let frontier_cap_events = GPU_FRONTIER_CAP_EVENTS.swap(0, Ordering::Relaxed);
         let mesh_slot_alloc_failed = GPU_MESH_SLOT_ALLOC_FAILED.swap(0, Ordering::Relaxed);
+        let evict_near_count = GPU_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
+        let evict_visible_count = GPU_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
+        let evict_far_count = GPU_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -768,6 +866,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             chunks_completed,
             frontier_cap_events,
             mesh_slot_alloc_failed,
+            evict_near_count,
+            evict_visible_count,
+            evict_far_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -1756,6 +1857,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.mark_page_submitted(task.page_index, serial);
+            atlas.touch_chunk_page(task.coord);
             if let Some(mesh_slice) = task.mesh_slice {
                 atlas.pending_mesh_finalize.insert(
                     task.coord,
@@ -1810,6 +1912,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) else {
             continue;
         };
+        atlas.touch_chunk_page(coord);
 
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(coord);
         let result = ReadyGpuMeshResult {
@@ -1853,6 +1956,19 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 }
 
 #[cfg(feature = "gpu-compute")]
+pub fn set_gpu_protected_chunks_on_renderer(
+    near_chunks: &[ChunkCoord],
+    visible_chunks: &[ChunkCoord],
+) {
+    if let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        atlas.set_protected_chunks(near_chunks, visible_chunks);
+    }
+}
+
 pub fn update_gpu_page_fences_on_renderer() {
     if let Some(Ok(state)) = WORKER_STATE
         .get()
