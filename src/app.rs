@@ -2388,6 +2388,18 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.gpu_compute_bytes_transferred = 0;
                         ui.profiler.gpu_compute_chunks_completed = 0;
                         ui.profiler.gpu_compute_chunks_per_sec = 0.0;
+                        ui.profiler.gpu_mesh_slots_used = mesh_stats.gpu_mesh_slots_used;
+                        ui.profiler.gpu_mesh_slot_capacity = mesh_stats.gpu_mesh_slot_capacity;
+                        ui.profiler.gpu_mesh_slot_in_flight_fences =
+                            mesh_stats.gpu_mesh_slot_in_flight_fences;
+                        ui.profiler.gpu_mesh_vertex_used = mesh_stats.gpu_mesh_vertex_used;
+                        ui.profiler.gpu_mesh_vertex_capacity = mesh_stats.gpu_mesh_vertex_capacity;
+                        ui.profiler.gpu_mesh_index_used = mesh_stats.gpu_mesh_index_used;
+                        ui.profiler.gpu_mesh_index_capacity = mesh_stats.gpu_mesh_index_capacity;
+                        ui.profiler.gpu_mesh_largest_free_vertex_span =
+                            mesh_stats.gpu_mesh_largest_free_vertex_span;
+                        ui.profiler.gpu_mesh_largest_free_index_span =
+                            mesh_stats.gpu_mesh_largest_free_index_span;
                         ui.profiler.mesh_stale_drop_count = mesh_stats.stale_drop_count;
                         ui.profiler.mesh_stale_drop_retry_enqueued =
                             mesh_stats.stale_drop_retry_enqueued;

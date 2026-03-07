@@ -38,17 +38,38 @@ pub const GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub const GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(feature = "gpu-compute")]
+const MIN_MESH_VERTEX_CAPACITY_PER_CHUNK: u64 = 256;
+#[cfg(feature = "gpu-compute")]
+const MIN_MESH_INDEX_CAPACITY_PER_CHUNK: u64 = 384;
+
+#[cfg(feature = "gpu-compute")]
 pub const fn mesh_pool_slot_capacity() -> u32 {
-    let vertex_slots = GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES
-        / (GPU_MESH_VERTEX_CAPACITY_PER_PAGE * std::mem::size_of::<GpuVertex>() as u64);
-    let index_slots = GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES
-        / (GPU_MESH_INDEX_CAPACITY_PER_PAGE * std::mem::size_of::<u32>() as u64);
-    let slots = if vertex_slots < index_slots {
-        vertex_slots
-    } else {
-        index_slots
-    };
-    slots as u32
+    GPU_PAGE_CAPACITY
+}
+
+#[cfg(feature = "gpu-compute")]
+pub const fn global_mesh_vertex_capacity_elements() -> u32 {
+    (GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / std::mem::size_of::<GpuVertex>() as u64) as u32
+}
+
+#[cfg(feature = "gpu-compute")]
+pub const fn global_mesh_index_capacity_elements() -> u32 {
+    (GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / std::mem::size_of::<u32>() as u64) as u32
+}
+
+#[cfg(feature = "gpu-compute")]
+fn lod_chunk_volume(lod: u8) -> u64 {
+    let shift = (lod as u32).min(5);
+    let cells_per_axis = (32u64 >> shift).max(1);
+    cells_per_axis * cells_per_axis * cells_per_axis
+}
+
+#[cfg(feature = "gpu-compute")]
+fn mesh_capacity_for_lod(lod: u8) -> (u32, u32) {
+    let volume = lod_chunk_volume(lod);
+    let vertex = (volume * 12).max(MIN_MESH_VERTEX_CAPACITY_PER_CHUNK);
+    let index = (volume * 18).max(MIN_MESH_INDEX_CAPACITY_PER_CHUNK);
+    (vertex as u32, index as u32)
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -157,7 +178,6 @@ struct MeshingBindResources<'a> {
 }
 
 #[cfg(feature = "gpu-compute")]
-#[derive(Default)]
 struct ChunkPageAtlas {
     page_for_chunk: HashMap<ChunkCoord, GpuPageIndex>,
     chunk_for_page: HashMap<GpuPageIndex, ChunkCoord>,
@@ -172,12 +192,83 @@ struct ChunkPageAtlas {
     diagnostics_for_chunk: HashMap<ChunkCoord, ChunkSimulationDiagnostics>,
     cached_materials: HashMap<ChunkCoord, Vec<MaterialId>>,
     mesh_slice_for_chunk: HashMap<ChunkCoord, MeshBufferSlice>,
+    mesh_alloc_for_chunk: HashMap<ChunkCoord, MeshBufferAllocation>,
     chunk_for_mesh_slot: HashMap<u32, ChunkCoord>,
     mesh_slot_last_used: HashMap<u32, u64>,
     mesh_slot_epoch: u64,
     next_mesh_slot: u32,
+    free_vertex_ranges: Vec<MeshRange>,
+    free_index_ranges: Vec<MeshRange>,
+    used_vertex_elements: u32,
+    used_index_elements: u32,
     next_page: GpuPageIndex,
     pending_mesh_finalize: HashMap<ChunkCoord, PendingGpuMeshFinalize>,
+}
+
+#[cfg(feature = "gpu-compute")]
+impl Default for ChunkPageAtlas {
+    fn default() -> Self {
+        Self {
+            page_for_chunk: HashMap::new(),
+            chunk_for_page: HashMap::new(),
+            page_fences: HashMap::new(),
+            page_last_used: HashMap::new(),
+            page_usage_epoch: 0,
+            priority_hint_for_chunk: HashMap::new(),
+            version_for_chunk: HashMap::new(),
+            state_for_chunk: HashMap::new(),
+            frontier_len_for_chunk: HashMap::new(),
+            tick_for_chunk: HashMap::new(),
+            diagnostics_for_chunk: HashMap::new(),
+            cached_materials: HashMap::new(),
+            mesh_slice_for_chunk: HashMap::new(),
+            mesh_alloc_for_chunk: HashMap::new(),
+            chunk_for_mesh_slot: HashMap::new(),
+            mesh_slot_last_used: HashMap::new(),
+            mesh_slot_epoch: 0,
+            next_mesh_slot: 0,
+            free_vertex_ranges: vec![MeshRange {
+                start: 0,
+                len: global_mesh_vertex_capacity_elements(),
+            }],
+            free_index_ranges: vec![MeshRange {
+                start: 0,
+                len: global_mesh_index_capacity_elements(),
+            }],
+            used_vertex_elements: 0,
+            used_index_elements: 0,
+            next_page: GpuPageIndex(0),
+            pending_mesh_finalize: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+struct MeshRange {
+    start: u32,
+    len: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+struct MeshBufferAllocation {
+    vertex: MeshRange,
+    index: MeshRange,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+struct MeshPoolTelemetry {
+    slot_capacity: u32,
+    slots_used: u32,
+    in_flight_fences: u32,
+    vertex_used: u32,
+    vertex_capacity: u32,
+    index_used: u32,
+    index_capacity: u32,
+    largest_free_vertex_span: u32,
+    largest_free_index_span: u32,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -264,38 +355,95 @@ impl ChunkPageAtlas {
         }
     }
 
-    fn mesh_slice_for_chunk_or_allocate(&mut self, chunk: ChunkCoord) -> Option<MeshBufferSlice> {
+    fn mesh_slice_for_chunk_or_allocate(
+        &mut self,
+        chunk: ChunkCoord,
+        lod: u8,
+    ) -> Option<MeshBufferSlice> {
         if let Some(existing) = self.mesh_slice_for_chunk.get(&chunk).copied() {
             self.touch_mesh_slot(existing.slot_index);
             return Some(existing);
         }
 
+        let (required_vertex, required_index) = mesh_capacity_for_lod(lod);
         let slot_capacity = mesh_pool_slot_capacity();
         if slot_capacity == 0 {
             return None;
         }
 
-        let slot = if self.next_mesh_slot < slot_capacity {
-            let slot = self.next_mesh_slot;
+        let mut slot = if self.next_mesh_slot < slot_capacity {
+            let next = self.next_mesh_slot;
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
-            slot
+            next
         } else {
             self.evictable_mesh_slot(slot_capacity)?
         };
 
-        if let Some(evicted_chunk) = self.chunk_for_mesh_slot.remove(&slot) {
-            self.mesh_slice_for_chunk.remove(&evicted_chunk);
+        loop {
+            if self
+                .try_allocate_mesh_buffers(chunk, slot, required_vertex, required_index)
+                .is_some()
+            {
+                break;
+            }
+
+            let evict_slot = self.evictable_mesh_slot(slot_capacity)?;
+            if let Some(evicted_chunk) = self.chunk_for_mesh_slot.get(&evict_slot).copied() {
+                self.release_chunk_mesh_allocation(evicted_chunk);
+            }
+
+            if self.next_mesh_slot >= slot_capacity {
+                slot = evict_slot;
+            }
         }
+
+        self.mesh_slice_for_chunk.get(&chunk).copied()
+    }
+
+    fn try_allocate_mesh_buffers(
+        &mut self,
+        chunk: ChunkCoord,
+        slot: u32,
+        required_vertex: u32,
+        required_index: u32,
+    ) -> Option<MeshBufferSlice> {
+        let vertex = take_range(&mut self.free_vertex_ranges, required_vertex)?;
+        let index = take_range(&mut self.free_index_ranges, required_index).or_else(|| {
+            release_range(&mut self.free_vertex_ranges, vertex);
+            None
+        })?;
 
         let slice = MeshBufferSlice {
             slot_index: slot,
-            vertex_offset: (slot as u64 * GPU_MESH_VERTEX_CAPACITY_PER_PAGE) as u32,
-            index_offset: (slot as u64 * GPU_MESH_INDEX_CAPACITY_PER_PAGE) as u32,
+            vertex_offset: vertex.start,
+            index_offset: index.start,
         };
+        self.mesh_alloc_for_chunk
+            .insert(chunk, MeshBufferAllocation { vertex, index });
         self.mesh_slice_for_chunk.insert(chunk, slice);
         self.chunk_for_mesh_slot.insert(slot, chunk);
+        self.used_vertex_elements = self.used_vertex_elements.saturating_add(vertex.len);
+        self.used_index_elements = self.used_index_elements.saturating_add(index.len);
         self.touch_mesh_slot(slot);
         Some(slice)
+    }
+
+    fn release_chunk_mesh_allocation(&mut self, chunk: ChunkCoord) {
+        if let Some(slice) = self.mesh_slice_for_chunk.remove(&chunk) {
+            self.chunk_for_mesh_slot.remove(&slice.slot_index);
+            self.mesh_slot_last_used.remove(&slice.slot_index);
+        }
+
+        if let Some(allocation) = self.mesh_alloc_for_chunk.remove(&chunk) {
+            release_range(&mut self.free_vertex_ranges, allocation.vertex);
+            release_range(&mut self.free_index_ranges, allocation.index);
+            self.used_vertex_elements = self
+                .used_vertex_elements
+                .saturating_sub(allocation.vertex.len);
+            self.used_index_elements = self
+                .used_index_elements
+                .saturating_sub(allocation.index.len);
+        }
     }
 
     fn touch_mesh_slot(&mut self, slot: u32) {
@@ -334,6 +482,20 @@ impl ChunkPageAtlas {
             .keys()
             .filter(|slot| !self.is_mesh_slot_fence_safe(**slot))
             .count() as u32
+    }
+
+    fn mesh_pool_telemetry(&self) -> MeshPoolTelemetry {
+        MeshPoolTelemetry {
+            slot_capacity: mesh_pool_slot_capacity(),
+            slots_used: self.mesh_slice_for_chunk.len() as u32,
+            in_flight_fences: self.in_flight_mesh_slot_fence_count(),
+            vertex_used: self.used_vertex_elements,
+            vertex_capacity: global_mesh_vertex_capacity_elements(),
+            index_used: self.used_index_elements,
+            index_capacity: global_mesh_index_capacity_elements(),
+            largest_free_vertex_span: largest_range_len(&self.free_vertex_ranges),
+            largest_free_index_span: largest_range_len(&self.free_index_ranges),
+        }
     }
 
     fn resolve_chunk(&self, page_index: GpuPageIndex) -> Option<ChunkCoord> {
@@ -417,16 +579,59 @@ impl ChunkPageAtlas {
             self.tick_for_chunk.remove(&chunk);
             self.diagnostics_for_chunk.remove(&chunk);
             self.cached_materials.remove(&chunk);
-            if let Some(slice) = self.mesh_slice_for_chunk.remove(&chunk) {
-                self.chunk_for_mesh_slot.remove(&slice.slot_index);
-                self.mesh_slot_last_used.remove(&slice.slot_index);
-            }
+            self.release_chunk_mesh_allocation(chunk);
             self.pending_mesh_finalize.remove(&chunk);
             self.priority_hint_for_chunk.remove(&chunk);
             self.page_fences.remove(&page_index);
             self.page_last_used.remove(&page_index);
         }
     }
+}
+
+#[cfg(feature = "gpu-compute")]
+fn take_range(free_ranges: &mut Vec<MeshRange>, required_len: u32) -> Option<MeshRange> {
+    let idx = free_ranges.iter().position(|r| r.len >= required_len)?;
+    let range = free_ranges[idx];
+    let allocated = MeshRange {
+        start: range.start,
+        len: required_len,
+    };
+    if range.len == required_len {
+        free_ranges.swap_remove(idx);
+    } else {
+        free_ranges[idx].start = free_ranges[idx].start.saturating_add(required_len);
+        free_ranges[idx].len = free_ranges[idx].len.saturating_sub(required_len);
+    }
+    Some(allocated)
+}
+
+#[cfg(feature = "gpu-compute")]
+fn release_range(free_ranges: &mut Vec<MeshRange>, released: MeshRange) {
+    free_ranges.push(released);
+    merge_free_ranges(free_ranges);
+}
+
+#[cfg(feature = "gpu-compute")]
+fn merge_free_ranges(free_ranges: &mut Vec<MeshRange>) {
+    free_ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<MeshRange> = Vec::with_capacity(free_ranges.len());
+    for range in free_ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            let last_end = last.start.saturating_add(last.len);
+            if last_end >= range.start {
+                let range_end = range.start.saturating_add(range.len);
+                last.len = range_end.saturating_sub(last.start).max(last.len);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    *free_ranges = merged;
+}
+
+#[cfg(feature = "gpu-compute")]
+fn largest_range_len(free_ranges: &[MeshRange]) -> u32 {
+    free_ranges.iter().map(|range| range.len).max().unwrap_or(0)
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1573,9 +1778,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
 
-        let mesh_slot_capacity = mesh_pool_slot_capacity();
-        let mesh_slice = atlas.mesh_slice_for_chunk_or_allocate(job.coord);
-        let mesh_slot_in_flight_fences = atlas.in_flight_mesh_slot_fence_count();
+        let mesh_slice = atlas.mesh_slice_for_chunk_or_allocate(job.coord, job.lod as u8);
+        let mesh_pool_telemetry = atlas.mesh_pool_telemetry();
 
         let current_state = atlas.state_for_chunk.get(&job.coord).copied().unwrap_or(0);
         let tick = atlas.tick_for_chunk.get(&job.coord).copied().unwrap_or(0);
@@ -1698,16 +1902,32 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
 
                         log::debug!(
-                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted (slot_capacity={}, in_flight_fences={})",
+                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted slots={}/{} in_flight_fences={} vertex={}/{} index={}/{} largest_free[v/i]={}/{}",
                             job.coord,
-                            mesh_slot_capacity,
-                            mesh_slot_in_flight_fences,
+                            mesh_pool_telemetry.slots_used,
+                            mesh_pool_telemetry.slot_capacity,
+                            mesh_pool_telemetry.in_flight_fences,
+                            mesh_pool_telemetry.vertex_used,
+                            mesh_pool_telemetry.vertex_capacity,
+                            mesh_pool_telemetry.index_used,
+                            mesh_pool_telemetry.index_capacity,
+                            mesh_pool_telemetry.largest_free_vertex_span,
+                            mesh_pool_telemetry.largest_free_index_span,
                         );
 
                         ChunkMeshArtifact::Skipped {
                             reason: MeshSkipReason::MeshSlotCapacitySaturated {
-                                slot_capacity: mesh_slot_capacity,
-                                in_flight_fences: mesh_slot_in_flight_fences,
+                                slot_capacity: mesh_pool_telemetry.slot_capacity,
+                                in_flight_fences: mesh_pool_telemetry.in_flight_fences,
+                                slots_used: mesh_pool_telemetry.slots_used,
+                                vertex_used: mesh_pool_telemetry.vertex_used,
+                                vertex_capacity: mesh_pool_telemetry.vertex_capacity,
+                                index_used: mesh_pool_telemetry.index_used,
+                                index_capacity: mesh_pool_telemetry.index_capacity,
+                                largest_free_vertex_span: mesh_pool_telemetry
+                                    .largest_free_vertex_span,
+                                largest_free_index_span: mesh_pool_telemetry
+                                    .largest_free_index_span,
                             },
                         }
                     }
