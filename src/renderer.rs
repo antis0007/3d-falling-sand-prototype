@@ -50,6 +50,7 @@ const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
 const OUTCOME_TRACE_SAMPLES_PER_SECOND: u32 = 6;
 const GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME: usize = 64;
 const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 1.0;
+const LOD_MISMATCH_GRACE_MAX_FRAMES: u64 = 8;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -602,6 +603,7 @@ pub struct Renderer {
     mesh_versions: HashMap<ChunkCoord, u64>,
     lod_selection: HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: HashSet<ChunkCoord>,
+    pending_lod_remesh_since: HashMap<ChunkCoord, u64>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     pending_gpu_results: HashMap<(ChunkCoord, u64), PendingGpuMeshResult>,
     terminal_superseded_total: usize,
@@ -657,6 +659,7 @@ pub struct CullStats {
     pub drawn: usize,
     pub frustum_culled: usize,
     pub lod_filtered: usize,
+    pub lod_mismatch_grace_drawn: usize,
     pub screen_culled: usize,
 }
 
@@ -1832,6 +1835,7 @@ impl Renderer {
             mesh_versions: HashMap::new(),
             lod_selection: HashMap::new(),
             pending_lod_remesh: HashSet::new(),
+            pending_lod_remesh_since: HashMap::new(),
             inflight_mesh_chunks: HashSet::new(),
             pending_gpu_results: HashMap::new(),
             terminal_superseded_total: 0,
@@ -1903,6 +1907,9 @@ impl Renderer {
             draw,
             &self.visible_slots,
             &self.lod_selection,
+            &self.pending_lod_remesh,
+            &self.pending_lod_remesh_since,
+            self.mesh_rebuild_frame_index,
             visibility,
         )
     }
@@ -1925,12 +1932,21 @@ impl Renderer {
                 .copied()
                 .unwrap_or(ChunkLod::Near);
             let draw_lod = lod_from_u8(draw.lod);
-            if draw_lod != selected_lod {
-                stats.lod_filtered += 1;
-                continue;
-            }
             if !draw_is_drawable(draw) {
                 continue;
+            }
+            if draw_lod != selected_lod {
+                if lod_mismatch_grace_allows_draw(
+                    coord,
+                    &self.pending_lod_remesh,
+                    &self.pending_lod_remesh_since,
+                    self.mesh_rebuild_frame_index,
+                ) {
+                    stats.lod_mismatch_grace_drawn += 1;
+                } else {
+                    stats.lod_filtered += 1;
+                    continue;
+                }
             }
             if self.settings.frustum_culling
                 && !aabb_in_view(
@@ -2756,6 +2772,7 @@ impl Renderer {
             self.mesh_lifecycle
                 .insert(result.coord, MeshLifecycleState::Rejected);
             self.pending_lod_remesh.remove(&result.coord);
+            self.pending_lod_remesh_since.remove(&result.coord);
             continue;
         }
 
@@ -2933,6 +2950,7 @@ impl Renderer {
         self.mesh_versions.clear();
         self.lod_selection.clear();
         self.pending_lod_remesh.clear();
+        self.pending_lod_remesh_since.clear();
         self.inflight_mesh_chunks.clear();
         self.pending_gpu_results.clear();
         self.terminal_superseded_total = 0;
@@ -3278,6 +3296,7 @@ impl Renderer {
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Requested);
         self.pending_lod_remesh.remove(&coord);
+        self.pending_lod_remesh_since.remove(&coord);
         self.dirty_queues.remove_coord(coord);
     }
 
@@ -3292,6 +3311,7 @@ impl Renderer {
         while let Some(coord) = self.urgent_mesh_queue.pop_front() {
             self.urgent_mesh_set.remove(&coord);
             self.pending_lod_remesh.remove(&coord);
+            self.pending_lod_remesh_since.remove(&coord);
 
             let t0 = Instant::now();
             let snapshot =
@@ -3374,6 +3394,9 @@ impl Renderer {
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
         if self.pending_lod_remesh.insert(coord) {
+            self.pending_lod_remesh_since
+                .entry(coord)
+                .or_insert(self.mesh_rebuild_frame_index);
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
     }
@@ -3551,6 +3574,7 @@ impl Renderer {
                 break;
             };
             self.pending_lod_remesh.remove(&coord);
+            self.pending_lod_remesh_since.remove(&coord);
             snapshots.push(coord);
         }
 
@@ -3583,6 +3607,7 @@ impl Renderer {
                 .or_else(|| self.dirty_queues.pop_back_tier(DirtyTier::Urgent));
             if let Some(coord) = removed {
                 self.pending_lod_remesh.remove(&coord);
+                self.pending_lod_remesh_since.remove(&coord);
                 dropped += 1;
             } else {
                 break;
@@ -4442,11 +4467,29 @@ fn draw_is_drawable(draw: &GpuChunkDraw) -> bool {
     draw.index_count.unwrap_or(0) > 0
 }
 
+fn lod_mismatch_grace_allows_draw(
+    coord: ChunkCoord,
+    pending_lod_remesh: &HashSet<ChunkCoord>,
+    pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
+    mesh_rebuild_frame_index: u64,
+) -> bool {
+    if !pending_lod_remesh.contains(&coord) {
+        return false;
+    }
+    let Some(first_pending_frame) = pending_lod_remesh_since.get(&coord).copied() else {
+        return false;
+    };
+    mesh_rebuild_frame_index.saturating_sub(first_pending_frame) <= LOD_MISMATCH_GRACE_MAX_FRAMES
+}
+
 fn chunk_passes_draw_contract(
     coord: ChunkCoord,
     draw: &GpuChunkDraw,
     visible_slots: &HashMap<u32, ChunkCoord>,
     lod_selection: &HashMap<ChunkCoord, ChunkLod>,
+    pending_lod_remesh: &HashSet<ChunkCoord>,
+    pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
+    mesh_rebuild_frame_index: u64,
     visibility: DrawVisibilityInput,
 ) -> bool {
     if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
@@ -4454,7 +4497,15 @@ fn chunk_passes_draw_contract(
     }
     let selected_lod = lod_selection.get(&coord).copied().unwrap_or(ChunkLod::Near);
     let draw_lod = lod_from_u8(draw.lod);
-    if draw_lod != selected_lod {
+    let lod_matches_selection = draw_lod == selected_lod;
+    if !lod_matches_selection
+        && !lod_mismatch_grace_allows_draw(
+            coord,
+            pending_lod_remesh,
+            pending_lod_remesh_since,
+            mesh_rebuild_frame_index,
+        )
+    {
         return false;
     }
     if !draw_is_drawable(draw) {
@@ -5258,11 +5309,75 @@ mod tests {
                 &draw,
                 &visible_slots,
                 &lod_selection,
+                &HashSet::new(),
+                &HashMap::new(),
+                0,
                 visibility,
             ));
         }
     }
 
+    #[test]
+    fn lod_mismatch_pending_remesh_keeps_chunk_visible_during_grace_window() {
+        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(3, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Near);
+        let mut pending_lod_remesh = HashSet::new();
+        pending_lod_remesh.insert(coord);
+        let mut pending_lod_remesh_since = HashMap::new();
+        pending_lod_remesh_since.insert(coord, 10);
+
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(3),
+            draw_indirect_index: 3,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
+            draw_source: DrawSource::CpuUploaded,
+            index_count: Some(18),
+        };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        assert!(chunk_passes_draw_contract(
+            coord,
+            &draw,
+            &visible_slots,
+            &lod_selection,
+            &pending_lod_remesh,
+            &pending_lod_remesh_since,
+            16,
+            visibility,
+        ));
+    }
+
+    #[test]
+    fn lod_mismatch_grace_expires_without_replacement_artifact() {
+        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let mut pending_lod_remesh = HashSet::new();
+        pending_lod_remesh.insert(coord);
+        let mut pending_lod_remesh_since = HashMap::new();
+        pending_lod_remesh_since.insert(coord, 1);
+
+        assert!(!lod_mismatch_grace_allows_draw(
+            coord,
+            &pending_lod_remesh,
+            &pending_lod_remesh_since,
+            1 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
+        ));
+    }
     #[test]
     fn stale_artifacts_are_always_marked_for_retry() {
         assert_eq!(
@@ -5401,6 +5516,9 @@ mod tests {
             &draw,
             &visible_slots,
             &lod_selection,
+            &HashSet::new(),
+            &HashMap::new(),
+            0,
             visibility,
         ));
 
@@ -5410,6 +5528,9 @@ mod tests {
             &draw,
             &visible_slots,
             &lod_selection,
+            &HashSet::new(),
+            &HashMap::new(),
+            0,
             visibility,
         ));
     }
