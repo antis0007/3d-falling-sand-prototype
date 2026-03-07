@@ -49,8 +49,12 @@ const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
 const MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS: u32 = 3;
 const MESH_RETRY_SKIPPED_WARN_ATTEMPTS: u32 = 4;
 const OUTCOME_TRACE_SAMPLES_PER_SECOND: u32 = 6;
-const GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME: usize = 64;
-const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 1.0;
+const MESH_BACKPRESSURE_START: usize = 80;
+const MESH_BACKPRESSURE_HIGH: usize = 180;
+const GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME: usize = 96;
+const GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME: usize = 192;
+const GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS: f32 = 1.25;
+const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 3.0;
 const LOD_MISMATCH_GRACE_MAX_FRAMES: u64 = 8;
 const DRAW_CONTINUITY_MAX_FRAMES: u64 = 64;
 const BUSH_ID: MaterialId = 18;
@@ -624,6 +628,8 @@ pub struct Renderer {
     startup_seed_trace_emitted: u32,
     startup_epoch: Instant,
     origin_voxel: VoxelCoord,
+    gpu_dispatch_budget_tasks_last: usize,
+    gpu_dispatch_budget_ms_last: f32,
 
     pub day: bool,
     pub mesh_backend: MeshPipelineBackend,
@@ -698,6 +704,9 @@ pub struct MeshRebuildStats {
     pub gpu_dispatch_enqueue_submit_ms: f32,
     pub gpu_dispatch_wait_sync_ms: f32,
     pub gpu_dispatch_tasks_submitted: usize,
+    pub gpu_dispatch_task_budget: usize,
+    pub gpu_dispatch_queue_depth: usize,
+    pub gpu_dispatch_headroom: f32,
     pub gpu_mesh_adopted_count: usize,
     pub gpu_mesh_adoption_latency_ms: f32,
     pub gpu_mesh_visible_count: usize,
@@ -767,6 +776,7 @@ pub struct MeshRebuildStats {
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
     pub mesh_dropped_before_drawable: usize,
+    pub mesh_drawable_filtered_under_load: usize,
     pub mesh_last_good_retained: usize,
     pub mesh_visible_logical_not_drawable: usize,
 }
@@ -1877,6 +1887,8 @@ impl Renderer {
             startup_seed_trace_emitted: 0,
             startup_epoch: Instant::now(),
             origin_voxel: VoxelCoord { x: 0, y: 0, z: 0 },
+            gpu_dispatch_budget_tasks_last: GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            gpu_dispatch_budget_ms_last: GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS,
             day: true,
             mesh_backend,
             startup_diagnostics: StartupDiagnostics {
@@ -2033,6 +2045,55 @@ impl Renderer {
             }
         }
         visible
+    }
+
+    fn dynamic_gpu_dispatch_budget(
+        &mut self,
+        mesh_budget: usize,
+        queue_depth: usize,
+    ) -> (usize, std::time::Duration, f32) {
+        let queue_scale = if queue_depth <= MESH_BACKPRESSURE_START {
+            1.0
+        } else {
+            1.0 + ((queue_depth - MESH_BACKPRESSURE_START) as f32
+                / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+                .clamp(0.0, 1.0)
+                * 1.35
+        };
+        let workload_scale = ((mesh_budget as f32)
+            / GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME as f32)
+            .clamp(0.75, 1.65);
+        let headroom = ((mesh_budget as f32 - queue_depth as f32) / mesh_budget.max(1) as f32)
+            .clamp(-1.0, 1.0);
+        let headroom_scale = (1.0 + headroom * 0.45).clamp(0.7, 1.5);
+
+        let tasks = ((GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME as f32)
+            * queue_scale
+            * workload_scale
+            * headroom_scale)
+            .round() as usize;
+        let task_budget = tasks.clamp(
+            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME,
+        );
+
+        let time_budget_ms = (GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS
+            * queue_scale
+            * (0.85 + workload_scale * 0.35)
+            * headroom_scale)
+            .clamp(
+                GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS,
+                GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS,
+            );
+
+        self.gpu_dispatch_budget_tasks_last = task_budget;
+        self.gpu_dispatch_budget_ms_last = time_budget_ms;
+
+        (
+            task_budget,
+            std::time::Duration::from_secs_f32(time_budget_ms / 1000.0),
+            headroom,
+        )
     }
 
     /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
@@ -2335,12 +2396,13 @@ impl Renderer {
                 self.visible_gpu_chunks.keys().copied().collect();
             set_gpu_protected_chunks_on_renderer(&protected_near, &protected_visible);
 
-            let dispatch_budget =
-                std::time::Duration::from_secs_f32(GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS / 1000.0);
-            match dispatch_gpu_chunk_tasks_on_renderer(
-                GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME,
-                dispatch_budget,
-            ) {
+            let queue_depth_for_dispatch = self.dirty_queues.total_len() + self.mesh_queue.inflight;
+            let (task_budget, dispatch_budget, dispatch_headroom) =
+                self.dynamic_gpu_dispatch_budget(mesh_budget, queue_depth_for_dispatch);
+            stats.gpu_dispatch_task_budget = task_budget;
+            stats.gpu_dispatch_queue_depth = queue_depth_for_dispatch;
+            stats.gpu_dispatch_headroom = dispatch_headroom;
+            match dispatch_gpu_chunk_tasks_on_renderer(task_budget, dispatch_budget) {
                 Ok(dispatch_stats) => {
                     stats.gpu_dispatch_enqueue_submit_ms += dispatch_stats.enqueue_submit_ms;
                     stats.gpu_dispatch_wait_sync_ms += dispatch_stats.wait_sync_ms;
@@ -2983,6 +3045,8 @@ impl Renderer {
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
         stats.flow_rejected = stats.mesh_artifacts_rejected;
+        stats.mesh_drawable_filtered_under_load =
+            stats.mesh_dropped_before_drawable + stats.dirty_queue_drop_count;
         stats.mesh_visible_logical_not_drawable = self
             .mesh_lifecycle
             .iter()

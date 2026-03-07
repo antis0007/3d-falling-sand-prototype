@@ -2135,16 +2135,13 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         };
         atlas.touch_chunk_page(coord);
 
-        let index_count =
-            read_gpu_draw_index_count(state, pending.draw_indirect_index).unwrap_or(0);
-
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(coord);
         let result = ReadyGpuMeshResult {
             coord,
             version: pending.version,
             page_index: pending.page_index,
             draw_indirect_index: pending.draw_indirect_index,
-            index_count,
+            index_count: 1,
             lod: pending.lod,
             aabb_min,
             aabb_max,
@@ -2178,63 +2175,6 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         });
     }
     out
-}
-
-#[cfg(feature = "gpu-compute")]
-fn read_gpu_draw_index_count(state: &WorkerGpuState, draw_indirect_index: u32) -> Option<u32> {
-    let byte_len = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
-    let byte_offset = draw_indirect_index as u64 * byte_len;
-    let staging = state.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gpu draw indirect readback"),
-        size: byte_len,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = state
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu draw indirect readback encoder"),
-        });
-    encoder.copy_buffer_to_buffer(
-        &state.draw_indirect_buffer,
-        byte_offset,
-        &staging,
-        0,
-        byte_len,
-    );
-    state.queue.submit(std::iter::once(encoder.finish()));
-
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let slice = staging.slice(..);
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = state.device.poll(wgpu::Maintain::Wait);
-
-    match rx.recv_timeout(Duration::from_millis(100)) {
-        Ok(Ok(())) => {
-            let mapped = slice.get_mapped_range();
-            let args = *bytemuck::from_bytes::<DrawIndexedIndirectArgs>(&mapped);
-            drop(mapped);
-            staging.unmap();
-            Some(args.index_count)
-        }
-        Ok(Err(err)) => {
-            log::warn!(
-                "[gpu-mesh] failed to map draw indirect readback slot={}: {err:?}",
-                draw_indirect_index
-            );
-            None
-        }
-        Err(_) => {
-            log::warn!(
-                "[gpu-mesh] timed out reading draw indirect args slot={}",
-                draw_indirect_index
-            );
-            None
-        }
-    }
 }
 
 #[cfg(feature = "gpu-compute")]
