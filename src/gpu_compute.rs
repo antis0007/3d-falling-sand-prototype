@@ -654,10 +654,111 @@ struct WorkerGpuState {
     face_mask_buffer: Arc<wgpu::Buffer>,
     face_offset_buffer: Arc<wgpu::Buffer>,
     face_count_buffer: Arc<wgpu::Buffer>,
+    draw_indirect_readback: Mutex<DrawIndirectReadbackState>,
     runtime_config: GpuSimulationRuntimeConfig,
     scratch: GpuScratchPool,
     simulation_bg: wgpu::BindGroup,
     meshing_bg: wgpu::BindGroup,
+}
+
+#[cfg(feature = "gpu-compute")]
+struct DrawIndirectReadbackState {
+    staging: wgpu::Buffer,
+    map_result_rx: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    requested_serial: u64,
+    ready_serial: u64,
+    cached_index_counts: Vec<u32>,
+}
+
+#[cfg(feature = "gpu-compute")]
+impl DrawIndirectReadbackState {
+    fn new(device: &wgpu::Device) -> Self {
+        let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+        let slot_capacity = mesh_pool_slot_capacity() as u64;
+        let size = draw_stride * slot_capacity;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu draw indirect frame readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            staging,
+            map_result_rx: None,
+            requested_serial: 0,
+            ready_serial: 0,
+            cached_index_counts: vec![0; mesh_pool_slot_capacity() as usize],
+        }
+    }
+
+    fn try_collect(&mut self) {
+        let Some(rx) = self.map_result_rx.take() else {
+            return;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                let mapped = self.staging.slice(..).get_mapped_range();
+                let args = bytemuck::cast_slice::<u8, DrawIndexedIndirectArgs>(&mapped);
+                for (slot, entry) in args.iter().enumerate() {
+                    if slot < self.cached_index_counts.len() {
+                        self.cached_index_counts[slot] = entry.index_count;
+                    }
+                }
+                drop(mapped);
+                self.staging.unmap();
+                self.ready_serial = self.requested_serial;
+            }
+            Ok(Err(err)) => {
+                log::warn!("[gpu-mesh] draw indirect metadata readback map failed: {err:?}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.map_result_rx = Some(rx);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::warn!("[gpu-mesh] draw indirect metadata readback callback channel closed");
+            }
+        }
+    }
+
+    fn request_snapshot_if_needed(&mut self, state: &WorkerGpuState, completed_serial: u64) {
+        if completed_serial == 0
+            || self.map_result_rx.is_some()
+            || self.ready_serial >= completed_serial
+        {
+            return;
+        }
+
+        let byte_len = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64
+            * mesh_pool_slot_capacity() as u64;
+        let mut encoder =
+            state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("gpu draw indirect frame readback encoder"),
+                });
+        encoder.copy_buffer_to_buffer(&state.draw_indirect_buffer, 0, &self.staging, 0, byte_len);
+        state.queue.submit(std::iter::once(encoder.finish()));
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+        self.requested_serial = completed_serial;
+        self.map_result_rx = Some(rx);
+    }
+
+    fn has_data_for_submission(&self, submission_serial: u64) -> bool {
+        self.ready_serial >= submission_serial
+    }
+
+    fn index_count_for_slot(&self, draw_indirect_index: u32) -> Option<u32> {
+        self.cached_index_counts.get(draw_indirect_index as usize).copied()
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1704,6 +1805,7 @@ pub fn initialize_gpu_compute_worker(
                 chunk_origin_buffer: &shared_mesh_buffers.chunk_origin_buffer,
             },
         );
+        let draw_indirect_readback = DrawIndirectReadbackState::new(&device);
 
         Ok(Arc::new(WorkerGpuState {
             device,
@@ -1724,6 +1826,7 @@ pub fn initialize_gpu_compute_worker(
             face_mask_buffer: shared_mesh_buffers.face_mask_buffer,
             face_offset_buffer: shared_mesh_buffers.face_offset_buffer,
             face_count_buffer: shared_mesh_buffers.face_count_buffer,
+            draw_indirect_readback: Mutex::new(draw_indirect_readback),
             runtime_config: GpuSimulationRuntimeConfig::default(),
             scratch,
             simulation_bg,
@@ -2122,6 +2225,15 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
     atlas.refresh_completed_serial(completed);
 
+    {
+        let mut readback = state
+            .draw_indirect_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        readback.try_collect();
+        readback.request_snapshot_if_needed(state, completed);
+    }
+
     let ready_coords: Vec<_> = atlas
         .pending_mesh_finalize
         .iter()
@@ -2133,10 +2245,30 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) else {
             continue;
         };
-        atlas.touch_chunk_page(coord);
 
-        let index_count =
-            read_gpu_draw_index_count(state, pending.draw_indirect_index).unwrap_or(0);
+        let index_count = {
+            let readback = state
+                .draw_indirect_readback
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !readback.has_data_for_submission(pending.submission_serial) {
+                atlas.pending_mesh_finalize.insert(coord, pending);
+                continue;
+            }
+            readback
+                .index_count_for_slot(pending.draw_indirect_index)
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "[gpu-mesh] missing draw indirect metadata for slot={}, chunk={:?}, serial={}",
+                        pending.draw_indirect_index,
+                        coord,
+                        pending.submission_serial
+                    );
+                    0
+                })
+        };
+
+        atlas.touch_chunk_page(coord);
 
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(coord);
         let result = ReadyGpuMeshResult {
@@ -2178,63 +2310,6 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         });
     }
     out
-}
-
-#[cfg(feature = "gpu-compute")]
-fn read_gpu_draw_index_count(state: &WorkerGpuState, draw_indirect_index: u32) -> Option<u32> {
-    let byte_len = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
-    let byte_offset = draw_indirect_index as u64 * byte_len;
-    let staging = state.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gpu draw indirect readback"),
-        size: byte_len,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = state
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gpu draw indirect readback encoder"),
-        });
-    encoder.copy_buffer_to_buffer(
-        &state.draw_indirect_buffer,
-        byte_offset,
-        &staging,
-        0,
-        byte_len,
-    );
-    state.queue.submit(std::iter::once(encoder.finish()));
-
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let slice = staging.slice(..);
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = state.device.poll(wgpu::Maintain::Wait);
-
-    match rx.recv_timeout(Duration::from_millis(100)) {
-        Ok(Ok(())) => {
-            let mapped = slice.get_mapped_range();
-            let args = *bytemuck::from_bytes::<DrawIndexedIndirectArgs>(&mapped);
-            drop(mapped);
-            staging.unmap();
-            Some(args.index_count)
-        }
-        Ok(Err(err)) => {
-            log::warn!(
-                "[gpu-mesh] failed to map draw indirect readback slot={}: {err:?}",
-                draw_indirect_index
-            );
-            None
-        }
-        Err(_) => {
-            log::warn!(
-                "[gpu-mesh] timed out reading draw indirect args slot={}",
-                draw_indirect_index
-            );
-            None
-        }
-    }
 }
 
 #[cfg(feature = "gpu-compute")]
