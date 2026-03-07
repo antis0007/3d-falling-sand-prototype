@@ -2580,56 +2580,7 @@ impl Renderer {
                     continue;
                 }
 
-                let authoritative_draw = match self
-                    .read_draw_indexed_indirect_command(*draw_indirect_index)
-                {
-                    Ok(command) => command,
-                    Err(err) => {
-                        stats.mesh_artifacts_rejected += 1;
-                        stats.mesh_reject_failed += 1;
-                        self.mesh_lifecycle
-                            .insert(result.coord, MeshLifecycleState::Rejected);
-                        self.sampled_outcome_trace(
-                            &result,
-                            RebuildOutcome::SkippedAdoptionRejected,
-                            Some(*page_index),
-                            Some(*draw_indirect_index),
-                            None,
-                            Some("authoritative_indirect_readback_failed"),
-                        );
-                        log::warn!(
-                            "[mesh] rejecting gpu artifact chunk={:?}: failed to read authoritative indirect args: {}",
-                            result.coord,
-                            short_error_message(&err.to_string())
-                        );
-                        skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
-                        continue;
-                    }
-                };
-
-                let resolved_index_count = authoritative_draw.index_count;
-
-                if resolved_index_count == 0 {
-                    stats.mesh_artifacts_rejected += 1;
-                    stats.mesh_reject_zero_index += 1;
-                    Self::record_rebuild_outcome(
-                        &mut stats,
-                        RebuildOutcome::SkippedSparseIndirectUndrawable,
-                    );
-                    self.mesh_lifecycle
-                        .insert(result.coord, MeshLifecycleState::Rejected);
-                    self.sampled_outcome_trace(
-                        &result,
-                        RebuildOutcome::SkippedSparseIndirectUndrawable,
-                        Some(*page_index),
-                        Some(*draw_indirect_index),
-                        Some(resolved_index_count),
-                        Some("authoritative_zero_indirect"),
-                    );
-                    skipped_retry_chunks
-                        .push((result.coord, MeshSkipReason::SparseIndirectUndrawable));
-                    continue;
-                }
+                let resolved_index_count = index_count.max(1);
 
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
 
@@ -3092,7 +3043,7 @@ impl Renderer {
                     page_index: ready.result.page_index,
                     draw_indirect_index: ready.result.draw_indirect_index,
                     lod: ready.result.lod,
-                    index_count: 0,
+                    index_count: 1,
                     aabb_min: ready.result.aabb_min,
                     aabb_max: ready.result.aabb_max,
                     chunk_origin_world: ready.result.chunk_origin_world,
@@ -3143,50 +3094,6 @@ impl Renderer {
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
         true
-    }
-
-    fn read_draw_indexed_indirect_command(
-        &self,
-        draw_indirect_index: u32,
-    ) -> anyhow::Result<DrawIndexedIndirectCommand> {
-        let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-        let offset = draw_indirect_index as u64 * stride;
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("renderer_draw_indirect_readback"),
-            size: stride,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("renderer_draw_indirect_readback_encoder"),
-            });
-        encoder.copy_buffer_to_buffer(
-            &self.global_gpu_draw_indirect_buffer,
-            offset,
-            &staging,
-            0,
-            stride,
-        );
-        self.queue.submit(Some(encoder.finish()));
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |res| {
-                let _ = tx.send(res.map_err(anyhow::Error::from));
-            });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()
-            .context("failed to receive renderer indirect map_async result")??;
-
-        let data = staging.slice(..).get_mapped_range();
-        let command = bytemuck::pod_read_unaligned(&data);
-        drop(data);
-        staging.unmap();
-        Ok(command)
     }
 
     fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
