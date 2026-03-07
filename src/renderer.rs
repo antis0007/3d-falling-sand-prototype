@@ -57,6 +57,7 @@ const GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS: f32 = 1.25;
 const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 3.0;
 const LOD_MISMATCH_GRACE_MAX_FRAMES: u64 = 8;
 const DRAW_CONTINUITY_MAX_FRAMES: u64 = 64;
+const DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS: f32 = 2.0;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 
@@ -4695,14 +4696,28 @@ fn lod_mismatch_grace_allows_draw(
     pending_lod_remesh: &HashSet<ChunkCoord>,
     pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
     mesh_rebuild_frame_index: u64,
+    draw_is_existing_drawable: bool,
 ) -> bool {
-    if !pending_lod_remesh.contains(&coord) {
+    if !draw_is_existing_drawable || !pending_lod_remesh.contains(&coord) {
         return false;
     }
     let Some(first_pending_frame) = pending_lod_remesh_since.get(&coord).copied() else {
         return false;
     };
     mesh_rebuild_frame_index.saturating_sub(first_pending_frame) <= LOD_MISMATCH_GRACE_MAX_FRAMES
+}
+
+fn continuity_fallback_distance_gate_allows_draw(
+    coord: ChunkCoord,
+    draw_lod: ChunkLod,
+    selected_lod: ChunkLod,
+    world_camera_pos: Vec3,
+) -> bool {
+    if draw_lod == ChunkLod::Near || selected_lod == ChunkLod::Near {
+        return false;
+    }
+    chunk_horizontal_distance_to_camera(coord, world_camera_pos)
+        >= DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS
 }
 
 fn visible_draw_mappings_are_bijective(
@@ -4765,6 +4780,7 @@ fn chunk_draw_contract_decision(
             pending_lod_remesh,
             pending_lod_remesh_since,
             mesh_rebuild_frame_index,
+            draw_is_drawable(draw),
         );
 
     let visible = chunk_visible_in_world_space(
@@ -4786,6 +4802,12 @@ fn chunk_draw_contract_decision(
 
     if has_pending_replacement
         && pending_lod_remesh.contains(&coord)
+        && continuity_fallback_distance_gate_allows_draw(
+            coord,
+            draw_lod,
+            selected_lod,
+            visibility.world_camera_pos,
+        )
         && pending_lod_remesh_since
             .get(&coord)
             .map(|first_pending_frame| {
@@ -5669,11 +5691,11 @@ mod tests {
 
     #[test]
     fn continuity_fallback_keeps_previous_drawable_during_pending_replacement() {
-        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let coord = ChunkCoord { x: 4, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(5, coord);
         let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Near);
+        lod_selection.insert(coord, ChunkLod::Mid);
         let mut pending_lod_remesh = HashSet::new();
         pending_lod_remesh.insert(coord);
         let mut pending_lod_remesh_since = HashMap::new();
@@ -5681,7 +5703,7 @@ mod tests {
         let draw = GpuChunkDraw {
             page_index: GpuPageIndex(5),
             draw_indirect_index: 5,
-            lod: ChunkLod::Mid as u8,
+            lod: ChunkLod::Far as u8,
             origin: Vec3::ZERO,
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
@@ -5709,6 +5731,104 @@ mod tests {
                 &pending_lod_remesh,
                 &pending_lod_remesh_since,
                 10 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
+                true,
+                visibility,
+            ),
+            DrawContractDecision::ContinuityFallback
+        );
+    }
+
+    #[test]
+    fn continuity_fallback_filters_near_chunks_until_replacement_is_ready() {
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(8, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Near);
+        let mut pending_lod_remesh = HashSet::new();
+        pending_lod_remesh.insert(coord);
+        let mut pending_lod_remesh_since = HashMap::new();
+        pending_lod_remesh_since.insert(coord, 2);
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(8),
+            draw_indirect_index: 8,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(12),
+        };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        assert_eq!(
+            chunk_draw_contract_decision(
+                coord,
+                &draw,
+                &visible_slots,
+                &lod_selection,
+                &pending_lod_remesh,
+                &pending_lod_remesh_since,
+                2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
+                true,
+                visibility,
+            ),
+            DrawContractDecision::Filtered
+        );
+    }
+
+    #[test]
+    fn continuity_fallback_allows_far_chunks_while_replacement_is_pending() {
+        let coord = ChunkCoord { x: 6, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(9, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Mid);
+        let mut pending_lod_remesh = HashSet::new();
+        pending_lod_remesh.insert(coord);
+        let mut pending_lod_remesh_since = HashMap::new();
+        pending_lod_remesh_since.insert(coord, 2);
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(9),
+            draw_indirect_index: 9,
+            lod: ChunkLod::Far as u8,
+            origin: Vec3::new(96.0, 0.0, 0.0),
+            world_aabb_min: Vec3::new(95.0, -1.0, -4.0),
+            world_aabb_max: Vec3::new(97.0, 1.0, -2.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(12),
+        };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(1.0, 0.0, 0.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: false,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        assert_eq!(
+            chunk_draw_contract_decision(
+                coord,
+                &draw,
+                &visible_slots,
+                &lod_selection,
+                &pending_lod_remesh,
+                &pending_lod_remesh_since,
+                2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
                 true,
                 visibility,
             ),
@@ -5792,6 +5912,38 @@ mod tests {
             &pending_lod_remesh,
             &pending_lod_remesh_since,
             1 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
+            true,
+        ));
+    }
+
+    #[test]
+    fn lod_mismatch_grace_requires_drawable_and_expires() {
+        let coord = ChunkCoord { x: 3, y: 0, z: 0 };
+        let mut pending_lod_remesh = HashSet::new();
+        pending_lod_remesh.insert(coord);
+        let mut pending_lod_remesh_since = HashMap::new();
+        pending_lod_remesh_since.insert(coord, 5);
+
+        assert!(lod_mismatch_grace_allows_draw(
+            coord,
+            &pending_lod_remesh,
+            &pending_lod_remesh_since,
+            5 + LOD_MISMATCH_GRACE_MAX_FRAMES,
+            true,
+        ));
+        assert!(!lod_mismatch_grace_allows_draw(
+            coord,
+            &pending_lod_remesh,
+            &pending_lod_remesh_since,
+            5 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
+            true,
+        ));
+        assert!(!lod_mismatch_grace_allows_draw(
+            coord,
+            &pending_lod_remesh,
+            &pending_lod_remesh_since,
+            5 + LOD_MISMATCH_GRACE_MAX_FRAMES,
+            false,
         ));
     }
     #[test]
