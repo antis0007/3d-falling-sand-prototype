@@ -388,9 +388,7 @@ impl ChunkPageAtlas {
             }
 
             let evict_slot = self.evictable_mesh_slot(slot_capacity)?;
-            if let Some(evicted_chunk) = self.chunk_for_mesh_slot.get(&evict_slot).copied() {
-                self.release_chunk_mesh_allocation(evicted_chunk);
-            }
+            self.evict_mesh_slot(evict_slot);
 
             if self.next_mesh_slot >= slot_capacity {
                 slot = evict_slot;
@@ -425,6 +423,7 @@ impl ChunkPageAtlas {
         self.used_vertex_elements = self.used_vertex_elements.saturating_add(vertex.len);
         self.used_index_elements = self.used_index_elements.saturating_add(index.len);
         self.touch_mesh_slot(slot);
+        self.assert_mesh_slot_chunk_mapping_invariants();
         Some(slice)
     }
 
@@ -443,6 +442,33 @@ impl ChunkPageAtlas {
             self.used_index_elements = self
                 .used_index_elements
                 .saturating_sub(allocation.index.len);
+        }
+
+        self.assert_mesh_slot_chunk_mapping_invariants();
+    }
+
+    fn mesh_slot_protection_hint(&self, slot: u32) -> PagePriorityHint {
+        self.chunk_for_mesh_slot
+            .get(&slot)
+            .and_then(|chunk| self.priority_hint_for_chunk.get(chunk))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn evict_mesh_slot(&mut self, slot: u32) {
+        if let Some(chunk) = self.chunk_for_mesh_slot.get(&slot).copied() {
+            match self.mesh_slot_protection_hint(slot) {
+                PagePriorityHint::Far => {
+                    let _ = GPU_MESH_EVICT_FAR_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                PagePriorityHint::Near => {
+                    let _ = GPU_MESH_EVICT_NEAR_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                PagePriorityHint::Visible => {
+                    let _ = GPU_MESH_EVICT_VISIBLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.release_chunk_mesh_allocation(chunk);
         }
     }
 
@@ -463,18 +489,57 @@ impl ChunkPageAtlas {
     }
 
     fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
-        let mut selected: Option<(u64, u32)> = None;
+        let mut selected: Option<((u8, u8, u64), u32)> = None;
         for slot in 0..slot_capacity {
-            if !self.is_mesh_slot_fence_safe(slot) {
-                continue;
-            }
-            let age = self.mesh_slot_last_used.get(&slot).copied().unwrap_or(0);
-            let candidate = (age, slot);
-            if selected.map(|cur| candidate < cur).unwrap_or(true) {
+            let protection_rank = self.mesh_slot_protection_hint(slot).eviction_rank();
+            let fence_rank = if self.is_mesh_slot_fence_safe(slot) {
+                0
+            } else {
+                1
+            };
+            let recency_rank = self.mesh_slot_last_used.get(&slot).copied().unwrap_or(0);
+            let candidate = ((protection_rank, fence_rank, recency_rank), slot);
+            if selected
+                .map(|(cur_rank, cur_slot)| {
+                    candidate.0 < cur_rank || (candidate.0 == cur_rank && slot < cur_slot)
+                })
+                .unwrap_or(true)
+            {
                 selected = Some(candidate);
             }
         }
         selected.map(|(_, slot)| slot)
+    }
+
+    fn assert_mesh_slot_chunk_mapping_invariants(&self) {
+        assert_eq!(
+            self.mesh_slice_for_chunk.len(),
+            self.chunk_for_mesh_slot.len(),
+            "mesh slot/chunk map size mismatch"
+        );
+
+        for (chunk, slice) in &self.mesh_slice_for_chunk {
+            let owner = self
+                .chunk_for_mesh_slot
+                .get(&slice.slot_index)
+                .expect("mesh slot must resolve to chunk owner");
+            assert_eq!(owner, chunk, "mesh slot/chunk mapping mismatch");
+            assert!(
+                self.mesh_alloc_for_chunk.contains_key(chunk),
+                "mesh allocation missing for chunk with active mesh slice"
+            );
+        }
+
+        for (slot, chunk) in &self.chunk_for_mesh_slot {
+            let slice = self
+                .mesh_slice_for_chunk
+                .get(chunk)
+                .expect("chunk owner must resolve to active mesh slice");
+            assert_eq!(
+                slice.slot_index, *slot,
+                "chunk->mesh slice slot must match slot->chunk mapping"
+            );
+        }
     }
 
     fn in_flight_mesh_slot_fence_count(&self) -> u32 {
@@ -732,12 +797,11 @@ impl DrawIndirectReadbackState {
 
         let byte_len = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64
             * mesh_pool_slot_capacity() as u64;
-        let mut encoder =
-            state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("gpu draw indirect frame readback encoder"),
-                });
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gpu draw indirect frame readback encoder"),
+            });
         encoder.copy_buffer_to_buffer(&state.draw_indirect_buffer, 0, &self.staging, 0, byte_len);
         state.queue.submit(std::iter::once(encoder.finish()));
 
@@ -757,7 +821,9 @@ impl DrawIndirectReadbackState {
     }
 
     fn index_count_for_slot(&self, draw_indirect_index: u32) -> Option<u32> {
-        self.cached_index_counts.get(draw_indirect_index as usize).copied()
+        self.cached_index_counts
+            .get(draw_indirect_index as usize)
+            .copied()
     }
 }
 
@@ -1011,6 +1077,9 @@ pub struct GpuComputeProfilerSnapshot {
     pub evict_near_count: u64,
     pub evict_visible_count: u64,
     pub evict_far_count: u64,
+    pub mesh_evict_near_count: u64,
+    pub mesh_evict_visible_count: u64,
+    pub mesh_evict_far_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1030,6 +1099,12 @@ static GPU_EVICT_NEAR_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_EVICT_VISIBLE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_EVICT_FAR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_EVICT_NEAR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_EVICT_VISIBLE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_EVICT_FAR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1166,6 +1241,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let evict_near_count = GPU_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
         let evict_visible_count = GPU_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
         let evict_far_count = GPU_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_evict_near_count = GPU_MESH_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_evict_visible_count = GPU_MESH_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_evict_far_count = GPU_MESH_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -1176,6 +1254,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             evict_near_count,
             evict_visible_count,
             evict_far_count,
+            mesh_evict_near_count,
+            mesh_evict_visible_count,
+            mesh_evict_far_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
