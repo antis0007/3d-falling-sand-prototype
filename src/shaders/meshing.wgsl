@@ -10,7 +10,7 @@ const FACE_MASK_POS_Z: u32 = 1u << 4u;
 const FACE_MASK_NEG_Z: u32 = 1u << 5u;
 
 const MAX_FACES_PER_PAGE: u32 = GPU_MAX_FACES_PER_PAGE;
-const DEBUG_COLOR_OVERRIDE_ENABLED: bool = true;
+const DEBUG_COLOR_OVERRIDE_ENABLED: bool = false;
 const DEBUG_COLOR_OVERRIDE_PAGE: u32 = 0u;
 
 struct FrameParams {
@@ -168,7 +168,7 @@ fn material_color(material_id: u32) -> u32 {
 }
 
 fn debug_override_color(page: u32, dir: u32, material_id: u32) -> u32 {
-    if (DEBUG_COLOR_OVERRIDE_ENABLED && page == DEBUG_COLOR_OVERRIDE_PAGE) {
+    if (page == DEBUG_COLOR_OVERRIDE_PAGE) {
         if ((dir & 1u) == 0u) {
             return pack_rgba8(255u, 0u, 255u, 255u);
         }
@@ -299,7 +299,10 @@ fn emit_mesh(
         let vo = write_face * 4u;
         let io = write_face * 6u;
 
-        let color = debug_override_color(page, dir, id);
+        var color = material_color(id);
+        if (DEBUG_COLOR_OVERRIDE_ENABLED) {
+            color = debug_override_color(page, dir, id);
+        }
         write_face_quad(dir, base, chunk_origin, color, vertex_base + vo, index_base + io);
 
         write_face = write_face + 1u;
