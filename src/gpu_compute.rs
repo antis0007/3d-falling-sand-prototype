@@ -293,7 +293,7 @@ impl PagePriorityHint {
 }
 
 #[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGpuMeshFinalize {
     version: u64,
     lod: u8,
@@ -1076,6 +1076,9 @@ pub struct GpuComputeProfilerSnapshot {
     pub mesh_evict_near_count: u64,
     pub mesh_evict_visible_count: u64,
     pub mesh_evict_far_count: u64,
+    pub mesh_finalize_lock_hold_ms: f32,
+    pub mesh_finalize_events: u64,
+    pub mesh_finalize_requeued: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1107,6 +1110,12 @@ static GPU_DISPATCH_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static GPU_DISPATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_STARTUP_ZERO_FRONTIER_MESH_RUNS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_FINALIZE_LOCK_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_FINALIZE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_FINALIZE_REQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
@@ -1240,6 +1249,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let mesh_evict_near_count = GPU_MESH_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
         let mesh_evict_visible_count = GPU_MESH_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
         let mesh_evict_far_count = GPU_MESH_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_finalize_lock_hold_ns = GPU_MESH_FINALIZE_LOCK_HOLD_NS.swap(0, Ordering::Relaxed);
+        let mesh_finalize_events = GPU_MESH_FINALIZE_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_finalize_requeued = GPU_MESH_FINALIZE_REQUEUED_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -1253,6 +1265,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             mesh_evict_near_count,
             mesh_evict_visible_count,
             mesh_evict_far_count,
+            mesh_finalize_lock_hold_ms: mesh_finalize_lock_hold_ns as f32 / 1_000_000.0,
+            mesh_finalize_events,
+            mesh_finalize_requeued,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -2298,9 +2313,47 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         return Vec::new();
     };
 
+    #[derive(Clone, Copy)]
+    struct FinalizeCandidate {
+        coord: ChunkCoord,
+        pending: PendingGpuMeshFinalize,
+        snapshot_version: Option<u64>,
+        snapshot_page: Option<GpuPageIndex>,
+        snapshot_slot: Option<u32>,
+    }
+
+    enum CandidateCheck {
+        Ready { index_count: u32 },
+    }
+
     let completed = GPU_COMPLETED_SERIAL.load(Ordering::Relaxed);
-    let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-    atlas.refresh_completed_serial(completed);
+    let phase1_lock_start = Instant::now();
+    let candidates = {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        atlas.refresh_completed_serial(completed);
+
+        atlas
+            .pending_mesh_finalize
+            .iter()
+            .filter_map(|(coord, pending)| {
+                (pending.submission_serial <= completed).then_some(FinalizeCandidate {
+                    coord: *coord,
+                    pending: *pending,
+                    snapshot_version: atlas.version_for_chunk.get(coord).copied(),
+                    snapshot_page: atlas.page_for_chunk.get(coord).copied(),
+                    snapshot_slot: atlas
+                        .mesh_slice_for_chunk
+                        .get(coord)
+                        .copied()
+                        .map(|slice| slice.slot_index),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    GPU_MESH_FINALIZE_LOCK_HOLD_NS.fetch_add(
+        phase1_lock_start.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
 
     {
         let mut readback = state
@@ -2311,18 +2364,8 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         readback.request_snapshot_if_needed(state, completed);
     }
 
-    let ready_coords: Vec<_> = atlas
-        .pending_mesh_finalize
-        .iter()
-        .filter_map(|(coord, pending)| (pending.submission_serial <= completed).then_some(*coord))
-        .collect();
-
-    let mut out = Vec::with_capacity(ready_coords.len());
-    for coord in ready_coords {
-        let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) else {
-            continue;
-        };
-
+    let mut checks = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
         // Keep draw-indirect readback as a telemetry/back-compat path, but do not
         // block finalize readiness on full-buffer snapshot availability.
         let index_count = {
@@ -2331,59 +2374,110 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             readback
-                .index_count_for_slot(pending.draw_indirect_index)
+                .index_count_for_slot(candidate.pending.draw_indirect_index)
                 .unwrap_or_else(|| {
                     log::debug!(
                         "[gpu-mesh] draw indirect metadata unavailable for slot={}, chunk={:?}, serial={} (finalizing without blocking)",
-                        pending.draw_indirect_index,
-                        coord,
-                        pending.submission_serial
+                        candidate.pending.draw_indirect_index,
+                        candidate.coord,
+                        candidate.pending.submission_serial
                     );
                     0
                 })
         };
-
-        atlas.touch_chunk_page(coord);
-
-        let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(coord);
-        let result = ReadyGpuMeshResult {
-            coord,
-            version: pending.version,
-            page_index: pending.page_index,
-            draw_indirect_index: pending.draw_indirect_index,
-            index_count,
-            lod: pending.lod,
-            aabb_min,
-            aabb_max,
-            chunk_origin_world,
-        };
-
-        if atlas.version_for_chunk.get(&coord).copied() != Some(pending.version) {
-            out.push(ReadyGpuMeshFinalizeEvent {
-                result,
-                status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
-            });
-            continue;
-        }
-        if atlas.page_for_chunk.get(&coord).copied() != Some(pending.page_index)
-            || atlas
-                .mesh_slice_for_chunk
-                .get(&coord)
-                .copied()
-                .map(|slice| slice.slot_index)
-                != Some(pending.draw_indirect_index)
-        {
-            out.push(ReadyGpuMeshFinalizeEvent {
-                result,
-                status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
-            });
-            continue;
-        }
-        out.push(ReadyGpuMeshFinalizeEvent {
-            result,
-            status: ReadyGpuMeshFinalizeStatus::ReadyAndValid,
-        });
+        checks.push((candidate, CandidateCheck::Ready { index_count }));
     }
+
+    let mut out = Vec::with_capacity(checks.len());
+    let mut finalized_count = 0u64;
+    let mut requeued_count = 0u64;
+    let phase3_lock_start = Instant::now();
+    {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        for (candidate, check) in checks {
+            let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
+            else {
+                continue;
+            };
+            if current_pending != candidate.pending {
+                requeued_count += 1;
+                continue;
+            }
+
+            let CandidateCheck::Ready { index_count } = check;
+
+            atlas.pending_mesh_finalize.remove(&candidate.coord);
+            atlas.touch_chunk_page(candidate.coord);
+
+            let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(candidate.coord);
+            let result = ReadyGpuMeshResult {
+                coord: candidate.coord,
+                version: candidate.pending.version,
+                page_index: candidate.pending.page_index,
+                draw_indirect_index: candidate.pending.draw_indirect_index,
+                index_count,
+                lod: candidate.pending.lod,
+                aabb_min,
+                aabb_max,
+                chunk_origin_world,
+            };
+
+            if atlas.version_for_chunk.get(&candidate.coord).copied() != candidate.snapshot_version
+                || atlas.page_for_chunk.get(&candidate.coord).copied() != candidate.snapshot_page
+                || atlas
+                    .mesh_slice_for_chunk
+                    .get(&candidate.coord)
+                    .copied()
+                    .map(|slice| slice.slot_index)
+                    != candidate.snapshot_slot
+            {
+                requeued_count += 1;
+                atlas
+                    .pending_mesh_finalize
+                    .insert(candidate.coord, candidate.pending);
+                continue;
+            }
+
+            if atlas.version_for_chunk.get(&candidate.coord).copied()
+                != Some(candidate.pending.version)
+            {
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
+                });
+                finalized_count += 1;
+                continue;
+            }
+            if atlas.page_for_chunk.get(&candidate.coord).copied()
+                != Some(candidate.pending.page_index)
+                || atlas
+                    .mesh_slice_for_chunk
+                    .get(&candidate.coord)
+                    .copied()
+                    .map(|slice| slice.slot_index)
+                    != Some(candidate.pending.draw_indirect_index)
+            {
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
+                });
+                finalized_count += 1;
+                continue;
+            }
+            out.push(ReadyGpuMeshFinalizeEvent {
+                result,
+                status: ReadyGpuMeshFinalizeStatus::ReadyAndValid,
+            });
+            finalized_count += 1;
+        }
+    }
+    GPU_MESH_FINALIZE_LOCK_HOLD_NS.fetch_add(
+        phase3_lock_start.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    GPU_MESH_FINALIZE_COUNT.fetch_add(finalized_count, Ordering::Relaxed);
+    GPU_MESH_FINALIZE_REQUEUED_COUNT.fetch_add(requeued_count, Ordering::Relaxed);
+
     out
 }
 
