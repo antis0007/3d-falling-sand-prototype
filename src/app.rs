@@ -56,8 +56,6 @@ const MESH_BACKPRESSURE_HIGH: usize = 180;
 const DIRTY_BACKLOG_PRESSURE_START: usize = 96;
 const DIRTY_BACKLOG_PRESSURE_HIGH: usize = 320;
 const URGENT_GENERATION_BUDGET: usize = 4;
-const NEAR_GENERATION_BUDGET: usize = 24;
-const MID_GENERATION_BUDGET: usize = 24;
 const PROTECTED_HIGH_PRIORITY_SLOTS: usize = 2;
 const AUTO_TUNE_UPLOAD_LATENCY_START_MS: f32 = 200.0;
 const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
@@ -391,6 +389,124 @@ struct DesiredCapStats {
     budget_dropped: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct GenerationPressureModel {
+    near_cap: usize,
+    mid_cap: usize,
+    far_cap: usize,
+    ultra_cap: usize,
+    global_cap: usize,
+    near_dispatch_budget: usize,
+    mid_dispatch_budget: usize,
+    far_dispatch_budget: usize,
+}
+
+fn shell_span(start: i32, end: i32) -> usize {
+    (end - start).max(1) as usize
+}
+
+fn compute_generation_pressure_model(
+    effective_stream_tuning: &StreamingTuning,
+    pending_generate_count: usize,
+    worker_inflight: usize,
+    apply_budget_items: usize,
+    prior_mesh_backlog: usize,
+    prior_meshing_queue_depth: usize,
+    base_generate_drain_budget: usize,
+) -> GenerationPressureModel {
+    let queue_depth = pending_generate_count + worker_inflight;
+    let queue_pressure =
+        (queue_depth as f32 / (apply_budget_items.max(1) * 6) as f32).clamp(0.0, 1.0);
+    let mesh_pressure = ((prior_mesh_backlog as f32 - MESH_BACKPRESSURE_START as f32)
+        / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+        .clamp(0.0, 1.0);
+    let meshing_queue_pressure = ((prior_meshing_queue_depth as f32
+        - MESH_BACKPRESSURE_START as f32)
+        / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
+        .clamp(0.0, 1.0);
+    let pressure = queue_pressure
+        .max(mesh_pressure * 0.9)
+        .max(meshing_queue_pressure * 0.75);
+    let cap_scale = (1.0 - pressure * 0.6).clamp(0.4, 1.0);
+
+    let near_span = shell_span(0, effective_stream_tuning.near_radius_xz + 1);
+    let mid_span = shell_span(
+        effective_stream_tuning.near_radius_xz,
+        effective_stream_tuning.mid_radius_xz,
+    );
+    let far_span = shell_span(
+        effective_stream_tuning.mid_radius_xz,
+        effective_stream_tuning.far_radius_xz,
+    );
+    let ultra_span = shell_span(
+        effective_stream_tuning.far_radius_xz,
+        effective_stream_tuning.ultra_radius_xz,
+    );
+
+    let near_floor = apply_budget_items.max(PROTECTED_HIGH_PRIORITY_SLOTS * 2);
+    let base_global = apply_budget_items.max(1) * 12 + base_generate_drain_budget * 2;
+    let global_cap = ((base_global as f32) * cap_scale) as usize + near_floor;
+
+    let span_sum = near_span + mid_span + far_span + ultra_span;
+    let mut near_cap = (global_cap * near_span / span_sum).max(near_floor);
+    let mut mid_cap = (global_cap * mid_span / span_sum).max(1);
+    let mut far_cap = (global_cap * far_span / span_sum).max(1);
+    let mut ultra_cap = (global_cap * ultra_span / span_sum).max(1);
+
+    let mut total = near_cap + mid_cap + far_cap + ultra_cap;
+    while total > global_cap {
+        if ultra_cap > 1 {
+            ultra_cap -= 1;
+        } else if far_cap > 1 {
+            far_cap -= 1;
+        } else if mid_cap > 1 {
+            mid_cap -= 1;
+        } else if near_cap > near_floor {
+            near_cap -= 1;
+        } else {
+            break;
+        }
+        total -= 1;
+    }
+
+    let dispatch_budget = base_generate_drain_budget.max(PROTECTED_HIGH_PRIORITY_SLOTS);
+    let stable_near = queue_pressure < 0.4 && dispatch_budget > 2;
+    let near_dispatch_budget = if stable_near {
+        (dispatch_budget as f32 * 0.55).round() as usize
+    } else {
+        (dispatch_budget as f32 * 0.75).round() as usize
+    }
+    .clamp(PROTECTED_HIGH_PRIORITY_SLOTS, dispatch_budget);
+
+    let mut remaining_dispatch = dispatch_budget.saturating_sub(near_dispatch_budget);
+    let mut mid_dispatch_budget = ((remaining_dispatch as f32) * 0.55).round() as usize;
+    let mut far_dispatch_budget = remaining_dispatch.saturating_sub(mid_dispatch_budget);
+    if stable_near && remaining_dispatch > 0 {
+        mid_dispatch_budget = mid_dispatch_budget.max(1);
+        far_dispatch_budget = far_dispatch_budget.max(1);
+    }
+    if mid_dispatch_budget + far_dispatch_budget > remaining_dispatch {
+        let overflow = mid_dispatch_budget + far_dispatch_budget - remaining_dispatch;
+        far_dispatch_budget = far_dispatch_budget.saturating_sub(overflow);
+    }
+    remaining_dispatch = dispatch_budget
+        .saturating_sub(near_dispatch_budget)
+        .saturating_sub(mid_dispatch_budget)
+        .saturating_sub(far_dispatch_budget);
+    far_dispatch_budget += remaining_dispatch;
+
+    GenerationPressureModel {
+        near_cap,
+        mid_cap,
+        far_cap,
+        ultra_cap,
+        global_cap,
+        near_dispatch_budget,
+        mid_dispatch_budget,
+        far_dispatch_budget,
+    }
+}
+
 fn chebyshev_from_player(player_chunk: ChunkCoord, coord: ChunkCoord) -> i32 {
     (coord.x - player_chunk.x)
         .abs()
@@ -420,29 +536,67 @@ fn extract_frustum_planes(vp: Mat4) -> [Vec4; 6] {
 fn cap_desired_generation_order(
     desired: &DesiredChunks,
     player_chunk: ChunkCoord,
+    pressure_model: GenerationPressureModel,
 ) -> (Vec<ChunkCoord>, DesiredCapStats) {
     let mut prioritized = Vec::with_capacity(desired.generation_order.len());
     let mut stats = DesiredCapStats::default();
 
+    let mut push_with_cap =
+        |coords: &[ChunkCoord], cap: usize, kept: &mut usize, dropped: &mut usize| {
+            for &coord in coords {
+                if prioritized.len() >= pressure_model.global_cap || *kept >= cap {
+                    *dropped += 1;
+                    continue;
+                }
+                *kept += 1;
+                prioritized.push(coord);
+            }
+        };
+
+    let mut urgent_near = Vec::new();
+    let mut regular_near = Vec::new();
     for &coord in &desired.near {
         if chebyshev_from_player(player_chunk, coord) <= 1 {
             stats.uncapped_kept += 1;
+            urgent_near.push(coord);
+        } else {
+            regular_near.push(coord);
         }
-        stats.near_kept += 1;
-        prioritized.push(coord);
     }
-    for &coord in &desired.mid {
-        stats.mid_kept += 1;
-        prioritized.push(coord);
-    }
-    for &coord in &desired.far {
-        stats.far_kept += 1;
-        prioritized.push(coord);
-    }
-    for &coord in &desired.ultra {
-        stats.ultra_kept += 1;
-        prioritized.push(coord);
-    }
+
+    push_with_cap(
+        &urgent_near,
+        pressure_model.near_cap,
+        &mut stats.near_kept,
+        &mut stats.near_dropped,
+    );
+    push_with_cap(
+        &regular_near,
+        pressure_model.near_cap,
+        &mut stats.near_kept,
+        &mut stats.near_dropped,
+    );
+    push_with_cap(
+        &desired.mid,
+        pressure_model.mid_cap,
+        &mut stats.mid_kept,
+        &mut stats.mid_dropped,
+    );
+    push_with_cap(
+        &desired.far,
+        pressure_model.far_cap,
+        &mut stats.far_kept,
+        &mut stats.far_dropped,
+    );
+    push_with_cap(
+        &desired.ultra,
+        pressure_model.ultra_cap,
+        &mut stats.ultra_kept,
+        &mut stats.ultra_dropped,
+    );
+
+    stats.budget_dropped =
+        stats.near_dropped + stats.mid_dropped + stats.far_dropped + stats.ultra_dropped;
 
     (prioritized, stats)
 }
@@ -1363,12 +1517,28 @@ pub async fn run() -> anyhow::Result<()> {
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
                         let streaming_t0 = Instant::now();
-                        streaming.max_generate_schedule_per_update = scaled_budget(
+                        let apply_budget_items = scaled_budget(
+                            stream_tuning.base_apply_budget_items,
+                            stream_tuning.max_apply_budget_items,
+                            generated_ready.len(),
+                            stream_tuning.base_apply_budget_items,
+                        );
+                        let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
                             stream_tuning.max_generate_drain_items,
                             streaming.pending_generate_count(),
                             stream_tuning.base_generate_drain_items,
                         );
+                        let pressure_model = compute_generation_pressure_model(
+                            &effective_stream_tuning,
+                            streaming.pending_generate_count(),
+                            gen_worker_inflight,
+                            apply_budget_items,
+                            prior_mesh_backlog,
+                            prior_meshing_queue_depth,
+                            base_generate_drain_budget,
+                        );
+                        streaming.max_generate_schedule_per_update = pressure_model.global_cap;
                         let backpressure = if prior_mesh_backlog <= MESH_BACKPRESSURE_START {
                             0.0
                         } else {
@@ -1376,8 +1546,11 @@ pub async fn run() -> anyhow::Result<()> {
                                 / (MESH_BACKPRESSURE_HIGH - MESH_BACKPRESSURE_START) as f32)
                                 .clamp(0.0, 1.0)
                         };
-                        let (mut generation_priority, desired_cap_stats) =
-                            cap_desired_generation_order(&cached_desired, player_chunk);
+                        let (mut generation_priority, desired_cap_stats) = cap_desired_generation_order(
+                            &cached_desired,
+                            player_chunk,
+                            pressure_model,
+                        );
                         last_desired_cap_stats = desired_cap_stats;
                         if backpressure > 0.0 {
                             let far_radius_cutoff = (effective_stream_tuning.mid_radius_xz as f32
@@ -1519,15 +1692,7 @@ pub async fn run() -> anyhow::Result<()> {
                             }
                         }
 
-                        let base_generate_drain_budget = scaled_budget(
-                            stream_tuning.base_generate_drain_items,
-                            stream_tuning.max_generate_drain_items,
-                            streaming.pending_generate_count(),
-                            stream_tuning.base_generate_drain_items,
-                        );
-                        let near_budget = base_generate_drain_budget
-                            .min(NEAR_GENERATION_BUDGET)
-                            .max(PROTECTED_HIGH_PRIORITY_SLOTS);
+                        let near_budget = pressure_model.near_dispatch_budget;
                         let mut near_sent = 0usize;
                         for coord in dispatch_near.into_iter().take(near_budget) {
                             if !dispatch_coord(
@@ -1552,7 +1717,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         if !has_near_backlog {
                             if has_mid_backlog {
-                                let mut mid_budget = generate_drain_budget.min(MID_GENERATION_BUDGET);
+                                let mut mid_budget = generate_drain_budget.min(pressure_model.mid_dispatch_budget);
                                 for coord in dispatch_mid {
                                     if mid_budget == 0 {
                                         break;
@@ -1571,9 +1736,9 @@ pub async fn run() -> anyhow::Result<()> {
                                     mid_budget = mid_budget.saturating_sub(1);
                                 }
                             } else {
-                                let mut far_budget = generate_drain_budget;
+                                let mut mid_budget = generate_drain_budget.min(pressure_model.mid_dispatch_budget);
                                 for coord in dispatch_mid {
-                                    if far_budget == 0 {
+                                    if mid_budget == 0 {
                                         break;
                                     }
                                     if !dispatch_coord(
@@ -1587,8 +1752,11 @@ pub async fn run() -> anyhow::Result<()> {
                                     ) {
                                         break;
                                     }
-                                    far_budget = far_budget.saturating_sub(1);
+                                    mid_budget = mid_budget.saturating_sub(1);
                                 }
+                                let mut far_budget = generate_drain_budget
+                                    .saturating_sub(pressure_model.mid_dispatch_budget)
+                                    .min(pressure_model.far_dispatch_budget);
                                 for coord in dispatch_far {
                                     if far_budget == 0 {
                                         break;
@@ -1709,12 +1877,6 @@ pub async fn run() -> anyhow::Result<()> {
                             generated_ready.extend(prioritized);
                         }
 
-                        let apply_budget_items = scaled_budget(
-                            stream_tuning.base_apply_budget_items,
-                            stream_tuning.max_apply_budget_items,
-                            generated_ready.len(),
-                            stream_tuning.base_apply_budget_items,
-                        );
                         let apply_t0 = Instant::now();
                         let mut apply_count = 0usize;
                         while apply_count < apply_budget_items
@@ -3497,11 +3659,116 @@ mod tests {
             resident_keep: HashSet::new(),
         };
 
-        let (prioritized, stats) = cap_desired_generation_order(&desired, player);
+        let pressure_model = GenerationPressureModel {
+            near_cap: 8,
+            mid_cap: 8,
+            far_cap: 8,
+            ultra_cap: 8,
+            global_cap: 32,
+            near_dispatch_budget: 4,
+            mid_dispatch_budget: 2,
+            far_dispatch_budget: 2,
+        };
+
+        let (prioritized, stats) = cap_desired_generation_order(&desired, player, pressure_model);
         assert_eq!(prioritized, vec![near[0], mid[0], far[0]]);
         assert_eq!(stats.near_kept, 1);
         assert_eq!(stats.mid_kept, 1);
         assert_eq!(stats.far_kept, 1);
         assert_eq!(stats.budget_dropped, 0);
+    }
+
+    #[test]
+    fn generation_order_hard_cap_enforced() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near = vec![
+            ChunkCoord { x: 2, y: 0, z: 0 },
+            ChunkCoord { x: 3, y: 0, z: 0 },
+        ];
+        let mid = vec![
+            ChunkCoord { x: 5, y: 0, z: 0 },
+            ChunkCoord { x: 6, y: 0, z: 0 },
+        ];
+        let far = vec![
+            ChunkCoord { x: 9, y: 0, z: 0 },
+            ChunkCoord { x: 10, y: 0, z: 0 },
+        ];
+
+        let desired = DesiredChunks {
+            near,
+            mid,
+            far,
+            ultra: vec![ChunkCoord { x: 13, y: 0, z: 0 }],
+            generation_order: Vec::new(),
+            generation_scores: HashMap::new(),
+            resident_keep: HashSet::new(),
+        };
+
+        let pressure_model = GenerationPressureModel {
+            near_cap: 1,
+            mid_cap: 1,
+            far_cap: 1,
+            ultra_cap: 1,
+            global_cap: 3,
+            near_dispatch_budget: 2,
+            mid_dispatch_budget: 1,
+            far_dispatch_budget: 1,
+        };
+
+        let (prioritized, stats) = cap_desired_generation_order(&desired, player, pressure_model);
+        assert_eq!(prioritized.len(), 3);
+        assert_eq!(stats.near_kept, 1);
+        assert_eq!(stats.mid_kept, 1);
+        assert_eq!(stats.far_kept, 1);
+        assert_eq!(stats.ultra_kept, 0);
+        assert_eq!(stats.near_dropped, 1);
+        assert_eq!(stats.mid_dropped, 1);
+        assert_eq!(stats.far_dropped, 1);
+        assert_eq!(stats.ultra_dropped, 1);
+        assert_eq!(stats.budget_dropped, 4);
+    }
+
+    #[test]
+    fn generation_order_protects_urgent_and_near_before_mid_far_ultra() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let urgent = ChunkCoord { x: 1, y: 0, z: 0 };
+        let near = ChunkCoord { x: 3, y: 0, z: 0 };
+        let desired = DesiredChunks {
+            near: vec![urgent, near],
+            mid: vec![ChunkCoord { x: 6, y: 0, z: 0 }],
+            far: vec![ChunkCoord { x: 9, y: 0, z: 0 }],
+            ultra: vec![ChunkCoord { x: 12, y: 0, z: 0 }],
+            generation_order: Vec::new(),
+            generation_scores: HashMap::new(),
+            resident_keep: HashSet::new(),
+        };
+
+        let pressure_model = GenerationPressureModel {
+            near_cap: 2,
+            mid_cap: 2,
+            far_cap: 2,
+            ultra_cap: 2,
+            global_cap: 2,
+            near_dispatch_budget: 2,
+            mid_dispatch_budget: 1,
+            far_dispatch_budget: 1,
+        };
+
+        let (prioritized, stats) = cap_desired_generation_order(&desired, player, pressure_model);
+        assert_eq!(prioritized, vec![urgent, near]);
+        assert_eq!(stats.uncapped_kept, 1);
+        assert_eq!(stats.near_kept, 2);
+        assert_eq!(stats.mid_dropped, 1);
+        assert_eq!(stats.far_dropped, 1);
+        assert_eq!(stats.ultra_dropped, 1);
+    }
+
+    #[test]
+    fn pressure_model_avoids_mid_far_starvation_when_near_stable() {
+        let tuning = StreamingTuning::default();
+        let pressure = compute_generation_pressure_model(&tuning, 8, 4, 12, 16, 12, 24);
+        assert!(pressure.near_dispatch_budget < 24);
+        assert!(pressure.mid_dispatch_budget > 0);
+        assert!(pressure.far_dispatch_budget > 0);
     }
 }
