@@ -2572,6 +2572,7 @@ impl Renderer {
                 page_index,
                 draw_indirect_index,
                 lod,
+                index_count,
                 dispatch_ms,
                 aabb_min,
                 aabb_max,
@@ -2609,7 +2610,24 @@ impl Renderer {
                     continue;
                 }
 
-                let resolved_index_count = index_count.max(1);
+                if *index_count == 0 {
+                    stats.mesh_artifacts_rejected += 1;
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::Rejected);
+                    Self::record_rebuild_outcome(&mut stats, RebuildOutcome::SkippedZeroGeometry);
+                    self.sampled_outcome_trace(
+                        &result,
+                        RebuildOutcome::SkippedZeroGeometry,
+                        Some(*page_index),
+                        Some(*draw_indirect_index),
+                        Some(*index_count),
+                        Some("ready"),
+                    );
+                    skipped_retry_chunks.push((result.coord, MeshSkipReason::ZeroGeometry));
+                    continue;
+                }
+
+                let resolved_index_count = *index_count;
 
                 let adoption_latency_ms = result.queued_at.elapsed().as_secs_f32() * 1000.0;
 
@@ -3082,15 +3100,21 @@ impl Renderer {
         match ready.status {
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 pending.result.from_pending_finalize = true;
-                pending.result.artifact = ChunkMeshArtifact::GpuReady {
-                    page_index: ready.result.page_index,
-                    draw_indirect_index: ready.result.draw_indirect_index,
-                    lod: ready.result.lod,
-                    index_count: 1,
-                    aabb_min: ready.result.aabb_min,
-                    aabb_max: ready.result.aabb_max,
-                    chunk_origin_world: ready.result.chunk_origin_world,
-                    dispatch_ms: 0.0,
+                pending.result.artifact = if ready.result.index_count == 0 {
+                    ChunkMeshArtifact::Skipped {
+                        reason: MeshSkipReason::ZeroGeometry,
+                    }
+                } else {
+                    ChunkMeshArtifact::GpuReady {
+                        page_index: ready.result.page_index,
+                        draw_indirect_index: ready.result.draw_indirect_index,
+                        lod: ready.result.lod,
+                        index_count: ready.result.index_count,
+                        aabb_min: ready.result.aabb_min,
+                        aabb_max: ready.result.aabb_max,
+                        chunk_origin_world: ready.result.chunk_origin_world,
+                        dispatch_ms: 0.0,
+                    }
                 };
                 self.completed_meshes.push(pending.result);
             }
@@ -5558,5 +5582,54 @@ mod tests {
             0,
             visibility,
         ));
+    }
+
+    #[test]
+    fn gpu_ready_index_count_tracks_authoritative_indirect_args() {
+        let authoritative = DrawIndexedIndirectCommand {
+            index_count: 37,
+            instance_count: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        };
+        let result = MeshResult {
+            coord: coord(),
+            lod: ChunkLod::Near,
+            version: 11,
+            queued_at: Instant::now(),
+            artifact: ChunkMeshArtifact::GpuReady {
+                page_index: GpuPageIndex(2),
+                draw_indirect_index: 2,
+                lod: ChunkLod::Near as u8,
+                index_count: authoritative.index_count,
+                aabb_min: Vec3::ZERO,
+                aabb_max: Vec3::ONE,
+                chunk_origin_world: Vec3::ZERO,
+                dispatch_ms: 0.0,
+            },
+            urgent: false,
+            from_pending_finalize: true,
+        };
+
+        let (index_count, vertex_count) = Renderer::mesh_result_index_vertex_counts(&result);
+        assert_eq!(index_count, authoritative.index_count);
+        assert_eq!(vertex_count, 0);
+    }
+
+    #[test]
+    fn zero_index_gpu_draws_are_not_drawable() {
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(1),
+            draw_indirect_index: 1,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -2.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -1.0),
+            draw_source: DrawSource::GpuArtifact,
+            index_count: Some(0),
+        };
+
+        assert!(!draw_is_drawable(&draw));
     }
 }
