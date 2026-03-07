@@ -4,7 +4,7 @@ use crate::input::{FpsController, InputState};
 use crate::player::{camera_world_pos_from_blocks, grounded_eye_y_blocks};
 use crate::procgen::{apply_generated_chunk, biome_hint_at_world, generate_chunk};
 use crate::renderer::{
-    Camera, LodMeshingBudgets, LodRadii, Renderer, RendererSettings,
+    Camera, LodMeshingBudgets, LodRadii, MeshRebuildStats, Renderer, RendererSettings,
     UnknownNeighborOcclusionPolicy, VOXEL_SIZE,
 };
 use crate::sim_world::Rng;
@@ -44,6 +44,14 @@ const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
 const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
+const MAINTENANCE_TICK_MIN_MS: f32 = 8.0;
+const MAINTENANCE_TICK_MAX_MS: f32 = 48.0;
+const MAINTENANCE_PRESSURE_PENDING_FINALIZE_START: usize = 32;
+const MAINTENANCE_PRESSURE_PENDING_FINALIZE_HIGH: usize = 256;
+const MAINTENANCE_PRESSURE_DISPATCH_QUEUE_START: usize = 24;
+const MAINTENANCE_PRESSURE_DISPATCH_QUEUE_HIGH: usize = 192;
+const MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_START: usize = 12;
+const MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_HIGH: usize = 96;
 const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 const SIM_REGION_RECOMPUTE_CHUNK_DELTA: i32 = 2;
@@ -662,6 +670,73 @@ fn adaptive_remesh_job_budget(
         )
 }
 
+fn normalized_queue_pressure(depth: usize, start: usize, high: usize) -> f32 {
+    if depth <= start {
+        0.0
+    } else {
+        ((depth - start) as f32 / (high.saturating_sub(start).max(1)) as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn adaptive_maintenance_interval_ms(
+    pending_finalize_depth: usize,
+    dispatch_queue_depth: usize,
+    completed_mesh_backlog: usize,
+    last_frame_ms: f32,
+) -> f32 {
+    let pending_finalize_pressure = normalized_queue_pressure(
+        pending_finalize_depth,
+        MAINTENANCE_PRESSURE_PENDING_FINALIZE_START,
+        MAINTENANCE_PRESSURE_PENDING_FINALIZE_HIGH,
+    );
+    let dispatch_pressure = normalized_queue_pressure(
+        dispatch_queue_depth,
+        MAINTENANCE_PRESSURE_DISPATCH_QUEUE_START,
+        MAINTENANCE_PRESSURE_DISPATCH_QUEUE_HIGH,
+    );
+    let completed_backlog_pressure = normalized_queue_pressure(
+        completed_mesh_backlog,
+        MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_START,
+        MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_HIGH,
+    );
+    let work_pressure = pending_finalize_pressure
+        .max(dispatch_pressure)
+        .max(completed_backlog_pressure);
+
+    let base_interval = MAINTENANCE_TICK_MAX_MS
+        - (MAINTENANCE_TICK_MAX_MS - MAINTENANCE_TICK_MIN_MS) * work_pressure;
+    let frame_pressure = (last_frame_ms / FRAME_TIME_TARGET_MS).clamp(0.6, 2.2);
+    let frame_scale = if frame_pressure > 1.0 {
+        1.0 + (frame_pressure - 1.0) * 0.7
+    } else {
+        1.0 - (1.0 - frame_pressure) * 0.2
+    };
+
+    (base_interval * frame_scale).clamp(MAINTENANCE_TICK_MIN_MS, MAINTENANCE_TICK_MAX_MS)
+}
+
+fn should_force_maintenance_tick(
+    pending_finalize_depth: usize,
+    dispatch_queue_depth: usize,
+    completed_mesh_backlog: usize,
+) -> bool {
+    pending_finalize_depth >= MAINTENANCE_PRESSURE_PENDING_FINALIZE_HIGH
+        || dispatch_queue_depth >= MAINTENANCE_PRESSURE_DISPATCH_QUEUE_HIGH
+        || completed_mesh_backlog >= MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_HIGH
+}
+
+fn adaptive_redraw_interval_ms(maintenance_interval_ms: f32, last_frame_ms: f32) -> f32 {
+    let budget_pressure = (last_frame_ms / FRAME_TIME_TARGET_MS).clamp(0.7, 2.4);
+    let budget_scale = if budget_pressure > 1.0 {
+        1.0 + (budget_pressure - 1.0) * 0.45
+    } else {
+        1.0
+    };
+    let blended =
+        FRAME_TIME_TARGET_MS + (maintenance_interval_ms - FRAME_TIME_TARGET_MS).max(0.0) * 0.35;
+    (blended * budget_scale).clamp(FRAME_TIME_TARGET_MS, MAINTENANCE_TICK_MAX_MS)
+}
+
 fn coord_in_frustum(coord: ChunkCoord, frustum_planes: &[Vec4; 6]) -> bool {
     let center = Vec3::new(
         coord.x as f32 + 0.5,
@@ -961,6 +1036,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut spawn_pending = true;
     let mut spawn_pending_reason = SpawnPendingReason::Searching;
     let mut spawn_fallback_cursor: Option<VoxelCoord> = None;
+    let mut last_mesh_stats = MeshRebuildStats::default();
+    let mut next_maintenance_tick_at = Instant::now();
+    let mut next_redraw_at = Instant::now();
 
     let _ = set_cursor(window, false);
 
@@ -2296,48 +2374,74 @@ pub async fn run() -> anyhow::Result<()> {
                                 UnknownNeighborOcclusionPolicy::Aggressive
                             },
                         });
-                        let mesh_upload_budget = adaptive_mesh_upload_budget(
+                        let force_maintenance = should_force_maintenance_tick(
+                            last_mesh_stats.pending_finalize_total,
+                            last_mesh_stats.gpu_dispatch_queue_depth,
+                            last_mesh_stats.meshing_completed_depth,
+                        );
+                        let run_maintenance_tick = force_maintenance || now >= next_maintenance_tick_at;
+                        let mut mesh_upload_budget = ui.profiler.mesh_upload_budget_bytes;
+                        let mesh_stats = if run_maintenance_tick {
+                            mesh_upload_budget = adaptive_mesh_upload_budget(
+                                ui.profiler.frame_ms,
+                                prior_mesh_backlog,
+                            );
+                            let remesh_job_budget = adaptive_remesh_job_budget(
+                                ui.profiler.frame_ms,
+                                prior_dirty_backlog,
+                                prior_meshing_queue_depth,
+                                visible_chunk_count,
+                            );
+                            let current_mesh_stats = renderer.rebuild_dirty_store_chunks(
+                                &mut store,
+                                player_chunk,
+                                &cached_desired.generation_scores,
+                                remesh_job_budget,
+                                mesh_upload_budget,
+                                LodRadii {
+                                    near: effective_stream_tuning.near_radius_xz,
+                                    mid: effective_stream_tuning.mid_radius_xz,
+                                    far: effective_stream_tuning.far_radius_xz,
+                                    ultra: effective_stream_tuning.ultra_radius_xz,
+                                    hysteresis: effective_stream_tuning.lod_hysteresis,
+                                },
+                                LodMeshingBudgets {
+                                    near: effective_stream_tuning.lod_budget_near,
+                                    mid: effective_stream_tuning.lod_budget_mid,
+                                    far: effective_stream_tuning.lod_budget_far,
+                                    ultra: effective_stream_tuning.lod_budget_ultra,
+                                },
+                            );
+                            ui.log_once_per_second("mesh_dispatch_pressure", now_secs, || {
+                                format!(
+                                    "mesh dispatch submitted/budget={}/{} queue={} headroom={:.2} adopt_latency_ms={:.2} dropped_before_drawable={} filtered_drawable={}",
+                                    current_mesh_stats.gpu_dispatch_tasks_submitted,
+                                    current_mesh_stats.gpu_dispatch_task_budget,
+                                    current_mesh_stats.gpu_dispatch_queue_depth,
+                                    current_mesh_stats.gpu_dispatch_headroom,
+                                    current_mesh_stats.gpu_mesh_adoption_latency_ms,
+                                    current_mesh_stats.mesh_dropped_before_drawable,
+                                    current_mesh_stats.mesh_drawable_filtered_under_load,
+                                )
+                            });
+                            last_mesh_stats = current_mesh_stats;
+                            last_mesh_stats
+                        } else {
+                            last_mesh_stats
+                        };
+                        let maintenance_interval_ms = adaptive_maintenance_interval_ms(
+                            mesh_stats.pending_finalize_total,
+                            mesh_stats.gpu_dispatch_queue_depth,
+                            mesh_stats.meshing_completed_depth,
                             ui.profiler.frame_ms,
-                            prior_mesh_backlog,
                         );
-                        let remesh_job_budget = adaptive_remesh_job_budget(
+                        next_maintenance_tick_at = now
+                            + Duration::from_secs_f32((maintenance_interval_ms.max(1.0)) / 1000.0);
+                        let redraw_interval_ms = adaptive_redraw_interval_ms(
+                            maintenance_interval_ms,
                             ui.profiler.frame_ms,
-                            prior_dirty_backlog,
-                            prior_meshing_queue_depth,
-                            visible_chunk_count,
                         );
-                        let mesh_stats = renderer.rebuild_dirty_store_chunks(
-                            &mut store,
-                            player_chunk,
-                            &cached_desired.generation_scores,
-                            remesh_job_budget,
-                            mesh_upload_budget,
-                            LodRadii {
-                                near: effective_stream_tuning.near_radius_xz,
-                                mid: effective_stream_tuning.mid_radius_xz,
-                                far: effective_stream_tuning.far_radius_xz,
-                                ultra: effective_stream_tuning.ultra_radius_xz,
-                                hysteresis: effective_stream_tuning.lod_hysteresis,
-                            },
-                            LodMeshingBudgets {
-                                near: effective_stream_tuning.lod_budget_near,
-                                mid: effective_stream_tuning.lod_budget_mid,
-                                far: effective_stream_tuning.lod_budget_far,
-                                ultra: effective_stream_tuning.lod_budget_ultra,
-                            },
-                        );
-                        ui.log_once_per_second("mesh_dispatch_pressure", now_secs, || {
-                            format!(
-                                "mesh dispatch submitted/budget={}/{} queue={} headroom={:.2} adopt_latency_ms={:.2} dropped_before_drawable={} filtered_drawable={}",
-                                mesh_stats.gpu_dispatch_tasks_submitted,
-                                mesh_stats.gpu_dispatch_task_budget,
-                                mesh_stats.gpu_dispatch_queue_depth,
-                                mesh_stats.gpu_dispatch_headroom,
-                                mesh_stats.gpu_mesh_adoption_latency_ms,
-                                mesh_stats.mesh_dropped_before_drawable,
-                                mesh_stats.mesh_drawable_filtered_under_load,
-                            )
-                        });
+                        next_redraw_at = now + Duration::from_secs_f32((redraw_interval_ms.max(1.0)) / 1000.0);
                         ui.set_mesh_timing(mesh_stats.max_ms);
                         ui.profiler.desired_ms = desired_ms;
                         ui.profiler.streaming_ms = streaming_ms;
@@ -2771,7 +2875,15 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
             Event::AboutToWait => {
-                window.request_redraw();
+                let now = Instant::now();
+                let force_redraw = should_force_maintenance_tick(
+                    last_mesh_stats.pending_finalize_total,
+                    last_mesh_stats.gpu_dispatch_queue_depth,
+                    last_mesh_stats.meshing_completed_depth,
+                );
+                if force_redraw || now >= next_redraw_at {
+                    window.request_redraw();
+                }
             }
             _ => {}
         })
