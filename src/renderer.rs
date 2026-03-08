@@ -589,6 +589,7 @@ pub struct Renderer {
     pub depth_view: wgpu::TextureView,
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
+    chunk_mesh_records: HashMap<ChunkCoord, ChunkMeshRecord>,
     visible_slots: HashMap<u32, ChunkCoord>,
     slot_ownership_generation: HashMap<u32, u64>,
     next_slot_ownership_generation: u64,
@@ -784,6 +785,10 @@ pub struct MeshRebuildStats {
     pub mesh_drawable_filtered_under_load: usize,
     pub mesh_last_good_retained: usize,
     pub mesh_visible_logical_not_drawable: usize,
+    pub continuity_kept_count: usize,
+    pub replacement_commit_fail_count: usize,
+    pub candidate_rejected_but_drawable_preserved_count: usize,
+    pub dropped_to_void_count_by_reason: [usize; 5],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1203,6 +1208,65 @@ struct GpuChunkDraw {
     ownership_generation: u64,
     // Optional debug metadata only; indirect draw args remain authoritative.
     index_count: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChunkCandidate {
+    version: u64,
+    task_id: u64,
+    lod: ChunkLod,
+    pending_finalize: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ChunkMeshRecord {
+    current_drawable: Option<GpuChunkDraw>,
+    candidate: Option<ChunkCandidate>,
+    fallback: Option<GpuChunkDraw>,
+    state: ChunkRenderState,
+    continuity_grace_started_frame: Option<u64>,
+}
+
+impl Default for ChunkMeshRecord {
+    fn default() -> Self {
+        Self {
+            current_drawable: None,
+            candidate: None,
+            fallback: None,
+            state: ChunkRenderState::Idle,
+            continuity_grace_started_frame: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkRenderState {
+    Idle,
+    CandidatePending,
+    CandidateReady,
+    CandidateRejected,
+    CurrentDrawable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum VoidDropReason {
+    ReplacementRejected,
+    FinalizeInvalid,
+    Superseded,
+    GpuSaturated,
+    ExplicitRetirement,
+}
+
+impl VoidDropReason {
+    const fn as_index(self) -> usize {
+        match self {
+            Self::ReplacementRejected => 0,
+            Self::FinalizeInvalid => 1,
+            Self::Superseded => 2,
+            Self::GpuSaturated => 3,
+            Self::ExplicitRetirement => 4,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1886,6 +1950,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             visible_gpu_chunks: HashMap::new(),
+            chunk_mesh_records: HashMap::new(),
             visible_slots: HashMap::new(),
             slot_ownership_generation: HashMap::new(),
             next_slot_ownership_generation: 0,
@@ -2560,6 +2625,7 @@ impl Renderer {
                     pending_lod,
                     result.task_id,
                 );
+                self.stage_candidate(result.coord, result.version, result.task_id, result.lod, true);
                 self.pending_gpu_results.insert(
                     identity,
                     PendingGpuMeshResult {
@@ -2578,6 +2644,7 @@ impl Renderer {
             let desired = chunk_priority_scores.contains_key(&result.coord)
                 || self.visible_gpu_chunks.contains_key(&result.coord);
             let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
+            self.stage_candidate(result.coord, result.version, result.task_id, result.lod, false);
             let pending_replaced = self.invalidate_pending_gpu_entries_for_coord(
                 result.coord,
                 Some(result.version),
@@ -2608,6 +2675,11 @@ impl Renderer {
                 if had_prior_mesh {
                     stats.mesh_last_good_retained += 1;
                     replacement_failed_coords.insert(result.coord);
+                    self.record_candidate_rejected_preserving_current(
+                        result.coord,
+                        &mut stats,
+                        VoidDropReason::ReplacementRejected,
+                    );
                 }
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2628,6 +2700,11 @@ impl Renderer {
                 }
                 if had_prior_mesh {
                     replacement_failed_coords.insert(result.coord);
+                    self.record_candidate_rejected_preserving_current(
+                        result.coord,
+                        &mut stats,
+                        VoidDropReason::ReplacementRejected,
+                    );
                 }
                 stats.stale_drop_retry_enqueued += 1;
                 match retry_policy {
@@ -2807,6 +2884,11 @@ impl Renderer {
                     }
                     if had_prior_mesh {
                         replacement_failed_coords.insert(result.coord);
+                        self.record_candidate_rejected_preserving_current(
+                            result.coord,
+                            &mut stats,
+                            VoidDropReason::GpuSaturated,
+                        );
                     }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2830,6 +2912,11 @@ impl Renderer {
                     stats.mesh_artifacts_rejected += 1;
                     if had_prior_mesh {
                         replacement_failed_coords.insert(result.coord);
+                        self.record_candidate_rejected_preserving_current(
+                            result.coord,
+                            &mut stats,
+                            VoidDropReason::FinalizeInvalid,
+                        );
                     }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2858,7 +2945,7 @@ impl Renderer {
 
                 let slot = *draw_indirect_index;
 
-                let adopted = self.adopt_visible_chunk_draw(
+                let adopted = self.commit_candidate_drawable(
                     result.coord,
                     GpuChunkDraw {
                         page_index: *page_index,
@@ -2871,12 +2958,18 @@ impl Renderer {
                         ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
+                    result.version,
                 );
                 if !adopted {
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_unhandled += 1;
                     if had_prior_mesh {
                         replacement_failed_coords.insert(result.coord);
+                        self.record_candidate_rejected_preserving_current(
+                            result.coord,
+                            &mut stats,
+                            VoidDropReason::ReplacementRejected,
+                        );
                     }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2884,7 +2977,6 @@ impl Renderer {
                     continue;
                 }
 
-                self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Drawable);
                 self.mesh_retry_state.remove(&result.coord);
@@ -2977,7 +3069,7 @@ impl Renderer {
                     bytemuck::bytes_of(&draw_command),
                 );
 
-                let adopted = self.adopt_visible_chunk_draw(
+                let adopted = self.commit_candidate_drawable(
                     result.coord,
                     GpuChunkDraw {
                         page_index: GpuPageIndex(slot),
@@ -2990,6 +3082,7 @@ impl Renderer {
                         ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
+                    result.version,
                 );
                 if !adopted {
                     self.free_mesh_slots.push(slot);
@@ -2997,6 +3090,12 @@ impl Renderer {
                     stats.mesh_reject_unhandled += 1;
                     if had_prior_mesh {
                         replacement_failed_coords.insert(result.coord);
+                        stats.replacement_commit_fail_count += 1;
+                        self.record_candidate_rejected_preserving_current(
+                            result.coord,
+                            &mut stats,
+                            VoidDropReason::ReplacementRejected,
+                        );
                     }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -3004,7 +3103,6 @@ impl Renderer {
                     continue;
                 }
 
-                self.mesh_versions.insert(result.coord, result.version);
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Drawable);
                 self.mesh_retry_state.remove(&result.coord);
@@ -3039,6 +3137,11 @@ impl Renderer {
             if had_prior_mesh {
                 stats.mesh_last_good_retained += 1;
                 replacement_failed_coords.insert(result.coord);
+                self.record_candidate_rejected_preserving_current(
+                    result.coord,
+                    &mut stats,
+                    VoidDropReason::ReplacementRejected,
+                );
             }
             self.mesh_lifecycle
                 .insert(result.coord, MeshLifecycleState::Rejected);
@@ -3350,6 +3453,80 @@ impl Renderer {
 }
 
 impl Renderer {
+    fn mesh_record_mut(&mut self, coord: ChunkCoord) -> &mut ChunkMeshRecord {
+        self.chunk_mesh_records.entry(coord).or_default()
+    }
+
+    fn stage_candidate(&mut self, coord: ChunkCoord, version: u64, task_id: u64, lod: ChunkLod, pending: bool) {
+        if !cfg!(feature = "continuity_firewall") {
+            return;
+        }
+        let frame = self.mesh_rebuild_frame_index;
+        let record = self.mesh_record_mut(coord);
+        record.candidate = Some(ChunkCandidate { version, task_id, lod, pending_finalize: pending });
+        record.state = if pending {
+            ChunkRenderState::CandidatePending
+        } else {
+            ChunkRenderState::CandidateReady
+        };
+        if record.continuity_grace_started_frame.is_none() {
+            record.continuity_grace_started_frame = Some(frame);
+        }
+    }
+
+    fn commit_candidate_drawable(
+        &mut self,
+        coord: ChunkCoord,
+        draw: GpuChunkDraw,
+        committed_version: u64,
+    ) -> bool {
+        let adopted = self.adopt_visible_chunk_draw(coord, draw);
+        if cfg!(feature = "continuity_firewall") {
+            let visible = self.visible_gpu_chunks.get(&coord).copied();
+            let record = self.mesh_record_mut(coord);
+            if adopted {
+                record.current_drawable = visible;
+                record.candidate = None;
+                record.state = ChunkRenderState::CurrentDrawable;
+                record.continuity_grace_started_frame = None;
+            }
+        }
+        if adopted {
+            self.mesh_versions.insert(coord, committed_version);
+        }
+        adopted
+    }
+
+    fn record_candidate_rejected_preserving_current(
+        &mut self,
+        coord: ChunkCoord,
+        stats: &mut MeshRebuildStats,
+        reason: VoidDropReason,
+    ) {
+        if !cfg!(feature = "continuity_firewall") {
+            return;
+        }
+        let has_current = self
+            .chunk_mesh_records
+            .get(&coord)
+            .and_then(|r| r.current_drawable)
+            .is_some()
+            || self.visible_gpu_chunks.contains_key(&coord);
+        if has_current {
+            stats.continuity_kept_count += 1;
+            stats.candidate_rejected_but_drawable_preserved_count += 1;
+        } else {
+            stats.dropped_to_void_count_by_reason[reason.as_index()] += 1;
+        }
+        let record = self.mesh_record_mut(coord);
+        record.candidate = None;
+        if record.current_drawable.is_some() {
+            record.state = ChunkRenderState::CurrentDrawable;
+        } else {
+            record.state = ChunkRenderState::CandidateRejected;
+        }
+    }
+
     #[cfg(feature = "gpu-compute")]
     fn finalize_pending_gpu_result(
         &mut self,
@@ -3461,6 +3638,10 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
+                if cfg!(feature = "continuity_firewall") {
+                    let record = self.mesh_record_mut(ready.result.coord);
+                    record.state = ChunkRenderState::CandidatePending;
+                }
                 self.pending_gpu_results.insert(key, pending);
                 None
             }
@@ -3480,10 +3661,23 @@ impl Renderer {
                     chunk_origin_world: ready.result.chunk_origin_world,
                     dispatch_ms: 0.0,
                 };
+                if cfg!(feature = "continuity_firewall") {
+                    let record = self.mesh_record_mut(ready.result.coord);
+                    record.state = ChunkRenderState::CandidateReady;
+                }
                 self.completed_meshes.push(pending.result);
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
+                if cfg!(feature = "continuity_firewall") {
+                    let record = self.mesh_record_mut(ready.result.coord);
+                    record.candidate = None;
+                    if record.current_drawable.is_some() {
+                        record.state = ChunkRenderState::CurrentDrawable;
+                    } else {
+                        record.state = ChunkRenderState::CandidateRejected;
+                    }
+                }
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3491,6 +3685,15 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
+                if cfg!(feature = "continuity_firewall") {
+                    let record = self.mesh_record_mut(ready.result.coord);
+                    record.candidate = None;
+                    if record.current_drawable.is_some() {
+                        record.state = ChunkRenderState::CurrentDrawable;
+                    } else {
+                        record.state = ChunkRenderState::CandidateRejected;
+                    }
+                }
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3501,6 +3704,15 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
+                if cfg!(feature = "continuity_firewall") {
+                    let record = self.mesh_record_mut(ready.result.coord);
+                    record.candidate = None;
+                    if record.current_drawable.is_some() {
+                        record.state = ChunkRenderState::CurrentDrawable;
+                    } else {
+                        record.state = ChunkRenderState::CandidateRejected;
+                    }
+                }
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3546,6 +3758,14 @@ impl Renderer {
         });
         #[cfg(feature = "gpu-compute")]
         invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
+        if cfg!(feature = "continuity_firewall") {
+            if let Some(record) = self.chunk_mesh_records.get_mut(&coord) {
+                record.candidate = None;
+                if record.current_drawable.is_some() {
+                    record.state = ChunkRenderState::CurrentDrawable;
+                }
+            }
+        }
         dropped
     }
 
@@ -3569,6 +3789,12 @@ impl Renderer {
             }
             self.mesh_lifecycle
                 .insert(coord, MeshLifecycleState::Evicted);
+            if cfg!(feature = "continuity_firewall") {
+                let record = self.mesh_record_mut(coord);
+                record.current_drawable = None;
+                record.candidate = None;
+                record.state = ChunkRenderState::Idle;
+            }
             self.terminal_evicted_total += 1;
         }
     }
@@ -3661,6 +3887,10 @@ impl Renderer {
 
         // Release coord's previous slot mapping after commit.
         if let Some(previous_draw) = replaced_draw {
+            if cfg!(feature = "continuity_firewall") {
+                let record = self.mesh_record_mut(coord);
+                record.fallback = Some(previous_draw);
+            }
             let previous_slot = previous_draw.draw_indirect_index;
             if previous_slot != target_slot {
                 if self.visible_slots.get(&previous_slot) == Some(&coord) {
@@ -6043,6 +6273,7 @@ mod tests {
                 &lod_selection,
                 &HashSet::new(),
                 &HashMap::new(),
+                &HashMap::new(),
                 0,
                 visibility,
             ));
@@ -6091,6 +6322,7 @@ mod tests {
             &lod_selection,
             &pending_lod_remesh,
             &pending_lod_remesh_since,
+            &HashMap::new(),
             16,
             visibility,
         ));
@@ -6140,6 +6372,7 @@ mod tests {
                 &pending_lod_remesh_since,
                 10 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
                 true,
+                &HashMap::new(),
                 visibility,
             ),
             DrawContractDecision::ContinuityFallback
@@ -6190,6 +6423,7 @@ mod tests {
                 &pending_lod_remesh_since,
                 2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
                 true,
+                &HashMap::new(),
                 visibility,
             ),
             DrawContractDecision::Filtered
@@ -6240,6 +6474,7 @@ mod tests {
                 &pending_lod_remesh_since,
                 2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
                 true,
+                &HashMap::new(),
                 visibility,
             ),
             DrawContractDecision::ContinuityFallback
@@ -6290,6 +6525,7 @@ mod tests {
                 &pending_lod_remesh_since,
                 4 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
                 false,
+                &HashMap::new(),
                 visibility,
             ),
             DrawContractDecision::Filtered
@@ -6304,6 +6540,7 @@ mod tests {
                 &pending_lod_remesh_since,
                 4 + DRAW_CONTINUITY_MAX_FRAMES + 1,
                 true,
+                &HashMap::new(),
                 visibility,
             ),
             DrawContractDecision::Filtered
@@ -6580,6 +6817,7 @@ mod tests {
             &lod_selection,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             0,
             visibility,
         ));
@@ -6591,6 +6829,7 @@ mod tests {
             &visible_slots,
             &lod_selection,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             0,
             visibility,
@@ -6629,6 +6868,128 @@ mod tests {
         let (index_count, vertex_count) = Renderer::mesh_result_index_vertex_counts(&result);
         assert_eq!(index_count, authoritative.index_count);
         assert_eq!(vertex_count, 0);
+    }
+
+    #[test]
+    fn replacement_failure_keeps_old_mesh_visible() {
+        let coord = ChunkCoord { x: 3, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(1, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Mid);
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(1),
+            draw_indirect_index: 1,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
+            draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
+            index_count: Some(12),
+        };
+        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+        assert!(chunk_passes_draw_contract(
+            coord,
+            &draw,
+            &visible_slots,
+            &lod_selection,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            42,
+            visibility,
+        ));
+    }
+
+    #[test]
+    fn superseded_candidate_does_not_blank_chunk() {
+        let coord = ChunkCoord { x: 6, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(2, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Far);
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(2),
+            draw_indirect_index: 2,
+            lod: ChunkLod::Far as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -20.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -18.0),
+            draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
+            index_count: Some(24),
+        };
+        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+        assert!(!matches!(
+            chunk_draw_contract_decision(
+                coord,
+                &draw,
+                &visible_slots,
+                &lod_selection,
+                &HashSet::new(),
+                &HashMap::new(),
+                100,
+                false,
+                &HashMap::new(),
+                visibility,
+            ),
+            DrawContractDecision::Filtered
+        ));
+    }
+
+    #[test]
+    fn pending_finalize_does_not_revoke_current_drawable() {
+        let coord = ChunkCoord { x: 8, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(3, coord);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Mid);
+        let mut pending = HashSet::new();
+        pending.insert(coord);
+        let mut pending_since = HashMap::new();
+        pending_since.insert(coord, 5);
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(3),
+            draw_indirect_index: 3,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
+            draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
+            index_count: Some(24),
+        };
+        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+        assert!(chunk_passes_draw_contract(
+            coord,
+            &draw,
+            &visible_slots,
+            &lod_selection,
+            &pending,
+            &pending_since,
+            &HashMap::new(),
+            6,
+            visibility,
+        ));
     }
 
     #[test]
