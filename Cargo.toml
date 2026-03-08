@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["gpu-compute", "gpu_meshing_experimental"]
+default = ["gpu-compute"]
 procgen-profile = []
 gpu-compute = []
+# Legacy compatibility switch for migration/testing only; not a production architecture path.
 legacy-world-sim = []
+# Debug-only meshing fallback instrumentation.
 cpu_meshing_debug = []
+# Experimental candidate pipeline toggle. Renderer-visible residency authority remains in
+# renderer continuity policy regardless of this flag.
 gpu_meshing_experimental = []
+# Legacy artifact upload path retained for compatibility/debugging only.
 legacy_gpu_artifact_upload = []
 
 [dependencies]
