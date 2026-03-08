@@ -224,7 +224,7 @@ impl SimWorld {
 
         let mut candidates = self.prioritized_chunks(center);
         let mut stats = SimulationStepStats::default();
-        let mut voxel_budget = if metadata.max_voxels_to_process == 0 {
+        let voxel_budget = if metadata.max_voxels_to_process == 0 {
             usize::MAX
         } else {
             metadata.max_voxels_to_process

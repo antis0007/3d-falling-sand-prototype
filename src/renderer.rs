@@ -3465,12 +3465,16 @@ impl Renderer {
                 None
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
+                let index_count = ready
+                    .result
+                    .index_count
+                    .expect("ReadyAndValid finalize events must include an index count");
                 pending.result.from_pending_finalize = true;
                 pending.result.artifact = ChunkMeshArtifact::GpuReady {
                     page_index: ready.result.page_index,
                     draw_indirect_index: ready.result.draw_indirect_index,
                     lod: ready.result.lod,
-                    index_count: ready.result.index_count,
+                    index_count,
                     aabb_min: ready.result.aabb_min,
                     aabb_max: ready.result.aabb_max,
                     chunk_origin_world: ready.result.chunk_origin_world,
