@@ -3460,6 +3460,10 @@ impl Renderer {
         }
 
         match ready.status {
+            ReadyGpuMeshFinalizeStatus::NotReadyYet => {
+                self.pending_gpu_results.insert(key, pending);
+                None
+            }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 pending.result.from_pending_finalize = true;
                 pending.result.artifact = ChunkMeshArtifact::GpuReady {

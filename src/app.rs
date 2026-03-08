@@ -52,6 +52,10 @@ const MAINTENANCE_PRESSURE_DISPATCH_QUEUE_START: usize = 24;
 const MAINTENANCE_PRESSURE_DISPATCH_QUEUE_HIGH: usize = 192;
 const MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_START: usize = 12;
 const MAINTENANCE_PRESSURE_COMPLETED_BACKLOG_HIGH: usize = 96;
+const FINALIZE_BACKPRESSURE_PENDING_START: usize = 96;
+const FINALIZE_BACKPRESSURE_PENDING_HIGH: usize = 320;
+const FINALIZE_BACKPRESSURE_PROMOTION_LOW_WATERMARK: usize = 2;
+const FINALIZE_BACKPRESSURE_LOW_PROGRESS_STREAK_MAX: u32 = 180;
 const FIXED_SIM_STEP_SECONDS: f32 = 1.0 / 60.0;
 const SIMULATION_RADIUS_CHUNKS: i32 = 1; // 3x3x3 = 27 chunks max
 const SIM_REGION_RECOMPUTE_CHUNK_DELTA: i32 = 2;
@@ -670,6 +674,71 @@ fn adaptive_remesh_job_budget(
         )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MaintenanceThrottleState {
+    active: bool,
+    severity: f32,
+    remesh_scale: f32,
+    upload_scale: f32,
+    interval_scale: f32,
+    reason: &'static str,
+}
+
+impl Default for MaintenanceThrottleState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            severity: 0.0,
+            remesh_scale: 1.0,
+            upload_scale: 1.0,
+            interval_scale: 1.0,
+            reason: "normal",
+        }
+    }
+}
+
+fn compute_maintenance_throttle_state(
+    pending_finalize_depth: usize,
+    promoted_to_drawable: usize,
+    low_progress_streak: u32,
+) -> MaintenanceThrottleState {
+    let pending_pressure = normalized_queue_pressure(
+        pending_finalize_depth,
+        FINALIZE_BACKPRESSURE_PENDING_START,
+        FINALIZE_BACKPRESSURE_PENDING_HIGH,
+    );
+    if pending_pressure <= 0.0 {
+        return MaintenanceThrottleState::default();
+    }
+
+    let promotion_ratio = promoted_to_drawable as f32 / pending_finalize_depth.max(1) as f32;
+    let streak_ratio = (low_progress_streak as f32
+        / FINALIZE_BACKPRESSURE_LOW_PROGRESS_STREAK_MAX as f32)
+        .clamp(0.0, 1.0);
+    let promotion_pressure = if promoted_to_drawable
+        <= FINALIZE_BACKPRESSURE_PROMOTION_LOW_WATERMARK
+        || promotion_ratio <= 0.015
+    {
+        1.0
+    } else {
+        (1.0 - (promotion_ratio / 0.06)).clamp(0.0, 1.0)
+    };
+    let severity =
+        (pending_pressure * (0.45 + 0.55 * streak_ratio) * promotion_pressure).clamp(0.0, 1.0);
+    if severity <= 0.0 {
+        return MaintenanceThrottleState::default();
+    }
+
+    MaintenanceThrottleState {
+        active: true,
+        severity,
+        remesh_scale: (1.0 - 0.65 * severity).clamp(0.35, 1.0),
+        upload_scale: (1.0 - 0.45 * severity).clamp(0.55, 1.0),
+        interval_scale: (1.0 + 0.35 * severity).clamp(1.0, 1.35),
+        reason: "pending_finalize_high_and_promotions_low",
+    }
+}
+
 fn normalized_queue_pressure(depth: usize, start: usize, high: usize) -> f32 {
     if depth <= start {
         0.0
@@ -683,6 +752,7 @@ fn adaptive_maintenance_interval_ms(
     dispatch_queue_depth: usize,
     completed_mesh_backlog: usize,
     last_frame_ms: f32,
+    interval_scale: f32,
 ) -> f32 {
     let pending_finalize_pressure = normalized_queue_pressure(
         pending_finalize_depth,
@@ -712,7 +782,8 @@ fn adaptive_maintenance_interval_ms(
         1.0 - (1.0 - frame_pressure) * 0.2
     };
 
-    (base_interval * frame_scale).clamp(MAINTENANCE_TICK_MIN_MS, MAINTENANCE_TICK_MAX_MS)
+    (base_interval * frame_scale * interval_scale.max(1.0))
+        .clamp(MAINTENANCE_TICK_MIN_MS, MAINTENANCE_TICK_MAX_MS)
 }
 
 fn should_force_maintenance_tick(
@@ -1039,6 +1110,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last_mesh_stats = MeshRebuildStats::default();
     let mut next_maintenance_tick_at = Instant::now();
     let mut next_redraw_at = Instant::now();
+    let mut finalize_low_progress_streak = 0u32;
+    let mut maintenance_throttle_state = MaintenanceThrottleState::default();
+    let mut startup_burst_budget_frames = 180u32;
 
     let _ = set_cursor(window, false);
 
@@ -2374,24 +2448,55 @@ pub async fn run() -> anyhow::Result<()> {
                                 UnknownNeighborOcclusionPolicy::Aggressive
                             },
                         });
+                        if last_mesh_stats.pending_finalize_total >= FINALIZE_BACKPRESSURE_PENDING_START
+                            && last_mesh_stats.mesh_pending_promoted_to_drawable <= FINALIZE_BACKPRESSURE_PROMOTION_LOW_WATERMARK
+                        {
+                            finalize_low_progress_streak = finalize_low_progress_streak
+                                .saturating_add(1)
+                                .min(FINALIZE_BACKPRESSURE_LOW_PROGRESS_STREAK_MAX);
+                        } else {
+                            finalize_low_progress_streak = finalize_low_progress_streak.saturating_sub(1);
+                        }
+                        maintenance_throttle_state = compute_maintenance_throttle_state(
+                            last_mesh_stats.pending_finalize_total,
+                            last_mesh_stats.mesh_pending_promoted_to_drawable,
+                            finalize_low_progress_streak,
+                        );
+
                         let force_maintenance = should_force_maintenance_tick(
                             last_mesh_stats.pending_finalize_total,
                             last_mesh_stats.gpu_dispatch_queue_depth,
                             last_mesh_stats.meshing_completed_depth,
                         );
-                        let run_maintenance_tick = force_maintenance || now >= next_maintenance_tick_at;
+                        let startup_burst_active = startup_burst_budget_frames > 0
+                            && ui.profiler.frame_ms > FRAME_TIME_TARGET_MS * 1.2
+                            && last_mesh_stats.pending_finalize_total > MAINTENANCE_PRESSURE_PENDING_FINALIZE_START;
+                        let maintenance_deadline = now >= next_maintenance_tick_at;
+                        let run_maintenance_tick = force_maintenance
+                            || maintenance_deadline
+                            || startup_burst_active;
                         let mut mesh_upload_budget = ui.profiler.mesh_upload_budget_bytes;
                         let mesh_stats = if run_maintenance_tick {
-                            mesh_upload_budget = adaptive_mesh_upload_budget(
+                            let base_upload_budget = adaptive_mesh_upload_budget(
                                 ui.profiler.frame_ms,
                                 prior_mesh_backlog,
                             );
-                            let remesh_job_budget = adaptive_remesh_job_budget(
+                            mesh_upload_budget = ((base_upload_budget as f32)
+                                * maintenance_throttle_state.upload_scale)
+                                as usize;
+                            mesh_upload_budget = mesh_upload_budget
+                                .clamp(MESH_UPLOAD_BYTES_MIN_PER_FRAME, MESH_UPLOAD_BYTES_MAX_PER_FRAME);
+                            let base_remesh_job_budget = adaptive_remesh_job_budget(
                                 ui.profiler.frame_ms,
                                 prior_dirty_backlog,
                                 prior_meshing_queue_depth,
                                 visible_chunk_count,
                             );
+                            let remesh_job_budget = ((base_remesh_job_budget as f32)
+                                * maintenance_throttle_state.remesh_scale)
+                                as usize;
+                            let remesh_job_budget = remesh_job_budget
+                                .clamp(REMESH_JOB_BUDGET_PER_FRAME_MIN, REMESH_JOB_BUDGET_PER_FRAME_MAX);
                             let current_mesh_stats = renderer.rebuild_dirty_store_chunks(
                                 &mut store,
                                 player_chunk,
@@ -2424,6 +2529,29 @@ pub async fn run() -> anyhow::Result<()> {
                                     current_mesh_stats.mesh_drawable_filtered_under_load,
                                 )
                             });
+                            let zero_waiting = current_mesh_stats.outcome_skipped_zero_geometry
+                                .saturating_sub(current_mesh_stats.outcome_skipped_startup_zero_geometry);
+                            let ownership_invalidations = current_mesh_stats.mesh_pending_superseded
+                                + current_mesh_stats.mesh_pending_rejected
+                                + current_mesh_stats.mesh_reject_invalid_page;
+                            ui.log_once_per_second("mesh_finalize_telemetry", now_secs, || {
+                                format!(
+                                    "pending_finalize={} ready/promoted={}/{} ownership_invalidations={} zero_confirmed/meta_waiting={}/{} resident_visible_gpu={} throttle_active={} severity={:.2} remesh_scale={:.2} upload_scale={:.2} low_progress_streak={} reason={}",
+                                    current_mesh_stats.pending_finalize_total,
+                                    current_mesh_stats.mesh_pending_total,
+                                    current_mesh_stats.mesh_pending_promoted_to_drawable,
+                                    ownership_invalidations,
+                                    current_mesh_stats.outcome_skipped_startup_zero_geometry,
+                                    zero_waiting,
+                                    current_mesh_stats.gpu_mesh_visible_count,
+                                    maintenance_throttle_state.active,
+                                    maintenance_throttle_state.severity,
+                                    maintenance_throttle_state.remesh_scale,
+                                    maintenance_throttle_state.upload_scale,
+                                    finalize_low_progress_streak,
+                                    maintenance_throttle_state.reason,
+                                )
+                            });
                             last_mesh_stats = current_mesh_stats;
                             last_mesh_stats
                         } else {
@@ -2434,6 +2562,7 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.gpu_dispatch_queue_depth,
                             mesh_stats.meshing_completed_depth,
                             ui.profiler.frame_ms,
+                            maintenance_throttle_state.interval_scale,
                         );
                         next_maintenance_tick_at = now
                             + Duration::from_secs_f32((maintenance_interval_ms.max(1.0)) / 1000.0);
@@ -2442,6 +2571,9 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.profiler.frame_ms,
                         );
                         next_redraw_at = now + Duration::from_secs_f32((redraw_interval_ms.max(1.0)) / 1000.0);
+                        if startup_burst_budget_frames > 0 {
+                            startup_burst_budget_frames -= 1;
+                        }
                         ui.set_mesh_timing(mesh_stats.max_ms);
                         ui.profiler.desired_ms = desired_ms;
                         ui.profiler.streaming_ms = streaming_ms;
