@@ -12,6 +12,8 @@ const DEPTH_PENALTY_START_DELTA_Y: i32 = 3;
 const DEPTH_PENALTY_PER_CHUNK: f32 = 0.075;
 const ABOVE_PLAYER_RING_BOOST: f32 = 0.12;
 const HORIZONTAL_NEIGHBOR_SCHEDULE_FLOOR: usize = 4;
+const FAR_GENERATION_BUDGET_MULTIPLIER: usize = 4;
+const ULTRA_GENERATION_BUDGET_DIVISOR: usize = 2;
 
 pub fn is_urgent_chunk(player_chunk: ChunkCoord, coord: ChunkCoord) -> bool {
     let chebyshev = (coord.x - player_chunk.x)
@@ -302,6 +304,7 @@ impl ChunkStreaming {
 
         let near_set: HashSet<_> = near.iter().copied().collect();
         let mid_set: HashSet<_> = mid.iter().copied().collect();
+        let far_set: HashSet<_> = far.iter().copied().collect();
         for coord in near
             .iter()
             .copied()
@@ -414,16 +417,30 @@ impl ChunkStreaming {
             weighted_order.push(coord);
         }
 
-        // Keep urgent/near chunks at the front while preserving weighted order within each class.
-        let mut generation_order = Vec::with_capacity(weighted_order.len());
+        // Keep urgent/near chunks at the front while limiting far-ring breadth so distant rings
+        // cannot dominate backlog. Preserve weighted order within each class.
+        let near_mid_span = near.len() + mid.len();
+        let far_budget = near_mid_span.saturating_mul(FAR_GENERATION_BUDGET_MULTIPLIER);
+        let ultra_budget = far_budget / ULTRA_GENERATION_BUDGET_DIVISOR;
+
+        let mut generation_order = Vec::with_capacity(
+            near.len() + mid.len() + far.len().min(far_budget) + ultra.len().min(ultra_budget),
+        );
+        let mut far_kept = 0usize;
+        let mut ultra_kept = 0usize;
         for &coord in &weighted_order {
             if near_set.contains(&coord) || is_urgent_chunk(player_chunk, coord) {
                 generation_order.push(coord);
-            }
-        }
-        for coord in weighted_order {
-            if !near_set.contains(&coord) && !is_urgent_chunk(player_chunk, coord) {
+            } else if mid_set.contains(&coord) {
                 generation_order.push(coord);
+            } else if far_set.contains(&coord) {
+                if far_kept < far_budget {
+                    generation_order.push(coord);
+                    far_kept += 1;
+                }
+            } else if ultra_kept < ultra_budget {
+                generation_order.push(coord);
+                ultra_kept += 1;
             }
         }
 
@@ -436,7 +453,7 @@ impl ChunkStreaming {
 
         let mut mid_kept = 0usize;
         let mut far_kept = 0usize;
-        for &coord in &generation_order {
+        for &coord in &weighted_order {
             if resident_keep.contains(&coord) {
                 continue;
             }
@@ -1016,7 +1033,10 @@ mod tests {
     use crate::types::ChunkCoord;
 
     use super::Residency;
-    use super::{is_urgent_chunk, ChunkStreaming, GenerateJobClass};
+    use super::{
+        is_urgent_chunk, ChunkStreaming, GenerateJobClass, FAR_GENERATION_BUDGET_MULTIPLIER,
+        FAR_RING_UPWARD_BIAS_BUDGET, ULTRA_GENERATION_BUDGET_DIVISOR,
+    };
 
     #[test]
     fn scheduling_budget_limits_queued_chunks_not_scan_count() {
@@ -1457,6 +1477,95 @@ mod tests {
 
         assert!(mid_front_idx < mid_rear_idx);
         assert!(far_front_idx < far_rear_idx);
+    }
+
+    #[test]
+    fn desired_set_size_matches_radii_and_vertical_span() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let near_radius = 1;
+        let mid_radius = 2;
+        let far_radius = Some(3);
+        let ultra_radius = Some(4);
+        let vertical_radius = 2;
+
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            None,
+            near_radius,
+            mid_radius,
+            far_radius,
+            ultra_radius,
+            vertical_radius,
+            128,
+            128,
+            &HashMap::new(),
+            0,
+        );
+
+        let near_height = (vertical_radius * 2 + 1) as usize;
+        let mid_height = (vertical_radius * 2 + 1 + super::MID_RING_UPWARD_BIAS_BUDGET) as usize;
+        let far_height = (vertical_radius * 2 + 1 + FAR_RING_UPWARD_BIAS_BUDGET) as usize;
+
+        assert_eq!(desired.near.len(), 5 * near_height);
+        assert_eq!(desired.mid.len(), (13 - 5) * mid_height);
+        assert_eq!(desired.far.len(), (29 - 13) * far_height);
+        assert_eq!(desired.ultra.len(), (49 - 29) * far_height);
+    }
+
+    #[test]
+    fn generation_order_caps_far_and_ultra_breadth_after_near_mid() {
+        let player = ChunkCoord { x: 0, y: 0, z: 0 };
+        let desired = ChunkStreaming::desired_set(
+            player,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            None,
+            1,
+            3,
+            Some(10),
+            Some(18),
+            1,
+            128,
+            128,
+            &HashMap::new(),
+            0,
+        );
+
+        let near_mid = desired.near.len() + desired.mid.len();
+        let allowed_far = near_mid * FAR_GENERATION_BUDGET_MULTIPLIER;
+        let allowed_ultra = allowed_far / ULTRA_GENERATION_BUDGET_DIVISOR;
+
+        assert!(desired.generation_order.len() <= near_mid + allowed_far + allowed_ultra);
+        let front_window = near_mid.min(128);
+        let near_mid_in_front_window = desired
+            .generation_order
+            .iter()
+            .take(front_window)
+            .filter(|coord| desired.near.contains(coord) || desired.mid.contains(coord))
+            .count();
+        assert!(near_mid_in_front_window * 2 >= front_window);
+    }
+
+    #[test]
+    fn reprioritize_queue_reacts_to_player_movement() {
+        let mut streaming = ChunkStreaming::new(1);
+        let west = ChunkCoord { x: -6, y: 0, z: 0 };
+        let east = ChunkCoord { x: 6, y: 0, z: 0 };
+
+        streaming.defer_generation_dispatch(west, GenerateJobClass::Far);
+        streaming.defer_generation_dispatch(east, GenerateJobClass::Far);
+
+        let mut scores = HashMap::new();
+        scores.insert(west, 0.5);
+        scores.insert(east, 0.5);
+
+        streaming.reprioritize_generate_queue(ChunkCoord { x: -5, y: 0, z: 0 }, &scores);
+        assert_eq!(streaming.pending_generate.front().copied(), Some(west));
+
+        streaming.reprioritize_generate_queue(ChunkCoord { x: 5, y: 0, z: 0 }, &scores);
+        assert_eq!(streaming.pending_generate.front().copied(), Some(east));
     }
 
     #[test]
