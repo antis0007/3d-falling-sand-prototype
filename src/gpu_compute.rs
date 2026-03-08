@@ -426,7 +426,9 @@ impl ChunkPageAtlas {
             }
 
             let evict_slot = self.evictable_mesh_slot(slot_capacity)?;
-            self.evict_mesh_slot(evict_slot);
+            if !self.evict_mesh_slot(evict_slot) {
+                return None;
+            }
 
             if self.next_mesh_slot >= slot_capacity {
                 slot = evict_slot;
@@ -495,7 +497,7 @@ impl ChunkPageAtlas {
             .unwrap_or_default()
     }
 
-    fn evict_mesh_slot(&mut self, slot: u32) {
+    fn evict_mesh_slot(&mut self, slot: u32) -> bool {
         if let Some(chunk) = self.chunk_for_mesh_slot.get(&slot).copied() {
             match self.mesh_slot_protection_hint(slot) {
                 PagePriorityHint::Far => {
@@ -509,7 +511,10 @@ impl ChunkPageAtlas {
                 }
             }
             self.release_chunk_mesh_allocation(chunk);
+            return true;
         }
+
+        false
     }
 
     fn touch_mesh_slot(&mut self, slot: u32) {
@@ -530,7 +535,10 @@ impl ChunkPageAtlas {
 
     fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
         let mut selected: Option<((u8, u8, u64), u32)> = None;
-        for slot in 0..slot_capacity {
+        for (&slot, _) in &self.chunk_for_mesh_slot {
+            if slot >= slot_capacity {
+                continue;
+            }
             let protection_rank = self.mesh_slot_protection_hint(slot).eviction_rank();
             let fence_rank = if self.is_mesh_slot_fence_safe(slot) {
                 0
