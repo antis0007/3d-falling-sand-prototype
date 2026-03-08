@@ -805,6 +805,12 @@ pub struct MeshDrawStats {
     pub chunks_drawn: usize,
     pub continuity_fallback_drawn: usize,
     pub contract_filtered: usize,
+    pub draw_source_fresh_count: usize,
+    pub draw_source_stale_count: usize,
+    pub draw_source_fallback_count: usize,
+    pub draw_source_void_count: usize,
+    pub stale_draw_keepalive_count: usize,
+    pub continuity_void_prevented_count: usize,
     pub total_indices: u64,
     pub drawn_gpu_artifact_chunks: usize,
     pub drawn_gpu_artifact_indices: u64,
@@ -2027,53 +2033,25 @@ impl Renderer {
         self.origin_voxel = new_origin;
     }
 
-    fn should_render_draw(
+    fn choose_drawable_for_chunk(
         &self,
         coord: ChunkCoord,
-        draw: &GpuChunkDraw,
         visibility: DrawVisibilityInput,
-    ) -> bool {
-        !matches!(
-            chunk_draw_contract_decision(
-                coord,
-                draw,
-                &self.visible_slots,
-                &self.lod_selection,
-                &self.pending_lod_remesh,
-                &self.pending_lod_remesh_since,
-                self.mesh_rebuild_frame_index,
-                self.chunk_has_pending_replacement(coord),
-                &self.slot_ownership_generation,
-                visibility,
-            ),
-            DrawContractDecision::Filtered
-        )
-    }
-
-    fn chunk_has_pending_replacement(&self, coord: ChunkCoord) -> bool {
-        self.inflight_mesh_chunks.contains(&coord)
-            || self
-                .pending_gpu_results
-                .keys()
-                .any(|pending_identity| pending_identity.coord == coord)
-    }
-
-    fn draw_contract_decision_for_chunk(
-        &self,
-        coord: ChunkCoord,
-        draw: &GpuChunkDraw,
-        visibility: DrawVisibilityInput,
-    ) -> DrawContractDecision {
-        chunk_draw_contract_decision(
+    ) -> Option<ChosenDrawable> {
+        let committed = self.visible_gpu_chunks.get(&coord);
+        let fallback = self
+            .chunk_mesh_records
+            .get(&coord)
+            .and_then(|record| record.fallback.as_ref());
+        choose_drawable_for_chunk(
             coord,
-            draw,
+            committed,
+            fallback,
             &self.visible_slots,
             &self.lod_selection,
-            &self.pending_lod_remesh,
             &self.pending_lod_remesh_since,
-            self.mesh_rebuild_frame_index,
-            self.chunk_has_pending_replacement(coord),
             &self.slot_ownership_generation,
+            self.mesh_rebuild_frame_index,
             visibility,
         )
     }
@@ -2086,53 +2064,19 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut stats = CullStats::default();
-        for (&coord, draw) in &self.visible_gpu_chunks {
-            match self.draw_contract_decision_for_chunk(coord, draw, visibility) {
-                DrawContractDecision::Strict => {
-                    if lod_from_u8(draw.lod)
-                        != self
-                            .lod_selection
-                            .get(&coord)
-                            .copied()
-                            .unwrap_or(ChunkLod::Near)
-                    {
+        for &coord in self.visible_gpu_chunks.keys() {
+            match self.choose_drawable_for_chunk(coord, visibility) {
+                Some(chosen) => {
+                    if matches!(chosen.freshness, DrawableFreshness::StaleDrawable) {
                         stats.lod_mismatch_grace_drawn += 1;
                     }
-                    stats.drawn += 1;
-                }
-                DrawContractDecision::ContinuityFallback => {
-                    stats.continuity_fallback_drawn += 1;
-                    stats.drawn += 1;
-                }
-                DrawContractDecision::Filtered => {
-                    stats.contract_filtered += 1;
-                    let selected_lod = self
-                        .lod_selection
-                        .get(&coord)
-                        .copied()
-                        .unwrap_or(ChunkLod::Near);
-                    let draw_lod = lod_from_u8(draw.lod);
-                    if draw_lod != selected_lod {
-                        stats.lod_filtered += 1;
-                    } else if self.settings.frustum_culling
-                        && !aabb_in_view(
-                            visibility.vp_world,
-                            draw.world_aabb_min,
-                            draw.world_aabb_max,
-                        )
-                    {
-                        stats.frustum_culled += 1;
-                    } else if draw_is_drawable(draw)
-                        && !passes_screen_space_cull(
-                            visibility.world_camera_pos,
-                            draw_lod,
-                            draw.world_aabb_min,
-                            draw.world_aabb_max,
-                            visibility.screen_h,
-                        )
-                    {
-                        stats.screen_culled += 1;
+                    if matches!(chosen.freshness, DrawableFreshness::FallbackDrawable) {
+                        stats.continuity_fallback_drawn += 1;
                     }
+                    stats.drawn += 1;
+                }
+                None => {
+                    stats.contract_filtered += 1;
                 }
             }
         }
@@ -2147,8 +2091,8 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut visible = Vec::new();
-        for (&coord, draw) in &self.visible_gpu_chunks {
-            if self.should_render_draw(coord, draw, visibility) {
+        for &coord in self.visible_gpu_chunks.keys() {
+            if self.choose_drawable_for_chunk(coord, visibility).is_some() {
                 visible.push(coord);
             }
         }
@@ -2625,7 +2569,13 @@ impl Renderer {
                     pending_lod,
                     result.task_id,
                 );
-                self.stage_candidate(result.coord, result.version, result.task_id, result.lod, true);
+                self.stage_candidate(
+                    result.coord,
+                    result.version,
+                    result.task_id,
+                    result.lod,
+                    true,
+                );
                 self.pending_gpu_results.insert(
                     identity,
                     PendingGpuMeshResult {
@@ -2644,7 +2594,13 @@ impl Renderer {
             let desired = chunk_priority_scores.contains_key(&result.coord)
                 || self.visible_gpu_chunks.contains_key(&result.coord);
             let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
-            self.stage_candidate(result.coord, result.version, result.task_id, result.lod, false);
+            self.stage_candidate(
+                result.coord,
+                result.version,
+                result.task_id,
+                result.lod,
+                false,
+            );
             let pending_replaced = self.invalidate_pending_gpu_entries_for_coord(
                 result.coord,
                 Some(result.version),
@@ -3363,18 +3319,29 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut stats = MeshDrawStats::default();
-        for (&coord, draw) in &self.visible_gpu_chunks {
-            match self.draw_contract_decision_for_chunk(coord, draw, visibility) {
-                DrawContractDecision::Strict => {
-                    stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
+        for &coord in self.visible_gpu_chunks.keys() {
+            if let Some(chosen) = self.choose_drawable_for_chunk(coord, visibility) {
+                match chosen.freshness {
+                    DrawableFreshness::FreshDrawable => stats.draw_source_fresh_count += 1,
+                    DrawableFreshness::StaleDrawable => {
+                        stats.draw_source_stale_count += 1;
+                        stats.stale_draw_keepalive_count += 1;
+                        stats.continuity_void_prevented_count += 1;
+                    }
+                    DrawableFreshness::FallbackDrawable => {
+                        stats.draw_source_fallback_count += 1;
+                        stats.continuity_fallback_drawn += 1;
+                        stats.continuity_void_prevented_count += 1;
+                    }
+                    DrawableFreshness::None => {}
                 }
-                DrawContractDecision::ContinuityFallback => {
-                    stats.continuity_fallback_drawn += 1;
-                    stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
-                }
-                DrawContractDecision::Filtered => {
-                    stats.contract_filtered += 1;
-                }
+                stats.record_draw(
+                    chosen.draw.draw_source,
+                    chosen.draw.index_count.unwrap_or(0) as u64,
+                );
+            } else {
+                stats.contract_filtered += 1;
+                stats.draw_source_void_count += 1;
             }
         }
         stats
@@ -3414,16 +3381,12 @@ impl Renderer {
             screen_h: self.size.height,
         };
 
-        let mut drawable_chunks: Vec<(ChunkCoord, GpuChunkDraw)> = self
+        let mut drawable_chunks: Vec<(ChunkCoord, ChosenDrawable)> = self
             .visible_gpu_chunks
-            .iter()
-            .filter_map(|(&coord, draw)| {
-                match self.draw_contract_decision_for_chunk(coord, draw, visibility) {
-                    DrawContractDecision::Strict | DrawContractDecision::ContinuityFallback => {
-                        Some((coord, *draw))
-                    }
-                    DrawContractDecision::Filtered => None,
-                }
+            .keys()
+            .filter_map(|&coord| {
+                self.choose_drawable_for_chunk(coord, visibility)
+                    .map(|chosen| (coord, chosen))
             })
             .collect();
         drawable_chunks.sort_by_key(|(coord, _)| (coord.x, coord.y, coord.z));
@@ -3437,9 +3400,13 @@ impl Renderer {
             let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
             let mut draw_stats = MeshDrawStats::default();
             let mut drawn_slots = HashSet::with_capacity(drawable_chunks.len());
-            for (_, draw) in drawable_chunks {
+            for (_, chosen) in drawable_chunks {
+                let draw = chosen.draw;
                 if !drawn_slots.insert(draw.draw_indirect_index) {
                     continue;
+                }
+                if matches!(chosen.freshness, DrawableFreshness::FallbackDrawable) {
+                    draw_stats.continuity_fallback_drawn += 1;
                 }
                 draw_stats.record_draw(draw.draw_source, draw.index_count.unwrap_or(0) as u64);
                 pass.draw_indexed_indirect(
@@ -3457,13 +3424,25 @@ impl Renderer {
         self.chunk_mesh_records.entry(coord).or_default()
     }
 
-    fn stage_candidate(&mut self, coord: ChunkCoord, version: u64, task_id: u64, lod: ChunkLod, pending: bool) {
+    fn stage_candidate(
+        &mut self,
+        coord: ChunkCoord,
+        version: u64,
+        task_id: u64,
+        lod: ChunkLod,
+        pending: bool,
+    ) {
         if !cfg!(feature = "continuity_firewall") {
             return;
         }
         let frame = self.mesh_rebuild_frame_index;
         let record = self.mesh_record_mut(coord);
-        record.candidate = Some(ChunkCandidate { version, task_id, lod, pending_finalize: pending });
+        record.candidate = Some(ChunkCandidate {
+            version,
+            task_id,
+            lod,
+            pending_finalize: pending,
+        });
         record.state = if pending {
             ChunkRenderState::CandidatePending
         } else {
@@ -5300,35 +5279,6 @@ fn draw_is_drawable(draw: &GpuChunkDraw) -> bool {
     draw.index_count.unwrap_or(0) > 0
 }
 
-fn lod_mismatch_grace_allows_draw(
-    coord: ChunkCoord,
-    pending_lod_remesh: &HashSet<ChunkCoord>,
-    pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
-    mesh_rebuild_frame_index: u64,
-    draw_is_existing_drawable: bool,
-) -> bool {
-    if !draw_is_existing_drawable || !pending_lod_remesh.contains(&coord) {
-        return false;
-    }
-    let Some(first_pending_frame) = pending_lod_remesh_since.get(&coord).copied() else {
-        return false;
-    };
-    mesh_rebuild_frame_index.saturating_sub(first_pending_frame) <= LOD_MISMATCH_GRACE_MAX_FRAMES
-}
-
-fn continuity_fallback_distance_gate_allows_draw(
-    coord: ChunkCoord,
-    draw_lod: ChunkLod,
-    selected_lod: ChunkLod,
-    world_camera_pos: Vec3,
-) -> bool {
-    if draw_lod == ChunkLod::Near || selected_lod == ChunkLod::Near {
-        return false;
-    }
-    chunk_horizontal_distance_to_camera(coord, world_camera_pos)
-        >= DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS
-}
-
 fn visible_draw_mappings_are_bijective(
     visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
     visible_slots: &HashMap<u32, ChunkCoord>,
@@ -5368,6 +5318,166 @@ fn visible_draw_mappings_have_valid_generations(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawableFreshness {
+    FreshDrawable,
+    StaleDrawable,
+    FallbackDrawable,
+    None,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChosenDrawable {
+    draw: GpuChunkDraw,
+    freshness: DrawableFreshness,
+}
+
+fn stale_draw_keepalive_window_frames(
+    coord: ChunkCoord,
+    selected_lod: ChunkLod,
+    draw_lod: ChunkLod,
+    world_camera_pos: Vec3,
+) -> u64 {
+    let near_chunk = chunk_horizontal_distance_to_camera(coord, world_camera_pos)
+        <= DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS;
+    if near_chunk && selected_lod == ChunkLod::Near && draw_lod != ChunkLod::Near {
+        LOD_MISMATCH_GRACE_MAX_FRAMES
+    } else {
+        DRAW_CONTINUITY_MAX_FRAMES
+    }
+}
+
+fn is_drawable_usable(
+    coord: ChunkCoord,
+    draw: &GpuChunkDraw,
+    visible_slots: &HashMap<u32, ChunkCoord>,
+    slot_ownership_generation: &HashMap<u32, u64>,
+    visibility: DrawVisibilityInput,
+) -> bool {
+    if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
+        return false;
+    }
+    if !draw_is_drawable(draw) {
+        return false;
+    }
+    if slot_ownership_generation
+        .get(&draw.draw_indirect_index)
+        .copied()
+        != Some(draw.ownership_generation)
+    {
+        return false;
+    }
+    let draw_lod = lod_from_u8(draw.lod);
+    chunk_visible_in_world_space(
+        visibility.frustum_culling,
+        visibility.vp_world,
+        visibility.world_camera_pos,
+        draw_lod,
+        draw.world_aabb_min,
+        draw.world_aabb_max,
+        visibility.screen_h,
+    )
+}
+
+fn drawable_freshness(
+    selected_lod: ChunkLod,
+    coord: ChunkCoord,
+    draw: &GpuChunkDraw,
+    mesh_rebuild_frame_index: u64,
+    pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
+    world_camera_pos: Vec3,
+    explicit_fallback: bool,
+) -> DrawableFreshness {
+    if explicit_fallback {
+        return DrawableFreshness::FallbackDrawable;
+    }
+    let draw_lod = lod_from_u8(draw.lod);
+    if draw_lod == selected_lod {
+        return DrawableFreshness::FreshDrawable;
+    }
+    let age_frames = pending_lod_remesh_since
+        .get(&coord)
+        .map(|first_pending_frame| mesh_rebuild_frame_index.saturating_sub(*first_pending_frame))
+        .unwrap_or(0);
+    let keepalive =
+        stale_draw_keepalive_window_frames(coord, selected_lod, draw_lod, world_camera_pos);
+    if age_frames <= keepalive {
+        DrawableFreshness::StaleDrawable
+    } else {
+        DrawableFreshness::None
+    }
+}
+
+fn choose_drawable_for_chunk(
+    coord: ChunkCoord,
+    committed_drawable: Option<&GpuChunkDraw>,
+    fallback_drawable: Option<&GpuChunkDraw>,
+    visible_slots: &HashMap<u32, ChunkCoord>,
+    lod_selection: &HashMap<ChunkCoord, ChunkLod>,
+    pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
+    slot_ownership_generation: &HashMap<u32, u64>,
+    mesh_rebuild_frame_index: u64,
+    visibility: DrawVisibilityInput,
+) -> Option<ChosenDrawable> {
+    let selected_lod = lod_selection.get(&coord).copied().unwrap_or(ChunkLod::Near);
+
+    if let Some(committed) = committed_drawable {
+        if is_drawable_usable(
+            coord,
+            committed,
+            visible_slots,
+            slot_ownership_generation,
+            visibility,
+        ) {
+            let freshness = drawable_freshness(
+                selected_lod,
+                coord,
+                committed,
+                mesh_rebuild_frame_index,
+                pending_lod_remesh_since,
+                visibility.world_camera_pos,
+                false,
+            );
+            if !matches!(freshness, DrawableFreshness::None) {
+                return Some(ChosenDrawable {
+                    draw: *committed,
+                    freshness,
+                });
+            }
+        }
+    }
+
+    if let Some(fallback) = fallback_drawable {
+        if is_drawable_usable(
+            coord,
+            fallback,
+            visible_slots,
+            slot_ownership_generation,
+            visibility,
+        ) {
+            if !matches!(
+                drawable_freshness(
+                    selected_lod,
+                    coord,
+                    fallback,
+                    mesh_rebuild_frame_index,
+                    pending_lod_remesh_since,
+                    visibility.world_camera_pos,
+                    true,
+                ),
+                DrawableFreshness::None
+            ) {
+                return Some(ChosenDrawable {
+                    draw: *fallback,
+                    freshness: DrawableFreshness::FallbackDrawable,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrawContractDecision {
     Strict,
     ContinuityFallback,
@@ -5379,76 +5489,30 @@ fn chunk_draw_contract_decision(
     draw: &GpuChunkDraw,
     visible_slots: &HashMap<u32, ChunkCoord>,
     lod_selection: &HashMap<ChunkCoord, ChunkLod>,
-    pending_lod_remesh: &HashSet<ChunkCoord>,
+    _pending_lod_remesh: &HashSet<ChunkCoord>,
     pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
     mesh_rebuild_frame_index: u64,
-    has_pending_replacement: bool,
+    _has_pending_replacement: bool,
     slot_ownership_generation: &HashMap<u32, u64>,
     visibility: DrawVisibilityInput,
 ) -> DrawContractDecision {
-    if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
-        return DrawContractDecision::Filtered;
+    match choose_drawable_for_chunk(
+        coord,
+        Some(draw),
+        None,
+        visible_slots,
+        lod_selection,
+        pending_lod_remesh_since,
+        slot_ownership_generation,
+        mesh_rebuild_frame_index,
+        visibility,
+    ) {
+        Some(chosen) if matches!(chosen.freshness, DrawableFreshness::FallbackDrawable) => {
+            DrawContractDecision::ContinuityFallback
+        }
+        Some(_) => DrawContractDecision::Strict,
+        None => DrawContractDecision::Filtered,
     }
-    if !draw_is_drawable(draw) {
-        return DrawContractDecision::Filtered;
-    }
-    if slot_ownership_generation
-        .get(&draw.draw_indirect_index)
-        .copied()
-        != Some(draw.ownership_generation)
-    {
-        return DrawContractDecision::Filtered;
-    }
-
-    let selected_lod = lod_selection.get(&coord).copied().unwrap_or(ChunkLod::Near);
-    let draw_lod = lod_from_u8(draw.lod);
-    let lod_matches_selection = draw_lod == selected_lod;
-    let lod_grace = !lod_matches_selection
-        && lod_mismatch_grace_allows_draw(
-            coord,
-            pending_lod_remesh,
-            pending_lod_remesh_since,
-            mesh_rebuild_frame_index,
-            draw_is_drawable(draw),
-        );
-
-    let visible = chunk_visible_in_world_space(
-        visibility.frustum_culling,
-        visibility.vp_world,
-        visibility.world_camera_pos,
-        draw_lod,
-        draw.world_aabb_min,
-        draw.world_aabb_max,
-        visibility.screen_h,
-    );
-    if !visible {
-        return DrawContractDecision::Filtered;
-    }
-
-    if lod_matches_selection || lod_grace {
-        return DrawContractDecision::Strict;
-    }
-
-    if has_pending_replacement
-        && pending_lod_remesh.contains(&coord)
-        && continuity_fallback_distance_gate_allows_draw(
-            coord,
-            draw_lod,
-            selected_lod,
-            visibility.world_camera_pos,
-        )
-        && pending_lod_remesh_since
-            .get(&coord)
-            .map(|first_pending_frame| {
-                mesh_rebuild_frame_index.saturating_sub(*first_pending_frame)
-                    <= DRAW_CONTINUITY_MAX_FRAMES
-            })
-            .unwrap_or(false)
-    {
-        return DrawContractDecision::ContinuityFallback;
-    }
-
-    DrawContractDecision::Filtered
 }
 
 fn chunk_passes_draw_contract(
@@ -6234,64 +6298,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_and_cpu_draw_records_share_world_space_contract() {
-        let coord = ChunkCoord { x: 2, y: 0, z: -1 };
-        let mut visible_slots = HashMap::new();
-        visible_slots.insert(7, coord);
-        let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Mid);
-        let aabb_min = Vec3::new(30.0, 0.0, -20.0);
-        let aabb_max = Vec3::new(46.0, 16.0, -4.0);
-        let camera = Camera {
-            pos: Vec3::new(32.0, 8.0, 8.0),
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let visibility = DrawVisibilityInput {
-            frustum_culling: true,
-            vp_world: camera.view_proj(),
-            world_camera_pos: camera_world_position(&camera),
-            screen_h: 1080,
-        };
-
-        for source in [DrawSource::CpuUploaded, DrawSource::GpuArtifact] {
-            let draw = GpuChunkDraw {
-                page_index: GpuPageIndex(7),
-                draw_indirect_index: 7,
-                lod: ChunkLod::Mid as u8,
-                origin: Vec3::new(32.0, 0.0, -16.0),
-                world_aabb_min: aabb_min,
-                world_aabb_max: aabb_max,
-                draw_source: source,
-                ownership_generation: 1,
-                index_count: Some(12),
-            };
-            assert!(chunk_passes_draw_contract(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &HashSet::new(),
-                &HashMap::new(),
-                &HashMap::new(),
-                0,
-                visibility,
-            ));
-        }
-    }
-
-    #[test]
-    fn lod_mismatch_pending_remesh_keeps_chunk_visible_during_grace_window() {
-        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
+    fn stale_lower_lod_near_player_remains_visible_while_replacement_pending() {
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(3, coord);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Near);
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
         let mut pending_lod_remesh_since = HashMap::new();
         pending_lod_remesh_since.insert(coord, 10);
-
         let draw = GpuChunkDraw {
             page_index: GpuPageIndex(3),
             draw_indirect_index: 3,
@@ -6299,9 +6313,9 @@ mod tests {
             origin: Vec3::ZERO,
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
-            draw_source: DrawSource::CpuUploaded,
+            draw_source: DrawSource::StaleCached,
             ownership_generation: 1,
-            index_count: Some(18),
+            index_count: Some(12),
         };
         let camera = Camera {
             pos: Vec3::ZERO,
@@ -6315,91 +6329,36 @@ mod tests {
             screen_h: 1080,
         };
 
-        assert!(chunk_passes_draw_contract(
+        let chosen = choose_drawable_for_chunk(
             coord,
-            &draw,
+            Some(&draw),
+            None,
             &visible_slots,
             &lod_selection,
-            &pending_lod_remesh,
             &pending_lod_remesh_since,
-            &HashMap::new(),
-            16,
+            &HashMap::from([(3, 1)]),
+            12,
             visibility,
-        ));
+        )
+        .expect("stale draw should keep continuity");
+        assert_eq!(chosen.freshness, DrawableFreshness::StaleDrawable);
     }
 
     #[test]
-    fn continuity_fallback_keeps_previous_drawable_during_pending_replacement() {
-        let coord = ChunkCoord { x: 4, y: 0, z: 0 };
+    fn candidate_invalidation_does_not_affect_draw_contract() {
+        let coord = ChunkCoord { x: 2, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(5, coord);
-        let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Mid);
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 10);
         let draw = GpuChunkDraw {
             page_index: GpuPageIndex(5),
             draw_indirect_index: 5,
-            lod: ChunkLod::Far as u8,
-            origin: Vec3::ZERO,
-            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
-            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
-            draw_source: DrawSource::GpuArtifact,
-            ownership_generation: 1,
-            index_count: Some(12),
-        };
-        let camera = Camera {
-            pos: Vec3::ZERO,
-            dir: Vec3::new(0.0, 0.0, -1.0),
-            aspect: 1.0,
-        };
-        let visibility = DrawVisibilityInput {
-            frustum_culling: true,
-            vp_world: camera.view_proj(),
-            world_camera_pos: camera_world_position(&camera),
-            screen_h: 1080,
-        };
-
-        assert_eq!(
-            chunk_draw_contract_decision(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &pending_lod_remesh,
-                &pending_lod_remesh_since,
-                10 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-                true,
-                &HashMap::new(),
-                visibility,
-            ),
-            DrawContractDecision::ContinuityFallback
-        );
-    }
-
-    #[test]
-    fn continuity_fallback_filters_near_chunks_until_replacement_is_ready() {
-        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
-        let mut visible_slots = HashMap::new();
-        visible_slots.insert(8, coord);
-        let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Near);
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 2);
-        let draw = GpuChunkDraw {
-            page_index: GpuPageIndex(8),
-            draw_indirect_index: 8,
             lod: ChunkLod::Mid as u8,
             origin: Vec3::ZERO,
-            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
-            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
+            world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
             draw_source: DrawSource::GpuArtifact,
-            ownership_generation: 1,
-            index_count: Some(12),
+            ownership_generation: 7,
+            index_count: Some(20),
         };
         let camera = Camera {
             pos: Vec3::ZERO,
@@ -6413,95 +6372,78 @@ mod tests {
             screen_h: 1080,
         };
 
-        assert_eq!(
-            chunk_draw_contract_decision(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &pending_lod_remesh,
-                &pending_lod_remesh_since,
-                2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-                true,
-                &HashMap::new(),
-                visibility,
-            ),
-            DrawContractDecision::Filtered
+        let chosen = choose_drawable_for_chunk(
+            coord,
+            Some(&draw),
+            None,
+            &visible_slots,
+            &HashMap::from([(coord, ChunkLod::Mid)]),
+            &HashMap::new(),
+            &HashMap::from([(5, 7)]),
+            100,
+            visibility,
         );
+        assert!(chosen.is_some());
     }
 
     #[test]
-    fn continuity_fallback_allows_far_chunks_while_replacement_is_pending() {
+    fn fallback_mesh_draws_when_fresh_gpu_mesh_unavailable() {
+        let coord = ChunkCoord { x: 4, y: 0, z: 0 };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(8, coord);
+        let fallback = GpuChunkDraw {
+            page_index: GpuPageIndex(8),
+            draw_indirect_index: 8,
+            lod: ChunkLod::Far as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -16.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -14.0),
+            draw_source: DrawSource::Fallback,
+            ownership_generation: 11,
+            index_count: Some(16),
+        };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        let chosen = choose_drawable_for_chunk(
+            coord,
+            None,
+            Some(&fallback),
+            &visible_slots,
+            &HashMap::from([(coord, ChunkLod::Near)]),
+            &HashMap::new(),
+            &HashMap::from([(8, 11)]),
+            0,
+            visibility,
+        )
+        .expect("fallback should be drawn");
+        assert_eq!(chosen.freshness, DrawableFreshness::FallbackDrawable);
+    }
+
+    #[test]
+    fn lod_mismatch_no_longer_creates_void_when_usable_mesh_exists() {
         let coord = ChunkCoord { x: 6, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(9, coord);
-        let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Mid);
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 2);
         let draw = GpuChunkDraw {
             page_index: GpuPageIndex(9),
             draw_indirect_index: 9,
             lod: ChunkLod::Far as u8,
-            origin: Vec3::new(96.0, 0.0, 0.0),
-            world_aabb_min: Vec3::new(95.0, -1.0, -4.0),
-            world_aabb_max: Vec3::new(97.0, 1.0, -2.0),
-            draw_source: DrawSource::GpuArtifact,
-            ownership_generation: 1,
-            index_count: Some(12),
-        };
-        let camera = Camera {
-            pos: Vec3::ZERO,
-            dir: Vec3::new(1.0, 0.0, 0.0),
-            aspect: 1.0,
-        };
-        let visibility = DrawVisibilityInput {
-            frustum_culling: false,
-            vp_world: camera.view_proj(),
-            world_camera_pos: camera_world_position(&camera),
-            screen_h: 1080,
-        };
-
-        assert_eq!(
-            chunk_draw_contract_decision(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &pending_lod_remesh,
-                &pending_lod_remesh_since,
-                2 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-                true,
-                &HashMap::new(),
-                visibility,
-            ),
-            DrawContractDecision::ContinuityFallback
-        );
-    }
-
-    #[test]
-    fn continuity_fallback_requires_pending_replacement_and_time_bound() {
-        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
-        let mut visible_slots = HashMap::new();
-        visible_slots.insert(6, coord);
-        let mut lod_selection = HashMap::new();
-        lod_selection.insert(coord, ChunkLod::Near);
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 4);
-        let draw = GpuChunkDraw {
-            page_index: GpuPageIndex(6),
-            draw_indirect_index: 6,
-            lod: ChunkLod::Far as u8,
             origin: Vec3::ZERO,
-            world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
-            world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
-            draw_source: DrawSource::GpuArtifact,
-            ownership_generation: 1,
-            index_count: Some(18),
+            world_aabb_min: Vec3::new(-1.0, -1.0, -20.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -18.0),
+            draw_source: DrawSource::StaleCached,
+            ownership_generation: 13,
+            index_count: Some(24),
         };
         let camera = Camera {
             pos: Vec3::ZERO,
@@ -6515,85 +6457,21 @@ mod tests {
             screen_h: 1080,
         };
 
-        assert_eq!(
-            chunk_draw_contract_decision(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &pending_lod_remesh,
-                &pending_lod_remesh_since,
-                4 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-                false,
-                &HashMap::new(),
-                visibility,
-            ),
-            DrawContractDecision::Filtered
-        );
-        assert_eq!(
-            chunk_draw_contract_decision(
-                coord,
-                &draw,
-                &visible_slots,
-                &lod_selection,
-                &pending_lod_remesh,
-                &pending_lod_remesh_since,
-                4 + DRAW_CONTINUITY_MAX_FRAMES + 1,
-                true,
-                &HashMap::new(),
-                visibility,
-            ),
-            DrawContractDecision::Filtered
-        );
+        let chosen = choose_drawable_for_chunk(
+            coord,
+            Some(&draw),
+            None,
+            &visible_slots,
+            &HashMap::from([(coord, ChunkLod::Near)]),
+            &HashMap::new(),
+            &HashMap::from([(9, 13)]),
+            4,
+            visibility,
+        )
+        .expect("stale mismatched lod should still draw");
+        assert_eq!(chosen.freshness, DrawableFreshness::StaleDrawable);
     }
 
-    #[test]
-    fn lod_mismatch_grace_expires_without_replacement_artifact() {
-        let coord = ChunkCoord { x: 1, y: 0, z: 0 };
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 1);
-
-        assert!(!lod_mismatch_grace_allows_draw(
-            coord,
-            &pending_lod_remesh,
-            &pending_lod_remesh_since,
-            1 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-            true,
-        ));
-    }
-
-    #[test]
-    fn lod_mismatch_grace_requires_drawable_and_expires() {
-        let coord = ChunkCoord { x: 3, y: 0, z: 0 };
-        let mut pending_lod_remesh = HashSet::new();
-        pending_lod_remesh.insert(coord);
-        let mut pending_lod_remesh_since = HashMap::new();
-        pending_lod_remesh_since.insert(coord, 5);
-
-        assert!(lod_mismatch_grace_allows_draw(
-            coord,
-            &pending_lod_remesh,
-            &pending_lod_remesh_since,
-            5 + LOD_MISMATCH_GRACE_MAX_FRAMES,
-            true,
-        ));
-        assert!(!lod_mismatch_grace_allows_draw(
-            coord,
-            &pending_lod_remesh,
-            &pending_lod_remesh_since,
-            5 + LOD_MISMATCH_GRACE_MAX_FRAMES + 1,
-            true,
-        ));
-        assert!(!lod_mismatch_grace_allows_draw(
-            coord,
-            &pending_lod_remesh,
-            &pending_lod_remesh_since,
-            5 + LOD_MISMATCH_GRACE_MAX_FRAMES,
-            false,
-        ));
-    }
     #[test]
     fn visible_slot_supersession_replaces_previous_coord_mapping() {
         let slot = 7;
@@ -6888,7 +6766,11 @@ mod tests {
             ownership_generation: 1,
             index_count: Some(12),
         };
-        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
         let visibility = DrawVisibilityInput {
             frustum_culling: true,
             vp_world: camera.view_proj(),
@@ -6926,7 +6808,11 @@ mod tests {
             ownership_generation: 1,
             index_count: Some(24),
         };
-        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
         let visibility = DrawVisibilityInput {
             frustum_culling: true,
             vp_world: camera.view_proj(),
@@ -6972,7 +6858,11 @@ mod tests {
             ownership_generation: 1,
             index_count: Some(24),
         };
-        let camera = Camera { pos: Vec3::ZERO, dir: Vec3::new(0.0, 0.0, -1.0), aspect: 1.0 };
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
         let visibility = DrawVisibilityInput {
             frustum_culling: true,
             vp_world: camera.view_proj(),
