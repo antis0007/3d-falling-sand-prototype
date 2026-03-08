@@ -3354,9 +3354,14 @@ impl Renderer {
         }
 
         match ready.status {
+            ReadyGpuMeshFinalizeStatus::NotReadyYet => {
+                self.pending_gpu_results.insert(key, pending);
+                None
+            }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 pending.result.from_pending_finalize = true;
-                pending.result.artifact = if ready.result.index_count == 0 {
+                let ready_index_count = ready.result.index_count.unwrap_or(0);
+                pending.result.artifact = if ready_index_count == 0 {
                     ChunkMeshArtifact::Skipped {
                         reason: MeshSkipReason::ZeroGeometry,
                     }
@@ -3365,7 +3370,7 @@ impl Renderer {
                         page_index: ready.result.page_index,
                         draw_indirect_index: ready.result.draw_indirect_index,
                         lod: ready.result.lod,
-                        index_count: ready.result.index_count,
+                        index_count: ready_index_count,
                         aabb_min: ready.result.aabb_min,
                         aabb_max: ready.result.aabb_max,
                         chunk_origin_world: ready.result.chunk_origin_world,
