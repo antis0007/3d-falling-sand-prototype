@@ -631,8 +631,8 @@ pub struct Renderer {
     near_lod_distance: f32,
 
     mesh_queue: BackgroundMeshQueue,
-    completed_meshes: Vec<MeshResult>,
-    deferred_completed_receives: VecDeque<MeshResult>,
+    deferred_completed_meshes: VecDeque<MeshResult>,
+    deferred_mesh_results: VecDeque<MeshResult>,
     #[cfg(feature = "gpu-compute")]
     deferred_finalize_ready_events: VecDeque<ReadyGpuMeshFinalizeEvent>,
     deferred_retry_kinds: VecDeque<(ChunkCoord, MeshRetryKind)>,
@@ -813,6 +813,14 @@ pub struct MeshRebuildStats {
     pub pending_finalize_age_frames_max: u64,
     pub pending_finalize_age_frames_p50: u64,
     pub pending_finalize_age_frames_p95: u64,
+    pub deferred_mesh_results_count: usize,
+    pub deferred_finalize_events_count: usize,
+    pub deferred_completed_meshes_count: usize,
+    pub deferred_retry_failed_count: usize,
+    pub deferred_retry_skipped_count: usize,
+    pub pending_finalize_age_ms_max: f32,
+    pub pending_finalize_age_ms_p50: f32,
+    pub pending_finalize_age_ms_p95: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -926,12 +934,16 @@ const DIRTY_FAR_STARVE_LIMIT_FRAMES: u32 = 20;
 const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
 const MAX_LOD_REMESH_PER_FRAME: usize = 64;
 // Hard caps for renderer-side bookkeeping to avoid frame-time spikes during backlog churn.
-const MAX_COMPLETED_RECEIVE_PER_FRAME: usize = 96;
-const MAX_FINALIZE_EVENTS_PER_FRAME: usize = 96;
+const MAX_MESH_RESULTS_RECEIVED_PER_FRAME: usize = 96;
+const MAX_GPU_FINALIZE_EVENTS_PER_FRAME: usize = 96;
 const MAX_COMPLETED_ADOPTIONS_PER_FRAME: usize = 96;
-const MAX_RETRY_ACTIONS_PER_FRAME: usize = 64;
-const MAX_RETRY_SCAN_PER_FRAME: usize = 256;
+const MAX_RETRY_SCHEDULES_PER_FRAME: usize = 64;
+const MAX_RETRY_STATE_SCAN_PER_FRAME: usize = 256;
+const MAX_COMPLETED_BACKLOG_TRIMS_PER_FRAME: usize = 32;
+const MAX_RETRY_DEFERRED_PROMOTIONS_PER_FRAME: usize = 128;
+const MAX_FRESH_PRIORITY_SCAN_WINDOW: usize = 16;
 const FINALIZE_FAIRNESS_AGE_BOOST_FRAMES: u64 = 24;
+const ESTIMATED_FRAME_MS: f32 = 16.67;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -2044,8 +2056,8 @@ impl Renderer {
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
-            completed_meshes: Vec::new(),
-            deferred_completed_receives: VecDeque::new(),
+            deferred_completed_meshes: VecDeque::new(),
+            deferred_mesh_results: VecDeque::new(),
             #[cfg(feature = "gpu-compute")]
             deferred_finalize_ready_events: VecDeque::new(),
             deferred_retry_kinds: VecDeque::new(),
@@ -2538,95 +2550,17 @@ impl Renderer {
         let mut pending_rejected = 0usize;
         let mut replacement_failed_coords: HashSet<ChunkCoord> = HashSet::new();
 
-        let mut receive_budget = MAX_COMPLETED_RECEIVE_PER_FRAME;
-        while receive_budget > 0 {
-            match self.mesh_queue.try_recv() {
-                Ok(mut result) => {
-                    log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
-                    self.inflight_mesh_chunks.remove(&result.coord);
-                    self.mesh_lifecycle
-                        .insert(result.coord, MeshLifecycleState::ResultReady);
-                    result.bookkeeping_first_seen_frame = self.mesh_rebuild_frame_index;
-                    self.completed_meshes.push(result);
-                    receive_budget -= 1;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        if receive_budget == 0 {
-            stats.completed_receive_budget_hits += 1;
-            while let Ok(mut result) = self.mesh_queue.try_recv() {
-                self.inflight_mesh_chunks.remove(&result.coord);
-                self.mesh_lifecycle
-                    .insert(result.coord, MeshLifecycleState::ResultReady);
-                result.bookkeeping_first_seen_frame = self.mesh_rebuild_frame_index;
-                self.deferred_completed_receives.push_back(result);
-            }
-        }
-        while self.completed_meshes.len() < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
-            let Some(result) = self.deferred_completed_receives.pop_front() else {
-                break;
-            };
-            self.completed_meshes.push(result);
-        }
+        self.recv_mesh_results_bounded(&mut stats);
 
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
-            for ready in take_ready_gpu_mesh_results_on_renderer() {
-                self.deferred_finalize_ready_events.push_back(ready);
-            }
-            let mut finalize_budget = MAX_FINALIZE_EVENTS_PER_FRAME;
-            while finalize_budget > 0 {
-                let Some(ready) = self.deferred_finalize_ready_events.pop_front() else {
-                    break;
-                };
-                if let Some(coord) = self.finalize_pending_gpu_result(ready, &mut stats) {
-                    replacement_failed_coords.insert(coord);
-                }
-                finalize_budget -= 1;
-            }
-            if !self.deferred_finalize_ready_events.is_empty() {
-                stats.finalize_budget_hits += 1;
-            }
+            self.drain_finalize_events_bounded(&mut stats, &mut replacement_failed_coords);
         }
 
-        if self.completed_meshes.len() > COMPLETED_MESH_BACKLOG_THRESHOLD {
-            let mut low_priority_indices: Vec<usize> = self
-                .completed_meshes
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, result)| {
-                    (matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra) && !result.urgent)
-                        .then_some(idx)
-                })
-                .collect();
-            low_priority_indices.sort_by_key(|idx| self.completed_meshes[*idx].queued_at);
-
-            let mut to_drop = self.completed_meshes.len() - COMPLETED_MESH_BACKLOG_THRESHOLD;
-            let mut drop_mask = vec![false; self.completed_meshes.len()];
-            for idx in low_priority_indices {
-                if to_drop == 0 {
-                    break;
-                }
-                drop_mask[idx] = true;
-                to_drop -= 1;
-            }
-
-            if drop_mask.iter().any(|drop| *drop) {
-                let mut kept = Vec::with_capacity(self.completed_meshes.len());
-                for (idx, result) in self.completed_meshes.drain(..).enumerate() {
-                    if drop_mask[idx] {
-                        stats.age_drop_count += 1;
-                    } else {
-                        kept.push(result);
-                    }
-                }
-                self.completed_meshes = kept;
-            }
-        }
+        self.trim_completed_backlog_bounded(&mut stats);
 
         let mut bytes_uploaded = 0usize;
+
         let mut upload_budget_hit = false;
         let mut uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
@@ -2635,23 +2569,17 @@ impl Renderer {
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_chunks = Vec::new();
         let completed_meshes_depth =
-            self.completed_meshes.len() + self.deferred_completed_receives.len();
-        let adopt_budget = MAX_COMPLETED_ADOPTIONS_PER_FRAME.min(self.completed_meshes.len());
-        let selected_indices: std::collections::HashSet<usize> = self
-            .select_fair_completed_indices(adopt_budget)
-            .into_iter()
-            .collect();
+            self.deferred_completed_meshes.len() + self.deferred_mesh_results.len();
         let mut completed_results: Vec<MeshResult> = Vec::new();
-        let mut deferred_adopt = VecDeque::new();
-        for (idx, result) in self.completed_meshes.drain(..).enumerate() {
-            if selected_indices.contains(&idx) {
-                completed_results.push(result);
-            } else {
-                deferred_adopt.push_back(result);
-            }
+        let mut adoption_slots = 0usize;
+        while adoption_slots < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
+            let Some(result) = self.pop_fair_completed_mesh_for_adoption(adoption_slots) else {
+                break;
+            };
+            completed_results.push(result);
+            adoption_slots += 1;
         }
-        self.completed_meshes.extend(deferred_adopt);
-        if !self.completed_meshes.is_empty() {
+        if !self.deferred_completed_meshes.is_empty() {
             stats.adopt_budget_hits += 1;
         }
         for (completed_index, result) in completed_results.into_iter().enumerate() {
@@ -3319,6 +3247,12 @@ impl Renderer {
                 pending_ages[p50_idx.min(pending_ages.len() - 1)];
             stats.pending_finalize_age_frames_p95 =
                 pending_ages[p95_idx.min(pending_ages.len() - 1)];
+            stats.pending_finalize_age_ms_max =
+                stats.pending_finalize_age_frames_max as f32 * ESTIMATED_FRAME_MS;
+            stats.pending_finalize_age_ms_p50 =
+                stats.pending_finalize_age_frames_p50 as f32 * ESTIMATED_FRAME_MS;
+            stats.pending_finalize_age_ms_p95 =
+                stats.pending_finalize_age_frames_p95 as f32 * ESTIMATED_FRAME_MS;
         }
         debug_assert!(
             self.pending_gpu_results_by_finalize_key.len() <= self.pending_gpu_results.len(),
@@ -3336,13 +3270,29 @@ impl Renderer {
         stats.terminal_superseded_total = self.terminal_superseded_total;
         stats.terminal_evicted_total = self.terminal_evicted_total;
 
-        stats.completed_receive_deferred = self.deferred_completed_receives.len();
+        stats.completed_receive_deferred = self.deferred_mesh_results.len();
         #[cfg(feature = "gpu-compute")]
         {
             stats.finalize_deferred = self.deferred_finalize_ready_events.len();
         }
-        stats.adopt_deferred = self.completed_meshes.len();
-        stats.retry_deferred = self.retry_coord_queue.len();
+        stats.adopt_deferred = self.deferred_completed_meshes.len();
+        stats.retry_deferred = self.retry_coord_queue.len() + self.deferred_retry_kinds.len();
+        stats.deferred_mesh_results_count = self.deferred_mesh_results.len();
+        #[cfg(feature = "gpu-compute")]
+        {
+            stats.deferred_finalize_events_count = self.deferred_finalize_ready_events.len();
+        }
+        stats.deferred_completed_meshes_count = self.deferred_completed_meshes.len();
+        stats.deferred_retry_failed_count = self
+            .deferred_retry_kinds
+            .iter()
+            .filter(|(_, kind)| matches!(kind, MeshRetryKind::Failed))
+            .count();
+        stats.deferred_retry_skipped_count = self
+            .deferred_retry_kinds
+            .iter()
+            .filter(|(_, kind)| matches!(kind, MeshRetryKind::Skipped(_)))
+            .count();
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
@@ -3416,8 +3366,8 @@ impl Renderer {
         self.dirty_near_starve_frames = 0;
         self.dirty_far_starve_frames = 0;
         self.dirty_fair_cursor = 0;
-        self.completed_meshes.clear();
-        self.deferred_completed_receives.clear();
+        self.deferred_completed_meshes.clear();
+        self.deferred_mesh_results.clear();
         #[cfg(feature = "gpu-compute")]
         self.deferred_finalize_ready_events.clear();
         self.deferred_retry_kinds.clear();
@@ -3703,28 +3653,109 @@ impl Renderer {
         }
     }
 
-    fn select_fair_completed_indices(&self, budget: usize) -> Vec<usize> {
-        let mut scored: Vec<(usize, i32)> = self
-            .completed_meshes
-            .iter()
-            .enumerate()
-            .map(|(idx, result)| {
-                let age = self
-                    .mesh_rebuild_frame_index
-                    .saturating_sub(result.bookkeeping_first_seen_frame)
-                    / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES;
-                let age_boost = age.min(10_000) as i32;
-                let priority = Self::fairness_weight(result.lod as u8);
-                let urgent_bonus = if result.urgent { 250 } else { 0 };
-                (idx, priority + urgent_bonus + age_boost)
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored
-            .into_iter()
-            .take(budget.min(self.completed_meshes.len()))
-            .map(|(idx, _)| idx)
-            .collect()
+    fn recv_mesh_results_bounded(&mut self, stats: &mut MeshRebuildStats) {
+        while self.deferred_completed_meshes.len() < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
+            let Some(result) = self.deferred_mesh_results.pop_front() else {
+                break;
+            };
+            self.deferred_completed_meshes.push_back(result);
+        }
+
+        let mut receive_budget = MAX_MESH_RESULTS_RECEIVED_PER_FRAME;
+        while receive_budget > 0 {
+            match self.mesh_queue.try_recv() {
+                Ok(mut result) => {
+                    self.inflight_mesh_chunks.remove(&result.coord);
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::ResultReady);
+                    result.bookkeeping_first_seen_frame = self.mesh_rebuild_frame_index;
+                    if self.deferred_completed_meshes.len() < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
+                        self.deferred_completed_meshes.push_back(result);
+                    } else {
+                        self.deferred_mesh_results.push_back(result);
+                    }
+                    receive_budget -= 1;
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if receive_budget == 0 {
+            stats.completed_receive_budget_hits += 1;
+        }
+    }
+
+    fn pop_fair_completed_mesh_for_adoption(&mut self, adoption_slot: usize) -> Option<MeshResult> {
+        if self.deferred_completed_meshes.is_empty() {
+            return None;
+        }
+        let reserve_oldest = adoption_slot % 2 == 0;
+        if reserve_oldest {
+            return self.deferred_completed_meshes.pop_front();
+        }
+        let scan = MAX_FRESH_PRIORITY_SCAN_WINDOW.min(self.deferred_completed_meshes.len());
+        let mut best_idx = 0usize;
+        let mut best_score = i32::MIN;
+        for (idx, result) in self.deferred_completed_meshes.iter().take(scan).enumerate() {
+            let age = self
+                .mesh_rebuild_frame_index
+                .saturating_sub(result.bookkeeping_first_seen_frame)
+                / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES;
+            let score = Self::fairness_weight(result.lod as u8)
+                + if result.urgent { 250 } else { 0 }
+                + age.min(10_000) as i32;
+            if score > best_score {
+                best_score = score;
+                best_idx = idx;
+            }
+        }
+        self.deferred_completed_meshes.remove(best_idx)
+    }
+
+    fn trim_completed_backlog_bounded(&mut self, stats: &mut MeshRebuildStats) {
+        let mut trim_budget = MAX_COMPLETED_BACKLOG_TRIMS_PER_FRAME;
+        while self.deferred_completed_meshes.len() > COMPLETED_MESH_BACKLOG_THRESHOLD
+            && trim_budget > 0
+        {
+            if let Some(pos) = self
+                .deferred_completed_meshes
+                .iter()
+                .take(MAX_FRESH_PRIORITY_SCAN_WINDOW * 8)
+                .position(|result| {
+                    matches!(result.lod, ChunkLod::Far | ChunkLod::Ultra) && !result.urgent
+                })
+            {
+                self.deferred_completed_meshes.remove(pos);
+                stats.age_drop_count += 1;
+            } else {
+                self.deferred_completed_meshes.pop_back();
+                stats.age_drop_count += 1;
+            }
+            trim_budget -= 1;
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn drain_finalize_events_bounded(
+        &mut self,
+        stats: &mut MeshRebuildStats,
+        replacement_failed_coords: &mut HashSet<ChunkCoord>,
+    ) {
+        let incoming = take_ready_gpu_mesh_results_on_renderer();
+        self.deferred_finalize_ready_events.extend(incoming);
+
+        let mut finalize_budget = MAX_GPU_FINALIZE_EVENTS_PER_FRAME;
+        while finalize_budget > 0 {
+            let Some(ready) = self.deferred_finalize_ready_events.pop_front() else {
+                break;
+            };
+            if let Some(coord) = self.finalize_pending_gpu_result(ready, stats) {
+                replacement_failed_coords.insert(coord);
+            }
+            finalize_budget -= 1;
+        }
+        if !self.deferred_finalize_ready_events.is_empty() {
+            stats.finalize_budget_hits += 1;
+        }
     }
 
     #[cfg(feature = "gpu-compute")]
@@ -3853,7 +3884,7 @@ impl Renderer {
                 };
                 let record = self.mesh_record_mut(ready.result.coord);
                 record.state = ChunkRenderState::CandidateReady;
-                self.completed_meshes.push(pending.result);
+                self.deferred_completed_meshes.push_back(pending.result);
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
@@ -4480,13 +4511,18 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) -> RetryBackoffFrameStats {
-        while let Some((coord, _)) = self.deferred_retry_kinds.pop_front() {
+        let mut deferred_promotions = 0usize;
+        while deferred_promotions < MAX_RETRY_DEFERRED_PROMOTIONS_PER_FRAME {
+            let Some((coord, _)) = self.deferred_retry_kinds.pop_front() else {
+                break;
+            };
             if !self.retry_coord_queue.contains(&coord) {
                 self.retry_coord_queue.push_back(coord);
             }
+            deferred_promotions += 1;
         }
 
-        let scan_budget = MAX_RETRY_SCAN_PER_FRAME.min(self.retry_coord_queue.len());
+        let scan_budget = MAX_RETRY_STATE_SCAN_PER_FRAME.min(self.retry_coord_queue.len());
         let mut ready = Vec::new();
         let mut urgent_boost = Vec::new();
         for _ in 0..scan_budget {
@@ -4523,7 +4559,7 @@ impl Renderer {
             }
         }
         let ready_len = ready.len();
-        let retry_budget = MAX_RETRY_ACTIONS_PER_FRAME.min(ready_len);
+        let retry_budget = MAX_RETRY_SCHEDULES_PER_FRAME.min(ready_len);
         for coord in urgent_boost.into_iter().take(retry_budget) {
             self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
         }
@@ -4531,9 +4567,10 @@ impl Renderer {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
         RetryBackoffFrameStats {
-            budget_hit: self.retry_coord_queue.len() > MAX_RETRY_SCAN_PER_FRAME
-                || ready_len > retry_budget,
-            deferred: self.retry_coord_queue.len(),
+            budget_hit: self.retry_coord_queue.len() > MAX_RETRY_STATE_SCAN_PER_FRAME
+                || ready_len > retry_budget
+                || !self.deferred_retry_kinds.is_empty(),
+            deferred: self.retry_coord_queue.len() + self.deferred_retry_kinds.len(),
         }
     }
 
@@ -6982,8 +7019,8 @@ mod tests {
 
     #[test]
     fn completed_receive_is_bounded_per_frame() {
-        let accepted = MAX_COMPLETED_RECEIVE_PER_FRAME;
-        let deferred = MAX_COMPLETED_RECEIVE_PER_FRAME + 3;
+        let accepted = MAX_MESH_RESULTS_RECEIVED_PER_FRAME;
+        let deferred = MAX_MESH_RESULTS_RECEIVED_PER_FRAME + 3;
         assert!(accepted < deferred);
     }
 
@@ -7022,7 +7059,7 @@ mod tests {
 
     #[test]
     fn retry_processing_is_bounded_and_deferred() {
-        assert!(MAX_RETRY_ACTIONS_PER_FRAME < MAX_RETRY_SCAN_PER_FRAME);
+        assert!(MAX_RETRY_SCHEDULES_PER_FRAME < MAX_RETRY_STATE_SCAN_PER_FRAME);
     }
 
     #[test]
