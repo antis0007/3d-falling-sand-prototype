@@ -76,6 +76,11 @@ const AUTO_TUNE_UPLOAD_LATENCY_HIGH_MS: f32 = 450.0;
 const AUTO_TUNE_RAMP_UP_PER_SEC: f32 = 3.5;
 const AUTO_TUNE_RECOVER_PER_SEC: f32 = 0.6;
 const DESIRED_VIEW_RECOMPUTE_DOT_DELTA: f32 = 0.01;
+const DISPATCH_STARVATION_STREAK_FRAMES: u32 = 24;
+const APPLY_STARVATION_STREAK_FRAMES: u32 = 24;
+const CONVERGENCE_STALL_STREAK_FRAMES: u32 = 90;
+const LOW_LOADED_HIGH_BACKLOG_THRESHOLD: usize = 64;
+const LOW_LOADED_CHUNKS_THRESHOLD: usize = 24;
 
 const COLLISION_SAFETY_RADIUS_VOXELS: i32 = 4;
 const COLLISION_LOCAL_PRIORITY_REQUEST_BUDGET: usize = 12;
@@ -441,7 +446,7 @@ fn compute_generation_pressure_model(
     let pressure = queue_pressure
         .max(mesh_pressure * 0.9)
         .max(meshing_queue_pressure * 0.75);
-    let cap_scale = (1.0 - pressure * 0.6).clamp(0.4, 1.0);
+    let cap_scale = (1.0 - pressure * 0.75).clamp(0.3, 1.0);
 
     let near_span = shell_span(0, effective_stream_tuning.near_radius_xz + 1);
     let mid_span = shell_span(
@@ -457,8 +462,8 @@ fn compute_generation_pressure_model(
         effective_stream_tuning.ultra_radius_xz,
     );
 
-    let near_floor = apply_budget_items.max(PROTECTED_HIGH_PRIORITY_SLOTS * 2);
-    let base_global = apply_budget_items.max(1) * 12 + base_generate_drain_budget * 2;
+    let near_floor = (apply_budget_items * 2).max(PROTECTED_HIGH_PRIORITY_SLOTS * 3);
+    let base_global = apply_budget_items.max(1) * 10 + base_generate_drain_budget * 2;
     let global_cap = ((base_global as f32) * cap_scale) as usize + near_floor;
 
     let span_sum = near_span + mid_span + far_span + ultra_span;
@@ -483,15 +488,15 @@ fn compute_generation_pressure_model(
         total -= 1;
     }
 
-    let dispatch_budget = (((base_generate_drain_budget as f32) * (1.0 + pressure * 0.65)).round()
+    let dispatch_budget = (((base_generate_drain_budget as f32) * (1.0 + pressure * 0.35)).round()
         as usize)
         .max(PROTECTED_HIGH_PRIORITY_SLOTS)
         .min(effective_stream_tuning.max_generate_drain_items);
     let stable_near = queue_pressure < 0.4 && dispatch_budget > 2;
     let near_dispatch_budget = if stable_near {
-        (dispatch_budget as f32 * 0.55).round() as usize
+        (dispatch_budget as f32 * 0.6).round() as usize
     } else {
-        (dispatch_budget as f32 * 0.75).round() as usize
+        (dispatch_budget as f32 * 0.82).round() as usize
     }
     .clamp(PROTECTED_HIGH_PRIORITY_SLOTS, dispatch_budget);
 
@@ -1113,6 +1118,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut finalize_low_progress_streak = 0u32;
     let mut maintenance_throttle_state = MaintenanceThrottleState::default();
     let mut startup_burst_budget_frames = 180u32;
+    let mut dispatch_starvation_streak = 0u32;
+    let mut apply_starvation_streak = 0u32;
+    let mut convergence_stall_streak = 0u32;
 
     let _ = set_cursor(window, false);
 
@@ -1743,21 +1751,43 @@ pub async fn run() -> anyhow::Result<()> {
                         let desired_ms = desired_t0.elapsed().as_secs_f32() * 1000.0;
 
                         let streaming_t0 = Instant::now();
+                        let desired_backlog_count = cached_desired
+                            .generation_order
+                            .iter()
+                            .filter(|coord| !streaming.resident.contains(coord))
+                            .count();
+                        let near_backlog_count = cached_desired
+                            .near
+                            .iter()
+                            .filter(|coord| !streaming.resident.contains(coord))
+                            .count();
+                        let generated_backlog = generated_ready.len();
+                        let apply_backlog = generated_backlog
+                            .max(desired_backlog_count / 3)
+                            .max(near_backlog_count.saturating_mul(2));
                         let apply_budget_items = scaled_budget(
                             stream_tuning.base_apply_budget_items,
                             stream_tuning.max_apply_budget_items,
-                            generated_ready.len(),
+                            apply_backlog,
                             stream_tuning.base_apply_budget_items,
                         );
+                        let pending_generate_depth = streaming.pending_generate_count();
+                        let near_generation_pressure = near_backlog_count
+                            .max(desired_backlog_count / 4)
+                            .max(generated_backlog / 2);
+                        let generation_drain_backlog = pending_generate_depth
+                            .max(generated_backlog)
+                            .max(near_generation_pressure)
+                            .max(gen_worker_inflight);
                         let base_generate_drain_budget = scaled_budget(
                             stream_tuning.base_generate_drain_items,
                             stream_tuning.max_generate_drain_items,
-                            streaming.pending_generate_count(),
+                            generation_drain_backlog,
                             stream_tuning.base_generate_drain_items,
                         );
                         let pressure_model = compute_generation_pressure_model(
                             &effective_stream_tuning,
-                            streaming.pending_generate_count(),
+                            pending_generate_depth.max(near_generation_pressure),
                             gen_worker_inflight,
                             apply_budget_items,
                             prior_mesh_backlog,
@@ -1946,90 +1976,81 @@ pub async fn run() -> anyhow::Result<()> {
                             near_sent += 1;
                         }
 
+                        let near_unsatisfied = dispatch_near.len().saturating_sub(near_sent);
+                        let dispatch_starvation_active = has_near_backlog && near_sent == 0;
+                        let near_reserve_budget = if dispatch_starvation_active {
+                            base_generate_drain_budget.max(2)
+                        } else {
+                            near_unsatisfied.min(base_generate_drain_budget / 2)
+                        };
                         let generate_drain_budget = if gen_dispatch_paused {
                             0
                         } else {
-                            base_generate_drain_budget.saturating_sub(near_sent)
+                            base_generate_drain_budget
+                                .saturating_sub(near_sent)
+                                .saturating_sub(near_reserve_budget)
                         };
 
-                        if !has_near_backlog {
-                            if has_mid_backlog {
-                                let mut mid_budget = generate_drain_budget.min(pressure_model.mid_dispatch_budget);
-                                for coord in dispatch_mid {
-                                    if mid_budget == 0 {
-                                        break;
-                                    }
-                                    if !dispatch_coord(
-                                        coord,
-                                        GenerateJobClass::Mid,
-                                        &mut gen_request_count,
-                                        &mut gen_worker_inflight,
-                                        &mut store,
-                                        &mut streaming,
-                                        &mut cached_modified_chunks,
-                                    ) {
-                                        break;
-                                    }
-                                    mid_budget = mid_budget.saturating_sub(1);
+                        if generate_drain_budget > 0 {
+                            let mut mid_budget = generate_drain_budget
+                                .min(pressure_model.mid_dispatch_budget)
+                                .max(usize::from(has_mid_backlog && !dispatch_mid.is_empty()));
+                            let mut mid_sent = 0usize;
+                            for coord in dispatch_mid {
+                                if mid_budget == 0 {
+                                    break;
                                 }
-                            } else {
-                                let mut mid_budget = generate_drain_budget.min(pressure_model.mid_dispatch_budget);
-                                let mut mid_sent = 0usize;
-                                for coord in dispatch_mid {
-                                    if mid_budget == 0 {
-                                        break;
-                                    }
-                                    if !dispatch_coord(
-                                        coord,
-                                        GenerateJobClass::Mid,
-                                        &mut gen_request_count,
-                                        &mut gen_worker_inflight,
-                                        &mut store,
-                                        &mut streaming,
-                                        &mut cached_modified_chunks,
-                                    ) {
-                                        break;
-                                    }
-                                    mid_sent += 1;
-                                    mid_budget = mid_budget.saturating_sub(1);
+                                if !dispatch_coord(
+                                    coord,
+                                    GenerateJobClass::Mid,
+                                    &mut gen_request_count,
+                                    &mut gen_worker_inflight,
+                                    &mut store,
+                                    &mut streaming,
+                                    &mut cached_modified_chunks,
+                                ) {
+                                    break;
                                 }
-                                let mut far_budget = generate_drain_budget
-                                    .saturating_sub(mid_sent)
-                                    .min(pressure_model.far_dispatch_budget);
-                                for coord in dispatch_far {
-                                    if far_budget == 0 {
-                                        break;
-                                    }
-                                    if !dispatch_coord(
-                                        coord,
-                                        GenerateJobClass::Far,
-                                        &mut gen_request_count,
-                                        &mut gen_worker_inflight,
-                                        &mut store,
-                                        &mut streaming,
-                                        &mut cached_modified_chunks,
-                                    ) {
-                                        break;
-                                    }
-                                    far_budget = far_budget.saturating_sub(1);
+                                mid_sent += 1;
+                                mid_budget = mid_budget.saturating_sub(1);
+                            }
+
+                            let mut far_budget = generate_drain_budget
+                                .saturating_sub(mid_sent)
+                                .min(pressure_model.far_dispatch_budget);
+                            for coord in dispatch_far {
+                                if far_budget == 0 {
+                                    break;
                                 }
-                                for coord in dispatch_ultra {
-                                    if far_budget == 0 {
-                                        break;
-                                    }
-                                    if !dispatch_coord(
-                                        coord,
-                                        GenerateJobClass::Far,
-                                        &mut gen_request_count,
-                                        &mut gen_worker_inflight,
-                                        &mut store,
-                                        &mut streaming,
-                                        &mut cached_modified_chunks,
-                                    ) {
-                                        break;
-                                    }
-                                    far_budget = far_budget.saturating_sub(1);
+                                if !dispatch_coord(
+                                    coord,
+                                    GenerateJobClass::Far,
+                                    &mut gen_request_count,
+                                    &mut gen_worker_inflight,
+                                    &mut store,
+                                    &mut streaming,
+                                    &mut cached_modified_chunks,
+                                ) {
+                                    break;
                                 }
+                                far_budget = far_budget.saturating_sub(1);
+                            }
+                            for coord in dispatch_ultra {
+                                if far_budget == 0 {
+                                    break;
+                                }
+                                if !dispatch_coord(
+                                    coord,
+                                    GenerateJobClass::Far,
+                                    &mut gen_request_count,
+                                    &mut gen_worker_inflight,
+                                    &mut store,
+                                    &mut streaming,
+                                    &mut cached_modified_chunks,
+                                ) {
+                                    break;
+                                }
+                                far_budget = far_budget.saturating_sub(1);
                             }
                         }
                         let gen_recv_t0 = Instant::now();
@@ -2075,6 +2096,11 @@ pub async fn run() -> anyhow::Result<()> {
                         } else {
                             "blocked"
                         };
+                        if has_near_backlog && near_sent == 0 {
+                            dispatch_starvation_streak = dispatch_starvation_streak.saturating_add(1);
+                        } else {
+                            dispatch_starvation_streak = 0;
+                        }
                         if dispatched_count >= generator_config.dispatch_high && gen_completed_count == 0 {
                             let now_secs = start.elapsed().as_secs_f32();
                             ui.log_once_per_second("gen_starvation", now_secs, || {
@@ -2086,6 +2112,22 @@ pub async fn run() -> anyhow::Result<()> {
                                     gen_dispatch_paused,
                                     recv_progress,
                                     gen_recv_ms,
+                                )
+                            });
+                        }
+                        if dispatch_starvation_streak >= DISPATCH_STARVATION_STREAK_FRAMES {
+                            let now_secs = start.elapsed().as_secs_f32();
+                            ui.log_once_per_second("dispatch_starvation", now_secs, || {
+                                format!(
+                                    "dispatch starvation near_backlog={} near_budget={} near_sent={} gen_drain_budget={} pending_generate={} inflight={} paused={} streak={}",
+                                    dispatch_near.len(),
+                                    near_budget,
+                                    near_sent,
+                                    generate_drain_budget,
+                                    pending_count,
+                                    gen_worker_inflight,
+                                    gen_dispatch_paused,
+                                    dispatch_starvation_streak,
                                 )
                             });
                         }
@@ -2141,6 +2183,11 @@ pub async fn run() -> anyhow::Result<()> {
                             apply_count += 1;
                         }
                         let apply_ms = apply_t0.elapsed().as_secs_f32() * 1000.0;
+                        if generated_ready.len() >= apply_budget_items && apply_count == 0 {
+                            apply_starvation_streak = apply_starvation_streak.saturating_add(1);
+                        } else {
+                            apply_starvation_streak = 0;
+                        }
 
                         let evict_t0 = Instant::now();
                         let mut evict_count = 0usize;
@@ -2217,6 +2264,64 @@ pub async fn run() -> anyhow::Result<()> {
                                     generated_ready.len(),
                                     apply_budget_items,
                                     streaming.pending_generate_count()
+                                )
+                            });
+                        }
+                        if apply_starvation_streak >= APPLY_STARVATION_STREAK_FRAMES {
+                            ui.log_once_per_second("apply_starvation", now_secs, || {
+                                format!(
+                                    "apply starvation apply_queue={} apply_budget_items={} apply_count={} near_backlog={} pending_generate={} streak={}",
+                                    generated_ready.len(),
+                                    apply_budget_items,
+                                    apply_count,
+                                    near_backlog_count,
+                                    pending_count,
+                                    apply_starvation_streak,
+                                )
+                            });
+                        }
+                        let loaded_chunks = store.iter_loaded_chunks().count();
+                        let loaded_or_inflight = loaded_chunks
+                            .saturating_add(dispatched_count)
+                            .saturating_add(scheduled_count);
+                        let missing_loaded_to_desired = desired_backlog_count.saturating_sub(loaded_or_inflight);
+                        let convergence_stall = ui.profiler.frame_ms <= FRAME_TIME_TARGET_MS * 1.1
+                            && desired_backlog_count >= LOW_LOADED_HIGH_BACKLOG_THRESHOLD
+                            && missing_loaded_to_desired >= LOW_LOADED_HIGH_BACKLOG_THRESHOLD / 2
+                            && apply_count == 0
+                            && gen_completed_count == 0;
+                        if convergence_stall {
+                            convergence_stall_streak = convergence_stall_streak.saturating_add(1);
+                        } else {
+                            convergence_stall_streak = 0;
+                        }
+                        if loaded_chunks <= LOW_LOADED_CHUNKS_THRESHOLD
+                            && desired_backlog_count >= LOW_LOADED_HIGH_BACKLOG_THRESHOLD
+                        {
+                            ui.log_once_per_second("low_loaded_high_backlog", now_secs, || {
+                                format!(
+                                    "loaded low vs desired backlog loaded={} desired_backlog={} near_backlog={} scheduled={} generating={} apply_queue={}",
+                                    loaded_chunks,
+                                    desired_backlog_count,
+                                    near_backlog_count,
+                                    scheduled_count,
+                                    dispatched_count,
+                                    generated_ready.len(),
+                                )
+                            });
+                        }
+                        if convergence_stall_streak >= CONVERGENCE_STALL_STREAK_FRAMES {
+                            ui.log_once_per_second("convergence_failure", now_secs, || {
+                                format!(
+                                    "convergence stalled frame_ms={:.2} loaded={} desired_backlog={} missing_desired={} applied={} completed={} dispatch_streak={} apply_streak={}",
+                                    ui.profiler.frame_ms,
+                                    loaded_chunks,
+                                    desired_backlog_count,
+                                    missing_loaded_to_desired,
+                                    apply_count,
+                                    gen_completed_count,
+                                    dispatch_starvation_streak,
+                                    apply_starvation_streak,
                                 )
                             });
                         }
@@ -2471,10 +2576,15 @@ pub async fn run() -> anyhow::Result<()> {
                         let startup_burst_active = startup_burst_budget_frames > 0
                             && ui.profiler.frame_ms > FRAME_TIME_TARGET_MS * 1.2
                             && last_mesh_stats.pending_finalize_total > MAINTENANCE_PRESSURE_PENDING_FINALIZE_START;
+                        let convergence_guard_active = dispatch_starvation_streak
+                            >= DISPATCH_STARVATION_STREAK_FRAMES / 2
+                            || apply_starvation_streak >= APPLY_STARVATION_STREAK_FRAMES / 2
+                            || near_backlog_count >= LOW_LOADED_HIGH_BACKLOG_THRESHOLD / 2;
                         let maintenance_deadline = now >= next_maintenance_tick_at;
                         let run_maintenance_tick = force_maintenance
                             || maintenance_deadline
-                            || startup_burst_active;
+                            || startup_burst_active
+                            || convergence_guard_active;
                         let mut mesh_upload_budget = ui.profiler.mesh_upload_budget_bytes;
                         let mesh_stats = if run_maintenance_tick {
                             let base_upload_budget = adaptive_mesh_upload_budget(
@@ -2563,7 +2673,12 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.meshing_completed_depth,
                             ui.profiler.frame_ms,
                             maintenance_throttle_state.interval_scale,
-                        );
+                        )
+                        .min(if convergence_guard_active {
+                            (MAINTENANCE_TICK_MIN_MS * 1.5).max(FRAME_TIME_TARGET_MS)
+                        } else {
+                            MAINTENANCE_TICK_MAX_MS
+                        });
                         next_maintenance_tick_at = now
                             + Duration::from_secs_f32((maintenance_interval_ms.max(1.0)) / 1000.0);
                         let redraw_interval_ms = adaptive_redraw_interval_ms(
@@ -2649,11 +2764,16 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_resident_fallback = mesh_stats.resident_fallback;
                         ui.profiler.mesh_resident_unknown = mesh_stats.resident_unknown;
                         ui.profiler.gpu_upload_bytes_frame = mesh_stats.upload_bytes;
-                        // GPU compute profiler snapshot isn't exported; keep these stable defaults.
-                        ui.profiler.gpu_compute_dispatch_ms = 0.0;
-                        ui.profiler.gpu_compute_bytes_transferred = 0;
-                        ui.profiler.gpu_compute_chunks_completed = 0;
-                        ui.profiler.gpu_compute_chunks_per_sec = 0.0;
+                        // App frame does not expose independent GPU-compute telemetry yet; mirror meshing stats instead.
+                        ui.profiler.gpu_compute_dispatch_ms = mesh_stats.gpu_dispatch_ms;
+                        ui.profiler.gpu_compute_bytes_transferred = mesh_stats.gpu_readback_bytes;
+                        ui.profiler.gpu_compute_chunks_completed = mesh_stats.gpu_mesh_adopted_count as u64;
+                        ui.profiler.gpu_compute_chunks_per_sec = if ui.profiler.frame_ms > 0.0 {
+                            (mesh_stats.gpu_mesh_adopted_count as f32)
+                                / (ui.profiler.frame_ms / 1000.0)
+                        } else {
+                            0.0
+                        };
                         ui.profiler.gpu_mesh_slots_used = mesh_stats.gpu_mesh_slots_used;
                         ui.profiler.gpu_mesh_slot_capacity = mesh_stats.gpu_mesh_slot_capacity;
                         ui.profiler.gpu_mesh_slot_in_flight_fences =
@@ -2812,16 +2932,14 @@ pub async fn run() -> anyhow::Result<()> {
                         let cull_stats = renderer.cull_stats(&cam);
                         ui.profiler.culled_chunks = cull_stats.frustum_culled + cull_stats.screen_culled + cull_stats.lod_filtered;
                         ui.profiler.frustum_culled_chunks = cull_stats.frustum_culled;
-                        ui.profiler.missing_in_radius = cached_desired
+                        let loaded_chunks = store.iter_loaded_chunks().count();
+                        let desired_backlog_visible = cached_desired
                             .generation_order
                             .iter()
-                            .filter(|coord| {
-                                !streaming.resident.contains(coord)
-                                    && !streaming.dispatched_generate.contains(coord)
-                                    && !streaming.scheduled_generate.contains(coord)
-                            })
+                            .filter(|coord| !streaming.resident.contains(coord))
                             .count();
-                        ui.profiler.loaded_chunks = store.iter_loaded_chunks().count();
+                        ui.profiler.missing_in_radius = desired_backlog_visible;
+                        ui.profiler.loaded_chunks = loaded_chunks;
                         ui.profiler.resident_chunks = streaming.resident.len();
                         ui.profiler.scheduled_chunks = streaming.scheduled_generate.len();
                         ui.profiler.generating_chunks = streaming.dispatched_generate.len();
