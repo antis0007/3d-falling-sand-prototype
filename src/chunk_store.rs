@@ -647,7 +647,8 @@ impl ChunkStore {
         self.unmeshed_chunks.insert(coord);
         self.modified_chunks.remove(&coord);
 
-        if mark_self_dirty || self.deferred_dirty_on_load.remove(&coord) {
+        let had_deferred_dirty = self.deferred_dirty_on_load.remove(&coord);
+        if mark_self_dirty || had_deferred_dirty {
             self.dirty_chunks.insert(coord);
         }
 
@@ -676,6 +677,7 @@ impl ChunkStore {
             self.unmeshed_chunks.remove(&coord);
             self.chunk_voxel_versions.remove(&coord);
             self.deferred_neighbor_dirty_on_mesh.remove(&coord);
+            self.sim_dirty_voxels.remove(&coord);
             return removed.map(|chunk| (chunk, was_modified));
         }
         None
@@ -915,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn boundary_edits_mark_loaded_neighbors_as_urgent_once() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let west = ChunkCoord { x: -1, y: 0, z: 0 };
+
+        store.insert_chunk(center, Chunk::new_empty());
+        store.insert_chunk(west, Chunk::new_empty());
+        store.take_dirty_chunks();
+        store.take_urgent_dirty_chunks();
+
+        store.set_voxel(VoxelCoord { x: 0, y: 1, z: 1 }, 3);
+        store.set_voxel(VoxelCoord { x: 0, y: 1, z: 1 }, 4);
+
+        let urgent = store.take_urgent_dirty_chunks();
+        assert!(urgent.contains(&center));
+        assert!(urgent.contains(&west));
+        assert_eq!(urgent.iter().filter(|&&c| c == west).count(), 1);
+    }
+
+    #[test]
     fn chunk_voxel_version_increments_on_voxel_edits() {
         let mut store = ChunkStore::new();
         let chunk = ChunkCoord { x: 0, y: 0, z: 0 };
@@ -961,6 +983,18 @@ mod tests {
         store.take_dirty_chunks();
         store.mark_chunk_meshed(center);
         assert!(!store.is_dirty(east));
+    }
+
+    #[test]
+    fn remove_chunk_clears_sim_dirty_voxels_for_removed_chunk() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+
+        store.insert_chunk(center, Chunk::new_empty());
+        store.set_voxel(VoxelCoord { x: 1, y: 2, z: 3 }, 9);
+        store.remove_chunk(center);
+
+        assert!(store.take_sim_dirty_voxels().is_empty());
     }
 
     #[test]
@@ -1042,6 +1076,23 @@ mod tests {
 
         store.insert_chunk_with_policy(west, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
         assert!(store.is_dirty(west));
+    }
+
+    #[test]
+    fn remove_and_load_cycle_preserves_neighbor_dirtying() {
+        let mut store = ChunkStore::new();
+        let center = ChunkCoord { x: 0, y: 0, z: 0 };
+        let west = ChunkCoord { x: -1, y: 0, z: 0 };
+
+        store.insert_chunk(center, chunk_with_fill(1));
+        store.take_dirty_chunks();
+
+        store.remove_chunk(center);
+        store.insert_chunk_with_policy(west, Chunk::new_empty(), false, NeighborDirtyPolicy::None);
+
+        assert!(store.is_dirty(west));
+        let dirty = store.take_dirty_chunks();
+        assert_eq!(dirty.iter().filter(|&&c| c == west).count(), 1);
     }
 
     #[test]
