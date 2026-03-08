@@ -1141,6 +1141,7 @@ pub struct GpuDispatchFrameStats {
 pub struct ReadyGpuMeshResult {
     pub coord: ChunkCoord,
     pub version: u64,
+    pub submission_serial: u64,
     pub page_index: GpuPageIndex,
     pub draw_indirect_index: u32,
     pub index_count: u32,
@@ -2414,6 +2415,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             let result = ReadyGpuMeshResult {
                 coord: candidate.coord,
                 version: candidate.pending.version,
+                submission_serial: candidate.pending.submission_serial,
                 page_index: candidate.pending.page_index,
                 draw_indirect_index: candidate.pending.draw_indirect_index,
                 index_count,
