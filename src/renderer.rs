@@ -590,6 +590,8 @@ pub struct Renderer {
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
     visible_slots: HashMap<u32, ChunkCoord>,
+    slot_ownership_generation: HashMap<u32, u64>,
+    next_slot_ownership_generation: u64,
     free_mesh_slots: Vec<u32>,
     global_gpu_vertex_buffer: Arc<wgpu::Buffer>,
     global_gpu_index_buffer: Arc<wgpu::Buffer>,
@@ -613,7 +615,8 @@ pub struct Renderer {
     pending_lod_remesh: HashSet<ChunkCoord>,
     pending_lod_remesh_since: HashMap<ChunkCoord, u64>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
-    pending_gpu_results: HashMap<(ChunkCoord, u64), PendingGpuMeshResult>,
+    pending_gpu_results: HashMap<PendingGpuResultIdentity, PendingGpuMeshResult>,
+    next_gpu_mesh_task_id: u64,
     terminal_superseded_total: usize,
     terminal_evicted_total: usize,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
@@ -1128,6 +1131,7 @@ pub(crate) struct MeshJob {
     pub(crate) coord: ChunkCoord,
     pub(crate) lod: ChunkLod,
     pub(crate) version: u64,
+    pub(crate) task_id: u64,
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
     pub(crate) greedy: bool,
@@ -1138,6 +1142,7 @@ struct MeshResult {
     coord: ChunkCoord,
     lod: ChunkLod,
     version: u64,
+    task_id: u64,
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
@@ -1145,9 +1150,18 @@ struct MeshResult {
 }
 
 struct PendingGpuMeshResult {
+    identity: PendingGpuResultIdentity,
     result: MeshResult,
     first_seen_frame: u64,
     first_seen_completed_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PendingGpuResultIdentity {
+    coord: ChunkCoord,
+    version: u64,
+    lod: u8,
+    task_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1186,6 +1200,7 @@ struct GpuChunkDraw {
     world_aabb_min: Vec3,
     world_aabb_max: Vec3,
     draw_source: DrawSource,
+    ownership_generation: u64,
     // Optional debug metadata only; indirect draw args remain authoritative.
     index_count: Option<u32>,
 }
@@ -1413,6 +1428,7 @@ impl BackgroundMeshQueue {
                         coord: job.coord,
                         lod: job.lod,
                         version: job.version,
+                        task_id: job.task_id,
                         queued_at: job.queued_at,
                         artifact,
                         urgent: job.urgent,
@@ -1459,6 +1475,26 @@ impl BackgroundMeshQueue {
 }
 
 impl Renderer {
+    fn next_pending_gpu_identity(
+        &self,
+        coord: ChunkCoord,
+        version: u64,
+        lod: u8,
+        task_id: u64,
+    ) -> PendingGpuResultIdentity {
+        PendingGpuResultIdentity {
+            coord,
+            version,
+            lod,
+            task_id,
+        }
+    }
+
+    fn next_gpu_mesh_task_id(&mut self) -> u64 {
+        self.next_gpu_mesh_task_id = self.next_gpu_mesh_task_id.saturating_add(1);
+        self.next_gpu_mesh_task_id
+    }
+
     pub async fn new(
         window: &'static winit::window::Window,
         require_gpu_meshing: bool,
@@ -1851,6 +1887,8 @@ impl Renderer {
             depth_view,
             visible_gpu_chunks: HashMap::new(),
             visible_slots: HashMap::new(),
+            slot_ownership_generation: HashMap::new(),
+            next_slot_ownership_generation: 0,
             free_mesh_slots: (0..mesh_pool_slot_capacity() as u32).collect(),
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
@@ -1874,6 +1912,7 @@ impl Renderer {
             pending_lod_remesh_since: HashMap::new(),
             inflight_mesh_chunks: HashSet::new(),
             pending_gpu_results: HashMap::new(),
+            next_gpu_mesh_task_id: 0,
             terminal_superseded_total: 0,
             terminal_evicted_total: 0,
             mesh_lifecycle: HashMap::new(),
@@ -1939,6 +1978,7 @@ impl Renderer {
                 &self.pending_lod_remesh_since,
                 self.mesh_rebuild_frame_index,
                 self.chunk_has_pending_replacement(coord),
+                &self.slot_ownership_generation,
                 visibility,
             ),
             DrawContractDecision::Filtered
@@ -1950,7 +1990,7 @@ impl Renderer {
             || self
                 .pending_gpu_results
                 .keys()
-                .any(|(pending_coord, _)| *pending_coord == coord)
+                .any(|pending_identity| pending_identity.coord == coord)
     }
 
     fn draw_contract_decision_for_chunk(
@@ -1968,6 +2008,7 @@ impl Renderer {
             &self.pending_lod_remesh_since,
             self.mesh_rebuild_frame_index,
             self.chunk_has_pending_replacement(coord),
+            &self.slot_ownership_generation,
             visibility,
         )
     }
@@ -2169,12 +2210,14 @@ impl Renderer {
 
             let mut push_job = |lod: ChunkLod| {
                 let version = store.chunk_voxel_version(coord);
+                let task_id = self.next_gpu_mesh_task_id();
                 Self::enqueue_frame_job(
                     &mut frame_jobs,
                     MeshJob {
                         coord,
                         lod,
                         version,
+                        task_id,
                         queued_at: Instant::now(),
                         snapshot: snapshot.clone(),
                         greedy: self.settings.greedy_meshing,
@@ -2507,9 +2550,20 @@ impl Renderer {
                     Some(result.version),
                     "pending_result_insert",
                 );
+                let pending_lod = match &result.artifact {
+                    ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
+                    _ => result.lod as u8,
+                };
+                let identity = self.next_pending_gpu_identity(
+                    result.coord,
+                    result.version,
+                    pending_lod,
+                    result.task_id,
+                );
                 self.pending_gpu_results.insert(
-                    (result.coord, result.version),
+                    identity,
                     PendingGpuMeshResult {
+                        identity,
                         result,
                         first_seen_frame: self.mesh_rebuild_frame_index,
                         first_seen_completed_index: completed_index,
@@ -2592,7 +2646,7 @@ impl Renderer {
                     pending_rejected += 1;
                 }
 
-                log::warn!(
+                log::debug!(
                     "[mesh] skipped chunk={:?} reason={:?}",
                     result.coord,
                     reason
@@ -2705,9 +2759,20 @@ impl Renderer {
                     Some(result.version),
                     "pending_result_insert",
                 );
+                let pending_lod = match &result.artifact {
+                    ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
+                    _ => result.lod as u8,
+                };
+                let identity = self.next_pending_gpu_identity(
+                    result.coord,
+                    result.version,
+                    pending_lod,
+                    result.task_id,
+                );
                 self.pending_gpu_results.insert(
-                    (result.coord, result.version),
+                    identity,
                     PendingGpuMeshResult {
+                        identity,
                         result,
                         first_seen_frame: self.mesh_rebuild_frame_index,
                         first_seen_completed_index: completed_index,
@@ -2803,6 +2868,7 @@ impl Renderer {
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
                         draw_source: DrawSource::GpuArtifact,
+                        ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
                 );
@@ -2921,6 +2987,7 @@ impl Renderer {
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
                         draw_source: DrawSource::CpuUploaded,
+                        ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
                 );
@@ -3050,7 +3117,7 @@ impl Renderer {
             .filter(|state| state.startup_seed_recovered_nonzero)
             .count();
         let mut oldest_pending: Option<(u64, usize, ChunkCoord)> = None;
-        for ((coord, _), pending) in &self.pending_gpu_results {
+        for (identity, pending) in &self.pending_gpu_results {
             let age_frames = self
                 .mesh_rebuild_frame_index
                 .saturating_sub(pending.first_seen_frame);
@@ -3064,7 +3131,11 @@ impl Renderer {
                 {
                     Some((old_age, old_idx, old_coord))
                 }
-                _ => Some((age_frames, pending.first_seen_completed_index, *coord)),
+                _ => Some((
+                    age_frames,
+                    pending.first_seen_completed_index,
+                    identity.coord,
+                )),
             };
         }
         if let Some((age_frames, first_seen_completed_index, coord)) = oldest_pending {
@@ -3284,17 +3355,48 @@ impl Renderer {
         &mut self,
         ready: ReadyGpuMeshFinalizeEvent,
     ) -> Option<ChunkCoord> {
-        let key = (ready.result.coord, ready.result.version);
-        let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
+        let pending_key = self
+            .pending_gpu_results
+            .iter()
+            .find_map(|(identity, pending)| {
+                let Some((pending_page, pending_draw_slot, pending_lod)) =
+                    (match &pending.result.artifact {
+                        ChunkMeshArtifact::GpuPending {
+                            page_index,
+                            draw_indirect_index,
+                            lod,
+                            ..
+                        } => Some((*page_index, *draw_indirect_index, *lod)),
+                        _ => None,
+                    })
+                else {
+                    return None;
+                };
+                (identity.coord == ready.result.coord
+                    && identity.version == ready.result.version
+                    && identity.lod == ready.result.lod
+                    && identity.task_id == ready.result.task_id
+                    && pending_page == ready.result.page_index
+                    && pending_draw_slot == ready.result.draw_indirect_index
+                    && pending_lod == ready.result.lod)
+                    .then_some(*identity)
+            });
+
+        let Some(key) = pending_key else {
             log::debug!(
-                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} page={} draw_slot={} lod={} status={:?}",
+                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
                 ready.result.coord,
                 ready.result.version,
+                ready.result.task_id,
                 ready.result.page_index.0,
                 ready.result.draw_indirect_index,
                 ready.result.lod,
+                ready.result.submission_serial,
                 ready.status,
             );
+            return None;
+        };
+        let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
             return None;
         };
         let had_prior_visible = self.visible_gpu_chunks.contains_key(&ready.result.coord);
@@ -3327,12 +3429,13 @@ impl Renderer {
 
         if pending.result.coord != ready.result.coord
             || pending.result.version != ready.result.version
+            || pending.identity.lod != ready.result.lod
             || pending_page != ready.result.page_index
             || pending_draw_slot != ready.result.draw_indirect_index
             || pending_lod != ready.result.lod
         {
             log::debug!(
-                "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} status={:?}",
+                "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} pending_task_id={} ready_task_id={} ready_serial={} status={:?}",
                 ready.result.coord,
                 pending.result.coord,
                 ready.result.coord,
@@ -3344,6 +3447,9 @@ impl Renderer {
                 ready.result.draw_indirect_index,
                 pending_lod,
                 ready.result.lod,
+                pending.identity.task_id,
+                ready.result.task_id,
+                ready.result.submission_serial,
                 ready.status,
             );
             self.mesh_lifecycle
@@ -3360,22 +3466,15 @@ impl Renderer {
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 pending.result.from_pending_finalize = true;
-                let ready_index_count = ready.result.index_count.unwrap_or(0);
-                pending.result.artifact = if ready_index_count == 0 {
-                    ChunkMeshArtifact::Skipped {
-                        reason: MeshSkipReason::ZeroGeometry,
-                    }
-                } else {
-                    ChunkMeshArtifact::GpuReady {
-                        page_index: ready.result.page_index,
-                        draw_indirect_index: ready.result.draw_indirect_index,
-                        lod: ready.result.lod,
-                        index_count: ready_index_count,
-                        aabb_min: ready.result.aabb_min,
-                        aabb_max: ready.result.aabb_max,
-                        chunk_origin_world: ready.result.chunk_origin_world,
-                        dispatch_ms: 0.0,
-                    }
+                pending.result.artifact = ChunkMeshArtifact::GpuReady {
+                    page_index: ready.result.page_index,
+                    draw_indirect_index: ready.result.draw_indirect_index,
+                    lod: ready.result.lod,
+                    index_count: ready.result.index_count,
+                    aabb_min: ready.result.aabb_min,
+                    aabb_max: ready.result.aabb_max,
+                    chunk_origin_world: ready.result.chunk_origin_world,
+                    dispatch_ms: 0.0,
                 };
                 self.completed_meshes.push(pending.result);
                 None
@@ -3414,8 +3513,8 @@ impl Renderer {
         reason: &'static str,
     ) -> usize {
         let mut dropped = 0usize;
-        self.pending_gpu_results.retain(|(pending_coord, pending_version), pending| {
-            if *pending_coord != coord {
+        self.pending_gpu_results.retain(|identity, pending| {
+            if identity.coord != coord {
                 return true;
             }
             let (pending_page, pending_draw_slot, pending_lod) = match &pending.result.artifact {
@@ -3428,13 +3527,14 @@ impl Renderer {
                 _ => (None, None, None),
             };
             log::debug!(
-                "[mesh] drop_pending_result reason={} coord={:?} pending_version={} pending_page={:?} pending_draw_slot={:?} pending_lod={:?} requested_version={:?}",
+                "[mesh] drop_pending_result reason={} coord={:?} pending_version={} pending_page={:?} pending_draw_slot={:?} pending_lod={:?} pending_task_id={} requested_version={:?}",
                 reason,
                 coord,
-                pending_version,
+                identity.version,
                 pending_page.map(|p| p.0),
                 pending_draw_slot,
                 pending_lod,
+                identity.task_id,
                 requested_version,
             );
             dropped += 1;
@@ -3454,6 +3554,10 @@ impl Renderer {
             if self.visible_slots.get(&old.draw_indirect_index) == Some(&coord) {
                 self.visible_slots.remove(&old.draw_indirect_index);
             }
+            if reserved_slot != Some(old.draw_indirect_index) {
+                self.slot_ownership_generation
+                    .remove(&old.draw_indirect_index);
+            }
             if !matches!(old.draw_source, DrawSource::GpuArtifact)
                 && reserved_slot != Some(old.draw_indirect_index)
             {
@@ -3467,6 +3571,11 @@ impl Renderer {
 
     fn release_draw_slot_mapping(&mut self, coord: ChunkCoord) {
         self.release_draw_slot_mapping_with_reserved_slot(coord, None);
+    }
+
+    fn next_slot_generation(&mut self) -> u64 {
+        self.next_slot_ownership_generation = self.next_slot_ownership_generation.saturating_add(1);
+        self.next_slot_ownership_generation
     }
 
     fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) -> bool {
@@ -3484,16 +3593,30 @@ impl Renderer {
         let target_slot_is_acquirable = match previous_owner {
             None => true,
             Some(owner) if owner == coord => true,
-            Some(owner) => {
-                self.visible_gpu_chunks
-                    .get(&owner)
-                    .map(|owner_draw| owner_draw.draw_indirect_index)
-                    == Some(target_slot)
-            }
+            Some(owner) => self
+                .visible_gpu_chunks
+                .get(&owner)
+                .map(|owner_draw| {
+                    owner_draw.draw_indirect_index == target_slot
+                        && self.slot_ownership_generation.get(&target_slot).copied()
+                            == Some(owner_draw.ownership_generation)
+                })
+                .unwrap_or(false),
         };
         let coord_old_slot_is_owned = match coord_old_slot {
             None => true,
-            Some(old_slot) => self.visible_slots.get(&old_slot) == Some(&coord),
+            Some(old_slot) => {
+                self.visible_slots.get(&old_slot) == Some(&coord)
+                    && self
+                        .visible_gpu_chunks
+                        .get(&coord)
+                        .and_then(|existing| {
+                            self.slot_ownership_generation
+                                .get(&old_slot)
+                                .map(|g| *g == existing.ownership_generation)
+                        })
+                        .unwrap_or(false)
+            }
         };
 
         if !target_slot_is_acquirable || !coord_old_slot_is_owned {
@@ -3509,18 +3632,15 @@ impl Renderer {
             return false;
         }
 
-        log::debug!(
-            "[renderer] adopting draw slot transition coord={:?} slot={} previous_owner={:?} new_owner={:?} coord_old_slot={:?}",
-            coord,
-            target_slot,
-            previous_owner,
-            coord,
-            coord_old_slot,
-        );
+        let next_generation = self.next_slot_generation();
+        let mut draw = draw;
+        draw.ownership_generation = next_generation;
 
         // Commit phase: install forward + reverse mapping first.
         let replaced_draw = self.visible_gpu_chunks.insert(coord, draw);
         let displaced_coord = self.visible_slots.insert(target_slot, coord);
+        self.slot_ownership_generation
+            .insert(target_slot, next_generation);
 
         // Release displaced owner of the target slot after commit.
         if let Some(previous_coord) = displaced_coord {
@@ -3542,6 +3662,7 @@ impl Renderer {
                 if self.visible_slots.get(&previous_slot) == Some(&coord) {
                     self.visible_slots.remove(&previous_slot);
                 }
+                self.slot_ownership_generation.remove(&previous_slot);
                 if !matches!(previous_draw.draw_source, DrawSource::GpuArtifact) {
                     self.free_mesh_slots.push(previous_slot);
                 }
@@ -3564,6 +3685,10 @@ impl Renderer {
         debug_assert!(visible_draw_mappings_are_bijective(
             &self.visible_gpu_chunks,
             &self.visible_slots,
+        ));
+        debug_assert!(visible_draw_mappings_have_valid_generations(
+            &self.visible_gpu_chunks,
+            &self.slot_ownership_generation,
         ));
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
@@ -3789,6 +3914,7 @@ impl Renderer {
                 coord,
                 lod: primary_lod,
                 version,
+                task_id: self.next_gpu_mesh_task_id(),
                 queued_at,
                 snapshot: snapshot.clone(),
                 greedy: self.settings.greedy_meshing,
@@ -3799,6 +3925,7 @@ impl Renderer {
                     coord,
                     lod,
                     version,
+                    task_id: self.next_gpu_mesh_task_id(),
                     queued_at,
                     snapshot: snapshot.clone(),
                     greedy: self.settings.greedy_meshing,
@@ -4994,6 +5121,18 @@ fn visible_draw_mappings_are_bijective(
     true
 }
 
+fn visible_draw_mappings_have_valid_generations(
+    visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
+    slot_ownership_generation: &HashMap<u32, u64>,
+) -> bool {
+    visible_gpu_chunks.iter().all(|(_, draw)| {
+        slot_ownership_generation
+            .get(&draw.draw_indirect_index)
+            .copied()
+            == Some(draw.ownership_generation)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrawContractDecision {
     Strict,
@@ -5010,12 +5149,20 @@ fn chunk_draw_contract_decision(
     pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
     mesh_rebuild_frame_index: u64,
     has_pending_replacement: bool,
+    slot_ownership_generation: &HashMap<u32, u64>,
     visibility: DrawVisibilityInput,
 ) -> DrawContractDecision {
     if visible_slots.get(&draw.draw_indirect_index) != Some(&coord) {
         return DrawContractDecision::Filtered;
     }
     if !draw_is_drawable(draw) {
+        return DrawContractDecision::Filtered;
+    }
+    if slot_ownership_generation
+        .get(&draw.draw_indirect_index)
+        .copied()
+        != Some(draw.ownership_generation)
+    {
         return DrawContractDecision::Filtered;
     }
 
@@ -5077,6 +5224,7 @@ fn chunk_passes_draw_contract(
     lod_selection: &HashMap<ChunkCoord, ChunkLod>,
     pending_lod_remesh: &HashSet<ChunkCoord>,
     pending_lod_remesh_since: &HashMap<ChunkCoord, u64>,
+    slot_ownership_generation: &HashMap<u32, u64>,
     mesh_rebuild_frame_index: u64,
     visibility: DrawVisibilityInput,
 ) -> bool {
@@ -5090,6 +5238,7 @@ fn chunk_passes_draw_contract(
             pending_lod_remesh_since,
             mesh_rebuild_frame_index,
             false,
+            slot_ownership_generation,
             visibility,
         ),
         DrawContractDecision::Filtered
@@ -5585,6 +5734,7 @@ mod tests {
                 coord: low,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 1,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5594,6 +5744,7 @@ mod tests {
                 coord: high,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 2,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5636,6 +5787,7 @@ mod tests {
                 coord: far,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 3,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5645,6 +5797,7 @@ mod tests {
                 coord: near,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 4,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5876,6 +6029,7 @@ mod tests {
                 world_aabb_min: aabb_min,
                 world_aabb_max: aabb_max,
                 draw_source: source,
+                ownership_generation: 1,
                 index_count: Some(12),
             };
             assert!(chunk_passes_draw_contract(
@@ -5911,6 +6065,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::CpuUploaded,
+            ownership_generation: 1,
             index_count: Some(18),
         };
         let camera = Camera {
@@ -5956,6 +6111,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(12),
         };
         let camera = Camera {
@@ -6005,6 +6161,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(12),
         };
         let camera = Camera {
@@ -6054,6 +6211,7 @@ mod tests {
             world_aabb_min: Vec3::new(95.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(97.0, 1.0, -2.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(12),
         };
         let camera = Camera {
@@ -6103,6 +6261,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(18),
         };
         let camera = Camera {
@@ -6208,6 +6367,7 @@ mod tests {
             world_aabb_min: Vec3::new(16.0, 0.0, 0.0),
             world_aabb_max: Vec3::new(32.0, 16.0, 16.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(24),
         };
         let new_draw = GpuChunkDraw {
@@ -6218,6 +6378,7 @@ mod tests {
             world_aabb_min: Vec3::new(32.0, 0.0, 0.0),
             world_aabb_max: Vec3::new(48.0, 16.0, 16.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(24),
         };
 
@@ -6258,6 +6419,7 @@ mod tests {
             world_aabb_min: Vec3::ZERO,
             world_aabb_max: Vec3::splat(16.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(12),
         };
 
@@ -6388,6 +6550,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::CpuUploaded,
+            ownership_generation: 1,
             index_count: Some(6),
         };
         let mut visible_slots = HashMap::new();
@@ -6443,6 +6606,7 @@ mod tests {
             coord: coord(),
             lod: ChunkLod::Near,
             version: 11,
+            task_id: 42,
             queued_at: Instant::now(),
             artifact: ChunkMeshArtifact::GpuReady {
                 page_index: GpuPageIndex(2),
@@ -6473,6 +6637,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -2.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -1.0),
             draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
             index_count: Some(0),
         };
 
