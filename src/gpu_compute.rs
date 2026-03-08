@@ -1156,6 +1156,7 @@ pub enum ReadyGpuMeshFinalizeStatus {
     ReadyAndValid,
     DroppedStaleVersion,
     DroppedInvalidMapping,
+    DroppedSupersededIdentity,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -2438,6 +2439,33 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 continue;
             }
 
+            if result.coord != candidate.coord
+                || result.version != candidate.pending.version
+                || result.page_index != candidate.pending.page_index
+                || result.draw_indirect_index != candidate.pending.draw_indirect_index
+                || result.lod != candidate.pending.lod
+            {
+                log::debug!(
+                    "[gpu-mesh] drop_finalize reason=identity_mismatch coord={:?} result_version={} pending_version={} result_page={} pending_page={} result_draw_slot={} pending_draw_slot={} result_lod={} pending_lod={} serial={}",
+                    candidate.coord,
+                    result.version,
+                    candidate.pending.version,
+                    result.page_index.0,
+                    candidate.pending.page_index.0,
+                    result.draw_indirect_index,
+                    candidate.pending.draw_indirect_index,
+                    result.lod,
+                    candidate.pending.lod,
+                    candidate.pending.submission_serial,
+                );
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
+                });
+                finalized_count += 1;
+                continue;
+            }
+
             if atlas.version_for_chunk.get(&candidate.coord).copied()
                 != Some(candidate.pending.version)
             {
@@ -2457,6 +2485,23 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                     .map(|slice| slice.slot_index)
                     != Some(candidate.pending.draw_indirect_index)
             {
+                let atlas_page = atlas.page_for_chunk.get(&candidate.coord).copied();
+                let atlas_slot = atlas
+                    .mesh_slice_for_chunk
+                    .get(&candidate.coord)
+                    .copied()
+                    .map(|slice| slice.slot_index);
+                log::debug!(
+                    "[gpu-mesh] drop_finalize reason=invalid_mapping coord={:?} version={} lod={} pending_page={} atlas_page={:?} pending_draw_slot={} atlas_draw_slot={:?} serial={}",
+                    candidate.coord,
+                    candidate.pending.version,
+                    candidate.pending.lod,
+                    candidate.pending.page_index.0,
+                    atlas_page.map(|p| p.0),
+                    candidate.pending.draw_indirect_index,
+                    atlas_slot,
+                    candidate.pending.submission_serial,
+                );
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -2479,6 +2524,41 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     GPU_MESH_FINALIZE_REQUEUED_COUNT.fetch_add(requeued_count, Ordering::Relaxed);
 
     out
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn invalidate_gpu_pending_finalize_on_renderer(
+    coord: ChunkCoord,
+    requested_version: Option<u64>,
+    reason: &'static str,
+) {
+    if let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+            log::debug!(
+                "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                reason,
+                coord,
+                pending.version,
+                pending.lod,
+                pending.page_index.0,
+                pending.draw_indirect_index,
+                pending.submission_serial,
+                requested_version,
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu-compute"))]
+pub fn invalidate_gpu_pending_finalize_on_renderer(
+    _coord: ChunkCoord,
+    _requested_version: Option<u64>,
+    _reason: &'static str,
+) {
 }
 
 #[cfg(feature = "gpu-compute")]
