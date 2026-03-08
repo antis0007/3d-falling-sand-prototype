@@ -1636,7 +1636,7 @@ impl GpuComputeRuntime {
             )
         };
 
-        let mut dispatch = |pipeline: &wgpu::ComputePipeline, jacobi_iteration: u32| {
+        let dispatch = |pipeline: &wgpu::ComputePipeline, jacobi_iteration: u32| {
             let params = base_params(jacobi_iteration);
             state
                 .queue
@@ -2311,7 +2311,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         };
 
         let task_start = Instant::now();
-        let mut task_wait_sync = Duration::ZERO;
+        let task_wait_sync = Duration::ZERO;
 
         let scratch = &state.scratch;
 
