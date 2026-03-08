@@ -1960,6 +1960,7 @@ pub async fn run() -> anyhow::Result<()> {
                         }
 
                         let near_budget = pressure_model.near_dispatch_budget;
+                        let near_total = dispatch_near.len();
                         let mut near_sent = 0usize;
                         for coord in dispatch_near.into_iter().take(near_budget) {
                             if !dispatch_coord(
@@ -1976,7 +1977,7 @@ pub async fn run() -> anyhow::Result<()> {
                             near_sent += 1;
                         }
 
-                        let near_unsatisfied = dispatch_near.len().saturating_sub(near_sent);
+                        let near_unsatisfied = near_total.saturating_sub(near_sent);
                         let dispatch_starvation_active = has_near_backlog && near_sent == 0;
                         let near_reserve_budget = if dispatch_starvation_active {
                             base_generate_drain_budget.max(2)
@@ -2120,7 +2121,7 @@ pub async fn run() -> anyhow::Result<()> {
                             ui.log_once_per_second("dispatch_starvation", now_secs, || {
                                 format!(
                                     "dispatch starvation near_backlog={} near_budget={} near_sent={} gen_drain_budget={} pending_generate={} inflight={} paused={} streak={}",
-                                    dispatch_near.len(),
+                                    near_total,
                                     near_budget,
                                     near_sent,
                                     generate_drain_budget,
@@ -2311,10 +2312,11 @@ pub async fn run() -> anyhow::Result<()> {
                             });
                         }
                         if convergence_stall_streak >= CONVERGENCE_STALL_STREAK_FRAMES {
+                            let frame_ms = ui.profiler.frame_ms;
                             ui.log_once_per_second("convergence_failure", now_secs, || {
                                 format!(
                                     "convergence stalled frame_ms={:.2} loaded={} desired_backlog={} missing_desired={} applied={} completed={} dispatch_streak={} apply_streak={}",
-                                    ui.profiler.frame_ms,
+                                    frame_ms,
                                     loaded_chunks,
                                     desired_backlog_count,
                                     missing_loaded_to_desired,
