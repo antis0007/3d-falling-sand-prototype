@@ -31,7 +31,14 @@
 - `SUBSTEPS` in GPU-emulation backend increased to 3 for better settling/advection stability.
 - State movement priority table in `movement_candidates` controls powder, liquid, and gas transport characteristics.
 
+## Continuity and renderer authority (current state)
+
+- Renderer is the sole authority for visible residency and draw continuity.
+- GPU pipeline (meshing/finalize/atlas path) is a candidate producer/accelerator and is not the authority boundary.
+- Current drawable must survive candidate failure; fallback to lower detail is acceptable, renderer-visible voids are not.
+- Migration-era dual-ownership framing is obsolete: chunk ownership and renderer-visible authority are single-path responsibilities.
+
 ## Known limitations
 
 - Full world-simulation WGSL execution is not yet wired into `SimulationRuntime`; current `GpuFluid` mode is deterministic CPU emulation with diagnostics.
-- Cross-chunk fluid pressure continuity is still approximated by chunk-local movement and dirty-region readback.
+- Cross-chunk fluid pressure continuity is still approximated by chunk-local movement and dirty-region readback (simulation limitation, not renderer-visible residency authority).
