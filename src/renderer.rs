@@ -616,7 +616,7 @@ pub struct Renderer {
     pending_lod_remesh_since: HashMap<ChunkCoord, u64>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     pending_gpu_results: HashMap<PendingGpuResultIdentity, PendingGpuMeshResult>,
-    next_pending_gpu_task_id: u64,
+    next_gpu_mesh_task_id: u64,
     terminal_superseded_total: usize,
     terminal_evicted_total: usize,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
@@ -1131,6 +1131,7 @@ pub(crate) struct MeshJob {
     pub(crate) coord: ChunkCoord,
     pub(crate) lod: ChunkLod,
     pub(crate) version: u64,
+    pub(crate) task_id: u64,
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
     pub(crate) greedy: bool,
@@ -1141,6 +1142,7 @@ struct MeshResult {
     coord: ChunkCoord,
     lod: ChunkLod,
     version: u64,
+    task_id: u64,
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
     urgent: bool,
@@ -1426,6 +1428,7 @@ impl BackgroundMeshQueue {
                         coord: job.coord,
                         lod: job.lod,
                         version: job.version,
+                        task_id: job.task_id,
                         queued_at: job.queued_at,
                         artifact,
                         urgent: job.urgent,
@@ -1473,18 +1476,23 @@ impl BackgroundMeshQueue {
 
 impl Renderer {
     fn next_pending_gpu_identity(
-        &mut self,
+        &self,
         coord: ChunkCoord,
         version: u64,
         lod: u8,
+        task_id: u64,
     ) -> PendingGpuResultIdentity {
-        self.next_pending_gpu_task_id = self.next_pending_gpu_task_id.saturating_add(1);
         PendingGpuResultIdentity {
             coord,
             version,
             lod,
-            task_id: self.next_pending_gpu_task_id,
+            task_id,
         }
+    }
+
+    fn next_gpu_mesh_task_id(&mut self) -> u64 {
+        self.next_gpu_mesh_task_id = self.next_gpu_mesh_task_id.saturating_add(1);
+        self.next_gpu_mesh_task_id
     }
 
     pub async fn new(
@@ -1904,7 +1912,7 @@ impl Renderer {
             pending_lod_remesh_since: HashMap::new(),
             inflight_mesh_chunks: HashSet::new(),
             pending_gpu_results: HashMap::new(),
-            next_pending_gpu_task_id: 0,
+            next_gpu_mesh_task_id: 0,
             terminal_superseded_total: 0,
             terminal_evicted_total: 0,
             mesh_lifecycle: HashMap::new(),
@@ -2202,12 +2210,14 @@ impl Renderer {
 
             let mut push_job = |lod: ChunkLod| {
                 let version = store.chunk_voxel_version(coord);
+                let task_id = self.next_gpu_mesh_task_id();
                 Self::enqueue_frame_job(
                     &mut frame_jobs,
                     MeshJob {
                         coord,
                         lod,
                         version,
+                        task_id,
                         queued_at: Instant::now(),
                         snapshot: snapshot.clone(),
                         greedy: self.settings.greedy_meshing,
@@ -2544,8 +2554,12 @@ impl Renderer {
                     ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
                     _ => result.lod as u8,
                 };
-                let identity =
-                    self.next_pending_gpu_identity(result.coord, result.version, pending_lod);
+                let identity = self.next_pending_gpu_identity(
+                    result.coord,
+                    result.version,
+                    pending_lod,
+                    result.task_id,
+                );
                 self.pending_gpu_results.insert(
                     identity,
                     PendingGpuMeshResult {
@@ -2749,8 +2763,12 @@ impl Renderer {
                     ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
                     _ => result.lod as u8,
                 };
-                let identity =
-                    self.next_pending_gpu_identity(result.coord, result.version, pending_lod);
+                let identity = self.next_pending_gpu_identity(
+                    result.coord,
+                    result.version,
+                    pending_lod,
+                    result.task_id,
+                );
                 self.pending_gpu_results.insert(
                     identity,
                     PendingGpuMeshResult {
@@ -3357,6 +3375,7 @@ impl Renderer {
                 (identity.coord == ready.result.coord
                     && identity.version == ready.result.version
                     && identity.lod == ready.result.lod
+                    && identity.task_id == ready.result.task_id
                     && pending_page == ready.result.page_index
                     && pending_draw_slot == ready.result.draw_indirect_index
                     && pending_lod == ready.result.lod)
@@ -3365,9 +3384,10 @@ impl Renderer {
 
         let Some(key) = pending_key else {
             log::debug!(
-                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} page={} draw_slot={} lod={} serial={} status={:?}",
+                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
                 ready.result.coord,
                 ready.result.version,
+                ready.result.task_id,
                 ready.result.page_index.0,
                 ready.result.draw_indirect_index,
                 ready.result.lod,
@@ -3415,7 +3435,7 @@ impl Renderer {
             || pending_lod != ready.result.lod
         {
             log::debug!(
-                "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} pending_task_id={} ready_serial={} status={:?}",
+                "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} pending_task_id={} ready_task_id={} ready_serial={} status={:?}",
                 ready.result.coord,
                 pending.result.coord,
                 ready.result.coord,
@@ -3428,6 +3448,7 @@ impl Renderer {
                 pending_lod,
                 ready.result.lod,
                 pending.identity.task_id,
+                ready.result.task_id,
                 ready.result.submission_serial,
                 ready.status,
             );
@@ -3889,6 +3910,7 @@ impl Renderer {
                 coord,
                 lod: primary_lod,
                 version,
+                task_id: self.next_gpu_mesh_task_id(),
                 queued_at,
                 snapshot: snapshot.clone(),
                 greedy: self.settings.greedy_meshing,
@@ -3899,6 +3921,7 @@ impl Renderer {
                     coord,
                     lod,
                     version,
+                    task_id: self.next_gpu_mesh_task_id(),
                     queued_at,
                     snapshot: snapshot.clone(),
                     greedy: self.settings.greedy_meshing,
@@ -5707,6 +5730,7 @@ mod tests {
                 coord: low,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 1,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5716,6 +5740,7 @@ mod tests {
                 coord: high,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 2,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5758,6 +5783,7 @@ mod tests {
                 coord: far,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 3,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -5767,6 +5793,7 @@ mod tests {
                 coord: near,
                 lod: ChunkLod::Near,
                 version: 0,
+                task_id: 4,
                 queued_at: Instant::now(),
                 snapshot: snapshot.clone(),
                 greedy: false,
@@ -6575,6 +6602,7 @@ mod tests {
             coord: coord(),
             lod: ChunkLod::Near,
             version: 11,
+            task_id: 42,
             queued_at: Instant::now(),
             artifact: ChunkMeshArtifact::GpuReady {
                 page_index: GpuPageIndex(2),

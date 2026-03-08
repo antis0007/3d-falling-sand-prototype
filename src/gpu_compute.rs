@@ -296,6 +296,7 @@ impl PagePriorityHint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGpuMeshFinalize {
     version: u64,
+    task_id: u64,
     lod: u8,
     page_index: GpuPageIndex,
     draw_indirect_index: u32,
@@ -1141,6 +1142,7 @@ pub struct GpuDispatchFrameStats {
 pub struct ReadyGpuMeshResult {
     pub coord: ChunkCoord,
     pub version: u64,
+    pub task_id: u64,
     pub submission_serial: u64,
     pub page_index: GpuPageIndex,
     pub draw_indirect_index: u32,
@@ -1181,6 +1183,7 @@ pub struct GpuChunkTask {
     pub startup_seeding_mode: bool,
     pub mesh_slice: Option<MeshBufferSlice>,
     pub version: u64,
+    pub task_id: u64,
     pub lod: u8,
 }
 
@@ -2045,6 +2048,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 startup_seeding_mode,
                 mesh_slice,
                 version: job.version,
+                task_id: job.task_id,
                 lod: job.lod as u8,
             })
             .context("failed to send GPU chunk task")?;
@@ -2281,6 +2285,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                     task.coord,
                     PendingGpuMeshFinalize {
                         version: task.version,
+                        task_id: task.task_id,
                         lod: task.lod,
                         page_index: task.page_index,
                         draw_indirect_index: mesh_slice.slot_index,
@@ -2415,6 +2420,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             let result = ReadyGpuMeshResult {
                 coord: candidate.coord,
                 version: candidate.pending.version,
+                task_id: candidate.pending.task_id,
                 submission_serial: candidate.pending.submission_serial,
                 page_index: candidate.pending.page_index,
                 draw_indirect_index: candidate.pending.draw_indirect_index,
