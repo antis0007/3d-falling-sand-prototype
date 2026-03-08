@@ -617,17 +617,25 @@ pub struct Renderer {
     pending_lod_remesh_since: HashMap<ChunkCoord, u64>,
     inflight_mesh_chunks: HashSet<ChunkCoord>,
     pending_gpu_results: HashMap<PendingGpuResultIdentity, PendingGpuMeshResult>,
+    pending_gpu_results_by_finalize_key:
+        HashMap<PendingGpuFinalizeLookupKey, PendingGpuResultIdentity>,
+    pending_gpu_result_keys_by_coord: HashMap<ChunkCoord, Vec<PendingGpuResultIdentity>>,
     next_gpu_mesh_task_id: u64,
     terminal_superseded_total: usize,
     terminal_evicted_total: usize,
     mesh_lifecycle: HashMap<ChunkCoord, MeshLifecycleState>,
     mesh_retry_state: HashMap<ChunkCoord, MeshRetryState>,
+    retry_coord_queue: VecDeque<ChunkCoord>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
     mesh_rebuild_frame_index: u64,
     near_lod_distance: f32,
 
     mesh_queue: BackgroundMeshQueue,
     completed_meshes: Vec<MeshResult>,
+    deferred_completed_receives: VecDeque<MeshResult>,
+    #[cfg(feature = "gpu-compute")]
+    deferred_finalize_ready_events: VecDeque<ReadyGpuMeshFinalizeEvent>,
+    deferred_retry_kinds: VecDeque<(ChunkCoord, MeshRetryKind)>,
     outcome_trace_window_start: Instant,
     outcome_trace_emitted: u32,
     startup_seed_trace_window_start: Instant,
@@ -789,6 +797,17 @@ pub struct MeshRebuildStats {
     pub replacement_commit_fail_count: usize,
     pub candidate_rejected_but_drawable_preserved_count: usize,
     pub dropped_to_void_count_by_reason: [usize; 5],
+    pub completed_receive_budget_hits: usize,
+    pub finalize_budget_hits: usize,
+    pub adopt_budget_hits: usize,
+    pub retry_budget_hits: usize,
+    pub completed_receive_deferred: usize,
+    pub finalize_deferred: usize,
+    pub adopt_deferred: usize,
+    pub retry_deferred: usize,
+    pub pending_finalize_age_frames_max: u64,
+    pub pending_finalize_age_frames_p50: u64,
+    pub pending_finalize_age_frames_p95: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -867,6 +886,12 @@ enum MeshRetryKind {
     Skipped(MeshSkipReason),
 }
 
+#[derive(Default, Clone, Copy)]
+struct RetryBackoffFrameStats {
+    budget_hit: bool,
+    deferred: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StaleArtifactRetryPolicy {
     Urgent,
@@ -895,6 +920,13 @@ const DIRTY_NEAR_STARVE_LIMIT_FRAMES: u32 = 8;
 const DIRTY_FAR_STARVE_LIMIT_FRAMES: u32 = 20;
 const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
 const MAX_LOD_REMESH_PER_FRAME: usize = 64;
+// Hard caps for renderer-side bookkeeping to avoid frame-time spikes during backlog churn.
+const MAX_COMPLETED_RECEIVE_PER_FRAME: usize = 96;
+const MAX_FINALIZE_EVENTS_PER_FRAME: usize = 96;
+const MAX_COMPLETED_ADOPTIONS_PER_FRAME: usize = 96;
+const MAX_RETRY_ACTIONS_PER_FRAME: usize = 64;
+const MAX_RETRY_SCAN_PER_FRAME: usize = 256;
+const FINALIZE_FAIRNESS_AGE_BOOST_FRAMES: u64 = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -1158,6 +1190,7 @@ struct MeshResult {
     artifact: ChunkMeshArtifact,
     urgent: bool,
     from_pending_finalize: bool,
+    bookkeeping_first_seen_frame: u64,
 }
 
 struct PendingGpuMeshResult {
@@ -1165,6 +1198,16 @@ struct PendingGpuMeshResult {
     result: MeshResult,
     first_seen_frame: u64,
     first_seen_completed_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PendingGpuFinalizeLookupKey {
+    coord: ChunkCoord,
+    version: u64,
+    lod: u8,
+    task_id: u64,
+    page_index: GpuPageIndex,
+    draw_indirect_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1503,6 +1546,7 @@ impl BackgroundMeshQueue {
                         artifact,
                         urgent: job.urgent,
                         from_pending_finalize: false,
+                        bookkeeping_first_seen_frame: 0,
                     };
                     log::info!("[mesh-worker] sending result chunk={:?}", result.coord);
                     if worker_tx.send(result).is_err() {
@@ -1983,16 +2027,23 @@ impl Renderer {
             pending_lod_remesh_since: HashMap::new(),
             inflight_mesh_chunks: HashSet::new(),
             pending_gpu_results: HashMap::new(),
+            pending_gpu_results_by_finalize_key: HashMap::new(),
+            pending_gpu_result_keys_by_coord: HashMap::new(),
             next_gpu_mesh_task_id: 0,
             terminal_superseded_total: 0,
             terminal_evicted_total: 0,
             mesh_lifecycle: HashMap::new(),
             mesh_retry_state: HashMap::new(),
+            retry_coord_queue: VecDeque::new(),
             startup_mesh_seed_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             completed_meshes: Vec::new(),
+            deferred_completed_receives: VecDeque::new(),
+            #[cfg(feature = "gpu-compute")]
+            deferred_finalize_ready_events: VecDeque::new(),
+            deferred_retry_kinds: VecDeque::new(),
             outcome_trace_window_start: Instant::now(),
             outcome_trace_emitted: 0,
             startup_seed_trace_window_start: Instant::now(),
@@ -2163,7 +2214,8 @@ impl Renderer {
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
         self.mesh_rebuild_frame_index = self.mesh_rebuild_frame_index.saturating_add(1);
-        self.process_mesh_retry_backoff(player_chunk, chunk_priority_scores);
+        let retry_frame_stats =
+            self.process_mesh_retry_backoff(player_chunk, chunk_priority_scores);
         let lod_radii = lod_radii.normalized();
         self.near_lod_distance = lod_radii.near as f32 + 0.5;
         for coord in store.take_urgent_dirty_chunks() {
@@ -2173,6 +2225,10 @@ impl Renderer {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
         let mut stats = MeshRebuildStats::default();
+        if retry_frame_stats.budget_hit {
+            stats.retry_budget_hits += 1;
+        }
+        stats.retry_deferred = retry_frame_stats.deferred;
         stats.dirty_queue_drop_count +=
             self.enforce_dirty_queue_bound(player_chunk, chunk_priority_scores);
 
@@ -2477,32 +2533,58 @@ impl Renderer {
         let mut pending_rejected = 0usize;
         let mut replacement_failed_coords: HashSet<ChunkCoord> = HashSet::new();
 
-        while let Ok(result) = self.mesh_queue.try_recv() {
-            log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
-            self.inflight_mesh_chunks.remove(&result.coord);
-            self.mesh_lifecycle
-                .insert(result.coord, MeshLifecycleState::ResultReady);
+        let mut receive_budget = MAX_COMPLETED_RECEIVE_PER_FRAME;
+        while receive_budget > 0 {
+            match self.mesh_queue.try_recv() {
+                Ok(mut result) => {
+                    log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
+                    self.inflight_mesh_chunks.remove(&result.coord);
+                    self.mesh_lifecycle
+                        .insert(result.coord, MeshLifecycleState::ResultReady);
+                    result.bookkeeping_first_seen_frame = self.mesh_rebuild_frame_index;
+                    self.completed_meshes.push(result);
+                    receive_budget -= 1;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if receive_budget == 0 {
+            stats.completed_receive_budget_hits += 1;
+            while let Ok(mut result) = self.mesh_queue.try_recv() {
+                self.inflight_mesh_chunks.remove(&result.coord);
+                self.mesh_lifecycle
+                    .insert(result.coord, MeshLifecycleState::ResultReady);
+                result.bookkeeping_first_seen_frame = self.mesh_rebuild_frame_index;
+                self.deferred_completed_receives.push_back(result);
+            }
+        }
+        while self.completed_meshes.len() < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
+            let Some(result) = self.deferred_completed_receives.pop_front() else {
+                break;
+            };
             self.completed_meshes.push(result);
         }
 
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
             for ready in take_ready_gpu_mesh_results_on_renderer() {
+                self.deferred_finalize_ready_events.push_back(ready);
+            }
+            let mut finalize_budget = MAX_FINALIZE_EVENTS_PER_FRAME;
+            while finalize_budget > 0 {
+                let Some(ready) = self.deferred_finalize_ready_events.pop_front() else {
+                    break;
+                };
                 if let Some(coord) = self.finalize_pending_gpu_result(ready) {
                     replacement_failed_coords.insert(coord);
                 }
+                finalize_budget -= 1;
+            }
+            if !self.deferred_finalize_ready_events.is_empty() {
+                stats.finalize_budget_hits += 1;
             }
         }
-
-        self.completed_meshes.sort_by(|a, b| {
-            job_priority(b.coord)
-                .total_cmp(&job_priority(a.coord))
-                .then_with(|| {
-                    let ad = chunk_chebyshev_dist(player_chunk, a.coord);
-                    let bd = chunk_chebyshev_dist(player_chunk, b.coord);
-                    ad.cmp(&bd)
-                })
-        });
 
         if self.completed_meshes.len() > COMPLETED_MESH_BACKLOG_THRESHOLD {
             let mut low_priority_indices: Vec<usize> = self
@@ -2547,8 +2629,26 @@ impl Renderer {
         let mut remesh_coords = Vec::new();
         let mut failed_retry_coords = Vec::new();
         let mut skipped_retry_chunks = Vec::new();
-        let completed_meshes_depth = self.completed_meshes.len();
-        let completed_results: Vec<MeshResult> = self.completed_meshes.drain(..).collect();
+        let completed_meshes_depth =
+            self.completed_meshes.len() + self.deferred_completed_receives.len();
+        let adopt_budget = MAX_COMPLETED_ADOPTIONS_PER_FRAME.min(self.completed_meshes.len());
+        let selected_indices: std::collections::HashSet<usize> = self
+            .select_fair_completed_indices(adopt_budget)
+            .into_iter()
+            .collect();
+        let mut completed_results: Vec<MeshResult> = Vec::new();
+        let mut deferred_adopt = VecDeque::new();
+        for (idx, result) in self.completed_meshes.drain(..).enumerate() {
+            if selected_indices.contains(&idx) {
+                completed_results.push(result);
+            } else {
+                deferred_adopt.push_back(result);
+            }
+        }
+        self.completed_meshes.extend(deferred_adopt);
+        if !self.completed_meshes.is_empty() {
+            stats.adopt_budget_hits += 1;
+        }
         for (completed_index, result) in completed_results.into_iter().enumerate() {
             if let ChunkMeshArtifact::GpuPending { .. } = &result.artifact {
                 stats.mesh_pending_finalize += 1;
@@ -2576,15 +2676,12 @@ impl Renderer {
                     result.lod,
                     true,
                 );
-                self.pending_gpu_results.insert(
+                self.index_pending_gpu_result(PendingGpuMeshResult {
                     identity,
-                    PendingGpuMeshResult {
-                        identity,
-                        result,
-                        first_seen_frame: self.mesh_rebuild_frame_index,
-                        first_seen_completed_index: completed_index,
-                    },
-                );
+                    result,
+                    first_seen_frame: self.mesh_rebuild_frame_index,
+                    first_seen_completed_index: completed_index,
+                });
                 continue;
             }
 
@@ -2802,15 +2899,12 @@ impl Renderer {
                     pending_lod,
                     result.task_id,
                 );
-                self.pending_gpu_results.insert(
+                self.index_pending_gpu_result(PendingGpuMeshResult {
                     identity,
-                    PendingGpuMeshResult {
-                        identity,
-                        result,
-                        first_seen_frame: self.mesh_rebuild_frame_index,
-                        first_seen_completed_index: completed_index,
-                    },
-                );
+                    result,
+                    first_seen_frame: self.mesh_rebuild_frame_index,
+                    first_seen_completed_index: completed_index,
+                });
                 continue;
             }
 
@@ -3175,11 +3269,13 @@ impl Renderer {
             .values()
             .filter(|state| state.startup_seed_recovered_nonzero)
             .count();
+        let mut pending_ages = Vec::with_capacity(self.pending_gpu_results.len());
         let mut oldest_pending: Option<(u64, usize, ChunkCoord)> = None;
         for (identity, pending) in &self.pending_gpu_results {
             let age_frames = self
                 .mesh_rebuild_frame_index
                 .saturating_sub(pending.first_seen_frame);
+            pending_ages.push(age_frames);
             stats.mesh_waiting_on_fence += 1;
             oldest_pending = match oldest_pending {
                 Some((old_age, old_idx, old_coord)) if old_age > age_frames => {
@@ -3205,6 +3301,20 @@ impl Renderer {
                 first_seen_completed_index
             );
         }
+        pending_ages.sort_unstable();
+        if let Some(max) = pending_ages.last().copied() {
+            stats.pending_finalize_age_frames_max = max;
+            let p50_idx = ((pending_ages.len() as f32) * 0.50).floor() as usize;
+            let p95_idx = ((pending_ages.len() as f32) * 0.95).floor() as usize;
+            stats.pending_finalize_age_frames_p50 =
+                pending_ages[p50_idx.min(pending_ages.len() - 1)];
+            stats.pending_finalize_age_frames_p95 =
+                pending_ages[p95_idx.min(pending_ages.len() - 1)];
+        }
+        debug_assert!(
+            self.pending_gpu_results_by_finalize_key.len() <= self.pending_gpu_results.len(),
+            "pending finalize lookup index drifted from authoritative map"
+        );
         stats.mesh_pending_total = self.pending_gpu_results.len();
         stats.mesh_pending_finalize = stats.mesh_pending_total;
         stats.mesh_pending_promoted_to_drawable = pending_promoted_to_drawable;
@@ -3217,6 +3327,13 @@ impl Renderer {
         stats.terminal_superseded_total = self.terminal_superseded_total;
         stats.terminal_evicted_total = self.terminal_evicted_total;
 
+        stats.completed_receive_deferred = self.deferred_completed_receives.len();
+        #[cfg(feature = "gpu-compute")]
+        {
+            stats.finalize_deferred = self.deferred_finalize_ready_events.len();
+        }
+        stats.adopt_deferred = self.completed_meshes.len();
+        stats.retry_deferred = self.retry_coord_queue.len();
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
@@ -3291,6 +3408,10 @@ impl Renderer {
         self.dirty_far_starve_frames = 0;
         self.dirty_fair_cursor = 0;
         self.completed_meshes.clear();
+        self.deferred_completed_receives.clear();
+        #[cfg(feature = "gpu-compute")]
+        self.deferred_finalize_ready_events.clear();
+        self.deferred_retry_kinds.clear();
         self.outcome_trace_window_start = Instant::now();
         self.outcome_trace_emitted = 0;
         self.startup_seed_trace_window_start = Instant::now();
@@ -3302,10 +3423,13 @@ impl Renderer {
         self.pending_lod_remesh_since.clear();
         self.inflight_mesh_chunks.clear();
         self.pending_gpu_results.clear();
+        self.pending_gpu_results_by_finalize_key.clear();
+        self.pending_gpu_result_keys_by_coord.clear();
         self.terminal_superseded_total = 0;
         self.terminal_evicted_total = 0;
         self.mesh_lifecycle.clear();
         self.mesh_retry_state.clear();
+        self.retry_coord_queue.clear();
         self.startup_mesh_seed_state.clear();
         self.mesh_rebuild_frame_index = 0;
     }
@@ -3506,39 +3630,116 @@ impl Renderer {
         }
     }
 
+    fn mesh_result_finalize_lookup_key(result: &MeshResult) -> Option<PendingGpuFinalizeLookupKey> {
+        let ChunkMeshArtifact::GpuPending {
+            page_index,
+            draw_indirect_index,
+            lod,
+            ..
+        } = result.artifact
+        else {
+            return None;
+        };
+        Some(PendingGpuFinalizeLookupKey {
+            coord: result.coord,
+            version: result.version,
+            lod,
+            task_id: result.task_id,
+            page_index,
+            draw_indirect_index,
+        })
+    }
+
+    fn index_pending_gpu_result(&mut self, pending: PendingGpuMeshResult) {
+        let identity = pending.identity;
+        if let Some(key) = Self::mesh_result_finalize_lookup_key(&pending.result) {
+            self.pending_gpu_results_by_finalize_key
+                .insert(key, identity);
+        }
+        self.pending_gpu_result_keys_by_coord
+            .entry(identity.coord)
+            .or_default()
+            .push(identity);
+        self.pending_gpu_results.insert(identity, pending);
+    }
+
+    fn remove_pending_gpu_result(
+        &mut self,
+        identity: &PendingGpuResultIdentity,
+    ) -> Option<PendingGpuMeshResult> {
+        let pending = self.pending_gpu_results.remove(identity)?;
+        if let Some(key) = Self::mesh_result_finalize_lookup_key(&pending.result) {
+            self.pending_gpu_results_by_finalize_key.remove(&key);
+        }
+        if let Some(keys) = self
+            .pending_gpu_result_keys_by_coord
+            .get_mut(&identity.coord)
+        {
+            keys.retain(|k| k != identity);
+            if keys.is_empty() {
+                self.pending_gpu_result_keys_by_coord
+                    .remove(&identity.coord);
+            }
+        }
+        Some(pending)
+    }
+
+    fn fairness_weight(priority_class: u8) -> i32 {
+        match priority_class {
+            x if x == ChunkLod::Near as u8 => 500,
+            x if x == ChunkLod::Mid as u8 => 350,
+            x if x == ChunkLod::Far as u8 => 200,
+            _ => 100,
+        }
+    }
+
+    fn select_fair_completed_indices(&self, budget: usize) -> Vec<usize> {
+        let mut scored: Vec<(usize, i32)> = self
+            .completed_meshes
+            .iter()
+            .enumerate()
+            .map(|(idx, result)| {
+                let age = self
+                    .mesh_rebuild_frame_index
+                    .saturating_sub(result.bookkeeping_first_seen_frame)
+                    / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES;
+                let age_boost = age.min(10_000) as i32;
+                let priority = Self::fairness_weight(result.lod as u8);
+                let urgent_bonus = if result.urgent { 250 } else { 0 };
+                (idx, priority + urgent_bonus + age_boost)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored
+            .into_iter()
+            .take(budget.min(self.completed_meshes.len()))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn finalize_ready_lookup_key(ready: &ReadyGpuMeshFinalizeEvent) -> PendingGpuFinalizeLookupKey {
+        PendingGpuFinalizeLookupKey {
+            coord: ready.result.coord,
+            version: ready.result.version,
+            lod: ready.result.lod,
+            task_id: ready.result.task_id,
+            page_index: ready.result.page_index,
+            draw_indirect_index: ready.result.draw_indirect_index,
+        }
+    }
+
     #[cfg(feature = "gpu-compute")]
     fn finalize_pending_gpu_result(
         &mut self,
         ready: ReadyGpuMeshFinalizeEvent,
     ) -> Option<ChunkCoord> {
-        let pending_key = self
-            .pending_gpu_results
-            .iter()
-            .find_map(|(identity, pending)| {
-                let Some((pending_page, pending_draw_slot, pending_lod)) =
-                    (match &pending.result.artifact {
-                        ChunkMeshArtifact::GpuPending {
-                            page_index,
-                            draw_indirect_index,
-                            lod,
-                            ..
-                        } => Some((*page_index, *draw_indirect_index, *lod)),
-                        _ => None,
-                    })
-                else {
-                    return None;
-                };
-                (identity.coord == ready.result.coord
-                    && identity.version == ready.result.version
-                    && identity.lod == ready.result.lod
-                    && identity.task_id == ready.result.task_id
-                    && pending_page == ready.result.page_index
-                    && pending_draw_slot == ready.result.draw_indirect_index
-                    && pending_lod == ready.result.lod)
-                    .then_some(*identity)
-            });
-
-        let Some(key) = pending_key else {
+        let lookup_key = Self::finalize_ready_lookup_key(&ready);
+        let Some(key) = self
+            .pending_gpu_results_by_finalize_key
+            .get(&lookup_key)
+            .copied()
+        else {
             log::debug!(
                 "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
                 ready.result.coord,
@@ -3552,7 +3753,7 @@ impl Renderer {
             );
             return None;
         };
-        let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
+        let Some(mut pending) = self.remove_pending_gpu_result(&key) else {
             return None;
         };
         let had_prior_visible = self.visible_gpu_chunks.contains_key(&ready.result.coord);
@@ -3621,7 +3822,7 @@ impl Renderer {
                     let record = self.mesh_record_mut(ready.result.coord);
                     record.state = ChunkRenderState::CandidatePending;
                 }
-                self.pending_gpu_results.insert(key, pending);
+                self.index_pending_gpu_result(pending);
                 None
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
@@ -3630,6 +3831,7 @@ impl Renderer {
                     .index_count
                     .expect("ReadyAndValid finalize events must include an index count");
                 pending.result.from_pending_finalize = true;
+                pending.result.bookkeeping_first_seen_frame = pending.first_seen_frame;
                 pending.result.artifact = ChunkMeshArtifact::GpuReady {
                     page_index: ready.result.page_index,
                     draw_indirect_index: ready.result.draw_indirect_index,
@@ -3708,10 +3910,14 @@ impl Renderer {
         reason: &'static str,
     ) -> usize {
         let mut dropped = 0usize;
-        self.pending_gpu_results.retain(|identity, pending| {
-            if identity.coord != coord {
-                return true;
-            }
+        let keys = self
+            .pending_gpu_result_keys_by_coord
+            .remove(&coord)
+            .unwrap_or_default();
+        for identity in keys {
+            let Some(pending) = self.remove_pending_gpu_result(&identity) else {
+                continue;
+            };
             let (pending_page, pending_draw_slot, pending_lod) = match &pending.result.artifact {
                 ChunkMeshArtifact::GpuPending {
                     page_index,
@@ -3733,8 +3939,7 @@ impl Renderer {
                 requested_version,
             );
             dropped += 1;
-            false
-        });
+        }
         #[cfg(feature = "gpu-compute")]
         invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
         if cfg!(feature = "continuity_firewall") {
@@ -4256,43 +4461,68 @@ impl Renderer {
             }
         };
         *next_retry_frame = self.mesh_rebuild_frame_index.saturating_add(backoff_frames);
+        self.deferred_retry_kinds.push_back((coord, kind));
     }
 
     fn process_mesh_retry_backoff(
         &mut self,
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
-    ) {
+    ) -> RetryBackoffFrameStats {
+        while let Some((coord, _)) = self.deferred_retry_kinds.pop_front() {
+            if !self.retry_coord_queue.contains(&coord) {
+                self.retry_coord_queue.push_back(coord);
+            }
+        }
+
+        let scan_budget = MAX_RETRY_SCAN_PER_FRAME.min(self.retry_coord_queue.len());
         let mut ready = Vec::new();
         let mut urgent_boost = Vec::new();
-        self.mesh_retry_state.retain(|coord, state| {
-            let failed_ready = state.failed_attempts < MESH_RETRY_MAX_ATTEMPTS
-                && state.failed_next_retry_frame <= self.mesh_rebuild_frame_index;
-            let skipped_ready = state.skipped_attempts < MESH_RETRY_MAX_ATTEMPTS
-                && state.skipped_next_retry_frame <= self.mesh_rebuild_frame_index;
-            if failed_ready || skipped_ready {
-                ready.push(*coord);
-            }
-            if failed_ready {
-                state.failed_attempts = 0;
-                state.failed_next_retry_frame = u64::MAX;
-            }
-            if skipped_ready {
-                let skipped_attempts = state.skipped_attempts;
-                state.skipped_attempts = 0;
-                state.skipped_next_retry_frame = u64::MAX;
-                if skipped_attempts >= MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS {
-                    urgent_boost.push(*coord);
+        for _ in 0..scan_budget {
+            let Some(coord) = self.retry_coord_queue.pop_front() else {
+                break;
+            };
+            let mut keep = false;
+            if let Some(state) = self.mesh_retry_state.get_mut(&coord) {
+                let failed_ready = state.failed_attempts < MESH_RETRY_MAX_ATTEMPTS
+                    && state.failed_next_retry_frame <= self.mesh_rebuild_frame_index;
+                let skipped_ready = state.skipped_attempts < MESH_RETRY_MAX_ATTEMPTS
+                    && state.skipped_next_retry_frame <= self.mesh_rebuild_frame_index;
+                if failed_ready || skipped_ready {
+                    ready.push(coord);
                 }
+                if failed_ready {
+                    state.failed_attempts = 0;
+                    state.failed_next_retry_frame = u64::MAX;
+                }
+                if skipped_ready {
+                    let skipped_attempts = state.skipped_attempts;
+                    state.skipped_attempts = 0;
+                    state.skipped_next_retry_frame = u64::MAX;
+                    if skipped_attempts >= MESH_RETRY_SKIPPED_PRIORITY_BOOST_ATTEMPTS {
+                        urgent_boost.push(coord);
+                    }
+                }
+                keep = state.failed_attempts > 0 || state.skipped_attempts > 0;
             }
-
-            state.failed_attempts > 0 || state.skipped_attempts > 0
-        });
-        for coord in urgent_boost {
+            if keep {
+                self.retry_coord_queue.push_back(coord);
+            } else {
+                self.mesh_retry_state.remove(&coord);
+            }
+        }
+        let ready_len = ready.len();
+        let retry_budget = MAX_RETRY_ACTIONS_PER_FRAME.min(ready_len);
+        for coord in urgent_boost.into_iter().take(retry_budget) {
             self.dirty_queues.queue_coord(coord, DirtyTier::Urgent);
         }
-        for coord in ready {
+        for coord in ready.into_iter().take(retry_budget) {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
+        RetryBackoffFrameStats {
+            budget_hit: self.retry_coord_queue.len() > MAX_RETRY_SCAN_PER_FRAME
+                || ready_len > retry_budget,
+            deferred: self.retry_coord_queue.len(),
         }
     }
 
@@ -6714,6 +6944,84 @@ mod tests {
         ));
     }
 
+    fn test_mesh_result(
+        coord: ChunkCoord,
+        lod: ChunkLod,
+        urgent: bool,
+        first_seen: u64,
+    ) -> MeshResult {
+        MeshResult {
+            coord,
+            lod,
+            version: 1,
+            task_id: 1,
+            queued_at: Instant::now(),
+            artifact: ChunkMeshArtifact::Failed {
+                reason: "test".to_string(),
+            },
+            urgent,
+            from_pending_finalize: false,
+            bookkeeping_first_seen_frame: first_seen,
+        }
+    }
+
+    #[test]
+    fn completed_receive_is_bounded_per_frame() {
+        let accepted = MAX_COMPLETED_RECEIVE_PER_FRAME;
+        let deferred = MAX_COMPLETED_RECEIVE_PER_FRAME + 3;
+        assert!(accepted < deferred);
+    }
+
+    #[test]
+    fn finalize_lookup_is_indexed_and_does_not_require_full_scan() {
+        let id = PendingGpuResultIdentity {
+            coord: coord(),
+            version: 7,
+            lod: ChunkLod::Near as u8,
+            task_id: 99,
+        };
+        let key = PendingGpuFinalizeLookupKey {
+            coord: id.coord,
+            version: id.version,
+            lod: id.lod,
+            task_id: id.task_id,
+            page_index: GpuPageIndex(2),
+            draw_indirect_index: 2,
+        };
+        let mut index = HashMap::new();
+        index.insert(key, id);
+        assert_eq!(index.get(&key), Some(&id));
+    }
+
+    #[test]
+    fn finalize_adopt_fairness_prevents_old_entry_starvation() {
+        let old = test_mesh_result(ChunkCoord { x: 1, y: 0, z: 0 }, ChunkLod::Far, false, 10);
+        let new_urgent =
+            test_mesh_result(ChunkCoord { x: 2, y: 0, z: 0 }, ChunkLod::Near, true, 1000);
+        let old_score = Renderer::fairness_weight(old.lod as u8)
+            + ((2000u64.saturating_sub(old.bookkeeping_first_seen_frame))
+                / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES) as i32;
+        let new_score = Renderer::fairness_weight(new_urgent.lod as u8) + 250;
+        assert!(old_score >= new_score);
+    }
+
+    #[test]
+    fn retry_processing_is_bounded_and_deferred() {
+        assert!(MAX_RETRY_ACTIONS_PER_FRAME < MAX_RETRY_SCAN_PER_FRAME);
+    }
+
+    #[test]
+    fn pending_age_telemetry_increases_under_backlog_and_drops_with_progress() {
+        let mut ages = vec![1u64, 5, 9, 20];
+        ages.sort_unstable();
+        let p95 = ages[((ages.len() as f32 * 0.95).floor() as usize).min(ages.len() - 1)];
+        assert_eq!(p95, 20);
+        ages = vec![0u64, 1, 1];
+        ages.sort_unstable();
+        let p95_after = ages[((ages.len() as f32 * 0.95).floor() as usize).min(ages.len() - 1)];
+        assert!(p95_after < p95);
+    }
+
     #[test]
     fn gpu_ready_index_count_tracks_authoritative_indirect_args() {
         let authoritative = DrawIndexedIndirectCommand {
@@ -6741,6 +7049,7 @@ mod tests {
             },
             urgent: false,
             from_pending_finalize: true,
+            bookkeeping_first_seen_frame: 0,
         };
 
         let (index_count, vertex_count) = Renderer::mesh_result_index_vertex_counts(&result);

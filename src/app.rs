@@ -2624,6 +2624,17 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.mesh_waiting_on_fence;
                         ui.profiler.mesh_pending_superseded = mesh_stats.mesh_pending_superseded;
                         ui.profiler.mesh_pending_rejected = mesh_stats.mesh_pending_rejected;
+                        ui.profiler.mesh_completed_receive_budget_hits = mesh_stats.completed_receive_budget_hits;
+                        ui.profiler.mesh_finalize_budget_hits = mesh_stats.finalize_budget_hits;
+                        ui.profiler.mesh_adopt_budget_hits = mesh_stats.adopt_budget_hits;
+                        ui.profiler.mesh_retry_budget_hits = mesh_stats.retry_budget_hits;
+                        ui.profiler.mesh_completed_receive_deferred = mesh_stats.completed_receive_deferred;
+                        ui.profiler.mesh_finalize_deferred = mesh_stats.finalize_deferred;
+                        ui.profiler.mesh_adopt_deferred = mesh_stats.adopt_deferred;
+                        ui.profiler.mesh_retry_deferred = mesh_stats.retry_deferred;
+                        ui.profiler.mesh_pending_finalize_age_max = mesh_stats.pending_finalize_age_frames_max;
+                        ui.profiler.mesh_pending_finalize_age_p50 = mesh_stats.pending_finalize_age_frames_p50;
+                        ui.profiler.mesh_pending_finalize_age_p95 = mesh_stats.pending_finalize_age_frames_p95;
                         ui.profiler.mesh_drawable_filtered_under_load = mesh_stats.mesh_drawable_filtered_under_load;
                         ui.profiler.mesh_reject_stale = mesh_stats.mesh_reject_stale;
                         ui.profiler.mesh_reject_invalid_page = mesh_stats.mesh_reject_invalid_page;
