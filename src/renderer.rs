@@ -794,8 +794,13 @@ pub struct MeshRebuildStats {
     pub mesh_last_good_retained: usize,
     pub mesh_visible_logical_not_drawable: usize,
     pub continuity_kept_count: usize,
+    pub continuity_keepalive_count: usize,
     pub replacement_commit_fail_count: usize,
     pub candidate_rejected_but_drawable_preserved_count: usize,
+    pub candidate_rejected_current_preserved: usize,
+    pub candidate_superseded_current_preserved: usize,
+    pub candidate_invalidated_current_preserved: usize,
+    pub void_drop_count: usize,
     pub dropped_to_void_count_by_reason: [usize; 5],
     pub completed_receive_budget_hits: usize,
     pub finalize_budget_hits: usize,
@@ -2576,7 +2581,7 @@ impl Renderer {
                 let Some(ready) = self.deferred_finalize_ready_events.pop_front() else {
                     break;
                 };
-                if let Some(coord) = self.finalize_pending_gpu_result(ready) {
+                if let Some(coord) = self.finalize_pending_gpu_result(ready, &mut stats) {
                     replacement_failed_coords.insert(coord);
                 }
                 finalize_budget -= 1;
@@ -2705,6 +2710,10 @@ impl Renderer {
             ) > 0;
             if pending_replaced {
                 pending_superseded += 1;
+                if had_prior_mesh {
+                    stats.candidate_invalidated_current_preserved += 1;
+                    stats.continuity_keepalive_count += 1;
+                }
             }
             let voxel_version = store.chunk_voxel_version(result.coord);
             log::debug!(
@@ -3556,9 +3565,6 @@ impl Renderer {
         lod: ChunkLod,
         pending: bool,
     ) {
-        if !cfg!(feature = "continuity_firewall") {
-            return;
-        }
         let frame = self.mesh_rebuild_frame_index;
         let record = self.mesh_record_mut(coord);
         record.candidate = Some(ChunkCandidate {
@@ -3577,6 +3583,17 @@ impl Renderer {
         }
     }
 
+    fn reject_candidate_preserve_current(record: &mut ChunkMeshRecord) -> bool {
+        record.candidate = None;
+        if record.current_drawable.is_some() {
+            record.state = ChunkRenderState::CurrentDrawable;
+            true
+        } else {
+            record.state = ChunkRenderState::CandidateRejected;
+            false
+        }
+    }
+
     fn commit_candidate_drawable(
         &mut self,
         coord: ChunkCoord,
@@ -3584,15 +3601,13 @@ impl Renderer {
         committed_version: u64,
     ) -> bool {
         let adopted = self.adopt_visible_chunk_draw(coord, draw);
-        if cfg!(feature = "continuity_firewall") {
-            let visible = self.visible_gpu_chunks.get(&coord).copied();
-            let record = self.mesh_record_mut(coord);
-            if adopted {
-                record.current_drawable = visible;
-                record.candidate = None;
-                record.state = ChunkRenderState::CurrentDrawable;
-                record.continuity_grace_started_frame = None;
-            }
+        let visible = self.visible_gpu_chunks.get(&coord).copied();
+        let record = self.mesh_record_mut(coord);
+        if adopted {
+            record.current_drawable = visible;
+            record.candidate = None;
+            record.state = ChunkRenderState::CurrentDrawable;
+            record.continuity_grace_started_frame = None;
         }
         if adopted {
             self.mesh_versions.insert(coord, committed_version);
@@ -3606,9 +3621,6 @@ impl Renderer {
         stats: &mut MeshRebuildStats,
         reason: VoidDropReason,
     ) {
-        if !cfg!(feature = "continuity_firewall") {
-            return;
-        }
         let has_current = self
             .chunk_mesh_records
             .get(&coord)
@@ -3617,17 +3629,15 @@ impl Renderer {
             || self.visible_gpu_chunks.contains_key(&coord);
         if has_current {
             stats.continuity_kept_count += 1;
+            stats.continuity_keepalive_count += 1;
             stats.candidate_rejected_but_drawable_preserved_count += 1;
+            stats.candidate_rejected_current_preserved += 1;
         } else {
+            stats.void_drop_count += 1;
             stats.dropped_to_void_count_by_reason[reason.as_index()] += 1;
         }
         let record = self.mesh_record_mut(coord);
-        record.candidate = None;
-        if record.current_drawable.is_some() {
-            record.state = ChunkRenderState::CurrentDrawable;
-        } else {
-            record.state = ChunkRenderState::CandidateRejected;
-        }
+        Self::reject_candidate_preserve_current(record);
     }
 
     fn mesh_result_finalize_lookup_key(result: &MeshResult) -> Option<PendingGpuFinalizeLookupKey> {
@@ -3733,6 +3743,7 @@ impl Renderer {
     fn finalize_pending_gpu_result(
         &mut self,
         ready: ReadyGpuMeshFinalizeEvent,
+        stats: &mut MeshRebuildStats,
     ) -> Option<ChunkCoord> {
         let lookup_key = Self::finalize_ready_lookup_key(&ready);
         let Some(key) = self
@@ -3818,10 +3829,8 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
-                if cfg!(feature = "continuity_firewall") {
-                    let record = self.mesh_record_mut(ready.result.coord);
-                    record.state = ChunkRenderState::CandidatePending;
-                }
+                let record = self.mesh_record_mut(ready.result.coord);
+                record.state = ChunkRenderState::CandidatePending;
                 self.index_pending_gpu_result(pending);
                 None
             }
@@ -3842,23 +3851,26 @@ impl Renderer {
                     chunk_origin_world: ready.result.chunk_origin_world,
                     dispatch_ms: 0.0,
                 };
-                if cfg!(feature = "continuity_firewall") {
-                    let record = self.mesh_record_mut(ready.result.coord);
-                    record.state = ChunkRenderState::CandidateReady;
-                }
+                let record = self.mesh_record_mut(ready.result.coord);
+                record.state = ChunkRenderState::CandidateReady;
                 self.completed_meshes.push(pending.result);
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
-                if cfg!(feature = "continuity_firewall") {
-                    let record = self.mesh_record_mut(ready.result.coord);
-                    record.candidate = None;
-                    if record.current_drawable.is_some() {
-                        record.state = ChunkRenderState::CurrentDrawable;
-                    } else {
-                        record.state = ChunkRenderState::CandidateRejected;
-                    }
+                let has_current = self
+                    .chunk_mesh_records
+                    .get(&ready.result.coord)
+                    .and_then(|record| record.current_drawable)
+                    .is_some()
+                    || self.visible_gpu_chunks.contains_key(&ready.result.coord);
+                if has_current {
+                    stats.continuity_keepalive_count += 1;
+                } else {
+                    stats.void_drop_count += 1;
                 }
+                let record = self.mesh_record_mut(ready.result.coord);
+                Self::reject_candidate_preserve_current(record);
+                stats.candidate_superseded_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3866,15 +3878,20 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
-                if cfg!(feature = "continuity_firewall") {
-                    let record = self.mesh_record_mut(ready.result.coord);
-                    record.candidate = None;
-                    if record.current_drawable.is_some() {
-                        record.state = ChunkRenderState::CurrentDrawable;
-                    } else {
-                        record.state = ChunkRenderState::CandidateRejected;
-                    }
+                let has_current = self
+                    .chunk_mesh_records
+                    .get(&ready.result.coord)
+                    .and_then(|record| record.current_drawable)
+                    .is_some()
+                    || self.visible_gpu_chunks.contains_key(&ready.result.coord);
+                if has_current {
+                    stats.continuity_keepalive_count += 1;
+                } else {
+                    stats.void_drop_count += 1;
                 }
+                let record = self.mesh_record_mut(ready.result.coord);
+                Self::reject_candidate_preserve_current(record);
+                stats.candidate_invalidated_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3885,15 +3902,20 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
-                if cfg!(feature = "continuity_firewall") {
-                    let record = self.mesh_record_mut(ready.result.coord);
-                    record.candidate = None;
-                    if record.current_drawable.is_some() {
-                        record.state = ChunkRenderState::CurrentDrawable;
-                    } else {
-                        record.state = ChunkRenderState::CandidateRejected;
-                    }
+                let has_current = self
+                    .chunk_mesh_records
+                    .get(&ready.result.coord)
+                    .and_then(|record| record.current_drawable)
+                    .is_some()
+                    || self.visible_gpu_chunks.contains_key(&ready.result.coord);
+                if has_current {
+                    stats.continuity_keepalive_count += 1;
+                } else {
+                    stats.void_drop_count += 1;
                 }
+                let record = self.mesh_record_mut(ready.result.coord);
+                Self::reject_candidate_preserve_current(record);
+                stats.candidate_superseded_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
@@ -3942,13 +3964,8 @@ impl Renderer {
         }
         #[cfg(feature = "gpu-compute")]
         invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
-        if cfg!(feature = "continuity_firewall") {
-            if let Some(record) = self.chunk_mesh_records.get_mut(&coord) {
-                record.candidate = None;
-                if record.current_drawable.is_some() {
-                    record.state = ChunkRenderState::CurrentDrawable;
-                }
-            }
+        if let Some(record) = self.chunk_mesh_records.get_mut(&coord) {
+            Self::reject_candidate_preserve_current(record);
         }
         dropped
     }
@@ -3973,12 +3990,10 @@ impl Renderer {
             }
             self.mesh_lifecycle
                 .insert(coord, MeshLifecycleState::Evicted);
-            if cfg!(feature = "continuity_firewall") {
-                let record = self.mesh_record_mut(coord);
-                record.current_drawable = None;
-                record.candidate = None;
-                record.state = ChunkRenderState::Idle;
-            }
+            let record = self.mesh_record_mut(coord);
+            record.current_drawable = None;
+            record.candidate = None;
+            record.state = ChunkRenderState::Idle;
             self.terminal_evicted_total += 1;
         }
     }
@@ -4071,10 +4086,8 @@ impl Renderer {
 
         // Release coord's previous slot mapping after commit.
         if let Some(previous_draw) = replaced_draw {
-            if cfg!(feature = "continuity_firewall") {
-                let record = self.mesh_record_mut(coord);
-                record.fallback = Some(previous_draw);
-            }
+            let record = self.mesh_record_mut(coord);
+            record.fallback = Some(previous_draw);
             let previous_slot = previous_draw.draw_indirect_index;
             if previous_slot != target_slot {
                 if self.visible_slots.get(&previous_slot) == Some(&coord) {
@@ -4289,7 +4302,6 @@ impl Renderer {
     }
 
     fn enqueue_urgent_mesh_chunk(&mut self, coord: ChunkCoord) {
-        self.invalidate_pending_gpu_entries_for_coord(coord, None, "urgent_remesh_enqueue");
         if self.urgent_mesh_set.insert(coord) {
             self.urgent_mesh_queue.push_back(coord);
         }
@@ -4380,7 +4392,6 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
-        self.invalidate_pending_gpu_entries_for_coord(coord, None, "dirty_remesh_enqueue");
         if self.urgent_mesh_set.contains(&coord) {
             return;
         }
@@ -6532,6 +6543,8 @@ mod tests {
         let coord = ChunkCoord { x: 0, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(3, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(3, 1);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Near);
         let mut pending_lod_remesh_since = HashMap::new();
@@ -6904,6 +6917,8 @@ mod tests {
         };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(0, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(0, 1);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Near);
         let camera = Camera {
@@ -6925,7 +6940,7 @@ mod tests {
             &lod_selection,
             &HashSet::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &slot_ownership_generation,
             0,
             visibility,
         ));
@@ -6938,7 +6953,7 @@ mod tests {
             &lod_selection,
             &HashSet::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &slot_ownership_generation,
             0,
             visibility,
         ));
@@ -7062,6 +7077,8 @@ mod tests {
         let coord = ChunkCoord { x: 3, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(1, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(1, 1);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Mid);
         let draw = GpuChunkDraw {
@@ -7093,7 +7110,7 @@ mod tests {
             &lod_selection,
             &HashSet::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &slot_ownership_generation,
             42,
             visibility,
         ));
@@ -7104,6 +7121,8 @@ mod tests {
         let coord = ChunkCoord { x: 6, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(2, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(2, 1);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Far);
         let draw = GpuChunkDraw {
@@ -7138,7 +7157,7 @@ mod tests {
                 &HashMap::new(),
                 100,
                 false,
-                &HashMap::new(),
+                &slot_ownership_generation,
                 visibility,
             ),
             DrawContractDecision::Filtered
@@ -7150,6 +7169,8 @@ mod tests {
         let coord = ChunkCoord { x: 8, y: 0, z: 0 };
         let mut visible_slots = HashMap::new();
         visible_slots.insert(3, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(3, 1);
         let mut lod_selection = HashMap::new();
         lod_selection.insert(coord, ChunkLod::Mid);
         let mut pending = HashSet::new();
@@ -7185,9 +7206,95 @@ mod tests {
             &lod_selection,
             &pending,
             &pending_since,
-            &HashMap::new(),
+            &slot_ownership_generation,
             6,
             visibility,
+        ));
+    }
+
+    #[test]
+    fn reject_candidate_only_preserves_current_drawable_state() {
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(7),
+            draw_indirect_index: 7,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -2.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -1.0),
+            draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 9,
+            index_count: Some(8),
+        };
+        let mut record = ChunkMeshRecord {
+            current_drawable: Some(draw),
+            candidate: Some(ChunkCandidate {
+                version: 2,
+                task_id: 3,
+                lod: ChunkLod::Near,
+                pending_finalize: true,
+            }),
+            fallback: None,
+            state: ChunkRenderState::CandidatePending,
+            continuity_grace_started_frame: Some(1),
+        };
+
+        let preserved = Renderer::reject_candidate_preserve_current(&mut record);
+
+        assert!(preserved);
+        assert!(record.candidate.is_none());
+        assert_eq!(record.state, ChunkRenderState::CurrentDrawable);
+        assert!(record.current_drawable.is_some());
+    }
+
+    #[test]
+    fn near_continuity_prefers_stale_drawable_over_void() {
+        let coord = ChunkCoord { x: 0, y: 0, z: 0 };
+        let draw = GpuChunkDraw {
+            page_index: GpuPageIndex(11),
+            draw_indirect_index: 11,
+            lod: ChunkLod::Far as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
+            world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
+            draw_source: DrawSource::GpuArtifact,
+            ownership_generation: 1,
+            index_count: Some(16),
+        };
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(11, coord);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(11, 1);
+        let mut lod_selection = HashMap::new();
+        lod_selection.insert(coord, ChunkLod::Near);
+        let mut pending_since = HashMap::new();
+        pending_since.insert(coord, 10);
+        let camera = Camera {
+            pos: Vec3::ZERO,
+            dir: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+        };
+        let visibility = DrawVisibilityInput {
+            frustum_culling: true,
+            vp_world: camera.view_proj(),
+            world_camera_pos: camera_world_position(&camera),
+            screen_h: 1080,
+        };
+
+        let chosen = choose_drawable_for_chunk(
+            coord,
+            Some(&draw),
+            None,
+            &visible_slots,
+            &lod_selection,
+            &pending_since,
+            &slot_ownership_generation,
+            11,
+            visibility,
+        );
+
+        assert!(matches!(
+            chosen.map(|c| c.freshness),
+            Some(DrawableFreshness::StaleDrawable)
         ));
     }
 
