@@ -14,7 +14,8 @@
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
 use crate::gpu_compute::{
-    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker, run_chunk_job_on_worker,
+    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker,
+    invalidate_gpu_pending_finalize_on_renderer, run_chunk_job_on_worker,
     set_gpu_protected_chunks_on_renderer, take_ready_gpu_mesh_results_on_renderer,
     update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
     SharedMeshBuffers,
@@ -2501,6 +2502,11 @@ impl Renderer {
                 stats.mesh_pending_finalize += 1;
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
+                self.invalidate_pending_gpu_entries_for_coord(
+                    result.coord,
+                    Some(result.version),
+                    "pending_result_insert",
+                );
                 self.pending_gpu_results.insert(
                     (result.coord, result.version),
                     PendingGpuMeshResult {
@@ -2518,12 +2524,11 @@ impl Renderer {
             let desired = chunk_priority_scores.contains_key(&result.coord)
                 || self.visible_gpu_chunks.contains_key(&result.coord);
             let had_prior_mesh = self.visible_gpu_chunks.contains_key(&result.coord);
-            let pending_replaced = {
-                let previous_len = self.pending_gpu_results.len();
-                self.pending_gpu_results
-                    .retain(|(coord, _), _| *coord != result.coord);
-                previous_len != self.pending_gpu_results.len()
-            };
+            let pending_replaced = self.invalidate_pending_gpu_entries_for_coord(
+                result.coord,
+                Some(result.version),
+                "new_result_received",
+            ) > 0;
             if pending_replaced {
                 pending_superseded += 1;
             }
@@ -2695,6 +2700,11 @@ impl Renderer {
                 stats.mesh_pending_finalize += 1;
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
+                self.invalidate_pending_gpu_entries_for_coord(
+                    result.coord,
+                    Some(result.version),
+                    "pending_result_insert",
+                );
                 self.pending_gpu_results.insert(
                     (result.coord, result.version),
                     PendingGpuMeshResult {
@@ -3276,9 +3286,72 @@ impl Renderer {
     ) -> Option<ChunkCoord> {
         let key = (ready.result.coord, ready.result.version);
         let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
+            log::debug!(
+                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} page={} draw_slot={} lod={} status={:?}",
+                ready.result.coord,
+                ready.result.version,
+                ready.result.page_index.0,
+                ready.result.draw_indirect_index,
+                ready.result.lod,
+                ready.status,
+            );
             return None;
         };
         let had_prior_visible = self.visible_gpu_chunks.contains_key(&ready.result.coord);
+
+        let Some((pending_page, pending_draw_slot, pending_lod)) = (match &pending.result.artifact {
+            ChunkMeshArtifact::GpuPending {
+                page_index,
+                draw_indirect_index,
+                lod,
+                ..
+            } => Some((*page_index, *draw_indirect_index, *lod)),
+            _ => None,
+        }) else {
+            log::debug!(
+                "[mesh] drop_finalize reason=missing_pending_identity coord={:?} pending_version={} ready_version={} ready_page={} ready_draw_slot={} ready_lod={} status={:?}",
+                ready.result.coord,
+                pending.result.version,
+                ready.result.version,
+                ready.result.page_index.0,
+                ready.result.draw_indirect_index,
+                ready.result.lod,
+                ready.status,
+            );
+            self.mesh_lifecycle
+                .insert(ready.result.coord, MeshLifecycleState::Superseded);
+            self.terminal_superseded_total += 1;
+            self.schedule_mesh_retry(ready.result.coord, MeshRetryKind::Failed);
+            return had_prior_visible.then_some(ready.result.coord);
+        };
+
+        if pending.result.coord != ready.result.coord
+            || pending.result.version != ready.result.version
+            || pending_page != ready.result.page_index
+            || pending_draw_slot != ready.result.draw_indirect_index
+            || pending_lod != ready.result.lod
+        {
+            log::debug!(
+                "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} status={:?}",
+                ready.result.coord,
+                pending.result.coord,
+                ready.result.coord,
+                pending.result.version,
+                ready.result.version,
+                pending_page.0,
+                ready.result.page_index.0,
+                pending_draw_slot,
+                ready.result.draw_indirect_index,
+                pending_lod,
+                ready.result.lod,
+                ready.status,
+            );
+            self.mesh_lifecycle
+                .insert(ready.result.coord, MeshLifecycleState::Superseded);
+            self.terminal_superseded_total += 1;
+            self.schedule_mesh_retry(ready.result.coord, MeshRetryKind::Failed);
+            return had_prior_visible.then_some(ready.result.coord);
+        }
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
@@ -3319,7 +3392,52 @@ impl Renderer {
                 );
                 had_prior_visible.then_some(ready.result.coord)
             }
+            ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
+                self.mesh_lifecycle
+                    .insert(ready.result.coord, MeshLifecycleState::Superseded);
+                self.terminal_superseded_total += 1;
+                self.schedule_mesh_retry(ready.result.coord, MeshRetryKind::Failed);
+                had_prior_visible.then_some(ready.result.coord)
+            }
         }
+    }
+
+    fn invalidate_pending_gpu_entries_for_coord(
+        &mut self,
+        coord: ChunkCoord,
+        requested_version: Option<u64>,
+        reason: &'static str,
+    ) -> usize {
+        let mut dropped = 0usize;
+        self.pending_gpu_results.retain(|(pending_coord, pending_version), pending| {
+            if *pending_coord != coord {
+                return true;
+            }
+            let (pending_page, pending_draw_slot, pending_lod) = match &pending.result.artifact {
+                ChunkMeshArtifact::GpuPending {
+                    page_index,
+                    draw_indirect_index,
+                    lod,
+                    ..
+                } => (Some(*page_index), Some(*draw_indirect_index), Some(*lod)),
+                _ => (None, None, None),
+            };
+            log::debug!(
+                "[mesh] drop_pending_result reason={} coord={:?} pending_version={} pending_page={:?} pending_draw_slot={:?} pending_lod={:?} requested_version={:?}",
+                reason,
+                coord,
+                pending_version,
+                pending_page.map(|p| p.0),
+                pending_draw_slot,
+                pending_lod,
+                requested_version,
+            );
+            dropped += 1;
+            false
+        });
+        #[cfg(feature = "gpu-compute")]
+        invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
+        dropped
     }
 
     fn release_draw_slot_mapping_with_reserved_slot(
@@ -3623,6 +3741,7 @@ impl Renderer {
     }
 
     fn enqueue_urgent_mesh_chunk(&mut self, coord: ChunkCoord) {
+        self.invalidate_pending_gpu_entries_for_coord(coord, None, "urgent_remesh_enqueue");
         if self.urgent_mesh_set.insert(coord) {
             self.urgent_mesh_queue.push_back(coord);
         }
@@ -3711,6 +3830,7 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
     ) {
+        self.invalidate_pending_gpu_entries_for_coord(coord, None, "dirty_remesh_enqueue");
         if self.urgent_mesh_set.contains(&coord) {
             return;
         }
