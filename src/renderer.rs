@@ -2422,6 +2422,7 @@ impl Renderer {
         let mut pending_promoted_to_drawable = 0usize;
         let mut pending_superseded = 0usize;
         let mut pending_rejected = 0usize;
+        let mut replacement_failed_coords: HashSet<ChunkCoord> = HashSet::new();
 
         while let Ok(result) = self.mesh_queue.try_recv() {
             log::trace!("[renderer] received mesh result chunk={:?}", result.coord);
@@ -2434,7 +2435,9 @@ impl Renderer {
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
             for ready in take_ready_gpu_mesh_results_on_renderer() {
-                self.finalize_pending_gpu_result(ready);
+                if let Some(coord) = self.finalize_pending_gpu_result(ready) {
+                    replacement_failed_coords.insert(coord);
+                }
             }
         }
 
@@ -2545,6 +2548,7 @@ impl Renderer {
                 }
                 if had_prior_mesh {
                     stats.mesh_last_good_retained += 1;
+                    replacement_failed_coords.insert(result.coord);
                 }
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2562,6 +2566,9 @@ impl Renderer {
                 stats.mesh_reject_stale += 1;
                 if pending_replaced {
                     pending_rejected += 1;
+                }
+                if had_prior_mesh {
+                    replacement_failed_coords.insert(result.coord);
                 }
                 stats.stale_drop_retry_enqueued += 1;
                 match retry_policy {
@@ -2651,6 +2658,7 @@ impl Renderer {
 
                 if had_prior_mesh {
                     stats.mesh_last_good_retained += 1;
+                    replacement_failed_coords.insert(result.coord);
                 }
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2676,6 +2684,7 @@ impl Renderer {
                 stats.mesh_reject_failed += 1;
                 if had_prior_mesh {
                     stats.mesh_last_good_retained += 1;
+                    replacement_failed_coords.insert(result.coord);
                 }
                 self.mesh_lifecycle
                     .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2721,6 +2730,9 @@ impl Renderer {
                     if pending_replaced {
                         pending_rejected += 1;
                     }
+                    if had_prior_mesh {
+                        replacement_failed_coords.insert(result.coord);
+                    }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
                     Self::record_rebuild_outcome(
@@ -2741,6 +2753,9 @@ impl Renderer {
 
                 if *index_count == 0 {
                     stats.mesh_artifacts_rejected += 1;
+                    if had_prior_mesh {
+                        replacement_failed_coords.insert(result.coord);
+                    }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
                     Self::record_rebuild_outcome(&mut stats, RebuildOutcome::SkippedZeroGeometry);
@@ -2784,6 +2799,9 @@ impl Renderer {
                 if !adopted {
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_unhandled += 1;
+                    if had_prior_mesh {
+                        replacement_failed_coords.insert(result.coord);
+                    }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
                     skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
@@ -2900,6 +2918,9 @@ impl Renderer {
                     self.free_mesh_slots.push(slot);
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_unhandled += 1;
+                    if had_prior_mesh {
+                        replacement_failed_coords.insert(result.coord);
+                    }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
                     skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
@@ -2940,6 +2961,7 @@ impl Renderer {
             stats.mesh_dropped_before_drawable += 1;
             if had_prior_mesh {
                 stats.mesh_last_good_retained += 1;
+                replacement_failed_coords.insert(result.coord);
             }
             self.mesh_lifecycle
                 .insert(result.coord, MeshLifecycleState::Rejected);
@@ -2956,6 +2978,19 @@ impl Renderer {
         }
         for coord in remesh_coords {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
+        }
+
+        for &coord in &replacement_failed_coords {
+            let still_visible = self.visible_gpu_chunks.contains_key(&coord);
+            if !still_visible {
+                log::error!(
+                    "[renderer] invariant violated: replacement failed for coord={coord:?} but visible draw was lost"
+                );
+            }
+            debug_assert!(
+                still_visible,
+                "replacement failed for {coord:?} but visible draw was lost"
+            );
         }
 
         stats.upload_count = uploaded;
@@ -3235,11 +3270,15 @@ impl Renderer {
 
 impl Renderer {
     #[cfg(feature = "gpu-compute")]
-    fn finalize_pending_gpu_result(&mut self, ready: ReadyGpuMeshFinalizeEvent) {
+    fn finalize_pending_gpu_result(
+        &mut self,
+        ready: ReadyGpuMeshFinalizeEvent,
+    ) -> Option<ChunkCoord> {
         let key = (ready.result.coord, ready.result.version);
         let Some(mut pending) = self.pending_gpu_results.remove(&key) else {
-            return;
+            return None;
         };
+        let had_prior_visible = self.visible_gpu_chunks.contains_key(&ready.result.coord);
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
@@ -3261,15 +3300,24 @@ impl Renderer {
                     }
                 };
                 self.completed_meshes.push(pending.result);
+                None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
                 self.terminal_superseded_total += 1;
+                self.schedule_mesh_retry(ready.result.coord, MeshRetryKind::Failed);
+                had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
                 self.mesh_lifecycle
-                    .insert(ready.result.coord, MeshLifecycleState::Rejected);
+                    .insert(ready.result.coord, MeshLifecycleState::Superseded);
+                self.terminal_superseded_total += 1;
+                self.schedule_mesh_retry(
+                    ready.result.coord,
+                    MeshRetryKind::Skipped(MeshSkipReason::InvalidPageMapping),
+                );
+                had_prior_visible.then_some(ready.result.coord)
             }
         }
     }
