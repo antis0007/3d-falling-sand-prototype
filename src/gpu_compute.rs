@@ -263,6 +263,15 @@ struct MeshBufferAllocation {
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug)]
+enum MeshSliceAllocateOutcome {
+    Success(MeshBufferSlice),
+    Saturated,
+    NoProgress,
+    InvalidState,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
 struct MeshPoolTelemetry {
     slot_capacity: u32,
     slots_used: u32,
@@ -360,7 +369,9 @@ impl ChunkPageAtlas {
         }
 
         let page = self.evictable_page().with_context(|| {
-            format!("no reusable gpu atlas pages available for chunk {chunk:?}")
+            format!(
+                "gpu page allocator saturated for chunk {chunk:?}: no fence-safe eviction candidate"
+            )
         })?;
         self.evict_page(page);
         self.page_for_chunk.insert(chunk, page);
@@ -397,45 +408,49 @@ impl ChunkPageAtlas {
         &mut self,
         chunk: ChunkCoord,
         lod: u8,
-    ) -> Option<MeshBufferSlice> {
+    ) -> MeshSliceAllocateOutcome {
         if let Some(existing) = self.mesh_slice_for_chunk.get(&chunk).copied() {
             self.touch_mesh_slot(existing.slot_index);
-            return Some(existing);
+            return MeshSliceAllocateOutcome::Success(existing);
         }
 
         let (required_vertex, required_index) = mesh_capacity_for_lod(lod);
         let slot_capacity = mesh_pool_slot_capacity();
         if slot_capacity == 0 {
-            return None;
+            return MeshSliceAllocateOutcome::InvalidState;
         }
 
-        let mut slot = if self.next_mesh_slot < slot_capacity {
+        let slot = if self.next_mesh_slot < slot_capacity {
             let next = self.next_mesh_slot;
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
             next
         } else {
-            self.evictable_mesh_slot(slot_capacity)?
+            match self.evictable_mesh_slot(slot_capacity) {
+                Some(evictable) => evictable,
+                None => return MeshSliceAllocateOutcome::Saturated,
+            }
         };
 
-        loop {
-            if self
-                .try_allocate_mesh_buffers(chunk, slot, required_vertex, required_index)
-                .is_some()
-            {
-                break;
-            }
-
-            let evict_slot = self.evictable_mesh_slot(slot_capacity)?;
-            if !self.evict_mesh_slot(evict_slot) {
-                return None;
-            }
-
-            if self.next_mesh_slot >= slot_capacity {
-                slot = evict_slot;
-            }
+        if let Some(slice) =
+            self.try_allocate_mesh_buffers(chunk, slot, required_vertex, required_index)
+        {
+            return MeshSliceAllocateOutcome::Success(slice);
         }
 
-        self.mesh_slice_for_chunk.get(&chunk).copied()
+        let Some(evict_slot) = self.evictable_mesh_slot(slot_capacity) else {
+            return MeshSliceAllocateOutcome::Saturated;
+        };
+        if !self.evict_mesh_slot(evict_slot) {
+            return MeshSliceAllocateOutcome::NoProgress;
+        }
+
+        if let Some(slice) =
+            self.try_allocate_mesh_buffers(chunk, evict_slot, required_vertex, required_index)
+        {
+            return MeshSliceAllocateOutcome::Success(slice);
+        }
+
+        MeshSliceAllocateOutcome::Saturated
     }
 
     fn try_allocate_mesh_buffers(
@@ -1158,6 +1173,13 @@ pub struct GpuComputeProfilerSnapshot {
     pub mesh_finalize_lock_hold_ms: f32,
     pub mesh_finalize_events: u64,
     pub mesh_finalize_requeued: u64,
+    pub allocator_no_progress_count: u64,
+    pub allocator_saturated_count: u64,
+    pub candidate_ready_count: u64,
+    pub candidate_failed_count: u64,
+    pub finalize_invalid_count: u64,
+    pub color_contract_mismatch_count: u64,
+    pub zero_or_invalid_mesh_output_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1209,6 +1231,20 @@ static GPU_MESH_ALLOCATOR_PRESSURE_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_RESIDENT_USAGE_PERCENT_X100: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_ALLOCATOR_NO_PROGRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_ALLOCATOR_SATURATED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_CANDIDATE_READY_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_CANDIDATE_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_FINALIZE_INVALID_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_COLOR_CONTRACT_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
@@ -1366,6 +1402,16 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT.swap(0, Ordering::Relaxed);
         let mesh_resident_usage_percent =
             GPU_MESH_RESIDENT_USAGE_PERCENT_X100.swap(0, Ordering::Relaxed) as f32 / 100.0;
+        let allocator_no_progress_count =
+            GPU_ALLOCATOR_NO_PROGRESS_COUNT.swap(0, Ordering::Relaxed);
+        let allocator_saturated_count = GPU_ALLOCATOR_SATURATED_COUNT.swap(0, Ordering::Relaxed);
+        let candidate_ready_count = GPU_CANDIDATE_READY_COUNT.swap(0, Ordering::Relaxed);
+        let candidate_failed_count = GPU_CANDIDATE_FAILED_COUNT.swap(0, Ordering::Relaxed);
+        let finalize_invalid_count = GPU_FINALIZE_INVALID_COUNT.swap(0, Ordering::Relaxed);
+        let color_contract_mismatch_count =
+            GPU_COLOR_CONTRACT_MISMATCH_COUNT.swap(0, Ordering::Relaxed);
+        let zero_or_invalid_mesh_output_count =
+            GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -1389,6 +1435,13 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             mesh_finalize_lock_hold_ms: mesh_finalize_lock_hold_ns as f32 / 1_000_000.0,
             mesh_finalize_events,
             mesh_finalize_requeued,
+            allocator_no_progress_count,
+            allocator_saturated_count,
+            candidate_ready_count,
+            candidate_failed_count,
+            finalize_invalid_count,
+            color_contract_mismatch_count,
+            zero_or_invalid_mesh_output_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -1932,6 +1985,7 @@ pub fn initialize_gpu_compute_worker(
                 COMPUTE_STORAGE_BINDING_COUNT
             );
         }
+        validate_gpu_vertex_contract().context("gpu mesh vertex host contract")?;
         let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
         let page_capacity = GPU_PAGE_CAPACITY as u64;
         let page_len = CHUNK_VOLUME as u64;
@@ -2094,7 +2148,22 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
 
-        let mesh_slice = atlas.mesh_slice_for_chunk_or_allocate(job.coord, job.lod as u8);
+        let mesh_slice_outcome = atlas.mesh_slice_for_chunk_or_allocate(job.coord, job.lod as u8);
+        let mesh_slice = match mesh_slice_outcome {
+            MeshSliceAllocateOutcome::Success(slice) => Some(slice),
+            MeshSliceAllocateOutcome::Saturated => {
+                GPU_ALLOCATOR_SATURATED_COUNT.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            MeshSliceAllocateOutcome::NoProgress => {
+                GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            MeshSliceAllocateOutcome::InvalidState => {
+                GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        };
         let mesh_pool_telemetry = atlas.mesh_pool_telemetry();
         let resident_usage = mesh_pool_telemetry
             .vertex_usage_percent
@@ -2516,6 +2585,9 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let mut promoted_ready_count = 0u64;
     let mut ownership_invalidations = 0u64;
     let mut superseded_count = 0u64;
+    let mut candidate_failed_count = 0u64;
+    let mut finalize_invalid_count = 0u64;
+    let mut zero_or_invalid_mesh_output_count = 0u64;
 
     let phase3_lock_start = Instant::now();
     {
@@ -2558,6 +2630,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 });
                 finalized_count += 1;
                 superseded_count += 1;
+                candidate_failed_count += 1;
                 continue;
             }
 
@@ -2583,15 +2656,35 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 });
                 finalized_count += 1;
                 ownership_invalidations += 1;
+                candidate_failed_count += 1;
                 continue;
             }
 
-            if result.index_count.is_none() {
+            let Some(index_count) = result.index_count else {
+                waiting_metadata_count += 1;
+                continue;
+            };
+
+            if index_count == 0 {
+                atlas.pending_mesh_finalize.remove(&candidate.coord);
+                log::debug!(
+                    "[gpu-mesh] finalize_invalid_output coord={:?} version={} task_id={} page={} slot={} serial={} lod={} reason=zero_index_count",
+                    result.coord,
+                    result.version,
+                    result.task_id,
+                    result.page_index.0,
+                    result.draw_indirect_index,
+                    result.submission_serial,
+                    result.lod,
+                );
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
-                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
                 });
-                waiting_metadata_count += 1;
+                finalized_count += 1;
+                candidate_failed_count += 1;
+                finalize_invalid_count += 1;
+                zero_or_invalid_mesh_output_count += 1;
                 continue;
             }
 
@@ -2616,6 +2709,11 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     GPU_MESH_FINALIZE_OWNERSHIP_INVALIDATED_COUNT
         .fetch_add(ownership_invalidations, Ordering::Relaxed);
     GPU_MESH_FINALIZE_SUPERSEDED_COUNT.fetch_add(superseded_count, Ordering::Relaxed);
+    GPU_CANDIDATE_READY_COUNT.fetch_add(promoted_ready_count, Ordering::Relaxed);
+    GPU_CANDIDATE_FAILED_COUNT.fetch_add(candidate_failed_count, Ordering::Relaxed);
+    GPU_FINALIZE_INVALID_COUNT.fetch_add(finalize_invalid_count, Ordering::Relaxed);
+    GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT
+        .fetch_add(zero_or_invalid_mesh_output_count, Ordering::Relaxed);
 
     out
 }
@@ -2802,6 +2900,37 @@ pub struct GpuVertex {
 #[cfg(feature = "gpu-compute")]
 const _: [(); std::mem::size_of::<GpuVertex>()] =
     [(); std::mem::size_of::<crate::renderer::Vertex>()];
+
+#[cfg(feature = "gpu-compute")]
+fn gpu_vertex_color_offset_bytes() -> usize {
+    let uninit = std::mem::MaybeUninit::<GpuVertex>::uninit();
+    let base = uninit.as_ptr();
+    // SAFETY: We only compute field addresses from an uninitialized pointer and never read data.
+    unsafe { std::ptr::addr_of!((*base).color) as usize - base as usize }
+}
+
+#[cfg(feature = "gpu-compute")]
+fn validate_gpu_vertex_contract() -> anyhow::Result<()> {
+    let gpu_size = std::mem::size_of::<GpuVertex>();
+    let renderer_size = std::mem::size_of::<crate::renderer::Vertex>();
+    let gpu_align = std::mem::align_of::<GpuVertex>();
+    let renderer_align = std::mem::align_of::<crate::renderer::Vertex>();
+    let color_offset = gpu_vertex_color_offset_bytes();
+
+    if gpu_size != renderer_size || gpu_align != renderer_align || color_offset != 12 {
+        GPU_COLOR_CONTRACT_MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        anyhow::bail!(
+            "gpu vertex contract mismatch: gpu[size={},align={},color_offset={}] renderer[size={},align={}]",
+            gpu_size,
+            gpu_align,
+            color_offset,
+            renderer_size,
+            renderer_align,
+        );
+    }
+
+    Ok(())
+}
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
