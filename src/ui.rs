@@ -58,6 +58,17 @@ pub struct ProfilerStats {
     pub mesh_pending_waiting_on_fence: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
+    pub mesh_completed_receive_budget_hits: usize,
+    pub mesh_finalize_budget_hits: usize,
+    pub mesh_adopt_budget_hits: usize,
+    pub mesh_retry_budget_hits: usize,
+    pub mesh_completed_receive_deferred: usize,
+    pub mesh_finalize_deferred: usize,
+    pub mesh_adopt_deferred: usize,
+    pub mesh_retry_deferred: usize,
+    pub mesh_pending_finalize_age_max: u64,
+    pub mesh_pending_finalize_age_p50: u64,
+    pub mesh_pending_finalize_age_p95: u64,
     pub mesh_drawable_filtered_under_load: usize,
     pub mesh_reject_stale: usize,
     pub mesh_reject_invalid_page: usize,
@@ -821,6 +832,26 @@ pub fn draw(
                     ui_state.profiler.mesh_pending_waiting_on_fence,
                     ui_state.profiler.mesh_pending_superseded,
                     ui_state.profiler.mesh_pending_rejected,
+                ));
+                ui.monospace(format!(
+                    "bookkeeping budget hits recv/finalize/adopt/retry: {}/{}/{}/{}",
+                    ui_state.profiler.mesh_completed_receive_budget_hits,
+                    ui_state.profiler.mesh_finalize_budget_hits,
+                    ui_state.profiler.mesh_adopt_budget_hits,
+                    ui_state.profiler.mesh_retry_budget_hits,
+                ));
+                ui.monospace(format!(
+                    "bookkeeping deferred recv/finalize/adopt/retry: {}/{}/{}/{}",
+                    ui_state.profiler.mesh_completed_receive_deferred,
+                    ui_state.profiler.mesh_finalize_deferred,
+                    ui_state.profiler.mesh_adopt_deferred,
+                    ui_state.profiler.mesh_retry_deferred,
+                ));
+                ui.monospace(format!(
+                    "pending finalize age frames p50/p95/max: {}/{}/{}",
+                    ui_state.profiler.mesh_pending_finalize_age_p50,
+                    ui_state.profiler.mesh_pending_finalize_age_p95,
+                    ui_state.profiler.mesh_pending_finalize_age_max,
                 ));
                 ui.monospace(format!(
                     "reject reasons stale/invalid-page/zero-index/failed/unhandled | zero-index soft-retries: {}/{}/{}/{}/{} | {}",
