@@ -1,6 +1,9 @@
 pub const GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub const GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MESH_SLOT_COUNT: u32 = 256;
+pub const CHUNK_VOLUME_VOXELS: u32 = 32 * 32 * 32;
+pub const MESH_VERTEX_ELEMENTS_PER_CHUNK: u32 = CHUNK_VOLUME_VOXELS * 12;
+pub const MESH_INDEX_ELEMENTS_PER_CHUNK: u32 = CHUNK_VOLUME_VOXELS * 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshBufferKind {
@@ -51,6 +54,25 @@ pub struct MeshWriteRange {
 pub struct MeshSlotWriteRanges {
     pub vertex: MeshWriteRange,
     pub index: MeshWriteRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshSliceContract {
+    pub slot_count: u32,
+    pub vertex_elements_per_chunk: u32,
+    pub index_elements_per_chunk: u32,
+    pub vertex_global_capacity_elements: u32,
+    pub index_global_capacity_elements: u32,
+}
+
+pub const fn gpu_mesh_slice_contract() -> MeshSliceContract {
+    MeshSliceContract {
+        slot_count: MESH_SLOT_COUNT,
+        vertex_elements_per_chunk: MESH_VERTEX_ELEMENTS_PER_CHUNK,
+        index_elements_per_chunk: MESH_INDEX_ELEMENTS_PER_CHUNK,
+        vertex_global_capacity_elements: MeshBufferKind::Vertex.global_capacity_elements(),
+        index_global_capacity_elements: MeshBufferKind::Index.global_capacity_elements(),
+    }
 }
 
 fn checked_range(
@@ -173,6 +195,39 @@ mod tests {
             MeshBufferKind::Index.slot_capacity_elements() * MESH_SLOT_COUNT,
             MeshBufferKind::Index.global_capacity_elements()
         );
+    }
+
+    #[test]
+    fn gpu_contract_chunk_capacity_fits_each_slot() {
+        let contract = gpu_mesh_slice_contract();
+        assert_eq!(contract.slot_count, MESH_SLOT_COUNT);
+        assert!(
+            contract.vertex_elements_per_chunk <= MeshBufferKind::Vertex.slot_capacity_elements()
+        );
+        assert!(
+            contract.index_elements_per_chunk <= MeshBufferKind::Index.slot_capacity_elements()
+        );
+    }
+
+    #[test]
+    fn slot_offsets_match_authoritative_contract_layout() {
+        let contract = gpu_mesh_slice_contract();
+        for slot in 0..contract.slot_count {
+            let vertex = validate_slot_write_ranges(
+                slot,
+                contract.vertex_elements_per_chunk,
+                contract.index_elements_per_chunk,
+            )
+            .expect("contract-sized slot range must validate");
+            assert_eq!(
+                vertex.vertex.offset_elements,
+                slot * MeshBufferKind::Vertex.slot_capacity_elements()
+            );
+            assert_eq!(
+                vertex.index.offset_elements,
+                slot * MeshBufferKind::Index.slot_capacity_elements()
+            );
+        }
     }
 
     #[test]
