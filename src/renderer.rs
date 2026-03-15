@@ -25,7 +25,7 @@ use crate::engine::visibility::debug_assert_not_rejected_before_drawable;
 use crate::engine::world::ChunkVersion;
 use crate::gpu_compute::{
     dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker,
-    invalidate_gpu_pending_finalize_on_renderer, run_chunk_job_on_worker,
+    invalidate_gpu_pending_finalize_and_queued_on_renderer, run_chunk_job_on_worker,
     set_gpu_protected_chunks_on_renderer, take_ready_gpu_mesh_results_on_renderer,
     update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
     SharedMeshBuffers,
@@ -3984,7 +3984,7 @@ impl Renderer {
             dropped += 1;
         }
         #[cfg(feature = "gpu-compute")]
-        invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
+        invalidate_gpu_pending_finalize_and_queued_on_renderer(coord, requested_version, reason);
         if self.chunk_mesh_records.contains_key(&coord) {
             let _ = self.reject_candidate_preserve_current_for_coord(coord);
         }

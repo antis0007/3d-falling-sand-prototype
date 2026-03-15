@@ -144,3 +144,89 @@ fn reported_success_requires_drawable_candidate() {
         falling_sand_3d::streaming::Residency::Resident
     );
 }
+
+#[cfg(feature = "gpu-compute")]
+#[test]
+fn queued_task_stale_page_generation_is_dropped_before_dispatch() {
+    use falling_sand_3d::gpu_compute::{
+        queued_task_is_stale_for_dispatch, QueuedTaskOwnershipIdentity, QueuedTaskOwnershipState,
+    };
+
+    let identity = QueuedTaskOwnershipIdentity {
+        page_generation: 7,
+        slot_generation: Some(11),
+    };
+
+    let current = QueuedTaskOwnershipState {
+        page_generation: 8,
+        slot_generation: Some(11),
+    };
+
+    assert!(queued_task_is_stale_for_dispatch(current, identity));
+}
+
+#[cfg(feature = "gpu-compute")]
+#[test]
+fn queued_task_stale_slot_generation_is_dropped_before_dispatch() {
+    use falling_sand_3d::gpu_compute::{
+        queued_task_is_stale_for_dispatch, QueuedTaskOwnershipIdentity, QueuedTaskOwnershipState,
+    };
+
+    let identity = QueuedTaskOwnershipIdentity {
+        page_generation: 4,
+        slot_generation: Some(9),
+    };
+
+    let current = QueuedTaskOwnershipState {
+        page_generation: 4,
+        slot_generation: Some(10),
+    };
+
+    assert!(queued_task_is_stale_for_dispatch(current, identity));
+}
+
+#[cfg(feature = "gpu-compute")]
+#[test]
+fn queued_eviction_or_invalidation_cleanly_stales_dispatch_identity() {
+    use falling_sand_3d::gpu_compute::{
+        invalidate_queued_task_ownership_state, queued_task_is_stale_for_dispatch,
+        QueuedTaskOwnershipIdentity, QueuedTaskOwnershipState,
+    };
+
+    let mut current = QueuedTaskOwnershipState {
+        page_generation: 12,
+        slot_generation: Some(3),
+    };
+
+    // Snapshot what the queued task captured before ownership changed.
+    let queued_identity = QueuedTaskOwnershipIdentity {
+        page_generation: current.page_generation,
+        slot_generation: current.slot_generation,
+    };
+
+    // Simulate eviction / ownership invalidation before dispatch.
+    invalidate_queued_task_ownership_state(&mut current);
+
+    assert!(queued_task_is_stale_for_dispatch(current, queued_identity));
+}
+
+#[cfg(feature = "gpu-compute")]
+#[test]
+fn valid_ownership_identity_remains_valid_for_finalize_path() {
+    use falling_sand_3d::gpu_compute::{
+        queued_task_is_stale_for_dispatch, QueuedTaskOwnershipIdentity, QueuedTaskOwnershipState,
+    };
+
+    // For valid ownership generations, dispatch should not classify the queued task as stale;
+    // this preserves normal finalize readiness for non-invalidated work.
+    let identity = QueuedTaskOwnershipIdentity {
+        page_generation: 21,
+        slot_generation: Some(34),
+    };
+    let current = QueuedTaskOwnershipState {
+        page_generation: 21,
+        slot_generation: Some(34),
+    };
+
+    assert!(!queued_task_is_stale_for_dispatch(current, identity));
+}
