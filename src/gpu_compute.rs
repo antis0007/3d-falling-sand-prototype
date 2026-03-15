@@ -3092,7 +3092,7 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
 mod tests {
     use super::{ChunkPageAtlas, MeshSliceAllocateOutcome, MESH_SLOT_COUNT};
     use crate::chunk_store::ChunkStore;
-use crate::engine::world::ChunkVersion;
+    use crate::engine::world::ChunkVersion;
     use crate::sim::XorShift32;
     use crate::sim_world::SimWorld;
     use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord};

@@ -18,9 +18,9 @@ use crate::engine::artifacts::{
     MeshArtifactMetadata, MeshArtifactPayloadKind, MeshArtifactPublicationState,
     MeshArtifactRegistry,
 };
-use crate::engine::gpu_residency::GpuResourceHandle;
+use crate::engine::gpu_residency::{GpuResidencyManager, ResidencyState, ResidencyUploadMetadata};
 use crate::engine::mesh::{debug_assert_lod_matches_key, LodLevel};
-use crate::engine::render::RenderLifecycleState;
+use crate::engine::render::{FrameEpoch, RenderLifecycleState};
 use crate::engine::visibility::debug_assert_not_rejected_before_drawable;
 use crate::engine::world::ChunkVersion;
 use crate::gpu_compute::{
@@ -612,6 +612,7 @@ pub struct Renderer {
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
     chunk_mesh_records: HashMap<ChunkCoord, ChunkMeshRecord>,
     artifact_registry: MeshArtifactRegistry,
+    gpu_residency: GpuResidencyManager,
     visible_slots: HashMap<u32, ChunkCoord>,
     slot_ownership_generation: HashMap<u32, u64>,
     next_slot_ownership_generation: u64,
@@ -650,6 +651,7 @@ pub struct Renderer {
     retry_coord_queue: VecDeque<ChunkCoord>,
     startup_mesh_seed_state: HashMap<ChunkCoord, StartupMeshSeedState>,
     mesh_rebuild_frame_index: u64,
+    frame_epoch: FrameEpoch,
     near_lod_distance: f32,
 
     mesh_queue: BackgroundMeshQueue,
@@ -1293,6 +1295,7 @@ struct GpuChunkDraw {
     world_aabb_min: Vec3,
     world_aabb_max: Vec3,
     draw_source: DrawSource,
+    artifact_key: Option<MeshArtifactKey>,
     ownership_generation: u64,
     // Optional debug metadata only; indirect draw args remain authoritative.
     index_count: Option<u32>,
@@ -1304,7 +1307,6 @@ struct ChunkCandidate {
     artifact_handle: MeshArtifactHandle,
     pending_finalize: bool,
     task_id: u64,
-    gpu_resource: Option<GpuResourceHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -2030,6 +2032,7 @@ impl Renderer {
             visible_gpu_chunks: HashMap::new(),
             chunk_mesh_records: HashMap::new(),
             artifact_registry: MeshArtifactRegistry::default(),
+            gpu_residency: GpuResidencyManager::default(),
             visible_slots: HashMap::new(),
             slot_ownership_generation: HashMap::new(),
             next_slot_ownership_generation: 0,
@@ -2066,6 +2069,7 @@ impl Renderer {
             retry_coord_queue: VecDeque::new(),
             startup_mesh_seed_state: HashMap::new(),
             mesh_rebuild_frame_index: 0,
+            frame_epoch: FrameEpoch::default(),
             near_lod_distance: 1.5,
             mesh_queue: BackgroundMeshQueue::new(2, 256, mesh_backend),
             deferred_completed_meshes: VecDeque::new(),
@@ -2243,6 +2247,18 @@ impl Renderer {
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
         self.mesh_rebuild_frame_index = self.mesh_rebuild_frame_index.saturating_add(1);
+        self.frame_epoch = FrameEpoch(self.mesh_rebuild_frame_index);
+        self.gpu_residency
+            .frame_completed(FrameEpoch(self.frame_epoch.get().saturating_sub(1)));
+        let _released_resources = self.gpu_residency.complete_releases_after_frame_safety();
+        let referenced_resources: Vec<_> = self
+            .visible_gpu_chunks
+            .values()
+            .filter_map(|draw| draw.artifact_key)
+            .filter_map(|key| self.gpu_residency.resolve_resident_handle(key))
+            .collect();
+        self.gpu_residency
+            .frame_submitted(self.frame_epoch, referenced_resources);
         let retry_frame_stats =
             self.process_mesh_retry_backoff(player_chunk, chunk_priority_scores);
         let lod_radii = lod_radii.normalized();
@@ -2954,6 +2970,11 @@ impl Renderer {
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
                         draw_source: DrawSource::GpuArtifact,
+                        artifact_key: Some(MeshArtifactKey {
+                            chunk_id: result.coord,
+                            chunk_version: result.version,
+                            lod: lod_level(result.lod),
+                        }),
                         ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
@@ -3105,6 +3126,11 @@ impl Renderer {
                         world_aabb_min: *aabb_min,
                         world_aabb_max: *aabb_max,
                         draw_source: DrawSource::CpuUploaded,
+                        artifact_key: Some(MeshArtifactKey {
+                            chunk_id: result.coord,
+                            chunk_version: result.version,
+                            lod: lod_level(result.lod),
+                        }),
                         ownership_generation: 0,
                         index_count: Some(resolved_index_count),
                     },
@@ -3430,7 +3456,9 @@ impl Renderer {
         self.retry_coord_queue.clear();
         self.startup_mesh_seed_state.clear();
         self.mesh_rebuild_frame_index = 0;
+        self.frame_epoch = FrameEpoch::default();
         self.artifact_registry.clear();
+        self.gpu_residency.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {
         // Keep frustum checks in world space; use GPU mesh metadata.
@@ -3523,8 +3551,17 @@ impl Renderer {
             let stride = std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
             let mut draw_stats = MeshDrawStats::default();
             let mut drawn_slots = HashSet::with_capacity(drawable_chunks.len());
-            for (_, chosen) in drawable_chunks {
+            for (coord, chosen) in drawable_chunks {
                 let draw = chosen.draw;
+                if let Some(artifact_key) = draw.artifact_key {
+                    let resident = self.gpu_residency.resolve_resident_handle(artifact_key);
+                    debug_assert!(
+                        resident.is_some(),
+                        "no draw resolution through renderer-private truth when residency manager disagrees: coord={:?} key={:?}",
+                        coord,
+                        artifact_key
+                    );
+                }
                 if !drawn_slots.insert(draw.draw_indirect_index) {
                     continue;
                 }
@@ -3571,14 +3608,22 @@ impl Renderer {
             registry_state
         );
 
-        let record = self.mesh_record_mut(coord);
         let handle = MeshArtifactHandle(task_id);
+        self.gpu_residency.enqueue_artifact_upload(
+            key,
+            Some(handle),
+            ResidencyUploadMetadata {
+                page_index: None,
+                draw_indirect_index: None,
+                lod: Some(lod as u8),
+            },
+        );
+        let record = self.mesh_record_mut(coord);
         record.candidate = Some(ChunkCandidate {
             artifact_key: key,
             artifact_handle: handle,
             pending_finalize: pending,
             task_id,
-            gpu_resource: None,
         });
         record.state = if pending {
             ChunkRenderState::CandidatePending
@@ -3609,6 +3654,8 @@ impl Renderer {
             .and_then(|record| record.candidate.map(|c| c.artifact_key))
         {
             self.artifact_registry.mark_superseded(candidate_key);
+            self.gpu_residency
+                .invalidate_artifact(candidate_key, self.frame_epoch);
         }
         let record = self.mesh_record_mut(coord);
         Self::reject_candidate_preserve_current(record)
@@ -3645,6 +3692,20 @@ impl Renderer {
                         payload_kind,
                     },
                 );
+                let residency = self.gpu_residency.mark_upload_complete_resident(
+                    candidate.artifact_key,
+                    Some(candidate.artifact_handle),
+                    ResidencyUploadMetadata {
+                        page_index: Some(draw.page_index),
+                        draw_indirect_index: Some(draw.draw_indirect_index),
+                        lod: Some(draw.lod),
+                    },
+                );
+                debug_assert_eq!(residency.state, ResidencyState::Resident);
+                debug_assert!(self
+                    .gpu_residency
+                    .resolve_resident_handle(candidate.artifact_key)
+                    .is_some());
                 debug_assert_drawable_registry_state_valid(
                     candidate.artifact_key,
                     self.artifact_registry
@@ -4115,6 +4176,10 @@ impl Renderer {
                 && reserved_slot != Some(old.draw_indirect_index)
             {
                 self.free_mesh_slots.push(old.draw_indirect_index);
+            }
+            if let Some(artifact_key) = old.artifact_key {
+                self.gpu_residency
+                    .request_evict_release(artifact_key, self.frame_epoch);
             }
             self.mesh_lifecycle
                 .insert(coord, MeshLifecycleState::Evicted);
@@ -6697,6 +6762,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::StaleCached,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(12),
         };
@@ -6740,6 +6806,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 7,
             index_count: Some(20),
         };
@@ -6782,6 +6849,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -16.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -14.0),
             draw_source: DrawSource::Fallback,
+            artifact_key: None,
             ownership_generation: 11,
             index_count: Some(16),
         };
@@ -6825,6 +6893,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -20.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -18.0),
             draw_source: DrawSource::StaleCached,
+            artifact_key: None,
             ownership_generation: 13,
             index_count: Some(24),
         };
@@ -6869,6 +6938,7 @@ mod tests {
             world_aabb_min: Vec3::new(16.0, 0.0, 0.0),
             world_aabb_max: Vec3::new(32.0, 16.0, 16.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(24),
         };
@@ -6880,6 +6950,7 @@ mod tests {
             world_aabb_min: Vec3::new(32.0, 0.0, 0.0),
             world_aabb_max: Vec3::new(48.0, 16.0, 16.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(24),
         };
@@ -6921,6 +6992,7 @@ mod tests {
             world_aabb_min: Vec3::ZERO,
             world_aabb_max: Vec3::splat(16.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(12),
         };
@@ -7052,6 +7124,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::CpuUploaded,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(6),
         };
@@ -7230,6 +7303,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -4.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -2.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(12),
         };
@@ -7274,6 +7348,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -20.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -18.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(24),
         };
@@ -7326,6 +7401,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(24),
         };
@@ -7363,6 +7439,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -2.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -1.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 9,
             index_count: Some(8),
         };
@@ -7403,6 +7480,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -8.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -6.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(16),
         };
@@ -7454,6 +7532,7 @@ mod tests {
             world_aabb_min: Vec3::new(-1.0, -1.0, -2.0),
             world_aabb_max: Vec3::new(1.0, 1.0, -1.0),
             draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
             ownership_generation: 1,
             index_count: Some(0),
         };
