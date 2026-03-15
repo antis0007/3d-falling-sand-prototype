@@ -23,7 +23,10 @@ fn continuity_replacement_failure_keeps_visible_chunk() {
     streaming.mark_generation_dropped(chunk);
 
     assert!(streaming.resident.contains(&chunk));
-    assert_eq!(streaming.residency_of(chunk), falling_sand_3d::streaming::Residency::Resident);
+    assert_eq!(
+        streaming.residency_of(chunk),
+        falling_sand_3d::streaming::Residency::Resident
+    );
 }
 
 #[test]
@@ -39,7 +42,10 @@ fn pending_or_invalid_candidate_does_not_blank_current_drawable() {
     assert!(streaming.resident.contains(&chunk));
     assert!(streaming.scheduled_generate.contains(&chunk));
     assert!(streaming.pending_generate_count() >= 1);
-    assert_eq!(streaming.residency_of(chunk), falling_sand_3d::streaming::Residency::Resident);
+    assert_eq!(
+        streaming.residency_of(chunk),
+        falling_sand_3d::streaming::Residency::Resident
+    );
 }
 
 #[test]
@@ -133,5 +139,8 @@ fn reported_success_requires_drawable_candidate() {
     );
 
     streaming.mark_generated(chunk, 42);
-    assert_eq!(streaming.residency_of(chunk), falling_sand_3d::streaming::Residency::Resident);
+    assert_eq!(
+        streaming.residency_of(chunk),
+        falling_sand_3d::streaming::Residency::Resident
+    );
 }

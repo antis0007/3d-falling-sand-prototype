@@ -22,10 +22,11 @@ use crate::gpu_compute::{
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
-    gpu_page_capacity, mesh_pool_slot_capacity, required_storage_buffer_binding_size_bytes,
-    ReadyGpuMeshFinalizeEvent, ReadyGpuMeshFinalizeStatus, COMPUTE_STORAGE_BINDING_COUNT,
-    GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    gpu_page_capacity, required_storage_buffer_binding_size_bytes, ReadyGpuMeshFinalizeEvent,
+    ReadyGpuMeshFinalizeStatus, COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
+use crate::mesh_layout::{self, MeshBufferKind};
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
@@ -1351,11 +1352,6 @@ struct StartupMeshSeedState {
     recovered_nonzero_at: Option<Instant>,
 }
 
-const GPU_MESH_VERTEX_CAPACITY_PER_SLOT: u64 =
-    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 24;
-const GPU_MESH_INDEX_CAPACITY_PER_SLOT: u64 =
-    (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * (CHUNK_SIZE_VOXELS as u64) * 36;
-
 pub(crate) enum ChunkMeshArtifact {
     Cpu {
         verts: Vec<Vertex>,
@@ -1898,7 +1894,7 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
         let page_capacity = gpu_page_capacity() as u64;
-        let mesh_slot_capacity = mesh_pool_slot_capacity() as u64;
+        let mesh_slot_capacity = mesh_layout::MESH_SLOT_COUNT as u64;
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
             size: GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
@@ -2021,7 +2017,7 @@ impl Renderer {
             visible_slots: HashMap::new(),
             slot_ownership_generation: HashMap::new(),
             next_slot_ownership_generation: 0,
-            free_mesh_slots: (0..mesh_pool_slot_capacity() as u32).collect(),
+            free_mesh_slots: (0..mesh_layout::MESH_SLOT_COUNT).collect(),
             global_gpu_vertex_buffer,
             global_gpu_index_buffer,
             global_gpu_draw_indirect_buffer,
@@ -3013,14 +3009,41 @@ impl Renderer {
                     continue;
                 };
 
-                let vertex_offset = slot as u64
-                    * GPU_MESH_VERTEX_CAPACITY_PER_SLOT
-                    * std::mem::size_of::<Vertex>() as u64;
+                let vertex_count = verts.len() as u32;
+                let index_count = inds.len() as u32;
+                let Some(write_ranges) =
+                    mesh_layout::validate_slot_write_ranges(slot, vertex_count, index_count)
+                else {
+                    self.free_mesh_slots.push(slot);
+                    stats.mesh_artifacts_rejected += 1;
+                    stats.mesh_reject_failed += 1;
+                    if had_prior_mesh {
+                        replacement_failed_coords.insert(result.coord);
+                        self.record_candidate_rejected_preserving_current(
+                            result.coord,
+                            &mut stats,
+                            VoidDropReason::FinalizeInvalid,
+                        );
+                    }
+                    log::error!(
+                        "[gpu-mesh] rejecting cpu upload due to invalid global mesh write range coord={:?} page_index={} slot_index={} vertex_offset_elements={} index_offset_elements={} vertex_count={} index_count={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={}",
+                        result.coord,
+                        slot,
+                        slot,
+                        mesh_layout::slot_base_offset_elements(MeshBufferKind::Vertex, slot).unwrap_or(u32::MAX),
+                        mesh_layout::slot_base_offset_elements(MeshBufferKind::Index, slot).unwrap_or(u32::MAX),
+                        vertex_count,
+                        index_count,
+                        MeshBufferKind::Vertex.global_capacity_elements(),
+                        MeshBufferKind::Index.global_capacity_elements(),
+                        MeshBufferKind::Vertex.global_size_bytes(),
+                        MeshBufferKind::Index.global_size_bytes(),
+                    );
+                    continue;
+                };
 
-                let index_offset = slot as u64
-                    * GPU_MESH_INDEX_CAPACITY_PER_SLOT
-                    * std::mem::size_of::<u32>() as u64;
-
+                let vertex_offset = write_ranges.vertex.offset_bytes;
+                let index_offset = write_ranges.index.offset_bytes;
                 let draw_offset =
                     slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
 
@@ -3040,13 +3063,13 @@ impl Renderer {
                     );
                 }
 
-                let resolved_index_count = indirect.index_count.max(inds.len() as u32);
+                let resolved_index_count = indirect.index_count.max(index_count);
 
                 let draw_command = DrawIndexedIndirectCommand {
                     index_count: resolved_index_count,
                     instance_count: 1,
-                    first_index: (index_offset / std::mem::size_of::<u32>() as u64) as u32,
-                    base_vertex: (vertex_offset / std::mem::size_of::<Vertex>() as u64) as i32,
+                    first_index: write_ranges.index.offset_elements,
+                    base_vertex: write_ranges.vertex.offset_elements as i32,
                     first_instance: 0,
                 };
 
@@ -3359,7 +3382,7 @@ impl Renderer {
         self.visible_gpu_chunks.clear();
         self.visible_slots.clear();
         self.free_mesh_slots.clear();
-        self.free_mesh_slots.extend(0..mesh_pool_slot_capacity());
+        self.free_mesh_slots.extend(0..mesh_layout::MESH_SLOT_COUNT);
         self.dirty_queues.clear();
         self.urgent_mesh_queue.clear();
         self.urgent_mesh_set.clear();

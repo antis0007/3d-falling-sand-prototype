@@ -1,3 +1,4 @@
+use crate::mesh_layout::{self, MeshBufferKind, MESH_SLOT_COUNT};
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason, VOXEL_SIZE};
 use crate::types::{ChunkCoord, GpuPageIndex, CHUNK_SIZE_VOXELS};
@@ -15,8 +16,6 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-#[cfg(feature = "gpu-compute")]
-const GPU_PAGE_CAPACITY: u32 = 256;
 const CHUNK_VOLUME: usize = 32 * 32 * 32;
 #[cfg(feature = "gpu-compute")]
 const MAC_U_COUNT: usize = (32 + 1) * 32 * 32;
@@ -33,29 +32,14 @@ const GPU_MESH_VERTEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 12;
 #[cfg(feature = "gpu-compute")]
 const GPU_MESH_INDEX_CAPACITY_PER_PAGE: u64 = (CHUNK_VOLUME as u64) * 18;
 #[cfg(feature = "gpu-compute")]
-pub const GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-#[cfg(feature = "gpu-compute")]
-pub const GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES: u64 = 256 * 1024 * 1024;
+pub use crate::mesh_layout::{
+    GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+};
 
 #[cfg(feature = "gpu-compute")]
 const MIN_MESH_VERTEX_CAPACITY_PER_CHUNK: u64 = 256;
 #[cfg(feature = "gpu-compute")]
 const MIN_MESH_INDEX_CAPACITY_PER_CHUNK: u64 = 384;
-
-#[cfg(feature = "gpu-compute")]
-pub const fn mesh_pool_slot_capacity() -> u32 {
-    GPU_PAGE_CAPACITY
-}
-
-#[cfg(feature = "gpu-compute")]
-pub const fn global_mesh_vertex_capacity_elements() -> u32 {
-    (GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / std::mem::size_of::<GpuVertex>() as u64) as u32
-}
-
-#[cfg(feature = "gpu-compute")]
-pub const fn global_mesh_index_capacity_elements() -> u32 {
-    (GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / std::mem::size_of::<u32>() as u64) as u32
-}
 
 #[cfg(feature = "gpu-compute")]
 fn lod_chunk_volume(lod: u8) -> u64 {
@@ -74,12 +58,12 @@ fn mesh_capacity_for_lod(lod: u8) -> (u32, u32) {
 
 #[cfg(feature = "gpu-compute")]
 const fn atlas_voxel_size_bytes() -> u64 {
-    (GPU_PAGE_CAPACITY as u64) * (CHUNK_VOLUME as u64) * 2 * std::mem::size_of::<u32>() as u64
+    (MESH_SLOT_COUNT as u64) * (CHUNK_VOLUME as u64) * 2 * std::mem::size_of::<u32>() as u64
 }
 
 #[cfg(feature = "gpu-compute")]
 const fn velocity_mac_size_bytes() -> u64 {
-    (GPU_PAGE_CAPACITY as u64) * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64
+    (MESH_SLOT_COUNT as u64) * (MAC_TOTAL_COUNT as u64) * 2 * std::mem::size_of::<f32>() as u64
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -95,7 +79,7 @@ pub(crate) const fn required_storage_buffer_binding_size_bytes() -> u64 {
 
 #[cfg(feature = "gpu-compute")]
 pub const fn gpu_page_capacity() -> u32 {
-    GPU_PAGE_CAPACITY
+    MESH_SLOT_COUNT
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,11 +217,11 @@ impl Default for ChunkPageAtlas {
             next_mesh_slot: 0,
             free_vertex_ranges: vec![MeshRange {
                 start: 0,
-                len: global_mesh_vertex_capacity_elements(),
+                len: MeshBufferKind::Vertex.global_capacity_elements(),
             }],
             free_index_ranges: vec![MeshRange {
                 start: 0,
-                len: global_mesh_index_capacity_elements(),
+                len: MeshBufferKind::Index.global_capacity_elements(),
             }],
             used_vertex_elements: 0,
             used_index_elements: 0,
@@ -358,7 +342,7 @@ impl ChunkPageAtlas {
             return Ok((existing, false));
         }
 
-        if self.next_page.0 < GPU_PAGE_CAPACITY {
+        if self.next_page.0 < MESH_SLOT_COUNT {
             let page = self.next_page;
             self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
             self.page_for_chunk.insert(chunk, page);
@@ -415,7 +399,7 @@ impl ChunkPageAtlas {
         }
 
         let (required_vertex, required_index) = mesh_capacity_for_lod(lod);
-        let slot_capacity = mesh_pool_slot_capacity();
+        let slot_capacity = MESH_SLOT_COUNT;
         if slot_capacity == 0 {
             return MeshSliceAllocateOutcome::InvalidState;
         }
@@ -613,10 +597,10 @@ impl ChunkPageAtlas {
     }
 
     fn mesh_pool_telemetry(&self) -> MeshPoolTelemetry {
-        let slot_capacity = mesh_pool_slot_capacity();
+        let slot_capacity = MESH_SLOT_COUNT;
         let slots_used = self.mesh_slice_for_chunk.len() as u32;
-        let vertex_capacity = global_mesh_vertex_capacity_elements();
-        let index_capacity = global_mesh_index_capacity_elements();
+        let vertex_capacity = MeshBufferKind::Vertex.global_capacity_elements();
+        let index_capacity = MeshBufferKind::Index.global_capacity_elements();
         MeshPoolTelemetry {
             slot_capacity,
             slots_used,
@@ -822,7 +806,7 @@ struct DrawIndirectReadbackState {
 impl DrawIndirectReadbackState {
     fn new(device: &wgpu::Device) -> Self {
         let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
-        let slot_capacity = mesh_pool_slot_capacity() as u64;
+        let slot_capacity = MESH_SLOT_COUNT as u64;
         let size = draw_stride * slot_capacity;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu draw indirect frame readback"),
@@ -836,7 +820,7 @@ impl DrawIndirectReadbackState {
             map_result_rx: None,
             requested_serial: 0,
             ready_serial: 0,
-            cached_index_counts: vec![0; mesh_pool_slot_capacity() as usize],
+            cached_index_counts: vec![0; MESH_SLOT_COUNT as usize],
         }
     }
 
@@ -878,8 +862,8 @@ impl DrawIndirectReadbackState {
             return;
         }
 
-        let byte_len = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64
-            * mesh_pool_slot_capacity() as u64;
+        let byte_len =
+            std::mem::size_of::<DrawIndexedIndirectArgs>() as u64 * MESH_SLOT_COUNT as u64;
         let mut encoder = state
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -962,7 +946,7 @@ fn clear_page_buffers(
 #[cfg(feature = "gpu-compute")]
 fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
     let page_len = CHUNK_VOLUME as u64;
-    let page_capacity = GPU_PAGE_CAPACITY as u64;
+    let page_capacity = MESH_SLOT_COUNT as u64;
     GpuScratchPool {
         page_params: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk page params"),
@@ -1088,6 +1072,80 @@ fn clear_meshing_outputs_for_page(
         0,
         bytemuck::cast_slice(&[0u32; 1]),
     );
+}
+
+#[cfg(feature = "gpu_meshing_experimental")]
+fn validate_mesh_slice_for_dispatch(
+    coord: ChunkCoord,
+    page_index: GpuPageIndex,
+    mesh_slice: MeshBufferSlice,
+) -> anyhow::Result<()> {
+    if page_index.0 >= MESH_SLOT_COUNT {
+        anyhow::bail!(
+            "invalid mesh dispatch page index for {:?}: page={} slot_capacity={}",
+            coord,
+            page_index.0,
+            MESH_SLOT_COUNT
+        );
+    }
+
+    let Some(vertex_limit) = mesh_slice
+        .vertex_offset
+        .checked_add(GPU_MESH_VERTEX_CAPACITY_PER_PAGE as u32)
+    else {
+        anyhow::bail!(
+            "invalid mesh vertex range overflow for {:?}: page={} slot={} vertex_offset_elements={} vertex_count={}",
+            coord,
+            page_index.0,
+            mesh_slice.slot_index,
+            mesh_slice.vertex_offset,
+            GPU_MESH_VERTEX_CAPACITY_PER_PAGE
+        );
+    };
+
+    let Some(index_limit) = mesh_slice
+        .index_offset
+        .checked_add(GPU_MESH_INDEX_CAPACITY_PER_PAGE as u32)
+    else {
+        anyhow::bail!(
+            "invalid mesh index range overflow for {:?}: page={} slot={} index_offset_elements={} index_count={}",
+            coord,
+            page_index.0,
+            mesh_slice.slot_index,
+            mesh_slice.index_offset,
+            GPU_MESH_INDEX_CAPACITY_PER_PAGE
+        );
+    };
+
+    let vertex_range = mesh_layout::validate_element_range(
+        MeshBufferKind::Vertex,
+        mesh_slice.vertex_offset,
+        GPU_MESH_VERTEX_CAPACITY_PER_PAGE as u32,
+    );
+    let index_range = mesh_layout::validate_element_range(
+        MeshBufferKind::Index,
+        mesh_slice.index_offset,
+        GPU_MESH_INDEX_CAPACITY_PER_PAGE as u32,
+    );
+
+    if mesh_slice.slot_index >= MESH_SLOT_COUNT || vertex_range.is_none() || index_range.is_none() {
+        anyhow::bail!(
+            "invalid mesh slice for dispatch coord={:?} page={} slot={} vertex_offset_elements={} vertex_limit_elements={} index_offset_elements={} index_limit_elements={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={}",
+            coord,
+            page_index.0,
+            mesh_slice.slot_index,
+            mesh_slice.vertex_offset,
+            vertex_limit,
+            mesh_slice.index_offset,
+            index_limit,
+            MeshBufferKind::Vertex.global_capacity_elements(),
+            MeshBufferKind::Index.global_capacity_elements(),
+            MeshBufferKind::Vertex.global_size_bytes(),
+            MeshBufferKind::Index.global_size_bytes(),
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1322,7 +1380,9 @@ pub struct GpuChunkTask {
 #[derive(Clone, Copy, Debug)]
 pub struct MeshBufferSlice {
     pub slot_index: u32,
+    /// Global vertex buffer offset in elements (not bytes).
     pub vertex_offset: u32,
+    /// Global index buffer offset in elements (not bytes).
     pub index_offset: u32,
 }
 
@@ -1746,6 +1806,7 @@ impl GpuComputeRuntime {
         _lod: u8,
         mesh_slice: MeshBufferSlice,
     ) -> anyhow::Result<()> {
+        validate_mesh_slice_for_dispatch(sim_job.chunk_coord, page_index, mesh_slice)?;
         clear_meshing_outputs_for_page(state, page_index, mesh_slice);
 
         let page_params = device_page_params(
@@ -1987,7 +2048,7 @@ pub fn initialize_gpu_compute_worker(
         }
         validate_gpu_vertex_contract().context("gpu mesh vertex host contract")?;
         let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
-        let page_capacity = GPU_PAGE_CAPACITY as u64;
+        let page_capacity = MESH_SLOT_COUNT as u64;
         let page_len = CHUNK_VOLUME as u64;
         let atlas_voxel_size = atlas_voxel_size_bytes();
         let velocity_mac_size = velocity_mac_size_bytes();
@@ -2456,6 +2517,9 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         }
 
         #[cfg(feature = "gpu_meshing_experimental")]
+        let mut submitted_mesh_slice = None;
+
+        #[cfg(feature = "gpu_meshing_experimental")]
         {
             if let Some(mesh_slice) = task.mesh_slice {
                 if task.startup_seeding_mode && task.frontier_count == 0 {
@@ -2469,7 +2533,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                     );
                 }
 
-                state.runtime.run_meshing_dispatch(
+                match state.runtime.run_meshing_dispatch(
                     &state,
                     scratch,
                     &sim_job,
@@ -2477,7 +2541,28 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                     meshing_state,
                     0,
                     mesh_slice,
-                )?;
+                ) {
+                    Ok(()) => {
+                        submitted_mesh_slice = Some(mesh_slice);
+                    }
+                    Err(err) => {
+                        log::error!(
+                            "[gpu-mesh] rejecting gpu mesh dispatch coord={:?} version={} task_id={} page_index={} slot_index={} vertex_offset={} index_offset={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={} error={:#}",
+                            task.coord,
+                            task.version,
+                            task.task_id,
+                            task.page_index.0,
+                            mesh_slice.slot_index,
+                            mesh_slice.vertex_offset,
+                            mesh_slice.index_offset,
+                            MeshBufferKind::Vertex.global_capacity_elements(),
+                            MeshBufferKind::Index.global_capacity_elements(),
+                            MeshBufferKind::Vertex.global_size_bytes(),
+                            MeshBufferKind::Index.global_size_bytes(),
+                            err,
+                        );
+                    }
+                }
             }
         }
 
@@ -2487,7 +2572,8 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.mark_page_submitted(task.page_index, serial);
             atlas.touch_chunk_page(task.coord);
-            if let Some(mesh_slice) = task.mesh_slice {
+            #[cfg(feature = "gpu_meshing_experimental")]
+            if let Some(mesh_slice) = submitted_mesh_slice {
                 let page_generation = atlas.page_generation(task.page_index);
                 let slot_generation = atlas.slot_generation(mesh_slice.slot_index);
                 atlas.pending_mesh_finalize.insert(
@@ -2937,7 +3023,9 @@ fn validate_gpu_vertex_contract() -> anyhow::Result<()> {
 #[repr(C)]
 pub struct ChunkMeshMeta {
     pub slot_index: u32,
+    /// Global vertex buffer offset in elements (not bytes).
     pub vertex_offset: u32,
+    /// Global index buffer offset in elements (not bytes).
     pub index_offset: u32,
     pub _pad: u32,
 }
