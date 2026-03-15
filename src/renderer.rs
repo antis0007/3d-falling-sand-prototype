@@ -13,7 +13,11 @@
 //!   subtracts `world_origin_offset` exactly once.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
-use crate::engine::artifacts::{ArtifactCandidateState, MeshArtifactHandle, MeshArtifactKey};
+use crate::engine::artifacts::{
+    debug_assert_drawable_registry_state_valid, MeshArtifactHandle, MeshArtifactKey,
+    MeshArtifactMetadata, MeshArtifactPayloadKind, MeshArtifactPublicationState,
+    MeshArtifactRegistry,
+};
 use crate::engine::gpu_residency::GpuResourceHandle;
 use crate::engine::mesh::{debug_assert_lod_matches_key, LodLevel};
 use crate::engine::render::RenderLifecycleState;
@@ -460,7 +464,6 @@ pub enum ChunkLod {
     Ultra,
 }
 
-
 fn lod_level(lod: ChunkLod) -> LodLevel {
     let raw = match lod {
         ChunkLod::Near => 0,
@@ -608,6 +611,7 @@ pub struct Renderer {
 
     visible_gpu_chunks: HashMap<ChunkCoord, GpuChunkDraw>,
     chunk_mesh_records: HashMap<ChunkCoord, ChunkMeshRecord>,
+    artifact_registry: MeshArtifactRegistry,
     visible_slots: HashMap<u32, ChunkCoord>,
     slot_ownership_generation: HashMap<u32, u64>,
     next_slot_ownership_generation: u64,
@@ -1296,7 +1300,10 @@ struct GpuChunkDraw {
 
 #[derive(Clone, Copy, Debug)]
 struct ChunkCandidate {
-    authority: ArtifactCandidateState,
+    artifact_key: MeshArtifactKey,
+    artifact_handle: MeshArtifactHandle,
+    pending_finalize: bool,
+    task_id: u64,
     gpu_resource: Option<GpuResourceHandle>,
 }
 
@@ -2022,6 +2029,7 @@ impl Renderer {
             depth_view,
             visible_gpu_chunks: HashMap::new(),
             chunk_mesh_records: HashMap::new(),
+            artifact_registry: MeshArtifactRegistry::default(),
             visible_slots: HashMap::new(),
             slot_ownership_generation: HashMap::new(),
             next_slot_ownership_generation: 0,
@@ -3422,6 +3430,7 @@ impl Renderer {
         self.retry_coord_queue.clear();
         self.startup_mesh_seed_state.clear();
         self.mesh_rebuild_frame_index = 0;
+        self.artifact_registry.clear();
     }
     pub fn mesh_draw_stats(&self, camera: &Camera) -> MeshDrawStats {
         // Keep frustum checks in world space; use GPU mesh metadata.
@@ -3547,20 +3556,28 @@ impl Renderer {
         pending: bool,
     ) {
         let frame = self.mesh_rebuild_frame_index;
-        let record = self.mesh_record_mut(coord);
         let key = MeshArtifactKey {
             chunk_id: coord,
             chunk_version: version,
             lod: lod_level(lod),
         };
         debug_assert_lod_matches_key(lod_level(lod), key);
+        self.artifact_registry.mark_artifact_building(key);
+        let registry_state = self.artifact_registry.artifact_state(key);
+        debug_assert!(
+            matches!(registry_state, MeshArtifactPublicationState::Building),
+            "renderer-local candidate state contradicts artifact registry for key {:?}: {:?}",
+            key,
+            registry_state
+        );
+
+        let record = self.mesh_record_mut(coord);
+        let handle = MeshArtifactHandle(task_id);
         record.candidate = Some(ChunkCandidate {
-            authority: ArtifactCandidateState {
-                key,
-                handle: MeshArtifactHandle(task_id),
-                pending_finalize: pending,
-                task_id,
-            },
+            artifact_key: key,
+            artifact_handle: handle,
+            pending_finalize: pending,
+            task_id,
             gpu_resource: None,
         });
         record.state = if pending {
@@ -3585,16 +3602,56 @@ impl Renderer {
         }
     }
 
+    fn reject_candidate_preserve_current_for_coord(&mut self, coord: ChunkCoord) -> bool {
+        if let Some(candidate_key) = self
+            .chunk_mesh_records
+            .get(&coord)
+            .and_then(|record| record.candidate.map(|c| c.artifact_key))
+        {
+            self.artifact_registry.mark_superseded(candidate_key);
+        }
+        let record = self.mesh_record_mut(coord);
+        Self::reject_candidate_preserve_current(record)
+    }
+
     fn commit_candidate_drawable(
         &mut self,
         coord: ChunkCoord,
         draw: GpuChunkDraw,
         committed_version: ChunkVersion,
     ) -> bool {
+        let candidate = self
+            .chunk_mesh_records
+            .get(&coord)
+            .and_then(|record| record.candidate);
         let adopted = self.adopt_visible_chunk_draw(coord, draw);
         let visible = self.visible_gpu_chunks.get(&coord).copied();
-        let record = self.mesh_record_mut(coord);
         if adopted {
+            if let Some(candidate) = candidate {
+                let payload_kind = match draw.draw_source {
+                    DrawSource::GpuArtifact => MeshArtifactPayloadKind::Gpu,
+                    _ => MeshArtifactPayloadKind::Cpu,
+                };
+                debug_assert!(
+                    !matches!(draw.draw_source, DrawSource::GpuArtifact)
+                        || candidate.pending_finalize,
+                    "gpu artifact adoption must come from pending finalize candidate"
+                );
+                self.artifact_registry.publish_artifact(
+                    candidate.artifact_key,
+                    candidate.artifact_handle,
+                    MeshArtifactMetadata {
+                        task_id: candidate.task_id,
+                        payload_kind,
+                    },
+                );
+                debug_assert_drawable_registry_state_valid(
+                    candidate.artifact_key,
+                    self.artifact_registry
+                        .artifact_state(candidate.artifact_key),
+                );
+            }
+            let record = self.mesh_record_mut(coord);
             record.current_drawable = visible;
             record.candidate = None;
             record.state = ChunkRenderState::CurrentDrawable;
@@ -3628,8 +3685,7 @@ impl Renderer {
             stats.void_drop_count += 1;
             stats.dropped_to_void_count_by_reason[reason.as_index()] += 1;
         }
-        let record = self.mesh_record_mut(coord);
-        Self::reject_candidate_preserve_current(record);
+        let _ = self.reject_candidate_preserve_current_for_coord(coord);
     }
 
     fn mesh_result_finalize_lookup_key(result: &MeshResult) -> Option<PendingGpuFinalizeLookupKey> {
@@ -3943,8 +3999,7 @@ impl Renderer {
                 } else {
                     stats.void_drop_count += 1;
                 }
-                let record = self.mesh_record_mut(ready.result.coord);
-                Self::reject_candidate_preserve_current(record);
+                let _ = self.reject_candidate_preserve_current_for_coord(ready.result.coord);
                 stats.candidate_superseded_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
@@ -3964,8 +4019,7 @@ impl Renderer {
                 } else {
                     stats.void_drop_count += 1;
                 }
-                let record = self.mesh_record_mut(ready.result.coord);
-                Self::reject_candidate_preserve_current(record);
+                let _ = self.reject_candidate_preserve_current_for_coord(ready.result.coord);
                 stats.candidate_invalidated_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
@@ -3988,8 +4042,7 @@ impl Renderer {
                 } else {
                     stats.void_drop_count += 1;
                 }
-                let record = self.mesh_record_mut(ready.result.coord);
-                Self::reject_candidate_preserve_current(record);
+                let _ = self.reject_candidate_preserve_current_for_coord(ready.result.coord);
                 stats.candidate_superseded_current_preserved += usize::from(has_current);
                 self.mesh_lifecycle
                     .insert(ready.result.coord, MeshLifecycleState::Superseded);
@@ -4039,8 +4092,8 @@ impl Renderer {
         }
         #[cfg(feature = "gpu-compute")]
         invalidate_gpu_pending_finalize_on_renderer(coord, requested_version, reason);
-        if let Some(record) = self.chunk_mesh_records.get_mut(&coord) {
-            Self::reject_candidate_preserve_current(record);
+        if self.chunk_mesh_records.contains_key(&coord) {
+            let _ = self.reject_candidate_preserve_current_for_coord(coord);
         }
         dropped
     }
@@ -4349,6 +4402,12 @@ impl Renderer {
     ) -> Result<(), TrySendError<MeshJob>> {
         let coord = job.coord;
         let lod = job.lod;
+        let key = MeshArtifactKey {
+            chunk_id: coord,
+            chunk_version: job.version,
+            lod: lod_level(lod),
+        };
+        self.artifact_registry.request_artifact_build(key);
         match self.mesh_queue.try_submit(job) {
             Ok(()) => {
                 self.inflight_mesh_chunks.insert(coord);
@@ -7310,10 +7369,15 @@ mod tests {
         let mut record = ChunkMeshRecord {
             current_drawable: Some(draw),
             candidate: Some(ChunkCandidate {
-                version: 2,
-                task_id: 3,
-                lod: ChunkLod::Near,
+                artifact_key: MeshArtifactKey {
+                    chunk_id: ChunkCoord { x: 0, y: 0, z: 0 },
+                    chunk_version: ChunkVersion(2),
+                    lod: lod_level(ChunkLod::Near),
+                },
+                artifact_handle: MeshArtifactHandle(3),
                 pending_finalize: true,
+                task_id: 3,
+                gpu_resource: None,
             }),
             fallback: None,
             state: ChunkRenderState::CandidatePending,
