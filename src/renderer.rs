@@ -13,6 +13,12 @@
 //!   subtracts `world_origin_offset` exactly once.
 
 use crate::chunk_store::{ChunkBorderStrips, ChunkStore};
+use crate::engine::artifacts::{ArtifactCandidateState, MeshArtifactHandle, MeshArtifactKey};
+use crate::engine::gpu_residency::GpuResourceHandle;
+use crate::engine::mesh::{debug_assert_lod_matches_key, LodLevel};
+use crate::engine::render::RenderLifecycleState;
+use crate::engine::visibility::debug_assert_not_rejected_before_drawable;
+use crate::engine::world::ChunkVersion;
 use crate::gpu_compute::{
     dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker,
     invalidate_gpu_pending_finalize_on_renderer, run_chunk_job_on_worker,
@@ -452,6 +458,17 @@ pub enum ChunkLod {
     Mid,
     Far,
     Ultra,
+}
+
+
+fn lod_level(lod: ChunkLod) -> LodLevel {
+    let raw = match lod {
+        ChunkLod::Near => 0,
+        ChunkLod::Mid => 1,
+        ChunkLod::Far => 2,
+        ChunkLod::Ultra => 3,
+    };
+    LodLevel(raw)
 }
 
 fn lod_rank(lod: ChunkLod) -> usize {
@@ -913,12 +930,12 @@ enum StaleArtifactRetryPolicy {
 }
 
 fn stale_artifact_retry_policy(
-    result_version: u64,
-    voxel_version: u64,
+    result_version: ChunkVersion,
+    voxel_version: ChunkVersion,
     lod: ChunkLod,
     urgent: bool,
 ) -> Option<StaleArtifactRetryPolicy> {
-    if result_version.saturating_add(1) >= voxel_version {
+    if result_version.get().saturating_add(1) >= voxel_version.get() {
         return None;
     }
 
@@ -1191,7 +1208,7 @@ impl ChunkSnapshot {
 pub(crate) struct MeshJob {
     pub(crate) coord: ChunkCoord,
     pub(crate) lod: ChunkLod,
-    pub(crate) version: u64,
+    pub(crate) version: ChunkVersion,
     pub(crate) task_id: u64,
     pub(crate) queued_at: Instant,
     pub(crate) snapshot: ChunkSnapshot,
@@ -1202,7 +1219,7 @@ pub(crate) struct MeshJob {
 struct MeshResult {
     coord: ChunkCoord,
     lod: ChunkLod,
-    version: u64,
+    version: ChunkVersion,
     task_id: u64,
     queued_at: Instant,
     artifact: ChunkMeshArtifact,
@@ -1221,7 +1238,7 @@ struct PendingGpuMeshResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PendingGpuFinalizeLookupKey {
     coord: ChunkCoord,
-    version: u64,
+    version: ChunkVersion,
     lod: u8,
     task_id: u64,
     page_index: GpuPageIndex,
@@ -1231,7 +1248,7 @@ struct PendingGpuFinalizeLookupKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PendingGpuResultIdentity {
     coord: ChunkCoord,
-    version: u64,
+    version: ChunkVersion,
     lod: u8,
     task_id: u64,
 }
@@ -1279,10 +1296,8 @@ struct GpuChunkDraw {
 
 #[derive(Clone, Copy, Debug)]
 struct ChunkCandidate {
-    version: u64,
-    task_id: u64,
-    lod: ChunkLod,
-    pending_finalize: bool,
+    authority: ArtifactCandidateState,
+    gpu_resource: Option<GpuResourceHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -1306,14 +1321,7 @@ impl Default for ChunkMeshRecord {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChunkRenderState {
-    Idle,
-    CandidatePending,
-    CandidateReady,
-    CandidateRejected,
-    CurrentDrawable,
-}
+type ChunkRenderState = RenderLifecycleState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum VoidDropReason {
@@ -1611,7 +1619,7 @@ impl Renderer {
     ) -> PendingGpuResultIdentity {
         PendingGpuResultIdentity {
             coord,
-            version,
+            version: ChunkVersion(version),
             lod,
             task_id,
         }
@@ -2294,7 +2302,7 @@ impl Renderer {
                     MeshJob {
                         coord,
                         lod,
-                        version,
+                        version: ChunkVersion(version),
                         task_id,
                         queued_at: Instant::now(),
                         snapshot: snapshot.clone(),
@@ -2585,7 +2593,7 @@ impl Renderer {
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
                 self.invalidate_pending_gpu_entries_for_coord(
                     result.coord,
-                    Some(result.version),
+                    Some(result.version.get()),
                     "pending_result_insert",
                 );
                 let pending_lod = match &result.artifact {
@@ -2594,7 +2602,7 @@ impl Renderer {
                 };
                 let identity = self.next_pending_gpu_identity(
                     result.coord,
-                    result.version,
+                    result.version.get(),
                     pending_lod,
                     result.task_id,
                 );
@@ -2629,7 +2637,7 @@ impl Renderer {
             );
             let pending_replaced = self.invalidate_pending_gpu_entries_for_coord(
                 result.coord,
-                Some(result.version),
+                Some(result.version.get()),
                 "new_result_received",
             ) > 0;
             if pending_replaced {
@@ -2646,7 +2654,7 @@ impl Renderer {
                 backend,
                 result.lod,
                 result.version,
-                voxel_version,
+                ChunkVersion(voxel_version),
                 desired,
                 had_prior_mesh,
                 index_count,
@@ -2674,7 +2682,7 @@ impl Renderer {
             // Never upload stale geometry; schedule a retry and skip this artifact.
             if let Some(retry_policy) = stale_artifact_retry_policy(
                 result.version,
-                voxel_version,
+                ChunkVersion(voxel_version),
                 result.lod,
                 result.urgent,
             ) {
@@ -2819,7 +2827,7 @@ impl Renderer {
                     .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
                 self.invalidate_pending_gpu_entries_for_coord(
                     result.coord,
-                    Some(result.version),
+                    Some(result.version.get()),
                     "pending_result_insert",
                 );
                 let pending_lod = match &result.artifact {
@@ -2828,7 +2836,7 @@ impl Renderer {
                 };
                 let identity = self.next_pending_gpu_identity(
                     result.coord,
-                    result.version,
+                    result.version.get(),
                     pending_lod,
                     result.task_id,
                 );
@@ -3533,18 +3541,27 @@ impl Renderer {
     fn stage_candidate(
         &mut self,
         coord: ChunkCoord,
-        version: u64,
+        version: ChunkVersion,
         task_id: u64,
         lod: ChunkLod,
         pending: bool,
     ) {
         let frame = self.mesh_rebuild_frame_index;
         let record = self.mesh_record_mut(coord);
+        let key = MeshArtifactKey {
+            chunk_id: coord,
+            chunk_version: version,
+            lod: lod_level(lod),
+        };
+        debug_assert_lod_matches_key(lod_level(lod), key);
         record.candidate = Some(ChunkCandidate {
-            version,
-            task_id,
-            lod,
-            pending_finalize: pending,
+            authority: ArtifactCandidateState {
+                key,
+                handle: MeshArtifactHandle(task_id),
+                pending_finalize: pending,
+                task_id,
+            },
+            gpu_resource: None,
         });
         record.state = if pending {
             ChunkRenderState::CandidatePending
@@ -3559,6 +3576,7 @@ impl Renderer {
     fn reject_candidate_preserve_current(record: &mut ChunkMeshRecord) -> bool {
         record.candidate = None;
         if record.current_drawable.is_some() {
+            debug_assert_not_rejected_before_drawable(true, false);
             record.state = ChunkRenderState::CurrentDrawable;
             true
         } else {
@@ -3571,7 +3589,7 @@ impl Renderer {
         &mut self,
         coord: ChunkCoord,
         draw: GpuChunkDraw,
-        committed_version: u64,
+        committed_version: ChunkVersion,
     ) -> bool {
         let adopted = self.adopt_visible_chunk_draw(coord, draw);
         let visible = self.visible_gpu_chunks.get(&coord).copied();
@@ -3580,10 +3598,11 @@ impl Renderer {
             record.current_drawable = visible;
             record.candidate = None;
             record.state = ChunkRenderState::CurrentDrawable;
+            debug_assert_not_rejected_before_drawable(false, true);
             record.continuity_grace_started_frame = None;
         }
         if adopted {
-            self.mesh_versions.insert(coord, committed_version);
+            self.mesh_versions.insert(coord, committed_version.get());
         }
         adopted
     }
@@ -4399,7 +4418,7 @@ impl Renderer {
             jobs.push(MeshJob {
                 coord,
                 lod: primary_lod,
-                version,
+                version: ChunkVersion(version),
                 task_id: self.next_gpu_mesh_task_id(),
                 queued_at,
                 snapshot: snapshot.clone(),
@@ -4410,7 +4429,7 @@ impl Renderer {
                 jobs.push(MeshJob {
                     coord,
                     lod,
-                    version,
+                    version: ChunkVersion(version),
                     task_id: self.next_gpu_mesh_task_id(),
                     queued_at,
                     snapshot: snapshot.clone(),

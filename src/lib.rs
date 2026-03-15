@@ -2,6 +2,7 @@ pub mod world;
 
 pub mod chunk_store;
 pub mod edits;
+pub mod engine;
 pub mod floating_origin;
 pub mod gpu_compute;
 pub mod material_ids;

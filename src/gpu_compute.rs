@@ -1,3 +1,4 @@
+use crate::engine::world::ChunkVersion;
 use crate::mesh_layout::{self, MeshBufferKind, MESH_SLOT_COUNT};
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason, VOXEL_SIZE};
@@ -295,7 +296,7 @@ impl PagePriorityHint {
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGpuMeshFinalize {
-    version: u64,
+    version: ChunkVersion,
     task_id: u64,
     lod: u8,
     page_index: GpuPageIndex,
@@ -1333,7 +1334,7 @@ pub struct GpuDispatchFrameStats {
 #[derive(Clone, Copy, Debug)]
 pub struct ReadyGpuMeshResult {
     pub coord: ChunkCoord,
-    pub version: u64,
+    pub version: ChunkVersion,
     pub task_id: u64,
     pub submission_serial: u64,
     pub page_index: GpuPageIndex,
@@ -1377,7 +1378,7 @@ pub struct GpuChunkTask {
     pub current_state: u32,
     pub startup_seeding_mode: bool,
     pub mesh_slice: Option<MeshBufferSlice>,
-    pub version: u64,
+    pub version: ChunkVersion,
     pub task_id: u64,
     pub lod: u8,
 }
@@ -2322,7 +2323,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
 
-            atlas.version_for_chunk.insert(job.coord, job.version);
+            atlas.version_for_chunk.insert(job.coord, job.version.get());
             atlas.state_for_chunk.insert(job.coord, next_state);
             atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
 
@@ -2585,7 +2586,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 atlas.pending_mesh_finalize.insert(
                     task.coord,
                     PendingGpuMeshFinalize {
-                        version: task.version,
+                        version: ChunkVersion(task.version),
                         task_id: task.task_id,
                         lod: task.lod,
                         page_index: task.page_index,
@@ -2713,7 +2714,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             };
 
             if atlas.version_for_chunk.get(&candidate.coord).copied()
-                != Some(candidate.pending.version)
+                != Some(candidate.pending.version.get())
             {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
@@ -3091,6 +3092,7 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
 mod tests {
     use super::{ChunkPageAtlas, MeshSliceAllocateOutcome, MESH_SLOT_COUNT};
     use crate::chunk_store::ChunkStore;
+use crate::engine::world::ChunkVersion;
     use crate::sim::XorShift32;
     use crate::sim_world::SimWorld;
     use crate::types::{chunk_to_world_min, ChunkCoord, VoxelCoord};
