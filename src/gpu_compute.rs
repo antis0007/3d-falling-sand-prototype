@@ -257,6 +257,15 @@ impl PagePriorityHint {
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleQueuedTaskReason {
+    PageOwnership,
+    PageGeneration,
+    SlotOwnership,
+    SlotGeneration,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGpuMeshFinalize {
     version: ChunkVersion,
     task_id: u64,
@@ -266,6 +275,59 @@ struct PendingGpuMeshFinalize {
     page_generation: u64,
     slot_generation: u64,
     submission_serial: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueuedTaskOwnershipIdentity {
+    pub page_generation: u64,
+    pub slot_generation: Option<u64>,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueuedTaskOwnershipState {
+    pub page_generation: u64,
+    pub slot_generation: Option<u64>,
+}
+
+#[cfg(feature = "gpu-compute")]
+fn queued_task_identity_is_stale(
+    mapped_page_generation: u64,
+    mapped_slot_generation: Option<u64>,
+    task_page_generation: u64,
+    task_slot_generation: Option<u64>,
+) -> bool {
+    if mapped_page_generation != task_page_generation {
+        return true;
+    }
+
+    match (mapped_slot_generation, task_slot_generation) {
+        (Some(mapped), Some(task)) => mapped != task,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn queued_task_is_stale_for_dispatch(
+    state: QueuedTaskOwnershipState,
+    identity: QueuedTaskOwnershipIdentity,
+) -> bool {
+    queued_task_identity_is_stale(
+        state.page_generation,
+        state.slot_generation,
+        identity.page_generation,
+        identity.slot_generation,
+    )
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn invalidate_queued_task_ownership_state(state: &mut QueuedTaskOwnershipState) {
+    state.page_generation = state.page_generation.saturating_add(1);
+    if let Some(slot_generation) = state.slot_generation.as_mut() {
+        *slot_generation = slot_generation.saturating_add(1);
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -549,6 +611,7 @@ impl ChunkPageAtlas {
                 .unwrap_or(0)
                 > 0
             {
+                GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let protection_rank = self.mesh_slot_protection_hint(slot).eviction_rank();
@@ -695,13 +758,14 @@ impl ChunkPageAtlas {
         assert_eq!(resolved, chunk, "gpu page/chunk mapping mismatch");
     }
 
-    fn is_stale_queued_task(&self, task: &GpuChunkTask) -> bool {
+    fn stale_queued_task_reason(&self, task: &GpuChunkTask) -> Option<StaleQueuedTaskReason> {
         let mapped_page = self.page_for_chunk.get(&task.coord).copied();
         if mapped_page != Some(task.page_index) {
-            return true;
+            return Some(StaleQueuedTaskReason::PageOwnership);
         }
+
         if self.page_generation(task.page_index) != task.page_generation {
-            return true;
+            return Some(StaleQueuedTaskReason::PageGeneration);
         }
 
         match (task.mesh_slice, task.slot_generation) {
@@ -711,13 +775,16 @@ impl ChunkPageAtlas {
                     .get(&mesh_slice.slot_index)
                     .copied();
                 if mapped_chunk != Some(task.coord) {
-                    return true;
+                    return Some(StaleQueuedTaskReason::SlotOwnership);
                 }
-                self.slot_generation(mesh_slice.slot_index) != slot_generation
+                if self.slot_generation(mesh_slice.slot_index) != slot_generation {
+                    return Some(StaleQueuedTaskReason::SlotGeneration);
+                }
+                None
             }
-            (Some(_), None) => true,
-            (None, Some(_)) => true,
-            (None, None) => false,
+            (Some(_), None) => Some(StaleQueuedTaskReason::SlotOwnership),
+            (None, Some(_)) => Some(StaleQueuedTaskReason::SlotOwnership),
+            (None, None) => None,
         }
     }
 
@@ -788,6 +855,7 @@ impl ChunkPageAtlas {
                 .unwrap_or(0)
                 > 0
             {
+                GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let fence = self.page_fences.get(&page).copied().unwrap_or_default();
@@ -1383,6 +1451,11 @@ pub struct GpuComputeProfilerSnapshot {
     pub color_contract_mismatch_count: u64,
     pub zero_or_invalid_mesh_output_count: u64,
     pub stale_queued_task_count: u64,
+    pub stale_queued_page_drop_count: u64,
+    pub stale_queued_slot_drop_count: u64,
+    pub queue_protected_page_eviction_skip_count: u64,
+    pub queue_protected_slot_eviction_skip_count: u64,
+    pub queue_invalidations_executed_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1452,6 +1525,16 @@ static GPU_COLOR_CONTRACT_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_STALE_QUEUED_TASK_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_PAGE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_SLOT_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
@@ -1625,6 +1708,16 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let zero_or_invalid_mesh_output_count =
             GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT.swap(0, Ordering::Relaxed);
         let stale_queued_task_count = GPU_STALE_QUEUED_TASK_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_page_drop_count =
+            GPU_STALE_QUEUED_PAGE_DROP_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_slot_drop_count =
+            GPU_STALE_QUEUED_SLOT_DROP_COUNT.swap(0, Ordering::Relaxed);
+        let queue_protected_page_eviction_skip_count =
+            GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
+        let queue_protected_slot_eviction_skip_count =
+            GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
+        let queue_invalidations_executed_count =
+            GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -1656,6 +1749,11 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             color_contract_mismatch_count,
             zero_or_invalid_mesh_output_count,
             stale_queued_task_count,
+            stale_queued_page_drop_count,
+            stale_queued_slot_drop_count,
+            queue_protected_page_eviction_skip_count,
+            queue_protected_slot_eviction_skip_count,
+            queue_invalidations_executed_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -2631,16 +2729,26 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
-            if atlas.is_stale_queued_task(&task) {
+            if let Some(reason) = atlas.stale_queued_task_reason(&task) {
                 GPU_STALE_QUEUED_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
+                match reason {
+                    StaleQueuedTaskReason::PageOwnership
+                    | StaleQueuedTaskReason::PageGeneration => {
+                        GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    StaleQueuedTaskReason::SlotOwnership
+                    | StaleQueuedTaskReason::SlotGeneration => {
+                        GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 stats.stale_tasks_skipped += 1;
-                log::debug!(
-                    "[gpu-mesh] stale queued task skipped coord={:?} version={} task_id={} page_index={} has_mesh={}",
+                log::trace!(
+                    "[gpu-mesh] stale queued task skipped coord={:?} version={} task_id={} page_index={} reason={:?}",
                     task.coord,
                     task.version,
                     task.task_id,
                     task.page_index.0,
-                    task.mesh_slice.is_some(),
+                    reason,
                 );
                 continue;
             }
@@ -3018,7 +3126,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 }
 
 #[cfg(feature = "gpu-compute")]
-pub fn invalidate_gpu_pending_finalize_on_renderer(
+pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
     coord: ChunkCoord,
     requested_version: Option<u64>,
     reason: &'static str,
@@ -3041,11 +3149,43 @@ pub fn invalidate_gpu_pending_finalize_on_renderer(
                 requested_version,
             );
         }
+
+        if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
+            let old_page_generation = atlas.page_generation(page_index);
+            let new_page_generation = atlas.bump_page_generation(page_index);
+
+            let slot_generation = atlas
+                .mesh_slice_for_chunk
+                .get(&coord)
+                .map(|slice| (slice.slot_index, atlas.slot_generation(slice.slot_index)))
+                .map(|(slot_index, old_generation)| {
+                    (
+                        slot_index,
+                        old_generation,
+                        atlas.bump_mesh_slot_generation(slot_index),
+                    )
+                });
+
+            GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "[gpu-mesh] invalidate_queued_tasks reason={} coord={:?} requested_version={:?} page={} page_generation={}=>{} slot={:?} slot_generation={:?}",
+                reason,
+                coord,
+                requested_version,
+                page_index.0,
+                old_page_generation,
+                new_page_generation,
+                slot_generation.map(|(slot_index, _, _)| slot_index),
+                slot_generation.map(|(_, old_generation, new_generation)| {
+                    (old_generation, new_generation)
+                }),
+            );
+        }
     }
 }
 
 #[cfg(not(feature = "gpu-compute"))]
-pub fn invalidate_gpu_pending_finalize_on_renderer(
+pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
     _coord: ChunkCoord,
     _requested_version: Option<u64>,
     _reason: &'static str,
