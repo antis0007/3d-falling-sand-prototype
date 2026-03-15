@@ -404,16 +404,22 @@ impl ChunkPageAtlas {
             return MeshSliceAllocateOutcome::InvalidState;
         }
 
+        let mut reused_slot = false;
         let slot = if self.next_mesh_slot < slot_capacity {
             let next = self.next_mesh_slot;
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
             next
         } else {
+            reused_slot = true;
             match self.evictable_mesh_slot(slot_capacity) {
                 Some(evictable) => evictable,
                 None => return MeshSliceAllocateOutcome::Saturated,
             }
         };
+
+        if reused_slot && !self.evict_mesh_slot(slot) {
+            return MeshSliceAllocateOutcome::NoProgress;
+        }
 
         if let Some(slice) =
             self.try_allocate_mesh_buffers(chunk, slot, required_vertex, required_index)
@@ -3083,6 +3089,7 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
 
 #[cfg(test)]
 mod tests {
+    use super::{ChunkPageAtlas, MeshSliceAllocateOutcome, MESH_SLOT_COUNT};
     use crate::chunk_store::ChunkStore;
     use crate::sim::XorShift32;
     use crate::sim_world::SimWorld;
@@ -3159,5 +3166,37 @@ mod tests {
             "mismatch count {} exceeded tolerance",
             mismatches
         );
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn reusing_slot_evicts_previous_owner_before_reallocation() {
+        let mut atlas = ChunkPageAtlas::default();
+        let owner_a = ChunkCoord { x: 0, y: 0, z: 0 };
+        let owner_b = ChunkCoord { x: 1, y: 0, z: 0 };
+
+        let allocated_a = atlas.mesh_slice_for_chunk_or_allocate(owner_a, 0);
+        let slot = match allocated_a {
+            MeshSliceAllocateOutcome::Success(slice) => slice.slot_index,
+            other => panic!("expected initial allocation success, got {other:?}"),
+        };
+
+        atlas.next_mesh_slot = MESH_SLOT_COUNT;
+        atlas.mesh_slot_last_used.insert(slot, 1);
+
+        let allocated_b = atlas.mesh_slice_for_chunk_or_allocate(owner_b, 0);
+        let slice_b = match allocated_b {
+            MeshSliceAllocateOutcome::Success(slice) => slice,
+            other => panic!("expected reused-slot allocation success, got {other:?}"),
+        };
+
+        assert_eq!(slice_b.slot_index, slot);
+        assert!(!atlas.mesh_slice_for_chunk.contains_key(&owner_a));
+        assert_eq!(atlas.chunk_for_mesh_slot.get(&slot), Some(&owner_b));
+        assert_eq!(
+            atlas.mesh_slice_for_chunk.len(),
+            atlas.chunk_for_mesh_slot.len()
+        );
+        atlas.assert_mesh_slot_chunk_mapping_invariants();
     }
 }
