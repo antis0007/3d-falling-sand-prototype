@@ -14,7 +14,7 @@ use glam::Vec3;
 #[cfg(feature = "gpu-compute")]
 use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 #[cfg(feature = "gpu-compute")]
@@ -193,8 +193,10 @@ impl Default for ChunkPageAtlas {
             mesh_slot_last_used: HashMap::new(),
             mesh_slot_epoch: 0,
             next_mesh_slot: 0,
-            mesh_slot_capacity_vertex_elements: MESH_VERTEX_ELEMENTS_PER_CHUNK,
-            mesh_slot_capacity_index_elements: MESH_INDEX_ELEMENTS_PER_CHUNK,
+            mesh_slot_capacity_vertex_elements: mesh_layout::MeshBufferKind::Vertex
+                .slot_capacity_elements(),
+            mesh_slot_capacity_index_elements: mesh_layout::MeshBufferKind::Index
+                .slot_capacity_elements(),
             next_page: GpuPageIndex(0),
             pending_mesh_finalize: HashMap::new(),
         }
@@ -208,6 +210,7 @@ enum MeshSliceAllocateOutcome {
     Saturated,
     NoProgress,
     InvalidState,
+    ContractUnsatisfiable,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -355,6 +358,9 @@ impl ChunkPageAtlas {
         }
 
         let _ = lod;
+        if mesh_layout::validate_gpu_mesh_slice_contract().is_err() {
+            return MeshSliceAllocateOutcome::ContractUnsatisfiable;
+        }
         let slot_capacity = MESH_SLOT_COUNT;
         if slot_capacity == 0 {
             return MeshSliceAllocateOutcome::InvalidState;
@@ -506,7 +512,17 @@ impl ChunkPageAtlas {
     }
 
     fn assert_mesh_slot_chunk_mapping_invariants(&self) {
-        let contract = mesh_layout::gpu_mesh_slice_contract();
+        let layout = mesh_layout::validate_gpu_mesh_slice_contract()
+            .expect("gpu mesh slice contract must remain satisfiable while allocator is live");
+        let contract = layout.contract;
+        assert_eq!(
+            self.mesh_slot_capacity_vertex_elements, layout.vertex_slot_capacity_elements,
+            "allocator/validator vertex-slot-capacity contract mismatch"
+        );
+        assert_eq!(
+            self.mesh_slot_capacity_index_elements, layout.index_slot_capacity_elements,
+            "allocator/validator index-slot-capacity contract mismatch"
+        );
         assert_eq!(
             self.mesh_slice_for_chunk.len(),
             self.chunk_for_mesh_slot.len(),
@@ -1054,7 +1070,10 @@ fn validate_mesh_slice_for_dispatch(
     page_index: GpuPageIndex,
     mesh_slice: MeshBufferSlice,
 ) -> anyhow::Result<()> {
-    let contract = mesh_layout::gpu_mesh_slice_contract();
+    let layout = mesh_layout::validate_gpu_mesh_slice_contract()
+        .map_err(anyhow::Error::msg)
+        .context("gpu mesh slice contract")?;
+    let contract = layout.contract;
     if page_index.0 >= contract.slot_count {
         anyhow::bail!(
             "invalid mesh dispatch page index for {:?}: page={} slot_capacity={}",
@@ -1311,6 +1330,8 @@ static GPU_MESH_RESIDENT_USAGE_PERCENT_X100: AtomicU64 = AtomicU64::new(0);
 static GPU_ALLOCATOR_NO_PROGRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_ALLOCATOR_SATURATED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_CAPACITY_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "gpu-compute")]
 static GPU_CANDIDATE_READY_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -2064,6 +2085,19 @@ pub fn initialize_gpu_compute_worker(
             );
         }
         validate_gpu_vertex_contract().context("gpu mesh vertex host contract")?;
+        let mesh_layout = mesh_layout::validate_gpu_mesh_slice_contract()
+            .map_err(anyhow::Error::msg)
+            .context("gpu mesh slice contract")?;
+        log::info!(
+            "gpu mesh slice contract: slots={} vertex_per_chunk={} index_per_chunk={} vertex_slot_capacity={} index_slot_capacity={} vertex_global_capacity={} index_global_capacity={}",
+            mesh_layout.contract.slot_count,
+            mesh_layout.contract.vertex_elements_per_chunk,
+            mesh_layout.contract.index_elements_per_chunk,
+            mesh_layout.vertex_slot_capacity_elements,
+            mesh_layout.index_slot_capacity_elements,
+            mesh_layout.contract.vertex_global_capacity_elements,
+            mesh_layout.contract.index_global_capacity_elements
+        );
         let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
         let page_capacity = MESH_SLOT_COUNT as u64;
         let page_len = CHUNK_VOLUME as u64;
@@ -2241,6 +2275,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
                 None
             }
+            MeshSliceAllocateOutcome::ContractUnsatisfiable => {
+                GPU_ALLOCATOR_SATURATED_COUNT.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         };
         let mesh_pool_telemetry = atlas.mesh_pool_telemetry();
         let resident_usage = mesh_pool_telemetry
@@ -2373,19 +2411,46 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    log::debug!(
-                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted slots={}/{} in_flight_fences={} vertex={}/{} index={}/{} largest_free[v/i]={}/{}",
+                    if !GPU_MESH_CAPACITY_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+                        let contract = mesh_layout::gpu_mesh_slice_contract();
+                        let vertex_slot_capacity = MeshBufferKind::Vertex.slot_capacity_elements();
+                        let index_slot_capacity = MeshBufferKind::Index.slot_capacity_elements();
+                        log::error!(
+                            "[mesh][capacity] mesh allocation failure: chunk={:?} lod={:?} reason=MeshSlotCapacitySaturated required[v/i]={}/{} slots_used={}/{} in_flight_fences={} per_slot_capacity[v/i]={}/{} total_capacity[v/i]={}/{} largest_free_span[v/i]={}/{}",
                             job.coord,
+                            job.lod,
+                            contract.vertex_elements_per_chunk,
+                            contract.index_elements_per_chunk,
                             mesh_pool_telemetry.slots_used,
                             mesh_pool_telemetry.slot_capacity,
                             mesh_pool_telemetry.in_flight_fences,
-                            mesh_pool_telemetry.vertex_used,
+                            vertex_slot_capacity,
+                            index_slot_capacity,
                             mesh_pool_telemetry.vertex_capacity,
-                            mesh_pool_telemetry.index_used,
                             mesh_pool_telemetry.index_capacity,
                             mesh_pool_telemetry.largest_free_vertex_span,
                             mesh_pool_telemetry.largest_free_index_span,
                         );
+                    }
+
+                    log::debug!(
+                        "[mesh] skipping gpu meshing for {:?}: reason=MeshSlotCapacitySaturated lod={:?} required[v/i]={}/{} slots={}/{} in_flight_fences={} per_slot[v/i]={}/{} used[v/i]={}/{} total[v/i]={}/{} largest_free[v/i]={}/{}",
+                        job.coord,
+                        job.lod,
+                        mesh_layout::MESH_VERTEX_ELEMENTS_PER_CHUNK,
+                        mesh_layout::MESH_INDEX_ELEMENTS_PER_CHUNK,
+                        mesh_pool_telemetry.slots_used,
+                        mesh_pool_telemetry.slot_capacity,
+                        mesh_pool_telemetry.in_flight_fences,
+                        MeshBufferKind::Vertex.slot_capacity_elements(),
+                        MeshBufferKind::Index.slot_capacity_elements(),
+                        mesh_pool_telemetry.vertex_used,
+                        mesh_pool_telemetry.index_used,
+                        mesh_pool_telemetry.vertex_capacity,
+                        mesh_pool_telemetry.index_capacity,
+                        mesh_pool_telemetry.largest_free_vertex_span,
+                        mesh_pool_telemetry.largest_free_index_span,
+                    );
 
                     ChunkMeshArtifact::Skipped {
                         reason: MeshSkipReason::MeshSlotCapacitySaturated {
@@ -2757,7 +2822,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             if index_count == 0 {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
                 log::debug!(
-                    "[gpu-mesh] finalize_invalid_output coord={:?} version={} task_id={} page={} slot={} serial={} lod={} reason=zero_index_count",
+                    "[gpu-mesh] finalize_invalid_output coord={:?} version={} task_id={} page={} slot={} serial={} lod={:?} reason=zero_index_count",
                     result.coord,
                     result.version,
                     result.task_id,
@@ -2820,7 +2885,7 @@ pub fn invalidate_gpu_pending_finalize_on_renderer(
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
             log::debug!(
-                "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
                 reason,
                 coord,
                 pending.version,

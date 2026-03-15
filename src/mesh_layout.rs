@@ -1,6 +1,8 @@
 pub const GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub const GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES: u64 = 256 * 1024 * 1024;
-pub const MESH_SLOT_COUNT: u32 = 256;
+// Surgical contract repair: keep current global buffers and per-chunk maxima,
+// and reduce slot cardinality so one full chunk fits into one deterministic slot.
+pub const MESH_SLOT_COUNT: u32 = 64;
 pub const CHUNK_VOLUME_VOXELS: u32 = 32 * 32 * 32;
 pub const MESH_VERTEX_ELEMENTS_PER_CHUNK: u32 = CHUNK_VOLUME_VOXELS * 12;
 pub const MESH_INDEX_ELEMENTS_PER_CHUNK: u32 = CHUNK_VOLUME_VOXELS * 18;
@@ -65,6 +67,13 @@ pub struct MeshSliceContract {
     pub index_global_capacity_elements: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshSliceLayout {
+    pub contract: MeshSliceContract,
+    pub vertex_slot_capacity_elements: u32,
+    pub index_slot_capacity_elements: u32,
+}
+
 pub const fn gpu_mesh_slice_contract() -> MeshSliceContract {
     MeshSliceContract {
         slot_count: MESH_SLOT_COUNT,
@@ -73,6 +82,85 @@ pub const fn gpu_mesh_slice_contract() -> MeshSliceContract {
         vertex_global_capacity_elements: MeshBufferKind::Vertex.global_capacity_elements(),
         index_global_capacity_elements: MeshBufferKind::Index.global_capacity_elements(),
     }
+}
+
+pub fn validate_gpu_mesh_slice_contract() -> Result<MeshSliceLayout, String> {
+    let contract = gpu_mesh_slice_contract();
+    if contract.slot_count == 0 {
+        return Err("gpu mesh slice contract invalid: slot_count must be > 0".to_string());
+    }
+
+    let vertex_slot_capacity = MeshBufferKind::Vertex.slot_capacity_elements();
+    let index_slot_capacity = MeshBufferKind::Index.slot_capacity_elements();
+
+    if contract.vertex_elements_per_chunk > vertex_slot_capacity {
+        return Err(format!(
+            "gpu mesh slice contract invalid: vertex per chunk {} exceeds per-slot vertex capacity {} (slots={} vertex_global_capacity={})",
+            contract.vertex_elements_per_chunk,
+            vertex_slot_capacity,
+            contract.slot_count,
+            contract.vertex_global_capacity_elements,
+        ));
+    }
+
+    if contract.index_elements_per_chunk > index_slot_capacity {
+        return Err(format!(
+            "gpu mesh slice contract invalid: index per chunk {} exceeds per-slot index capacity {} (slots={} index_global_capacity={})",
+            contract.index_elements_per_chunk,
+            index_slot_capacity,
+            contract.slot_count,
+            contract.index_global_capacity_elements,
+        ));
+    }
+
+    let last_slot = contract.slot_count.saturating_sub(1);
+    for (kind, per_chunk, global_capacity) in [
+        (
+            MeshBufferKind::Vertex,
+            contract.vertex_elements_per_chunk,
+            contract.vertex_global_capacity_elements,
+        ),
+        (
+            MeshBufferKind::Index,
+            contract.index_elements_per_chunk,
+            contract.index_global_capacity_elements,
+        ),
+    ] {
+        let Some(base) = slot_base_offset_elements(kind, last_slot) else {
+            return Err(format!(
+                "gpu mesh slice contract invalid: {label} last-slot base offset unavailable (slot={} slots={})",
+                last_slot,
+                contract.slot_count,
+                label = kind.label(),
+            ));
+        };
+        let Some(limit) = base.checked_add(per_chunk) else {
+            return Err(format!(
+                "gpu mesh slice contract invalid: {label} offset overflow in last slot (slot={} base={} count={})",
+                last_slot,
+                base,
+                per_chunk,
+                label = kind.label(),
+            ));
+        };
+        if limit > global_capacity {
+            return Err(format!(
+                "gpu mesh slice contract invalid: {label} last-slot write overruns global capacity (slot={} base={} count={} limit={} global={})",
+                last_slot,
+                base,
+                per_chunk,
+                limit,
+                global_capacity,
+                label = kind.label(),
+            ));
+        }
+    }
+
+    Ok(MeshSliceLayout {
+        contract,
+        vertex_slot_capacity_elements: vertex_slot_capacity,
+        index_slot_capacity_elements: index_slot_capacity,
+    })
 }
 
 fn checked_range(
@@ -228,6 +316,22 @@ mod tests {
                 slot * MeshBufferKind::Index.slot_capacity_elements()
             );
         }
+    }
+
+    #[test]
+    fn gpu_contract_validation_succeeds_and_matches_capacities() {
+        let layout = validate_gpu_mesh_slice_contract().expect("gpu contract must be satisfiable");
+        assert_eq!(layout.contract.slot_count, MESH_SLOT_COUNT);
+        assert_eq!(
+            layout.vertex_slot_capacity_elements,
+            MeshBufferKind::Vertex.slot_capacity_elements()
+        );
+        assert_eq!(
+            layout.index_slot_capacity_elements,
+            MeshBufferKind::Index.slot_capacity_elements()
+        );
+        assert!(layout.contract.vertex_elements_per_chunk <= layout.vertex_slot_capacity_elements);
+        assert!(layout.contract.index_elements_per_chunk <= layout.index_slot_capacity_elements);
     }
 
     #[test]
