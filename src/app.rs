@@ -995,9 +995,7 @@ pub async fn run() -> anyhow::Result<()> {
             .build(&event_loop)?,
     ));
 
-    let require_gpu_meshing = cli_has_flag("--require-gpu-meshing");
-    let force_disabled_meshing = cli_has_flag("--disable-meshing");
-    let mut renderer = Renderer::new(window, require_gpu_meshing, force_disabled_meshing).await?;
+    let mut renderer = Renderer::new(window).await?;
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
     let mut egui_state =
@@ -1031,7 +1029,6 @@ pub async fn run() -> anyhow::Result<()> {
     let mut ui = UiState::default();
     ui.startup_backend_label = match renderer.startup_diagnostics.backend_selected {
         crate::gpu_compute::MeshPipelineBackend::Disabled => "disabled",
-        crate::gpu_compute::MeshPipelineBackend::Cpu => "cpu",
         #[cfg(feature = "gpu-compute")]
         crate::gpu_compute::MeshPipelineBackend::Gpu => "gpu",
     }
@@ -1039,14 +1036,6 @@ pub async fn run() -> anyhow::Result<()> {
     ui.startup_required_limits = renderer.startup_diagnostics.required_limits_summary.clone();
     ui.startup_adapter_limits = renderer.startup_diagnostics.adapter_limits_summary.clone();
     ui.startup_error_message = renderer.startup_diagnostics.startup_error.clone();
-    if renderer.mesh_backend == crate::gpu_compute::MeshPipelineBackend::Disabled
-        && ui.startup_error_message.is_none()
-    {
-        ui.startup_error_message = Some(
-            "Meshing backend is disabled via --disable-meshing; world rendering is limited."
-                .to_string(),
-        );
-    }
     let mut brush = BrushSettings::default();
     let tool_textures = load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR);
     let mut edit_runtime = EditRuntimeState::default();

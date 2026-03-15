@@ -86,7 +86,6 @@ pub const fn gpu_page_capacity() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshPipelineBackend {
     Disabled,
-    Cpu,
     #[cfg(feature = "gpu-compute")]
     Gpu,
 }
@@ -95,7 +94,6 @@ impl MeshPipelineBackend {
     pub fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::Cpu => "cpu",
             #[cfg(feature = "gpu-compute")]
             Self::Gpu => "gpu",
         }
@@ -1081,7 +1079,6 @@ fn clear_meshing_outputs_for_page(
     );
 }
 
-#[cfg(feature = "gpu_meshing_experimental")]
 fn validate_mesh_slice_for_dispatch(
     coord: ChunkCoord,
     page_index: GpuPageIndex,
@@ -1802,7 +1799,6 @@ impl GpuComputeRuntime {
 
         Ok(())
     }
-    #[cfg(feature = "gpu_meshing_experimental")]
     fn run_meshing_dispatch(
         &self,
         state: &WorkerGpuState,
@@ -2335,49 +2331,41 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             atlas.cached_materials.insert(job.coord, incoming.to_vec());
         }
 
-        // CPU fallback meshing
-        #[cfg(not(feature = "gpu_meshing_experimental"))]
-        let (verts, inds, aabb_min, aabb_max, chunk_origin_world) =
-            mesh_chunk_snapshot(job.coord, &job.snapshot, job.lod, job.greedy);
-
-        // GPU meshing path
-        #[cfg(feature = "gpu_meshing_experimental")]
+        // Authoritative runtime meshing path (GPU).
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(job.coord);
 
         Ok(ComputedChunkArtifacts {
             simulation_diagnostics: diagnostics,
             mesh_artifact: {
-                #[cfg(feature = "gpu_meshing_experimental")]
-                {
-                    if let Some(mesh_slice) = mesh_slice {
-                        ChunkMeshArtifact::GpuPending {
-                            page_index,
-                            draw_indirect_index: mesh_slice.slot_index,
-                            lod: job.lod as u8,
-                            aabb_min,
-                            aabb_max,
-                            chunk_origin_world,
-                        }
-                    } else {
-                        let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
-                        let pressure = mesh_pool_telemetry.slot_usage_percent >= 95.0
-                            || mesh_pool_telemetry.vertex_usage_percent >= 95.0
-                            || mesh_pool_telemetry.index_usage_percent >= 95.0;
-                        if pressure {
-                            GPU_MESH_ALLOCATOR_PRESSURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let fragmented = mesh_pool_telemetry.vertex_used
-                            < mesh_pool_telemetry.vertex_capacity
-                            && mesh_pool_telemetry.largest_free_vertex_span
-                                < MIN_MESH_VERTEX_CAPACITY_PER_CHUNK as u32
-                            || mesh_pool_telemetry.index_used < mesh_pool_telemetry.index_capacity
-                                && mesh_pool_telemetry.largest_free_index_span
-                                    < MIN_MESH_INDEX_CAPACITY_PER_CHUNK as u32;
-                        if fragmented {
-                            GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT.fetch_add(1, Ordering::Relaxed);
-                        }
+                if let Some(mesh_slice) = mesh_slice {
+                    ChunkMeshArtifact::GpuPending {
+                        page_index,
+                        draw_indirect_index: mesh_slice.slot_index,
+                        lod: job.lod as u8,
+                        aabb_min,
+                        aabb_max,
+                        chunk_origin_world,
+                    }
+                } else {
+                    let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
+                    let pressure = mesh_pool_telemetry.slot_usage_percent >= 95.0
+                        || mesh_pool_telemetry.vertex_usage_percent >= 95.0
+                        || mesh_pool_telemetry.index_usage_percent >= 95.0;
+                    if pressure {
+                        GPU_MESH_ALLOCATOR_PRESSURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let fragmented = mesh_pool_telemetry.vertex_used
+                        < mesh_pool_telemetry.vertex_capacity
+                        && mesh_pool_telemetry.largest_free_vertex_span
+                            < MIN_MESH_VERTEX_CAPACITY_PER_CHUNK as u32
+                        || mesh_pool_telemetry.index_used < mesh_pool_telemetry.index_capacity
+                            && mesh_pool_telemetry.largest_free_index_span
+                                < MIN_MESH_INDEX_CAPACITY_PER_CHUNK as u32;
+                    if fragmented {
+                        GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
 
-                        log::debug!(
+                    log::debug!(
                             "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted slots={}/{} in_flight_fences={} vertex={}/{} index={}/{} largest_free[v/i]={}/{}",
                             job.coord,
                             mesh_pool_telemetry.slots_used,
@@ -2391,33 +2379,18 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             mesh_pool_telemetry.largest_free_index_span,
                         );
 
-                        ChunkMeshArtifact::Skipped {
-                            reason: MeshSkipReason::MeshSlotCapacitySaturated {
-                                slot_capacity: mesh_pool_telemetry.slot_capacity,
-                                in_flight_fences: mesh_pool_telemetry.in_flight_fences,
-                                slots_used: mesh_pool_telemetry.slots_used,
-                                vertex_used: mesh_pool_telemetry.vertex_used,
-                                vertex_capacity: mesh_pool_telemetry.vertex_capacity,
-                                index_used: mesh_pool_telemetry.index_used,
-                                index_capacity: mesh_pool_telemetry.index_capacity,
-                                largest_free_vertex_span: mesh_pool_telemetry
-                                    .largest_free_vertex_span,
-                                largest_free_index_span: mesh_pool_telemetry
-                                    .largest_free_index_span,
-                            },
-                        }
-                    }
-                }
-
-                #[cfg(not(feature = "gpu_meshing_experimental"))]
-                {
-                    ChunkMeshArtifact::Cpu {
-                        verts,
-                        inds,
-                        indirect: DrawIndirectArgs::default(),
-                        aabb_min,
-                        aabb_max,
-                        chunk_origin_world,
+                    ChunkMeshArtifact::Skipped {
+                        reason: MeshSkipReason::MeshSlotCapacitySaturated {
+                            slot_capacity: mesh_pool_telemetry.slot_capacity,
+                            in_flight_fences: mesh_pool_telemetry.in_flight_fences,
+                            slots_used: mesh_pool_telemetry.slots_used,
+                            vertex_used: mesh_pool_telemetry.vertex_used,
+                            vertex_capacity: mesh_pool_telemetry.vertex_capacity,
+                            index_used: mesh_pool_telemetry.index_used,
+                            index_capacity: mesh_pool_telemetry.index_capacity,
+                            largest_free_vertex_span: mesh_pool_telemetry.largest_free_vertex_span,
+                            largest_free_index_span: mesh_pool_telemetry.largest_free_index_span,
+                        },
                     }
                 }
             },
@@ -2523,10 +2496,8 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             )?;
         }
 
-        #[cfg(feature = "gpu_meshing_experimental")]
         let mut submitted_mesh_slice = None;
 
-        #[cfg(feature = "gpu_meshing_experimental")]
         {
             if let Some(mesh_slice) = task.mesh_slice {
                 if task.startup_seeding_mode && task.frontier_count == 0 {
@@ -2579,14 +2550,13 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.mark_page_submitted(task.page_index, serial);
             atlas.touch_chunk_page(task.coord);
-            #[cfg(feature = "gpu_meshing_experimental")]
             if let Some(mesh_slice) = submitted_mesh_slice {
                 let page_generation = atlas.page_generation(task.page_index);
                 let slot_generation = atlas.slot_generation(mesh_slice.slot_index);
                 atlas.pending_mesh_finalize.insert(
                     task.coord,
                     PendingGpuMeshFinalize {
-                        version: ChunkVersion(task.version),
+                        version: task.version,
                         task_id: task.task_id,
                         lod: task.lod,
                         page_index: task.page_index,
