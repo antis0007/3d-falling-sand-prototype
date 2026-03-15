@@ -3700,9 +3700,11 @@ impl Renderer {
                 .mesh_rebuild_frame_index
                 .saturating_sub(result.bookkeeping_first_seen_frame)
                 / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES;
+            // Larger scores mean higher adoption priority; age receives an amplified bonus so
+            // older backlog entries eventually outrank fresher high-priority entries.
             let score = Self::fairness_weight(result.lod as u8)
                 + if result.urgent { 250 } else { 0 }
-                + age.min(10_000) as i32;
+                + age.min(10_000) as i32 * 10;
             if score > best_score {
                 best_score = score;
                 best_idx = idx;
@@ -7052,7 +7054,8 @@ mod tests {
             test_mesh_result(ChunkCoord { x: 2, y: 0, z: 0 }, ChunkLod::Near, true, 1000);
         let old_score = Renderer::fairness_weight(old.lod as u8)
             + ((2000u64.saturating_sub(old.bookkeeping_first_seen_frame))
-                / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES) as i32;
+                / FINALIZE_FAIRNESS_AGE_BOOST_FRAMES) as i32
+                * 10;
         let new_score = Renderer::fairness_weight(new_urgent.lod as u8) + 250;
         assert!(old_score >= new_score);
     }
