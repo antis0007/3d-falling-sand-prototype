@@ -111,22 +111,24 @@ struct GpuFluidPipeline {
 
 #[cfg(feature = "gpu-compute")]
 impl GpuFluidBackend {
-    fn step_gpu_native(&mut self, store: &ChunkStore, region: &HashSet<ChunkCoord>) -> usize {
+    fn step_gpu_native(&mut self, store: &mut ChunkStore, region: &HashSet<ChunkCoord>) -> usize {
         if region.is_empty() {
             self.command_buffer.clear();
             return 0;
         }
         let commands = std::mem::take(&mut self.command_buffer);
         let Some(gpu) = self.ensure_gpu() else {
-            return 0;
+            Self::apply_queued_edits_to_store(store, commands);
+            return region.len();
         };
 
         gpu.ensure_slots(store, region);
         let total_cells = region.len() * CHUNK_VOLUME;
         gpu.ensure_capacity(total_cells.max(1));
 
-        let edits = gpu.translate_edits(commands);
+        let edits = gpu.translate_edits(&commands);
         gpu.dispatch_pipeline(total_cells as u32, &edits, 24);
+        Self::apply_queued_edits_to_store(store, commands);
         region.len()
     }
 
@@ -135,6 +137,22 @@ impl GpuFluidBackend {
             self.gpu = GpuFluidPipeline::new();
         }
         self.gpu.as_mut()
+    }
+
+    fn apply_queued_edits_to_store(store: &mut ChunkStore, commands: Vec<SimCommand>) {
+        for cmd in commands {
+            let below = VoxelCoord {
+                x: cmd.coord.x,
+                y: cmd.coord.y.saturating_sub(1),
+                z: cmd.coord.z,
+            };
+            if below != cmd.coord && store.get_voxel(below) == crate::world::EMPTY {
+                store.set_voxel(below, cmd.material_id);
+                store.set_voxel(cmd.coord, crate::world::EMPTY);
+            } else {
+                store.set_voxel(cmd.coord, cmd.material_id);
+            }
+        }
     }
 }
 
@@ -191,11 +209,16 @@ impl GpuFluidPipeline {
             ],
         });
 
+        let generated_material_ids_wgsl =
+            include_str!(concat!(env!("OUT_DIR"), "/material_ids.wgsl"));
+        let pipeline_shader_source = format!(
+            "{}\n{}",
+            generated_material_ids_wgsl,
+            include_str!("../shaders/gpu_fluid_pipeline.wgsl")
+        );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpu-fluid-pipeline-shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/gpu_fluid_pipeline.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(pipeline_shader_source.into()),
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -394,9 +417,9 @@ impl GpuFluidPipeline {
             .write_buffer(&self.material_state, offset, bytemuck::cast_slice(&dense));
     }
 
-    fn translate_edits(&self, command_buffer: Vec<SimCommand>) -> Vec<GpuEdit> {
+    fn translate_edits(&self, command_buffer: &[SimCommand]) -> Vec<GpuEdit> {
         let mut edits = Vec::new();
-        for cmd in command_buffer {
+        for &cmd in command_buffer {
             let (chunk, local) = voxel_to_chunk(cmd.coord);
             let Some(slot) = self.chunk_slots.get(&chunk).copied() else {
                 continue;
