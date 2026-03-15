@@ -36,7 +36,7 @@ use crate::gpu_compute::{
     ReadyGpuMeshFinalizeStatus, COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
     GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
-use crate::mesh_layout::{self, MeshBufferKind};
+use crate::mesh_layout;
 use crate::sim::{material, Phase};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
@@ -1275,7 +1275,6 @@ enum MeshLifecycleState {
 #[derive(Clone, Copy, Debug)]
 enum RebuildOutcome {
     GpuAdopted,
-    CpuUploaded,
     SkippedZeroGeometry,
     SkippedStartupZeroGeometry,
     SkippedNoArtifactCapacity,
@@ -1495,12 +1494,13 @@ fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> Chun
     match mesh_backend {
         MeshPipelineBackend::Disabled => {
             let _ = job;
+            debug_assert!(
+                false,
+                "runtime meshing backend must remain GPU-authoritative"
+            );
             ChunkMeshArtifact::Skipped {
                 reason: MeshSkipReason::BackendDisabled,
             }
-        }
-        MeshPipelineBackend::Cpu => {
-            crate::gpu_compute::cpu_generate_material_field(job).mesh_artifact
         }
         #[cfg(feature = "gpu-compute")]
         MeshPipelineBackend::Gpu => match run_chunk_job_on_worker(job) {
@@ -1639,11 +1639,7 @@ impl Renderer {
         self.next_gpu_mesh_task_id
     }
 
-    pub async fn new(
-        window: &'static winit::window::Window,
-        require_gpu_meshing: bool,
-        force_disabled_meshing: bool,
-    ) -> anyhow::Result<Self> {
+    pub async fn new(window: &'static winit::window::Window) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window)?;
@@ -1760,14 +1756,14 @@ impl Renderer {
             adapter_limits.max_buffer_size,
         );
 
-        let (mesh_backend, startup_error) = if force_disabled_meshing {
-            log::warn!("mesh backend selected: disabled (explicit CLI override)");
-            (MeshPipelineBackend::Disabled, None)
-        } else if GpuComputeRuntime::runtime_supported(&adapter, &device_limits) {
+        let (mesh_backend, startup_error) = if GpuComputeRuntime::runtime_supported(
+            &adapter,
+            &device_limits,
+        ) {
             #[cfg(feature = "gpu-compute")]
             {
                 log::info!(
-                    "mesh backend selected: gpu-compute (adapter supports compute pipelines, page_capacity={})",
+                    "mesh backend selected: gpu-compute authoritative runtime path (page_capacity={})",
                     gpu_page_capacity()
                 );
                 (MeshPipelineBackend::Gpu, None)
@@ -1782,8 +1778,8 @@ impl Renderer {
             #[cfg(feature = "gpu-compute")]
             {
                 let required_storage_size = required_storage_buffer_binding_size_bytes();
-                log::warn!(
-                    "gpu meshing unavailable: required_storage_size={}B, storage_buffers_per_shader_stage(required={} adapter={} requested={} device={}), storage_buffer_binding_size(required={} adapter={} requested={} device={}), max_buffer_size(required={} adapter={} requested={} device={})",
+                anyhow::bail!(
+                    "gpu meshing unavailable and no CPU runtime fallback exists: required_storage_size={}B, storage_buffers_per_shader_stage(required={} adapter={} requested={} device={}), storage_buffer_binding_size(required={} adapter={} requested={} device={}), max_buffer_size(required={} adapter={} requested={} device={})",
                     required_storage_size,
                     COMPUTE_STORAGE_BINDING_COUNT,
                     adapter_limits.max_storage_buffers_per_shader_stage,
@@ -1802,21 +1798,10 @@ impl Renderer {
 
             #[cfg(not(feature = "gpu-compute"))]
             {
-                log::warn!(
-                    "gpu meshing unavailable: `gpu-compute` feature is disabled in this build"
-                );
-            }
-
-            if require_gpu_meshing {
                 anyhow::bail!(
-                    "gpu meshing is required (--require-gpu-meshing), but adapter/runtime does not satisfy gpu-compute requirements"
+                    "gpu meshing is required at runtime, but `gpu-compute` feature is disabled in this build"
                 );
             }
-
-            log::warn!(
-                "mesh backend selected: cpu fallback path (adapter/runtime does not satisfy gpu-compute requirements)"
-            );
-            (MeshPipelineBackend::Cpu, None)
         };
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -2242,7 +2227,7 @@ impl Renderer {
         player_chunk: ChunkCoord,
         chunk_priority_scores: &HashMap<ChunkCoord, f32>,
         mesh_budget: usize,
-        upload_byte_budget: usize,
+        _upload_byte_budget: usize,
         lod_radii: LodRadii,
         lod_budgets: LodMeshingBudgets,
     ) -> MeshRebuildStats {
@@ -2587,10 +2572,10 @@ impl Renderer {
 
         self.trim_completed_backlog_bounded(&mut stats);
 
-        let mut bytes_uploaded = 0usize;
+        let bytes_uploaded = 0usize;
 
-        let mut upload_budget_hit = false;
-        let mut uploaded = 0usize;
+        let upload_budget_hit = false;
+        let uploaded = 0usize;
         let mut total_latency_ms = 0.0f32;
         let mut gpu_adoption_latency_ms_total = 0.0f32;
         let mut remesh_coords = Vec::new();
@@ -3018,164 +3003,10 @@ impl Renderer {
 
                 continue;
             }
-            if let ChunkMeshArtifact::Cpu {
-                verts,
-                inds,
-                indirect,
-                aabb_min,
-                aabb_max,
-                chunk_origin_world,
-            } = &result.artifact
-            {
-                let cpu_upload_bytes = verts.len() * std::mem::size_of::<Vertex>()
-                    + inds.len() * std::mem::size_of::<u32>()
-                    + std::mem::size_of::<DrawIndexedIndirectCommand>();
-                if bytes_uploaded.saturating_add(cpu_upload_bytes) > upload_byte_budget {
-                    if !upload_budget_hit {
-                        upload_budget_hit = true;
-                        stats.upload_budget_hit_count += 1;
-                    }
-                    stats.upload_budget_deferred_chunks += 1;
-                    remesh_coords.push(result.coord);
-                    continue;
-                }
-
-                let Some(slot) = self.free_mesh_slots.pop() else {
-                    stats.mesh_artifacts_rejected += 1;
-                    remesh_coords.push(result.coord);
-                    continue;
-                };
-
-                let vertex_count = verts.len() as u32;
-                let index_count = inds.len() as u32;
-                let Some(write_ranges) =
-                    mesh_layout::validate_slot_write_ranges(slot, vertex_count, index_count)
-                else {
-                    self.free_mesh_slots.push(slot);
-                    stats.mesh_artifacts_rejected += 1;
-                    stats.mesh_reject_failed += 1;
-                    if had_prior_mesh {
-                        replacement_failed_coords.insert(result.coord);
-                        self.record_candidate_rejected_preserving_current(
-                            result.coord,
-                            &mut stats,
-                            VoidDropReason::FinalizeInvalid,
-                        );
-                    }
-                    log::error!(
-                        "[gpu-mesh] rejecting cpu upload due to invalid global mesh write range coord={:?} page_index={} slot_index={} vertex_offset_elements={} index_offset_elements={} vertex_count={} index_count={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={}",
-                        result.coord,
-                        slot,
-                        slot,
-                        mesh_layout::slot_base_offset_elements(MeshBufferKind::Vertex, slot).unwrap_or(u32::MAX),
-                        mesh_layout::slot_base_offset_elements(MeshBufferKind::Index, slot).unwrap_or(u32::MAX),
-                        vertex_count,
-                        index_count,
-                        MeshBufferKind::Vertex.global_capacity_elements(),
-                        MeshBufferKind::Index.global_capacity_elements(),
-                        MeshBufferKind::Vertex.global_size_bytes(),
-                        MeshBufferKind::Index.global_size_bytes(),
-                    );
-                    continue;
-                };
-
-                let vertex_offset = write_ranges.vertex.offset_bytes;
-                let index_offset = write_ranges.index.offset_bytes;
-                let draw_offset =
-                    slot as u64 * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64;
-
-                if !verts.is_empty() {
-                    self.queue.write_buffer(
-                        &self.global_gpu_vertex_buffer,
-                        vertex_offset,
-                        bytemuck::cast_slice(verts),
-                    );
-                }
-
-                if !inds.is_empty() {
-                    self.queue.write_buffer(
-                        &self.global_gpu_index_buffer,
-                        index_offset,
-                        bytemuck::cast_slice(inds),
-                    );
-                }
-
-                let resolved_index_count = indirect.index_count.max(index_count);
-
-                let draw_command = DrawIndexedIndirectCommand {
-                    index_count: resolved_index_count,
-                    instance_count: 1,
-                    first_index: write_ranges.index.offset_elements,
-                    base_vertex: write_ranges.vertex.offset_elements as i32,
-                    first_instance: 0,
-                };
-
-                self.queue.write_buffer(
-                    &self.global_gpu_draw_indirect_buffer,
-                    draw_offset,
-                    bytemuck::bytes_of(&draw_command),
-                );
-
-                let adopted = self.commit_candidate_drawable(
-                    result.coord,
-                    GpuChunkDraw {
-                        page_index: GpuPageIndex(slot),
-                        draw_indirect_index: slot,
-                        lod: result.lod as u8,
-                        origin: *chunk_origin_world,
-                        world_aabb_min: *aabb_min,
-                        world_aabb_max: *aabb_max,
-                        draw_source: DrawSource::CpuUploaded,
-                        artifact_key: Some(MeshArtifactKey {
-                            chunk_id: result.coord,
-                            chunk_version: result.version,
-                            lod: lod_level(result.lod),
-                        }),
-                        ownership_generation: 0,
-                        index_count: Some(resolved_index_count),
-                    },
-                    result.version,
-                );
-                if !adopted {
-                    self.free_mesh_slots.push(slot);
-                    stats.mesh_artifacts_rejected += 1;
-                    stats.mesh_reject_unhandled += 1;
-                    if had_prior_mesh {
-                        replacement_failed_coords.insert(result.coord);
-                        stats.replacement_commit_fail_count += 1;
-                        self.record_candidate_rejected_preserving_current(
-                            result.coord,
-                            &mut stats,
-                            VoidDropReason::ReplacementRejected,
-                        );
-                    }
-                    self.mesh_lifecycle
-                        .insert(result.coord, MeshLifecycleState::Rejected);
-                    skipped_retry_chunks.push((result.coord, MeshSkipReason::AdoptionRejected));
-                    continue;
-                }
-
-                self.mesh_lifecycle
-                    .insert(result.coord, MeshLifecycleState::Drawable);
-                self.mesh_retry_state.remove(&result.coord);
-                store.mark_chunk_meshed(result.coord);
-                Self::record_rebuild_outcome(&mut stats, RebuildOutcome::CpuUploaded);
-                self.sampled_outcome_trace(
-                    &result,
-                    RebuildOutcome::CpuUploaded,
-                    Some(GpuPageIndex(slot)),
-                    Some(slot),
-                    Some(resolved_index_count),
-                    Some("pending"),
-                );
-
-                uploaded += 1;
-                bytes_uploaded += cpu_upload_bytes;
-
-                total_latency_ms += result.queued_at.elapsed().as_secs_f32() * 1000.0;
-
-                continue;
-            }
+            debug_assert!(
+                !matches!(result.artifact, ChunkMeshArtifact::Cpu { .. }),
+                "production runtime must never receive CPU mesh artifacts"
+            );
             log::warn!(
                 "[mesh] rejecting unhandled artifact variant for chunk={:?}",
                 result.coord
@@ -3675,10 +3506,11 @@ impl Renderer {
         let visible = self.visible_gpu_chunks.get(&coord).copied();
         if adopted {
             if let Some(candidate) = candidate {
-                let payload_kind = match draw.draw_source {
-                    DrawSource::GpuArtifact => MeshArtifactPayloadKind::Gpu,
-                    _ => MeshArtifactPayloadKind::Cpu,
-                };
+                let payload_kind = MeshArtifactPayloadKind::Gpu;
+                debug_assert!(
+                    matches!(draw.draw_source, DrawSource::GpuArtifact),
+                    "production runtime must only publish GPU mesh artifacts"
+                );
                 debug_assert!(
                     !matches!(draw.draw_source, DrawSource::GpuArtifact)
                         || candidate.pending_finalize,
@@ -4322,7 +4154,7 @@ impl Renderer {
     fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
         match result.artifact {
             ChunkMeshArtifact::GpuPending { .. } | ChunkMeshArtifact::GpuReady { .. } => "gpu",
-            ChunkMeshArtifact::Cpu { .. } => "cpu",
+            ChunkMeshArtifact::Cpu { .. } => "cpu-validator",
             ChunkMeshArtifact::Failed { .. } => "failed",
             ChunkMeshArtifact::Skipped { .. } => "skipped",
         }
@@ -4339,7 +4171,6 @@ impl Renderer {
     fn record_rebuild_outcome(stats: &mut MeshRebuildStats, outcome: RebuildOutcome) {
         match outcome {
             RebuildOutcome::GpuAdopted => stats.outcome_gpu_adopted += 1,
-            RebuildOutcome::CpuUploaded => stats.outcome_cpu_uploaded += 1,
             RebuildOutcome::SkippedZeroGeometry => stats.outcome_skipped_zero_geometry += 1,
             RebuildOutcome::SkippedStartupZeroGeometry => {
                 stats.outcome_skipped_startup_zero_geometry += 1
