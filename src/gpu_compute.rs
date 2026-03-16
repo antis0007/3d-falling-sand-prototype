@@ -1428,6 +1428,8 @@ pub struct GpuComputeProfilerSnapshot {
     pub frontier_cap_events: u64,
     pub mesh_slot_alloc_failed: u64,
     pub mesh_finalize_waiting_on_metadata: u64,
+    pub mesh_finalize_waiting_on_completion_serial: u64,
+    pub mesh_finalize_waiting_on_readback_snapshot: u64,
     pub mesh_finalize_promoted_ready: u64,
     pub mesh_finalize_ownership_invalidations: u64,
     pub mesh_finalize_superseded_results: u64,
@@ -1495,6 +1497,10 @@ static GPU_MESH_FINALIZE_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_MESH_FINALIZE_REQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_FINALIZE_WAITING_METADATA_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_FINALIZE_PROMOTED_READY_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1586,9 +1592,18 @@ pub enum ReadyGpuMeshFinalizeStatus {
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug)]
+pub enum ReadyGpuMeshFinalizeWaitReason {
+    WaitingOnCompletionSerial,
+    WaitingOnReadbackSnapshot,
+    WaitingOnMetadata,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
 pub struct ReadyGpuMeshFinalizeEvent {
     pub result: ReadyGpuMeshResult,
     pub status: ReadyGpuMeshFinalizeStatus,
+    pub wait_reason: Option<ReadyGpuMeshFinalizeWaitReason>,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1685,6 +1700,10 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let mesh_finalize_requeued = GPU_MESH_FINALIZE_REQUEUED_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_waiting_on_metadata =
             GPU_MESH_FINALIZE_WAITING_METADATA_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_finalize_waiting_on_completion_serial =
+            GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT.swap(0, Ordering::Relaxed);
+        let mesh_finalize_waiting_on_readback_snapshot =
+            GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_promoted_ready =
             GPU_MESH_FINALIZE_PROMOTED_READY_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_ownership_invalidations =
@@ -1726,6 +1745,8 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             frontier_cap_events,
             mesh_slot_alloc_failed,
             mesh_finalize_waiting_on_metadata,
+            mesh_finalize_waiting_on_completion_serial,
+            mesh_finalize_waiting_on_readback_snapshot,
             mesh_finalize_promoted_ready,
             mesh_finalize_ownership_invalidations,
             mesh_finalize_superseded_results,
@@ -2949,15 +2970,12 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let candidates = {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         atlas.refresh_completed_serial(completed);
-
         atlas
             .pending_mesh_finalize
             .iter()
-            .filter_map(|(coord, pending)| {
-                (pending.submission_serial <= completed).then_some(FinalizeCandidate {
-                    coord: *coord,
-                    pending: *pending,
-                })
+            .map(|(coord, pending)| FinalizeCandidate {
+                coord: *coord,
+                pending: *pending,
             })
             .collect::<Vec<_>>()
     };
@@ -2966,28 +2984,40 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         Ordering::Relaxed,
     );
 
-    let index_counts = {
+    let (snapshot_ready, index_counts) = {
         let mut readback = state
             .draw_indirect_readback
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         readback.try_collect();
         readback.request_snapshot_if_needed(state, completed);
-        candidates
+
+        let snapshot_ready = candidates
             .iter()
             .map(|candidate| {
-                if readback.has_snapshot_for(candidate.pending.submission_serial) {
-                    readback.index_count_for_slot(candidate.pending.draw_indirect_index)
-                } else {
+                candidate.pending.submission_serial <= completed
+                    && readback.has_snapshot_for(candidate.pending.submission_serial)
+            })
+            .collect::<Vec<_>>();
+        let index_counts = candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| {
+                if !snapshot_ready[idx] {
                     None
+                } else {
+                    readback.index_count_for_slot(candidate.pending.draw_indirect_index)
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (snapshot_ready, index_counts)
     };
 
     let mut out = Vec::with_capacity(candidates.len());
     let mut finalized_count = 0u64;
     let mut requeued_count = 0u64;
+    let mut waiting_completion_serial_count = 0u64;
+    let mut waiting_readback_snapshot_count = 0u64;
     let mut waiting_metadata_count = 0u64;
     let mut promoted_ready_count = 0u64;
     let mut ownership_invalidations = 0u64;
@@ -2999,17 +3029,11 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let phase3_lock_start = Instant::now();
     {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        for (candidate, index_count) in candidates.into_iter().zip(index_counts.into_iter()) {
-            let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
-            else {
-                continue;
-            };
-            if current_pending != candidate.pending {
-                requeued_count += 1;
-                superseded_count += 1;
-                continue;
-            }
-
+        for ((candidate, snapshot_ready), index_count) in candidates
+            .into_iter()
+            .zip(snapshot_ready.into_iter())
+            .zip(index_counts.into_iter())
+        {
             let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(candidate.coord);
             let result = ReadyGpuMeshResult {
                 coord: candidate.coord,
@@ -3027,6 +3051,31 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 chunk_origin_world,
             };
 
+            let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
+            else {
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
+                    wait_reason: None,
+                });
+                finalized_count += 1;
+                superseded_count += 1;
+                candidate_failed_count += 1;
+                continue;
+            };
+            if current_pending != candidate.pending {
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
+                    wait_reason: None,
+                });
+                finalized_count += 1;
+                requeued_count += 1;
+                superseded_count += 1;
+                candidate_failed_count += 1;
+                continue;
+            }
+
             if atlas.version_for_chunk.get(&candidate.coord).copied()
                 != Some(candidate.pending.version.get())
             {
@@ -3034,6 +3083,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
+                    wait_reason: None,
                 });
                 finalized_count += 1;
                 superseded_count += 1;
@@ -3060,6 +3110,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
+                    wait_reason: None,
                 });
                 finalized_count += 1;
                 ownership_invalidations += 1;
@@ -3067,26 +3118,45 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 continue;
             }
 
+            if candidate.pending.submission_serial > completed {
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                    wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial),
+                });
+                waiting_completion_serial_count += 1;
+                continue;
+            }
+
             let Some(index_count) = result.index_count else {
-                waiting_metadata_count += 1;
+                let wait_reason = if snapshot_ready {
+                    ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata
+                } else {
+                    ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot
+                };
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result,
+                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                    wait_reason: Some(wait_reason),
+                });
+                match wait_reason {
+                    ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata => {
+                        waiting_metadata_count += 1;
+                    }
+                    ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot => {
+                        waiting_readback_snapshot_count += 1;
+                    }
+                    ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial => {}
+                }
                 continue;
             };
 
             if index_count == 0 {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
-                log::debug!(
-                    "[gpu-mesh] finalize_invalid_output coord={:?} version={} task_id={} page={} slot={} serial={} lod={:?} reason=zero_index_count",
-                    result.coord,
-                    result.version,
-                    result.task_id,
-                    result.page_index.0,
-                    result.draw_indirect_index,
-                    result.submission_serial,
-                    result.lod,
-                );
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
+                    wait_reason: None,
                 });
                 finalized_count += 1;
                 candidate_failed_count += 1;
@@ -3100,6 +3170,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             out.push(ReadyGpuMeshFinalizeEvent {
                 result,
                 status: ReadyGpuMeshFinalizeStatus::ReadyAndValid,
+                wait_reason: None,
             });
             finalized_count += 1;
             promoted_ready_count += 1;
@@ -3111,6 +3182,10 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     );
     GPU_MESH_FINALIZE_COUNT.fetch_add(finalized_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_REQUEUED_COUNT.fetch_add(requeued_count, Ordering::Relaxed);
+    GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT
+        .fetch_add(waiting_completion_serial_count, Ordering::Relaxed);
+    GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT
+        .fetch_add(waiting_readback_snapshot_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_WAITING_METADATA_COUNT.fetch_add(waiting_metadata_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_PROMOTED_READY_COUNT.fetch_add(promoted_ready_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_OWNERSHIP_INVALIDATED_COUNT

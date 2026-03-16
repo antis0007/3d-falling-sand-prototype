@@ -2637,10 +2637,14 @@ pub async fn run() -> anyhow::Result<()> {
                                 + current_mesh_stats.mesh_reject_invalid_page;
                             ui.log_once_per_second("mesh_finalize_telemetry", now_secs, || {
                                 format!(
-                                    "pending_finalize={} ready/promoted={}/{} ownership_invalidations={} zero_confirmed/meta_waiting={}/{} resident_visible_gpu={} throttle_active={} severity={:.2} remesh_scale={:.2} upload_scale={:.2} low_progress_streak={} reason={}",
+                                    "pending_finalize={} ready/promoted={}/{} waiting(serial/readback/meta)={}/{}/{} aged_out={} ownership_invalidations={} zero_confirmed/meta_waiting={}/{} resident_visible_gpu={} throttle_active={} severity={:.2} remesh_scale={:.2} upload_scale={:.2} low_progress_streak={} reason={}",
                                     current_mesh_stats.pending_finalize_total,
                                     current_mesh_stats.mesh_pending_total,
                                     current_mesh_stats.mesh_pending_promoted_to_drawable,
+                                    current_mesh_stats.pending_finalize_waiting_on_completion_serial,
+                                    current_mesh_stats.pending_finalize_waiting_on_readback_snapshot,
+                                    current_mesh_stats.pending_finalize_waiting_on_metadata,
+                                    current_mesh_stats.pending_finalize_aged_out,
                                     ownership_invalidations,
                                     current_mesh_stats.outcome_skipped_startup_zero_geometry,
                                     zero_waiting,
