@@ -832,6 +832,7 @@ pub struct MeshRebuildStats {
     pub mesh_dropped_before_drawable: usize,
     pub mesh_drawable_filtered_under_load: usize,
     pub mesh_last_good_retained: usize,
+    pub mesh_last_good_visible_end_of_frame: usize,
     pub mesh_visible_logical_not_drawable: usize,
     pub continuity_kept_count: usize,
     pub continuity_keepalive_count: usize,
@@ -1291,6 +1292,15 @@ enum MeshLifecycleState {
     Superseded,
     Rejected,
     Evicted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplacementLossCause {
+    Superseded,
+    DistanceEvicted,
+    OwnershipInvalidated,
+    LifecycleInvalidated(MeshLifecycleState),
+    Unexplained,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2594,6 +2604,7 @@ impl Renderer {
         let mut pending_superseded = 0usize;
         let mut pending_rejected = 0usize;
         let mut replacement_failed_coords: HashSet<ChunkCoord> = HashSet::new();
+        let mut replacement_distance_evicted_coords: HashSet<ChunkCoord> = HashSet::new();
 
         self.recv_mesh_results_bounded(&mut stats);
 
@@ -3085,6 +3096,7 @@ impl Renderer {
         for &coord in &replacement_failed_coords {
             let still_visible = self.visible_gpu_chunks.contains_key(&coord);
             if still_visible {
+                stats.mesh_last_good_visible_end_of_frame += 1;
                 continue;
             }
 
@@ -3093,31 +3105,98 @@ impl Renderer {
                 .get(&coord)
                 .and_then(|record| record.current_drawable)
                 .is_some();
+
             let lifecycle = self
                 .mesh_lifecycle
                 .get(&coord)
                 .copied()
                 .unwrap_or(MeshLifecycleState::Rejected);
+
             let displacement_is_expected = matches!(
                 lifecycle,
                 MeshLifecycleState::Superseded | MeshLifecycleState::Evicted
             );
 
-            if has_current_record_drawable || displacement_is_expected {
-                replacement_failed_lost_but_superseded_or_evicted += 1;
-                continue;
-            }
+            let loss_cause = Self::replacement_loss_cause_for_coord(
+                coord,
+                &self.visible_gpu_chunks,
+                &self.mesh_lifecycle,
+                &replacement_distance_evicted_coords,
+            );
 
-            replacement_failed_lost_drawable += 1;
-            log::error!(
-                "[renderer] continuity drop after replacement failure coord={coord:?} lifecycle={:?} has_current_record_drawable={}",
-                lifecycle,
-                has_current_record_drawable,
-            );
-            debug_assert!(
-                has_current_record_drawable || displacement_is_expected,
-                "replacement failed for {coord:?} and continuity was dropped (lifecycle={lifecycle:?})"
-            );
+            match loss_cause {
+                None => {
+                    stats.mesh_last_good_visible_end_of_frame += 1;
+                }
+                Some(ReplacementLossCause::Superseded | ReplacementLossCause::DistanceEvicted) => {
+                    replacement_failed_lost_but_superseded_or_evicted += 1;
+
+                    match loss_cause {
+                        Some(ReplacementLossCause::Superseded) => {
+                            log::debug!(
+                                "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was superseded in-frame cause=superseded lifecycle={lifecycle:?} has_current_record_drawable={}",
+                                has_current_record_drawable,
+                            );
+                        }
+                        Some(ReplacementLossCause::DistanceEvicted) => {
+                            log::debug!(
+                                "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was evicted in-frame cause=distance_evicted lifecycle={lifecycle:?} has_current_record_drawable={}",
+                                has_current_record_drawable,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Some(ReplacementLossCause::OwnershipInvalidated) => {
+                    replacement_failed_lost_drawable += 1;
+                    log::warn!(
+                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was invalidated cause=ownership lifecycle={lifecycle:?} has_current_record_drawable={}",
+                        has_current_record_drawable,
+                    );
+                    debug_assert!(
+                        has_current_record_drawable || displacement_is_expected,
+                        "replacement failed for {coord:?} and continuity was dropped (cause=ownership, lifecycle={lifecycle:?})"
+                    );
+                }
+                Some(ReplacementLossCause::LifecycleInvalidated(state)) => {
+                    if matches!(state, MeshLifecycleState::Superseded | MeshLifecycleState::Evicted) {
+                        replacement_failed_lost_but_superseded_or_evicted += 1;
+                        log::debug!(
+                            "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                    } else {
+                        replacement_failed_lost_drawable += 1;
+                        log::warn!(
+                            "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                        debug_assert!(
+                            has_current_record_drawable || matches!(state, MeshLifecycleState::Superseded | MeshLifecycleState::Evicted),
+                            "replacement failed for {coord:?} and continuity was dropped (cause=lifecycle, state={state:?})"
+                        );
+                    }
+                }
+                Some(ReplacementLossCause::Unexplained) => {
+                    if has_current_record_drawable || displacement_is_expected {
+                        replacement_failed_lost_but_superseded_or_evicted += 1;
+                        log::debug!(
+                            "[renderer] continuity drop after replacement failure coord={coord:?} lifecycle={lifecycle:?} has_current_record_drawable={} cause=unexplained_but_record_or_lifecycle_allows_drop",
+                            has_current_record_drawable,
+                        );
+                    } else {
+                        replacement_failed_lost_drawable += 1;
+                        log::error!(
+                            "[renderer] invariant violated: replacement failed for coord={coord:?} but visible draw was lost cause=unexplained lifecycle={lifecycle:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                        debug_assert!(
+                            has_current_record_drawable || displacement_is_expected,
+                            "replacement failed for {coord:?} and continuity was dropped (cause=unexplained, lifecycle={lifecycle:?})"
+                        );
+                    }
+                }
+            }
         }
         if replacement_failed_lost_but_superseded_or_evicted > 0 {
             log::debug!(
@@ -3165,6 +3244,7 @@ impl Renderer {
 
         for coord in drop_keys {
             self.release_draw_slot_mapping(coord);
+            replacement_distance_evicted_coords.insert(coord);
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
@@ -4251,6 +4331,27 @@ impl Renderer {
     fn next_slot_generation(&mut self) -> u64 {
         self.next_slot_ownership_generation = self.next_slot_ownership_generation.saturating_add(1);
         self.next_slot_ownership_generation
+    }
+
+    fn replacement_loss_cause_for_coord(
+        coord: ChunkCoord,
+        visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
+        mesh_lifecycle: &HashMap<ChunkCoord, MeshLifecycleState>,
+        replacement_distance_evicted_coords: &HashSet<ChunkCoord>,
+    ) -> Option<ReplacementLossCause> {
+        if visible_gpu_chunks.contains_key(&coord) {
+            return None;
+        }
+        if replacement_distance_evicted_coords.contains(&coord) {
+            return Some(ReplacementLossCause::DistanceEvicted);
+        }
+        Some(match mesh_lifecycle.get(&coord).copied() {
+            Some(MeshLifecycleState::Superseded) => ReplacementLossCause::Superseded,
+            Some(MeshLifecycleState::Evicted) => ReplacementLossCause::DistanceEvicted,
+            Some(MeshLifecycleState::Rejected) => ReplacementLossCause::OwnershipInvalidated,
+            Some(state) => ReplacementLossCause::LifecycleInvalidated(state),
+            None => ReplacementLossCause::Unexplained,
+        })
     }
 
     fn adopt_visible_chunk_draw(&mut self, coord: ChunkCoord, draw: GpuChunkDraw) -> bool {
@@ -7479,6 +7580,42 @@ mod tests {
             6,
             visibility,
         ));
+    }
+
+    #[test]
+    fn replacement_rejection_with_same_frame_distance_eviction_is_explained() {
+        let coord = ChunkCoord { x: 8, y: 1, z: 0 };
+        let visible_gpu_chunks = HashMap::new();
+        let mut mesh_lifecycle = HashMap::new();
+        mesh_lifecycle.insert(coord, MeshLifecycleState::Evicted);
+        let mut distance_evicted = HashSet::new();
+        distance_evicted.insert(coord);
+
+        let cause = Renderer::replacement_loss_cause_for_coord(
+            coord,
+            &visible_gpu_chunks,
+            &mesh_lifecycle,
+            &distance_evicted,
+        );
+
+        assert_eq!(cause, Some(ReplacementLossCause::DistanceEvicted));
+    }
+
+    #[test]
+    fn replacement_rejection_unexplained_loss_is_flagged() {
+        let coord = ChunkCoord { x: 9, y: 1, z: 0 };
+        let visible_gpu_chunks = HashMap::new();
+        let mesh_lifecycle = HashMap::new();
+        let distance_evicted = HashSet::new();
+
+        let cause = Renderer::replacement_loss_cause_for_coord(
+            coord,
+            &visible_gpu_chunks,
+            &mesh_lifecycle,
+            &distance_evicted,
+        );
+
+        assert_eq!(cause, Some(ReplacementLossCause::Unexplained));
     }
 
     #[test]

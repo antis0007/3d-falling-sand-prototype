@@ -1628,6 +1628,30 @@ pub struct ReadyGpuMeshFinalizeEvent {
 }
 
 #[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingIndexCountDisposition {
+    WaitOnReadbackSnapshot,
+    WaitOnMetadata,
+    DropInvalidMapping,
+}
+
+#[cfg(feature = "gpu-compute")]
+fn classify_missing_index_count_disposition(
+    snapshot_ready: bool,
+    slot_lookup_valid: bool,
+) -> MissingIndexCountDisposition {
+    if !snapshot_ready {
+        return MissingIndexCountDisposition::WaitOnReadbackSnapshot;
+    }
+
+    if !slot_lookup_valid {
+        return MissingIndexCountDisposition::DropInvalidMapping;
+    }
+
+    MissingIndexCountDisposition::WaitOnMetadata
+}
+
+#[cfg(feature = "gpu-compute")]
 #[derive(Clone)]
 pub struct GpuChunkTask {
     pub coord: ChunkCoord,
@@ -3190,24 +3214,39 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             }
 
             let Some(index_count) = result.index_count else {
-                let wait_reason = if snapshot_ready {
-                    ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata
-                } else {
-                    ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot
-                };
-                out.push(ReadyGpuMeshFinalizeEvent {
-                    result,
-                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
-                    wait_reason: Some(wait_reason),
-                });
-                match wait_reason {
-                    ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata => {
-                        waiting_metadata_count += 1;
-                    }
-                    ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot => {
+                match classify_missing_index_count_disposition(
+                    snapshot_ready,
+                    (candidate.pending.draw_indirect_index as usize) < MESH_SLOT_COUNT as usize,
+                ) {
+                    MissingIndexCountDisposition::WaitOnReadbackSnapshot => {
+                        out.push(ReadyGpuMeshFinalizeEvent {
+                            result,
+                            status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                            wait_reason: Some(
+                                ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot,
+                            ),
+                        });
                         waiting_readback_snapshot_count += 1;
                     }
-                    ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial => {}
+                    MissingIndexCountDisposition::WaitOnMetadata => {
+                        out.push(ReadyGpuMeshFinalizeEvent {
+                            result,
+                            status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                            wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata),
+                        });
+                        waiting_metadata_count += 1;
+                    }
+                    MissingIndexCountDisposition::DropInvalidMapping => {
+                        atlas.pending_mesh_finalize.remove(&candidate.coord);
+                        out.push(ReadyGpuMeshFinalizeEvent {
+                            result,
+                            status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
+                            wait_reason: None,
+                        });
+                        finalized_count += 1;
+                        candidate_failed_count += 1;
+                        finalize_invalid_count += 1;
+                    }
                 }
                 continue;
             };
@@ -3599,6 +3638,8 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gpu-compute")]
+    use super::{classify_missing_index_count_disposition, MissingIndexCountDisposition};
     use super::{ChunkPageAtlas, MeshSliceAllocateOutcome, MESH_SLOT_COUNT};
     use crate::chunk_store::ChunkStore;
     use crate::engine::world::ChunkVersion;
@@ -3676,6 +3717,34 @@ mod tests {
             mismatches <= 0,
             "mismatch count {} exceeded tolerance",
             mismatches
+        );
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn missing_index_count_snapshot_ready_with_invalid_slot_drops_mapping() {
+        let disposition = classify_missing_index_count_disposition(true, false);
+        assert_eq!(
+            disposition,
+            MissingIndexCountDisposition::DropInvalidMapping,
+            "snapshot-ready + invalid slot lookup must terminally drop, not remain pending"
+        );
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn missing_index_count_snapshot_ready_with_valid_slot_waits_on_metadata() {
+        let disposition = classify_missing_index_count_disposition(true, true);
+        assert_eq!(disposition, MissingIndexCountDisposition::WaitOnMetadata);
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn missing_index_count_snapshot_not_ready_waits_on_snapshot() {
+        let disposition = classify_missing_index_count_disposition(false, false);
+        assert_eq!(
+            disposition,
+            MissingIndexCountDisposition::WaitOnReadbackSnapshot
         );
     }
 
