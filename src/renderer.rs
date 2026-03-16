@@ -4226,19 +4226,8 @@ impl Renderer {
             .get(&coord)
             .map(|existing| existing.draw_indirect_index);
 
-        let target_slot_is_acquirable = match previous_owner {
-            None => true,
-            Some(owner) if owner == coord => true,
-            Some(owner) => self
-                .visible_gpu_chunks
-                .get(&owner)
-                .map(|owner_draw| {
-                    owner_draw.draw_indirect_index == target_slot
-                        && self.slot_ownership_generation.get(&target_slot).copied()
-                            == Some(owner_draw.ownership_generation)
-                })
-                .unwrap_or(false),
-        };
+        let target_slot_is_acquirable =
+            Self::target_slot_owner_is_acquirable(previous_owner, coord);
         let coord_old_slot_is_owned = match coord_old_slot {
             None => true,
             Some(old_slot) => {
@@ -4274,22 +4263,9 @@ impl Renderer {
 
         // Commit phase: install forward + reverse mapping first.
         let replaced_draw = self.visible_gpu_chunks.insert(coord, draw);
-        let displaced_coord = self.visible_slots.insert(target_slot, coord);
+        self.visible_slots.insert(target_slot, coord);
         self.slot_ownership_generation
             .insert(target_slot, next_generation);
-
-        // Release displaced owner of the target slot after commit.
-        if let Some(previous_coord) = displaced_coord {
-            if previous_coord != coord {
-                self.release_draw_slot_mapping_with_reserved_slot(
-                    previous_coord,
-                    Some(target_slot),
-                );
-                self.mesh_lifecycle
-                    .insert(previous_coord, MeshLifecycleState::Superseded);
-                self.terminal_superseded_total += 1;
-            }
-        }
 
         // Release coord's previous slot mapping after commit.
         if let Some(previous_draw) = replaced_draw {
@@ -4331,6 +4307,16 @@ impl Renderer {
         self.mesh_lifecycle
             .insert(coord, MeshLifecycleState::Drawable);
         true
+    }
+
+    fn target_slot_owner_is_acquirable(
+        previous_owner: Option<ChunkCoord>,
+        coord: ChunkCoord,
+    ) -> bool {
+        match previous_owner {
+            None => true,
+            Some(owner) => owner == coord,
+        }
     }
 
     fn mesh_result_backend_label(result: &MeshResult) -> &'static str {
@@ -6935,6 +6921,92 @@ mod tests {
         )
         .expect("stale mismatched lod should still draw");
         assert_eq!(chosen.freshness, DrawableFreshness::StaleDrawable);
+    }
+
+    #[test]
+    fn adopting_other_coords_visible_slot_is_rejected_and_keeps_previous_visible() {
+        let slot = 11;
+        let coord_a = ChunkCoord { x: 1, y: 0, z: 0 };
+        let coord_b = ChunkCoord { x: 2, y: 0, z: 0 };
+
+        let draw_a = GpuChunkDraw {
+            page_index: GpuPageIndex(slot),
+            draw_indirect_index: slot,
+            lod: ChunkLod::Near as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::ZERO,
+            world_aabb_max: Vec3::splat(16.0),
+            draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
+            ownership_generation: 41,
+            index_count: Some(24),
+        };
+
+        let draw_b = GpuChunkDraw {
+            ownership_generation: 0,
+            ..draw_a
+        };
+
+        let mut visible_gpu_chunks = HashMap::new();
+        visible_gpu_chunks.insert(coord_a, draw_a);
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(slot, coord_a);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(slot, draw_a.ownership_generation);
+
+        let target_slot_is_acquirable =
+            Renderer::target_slot_owner_is_acquirable(visible_slots.get(&slot).copied(), coord_b);
+        assert!(!target_slot_is_acquirable);
+
+        if target_slot_is_acquirable {
+            visible_gpu_chunks.insert(coord_b, draw_b);
+            visible_slots.insert(slot, coord_b);
+            slot_ownership_generation.insert(slot, draw_b.ownership_generation);
+        }
+
+        assert_eq!(visible_slots.get(&slot), Some(&coord_a));
+        assert!(visible_gpu_chunks.contains_key(&coord_a));
+        assert!(!visible_gpu_chunks.contains_key(&coord_b));
+        assert_eq!(slot_ownership_generation.get(&slot), Some(&41));
+    }
+
+    #[test]
+    fn replacement_failed_then_other_coord_attempt_cannot_evict_current_visible() {
+        let slot = 13;
+        let coord_a = ChunkCoord { x: 3, y: 0, z: 0 };
+        let coord_b = ChunkCoord { x: 4, y: 0, z: 0 };
+
+        let draw_a = GpuChunkDraw {
+            page_index: GpuPageIndex(slot),
+            draw_indirect_index: slot,
+            lod: ChunkLod::Mid as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::ZERO,
+            world_aabb_max: Vec3::splat(16.0),
+            draw_source: DrawSource::GpuArtifact,
+            artifact_key: None,
+            ownership_generation: 99,
+            index_count: Some(12),
+        };
+
+        let mut visible_gpu_chunks = HashMap::new();
+        visible_gpu_chunks.insert(coord_a, draw_a);
+        let mut visible_slots = HashMap::new();
+        visible_slots.insert(slot, coord_a);
+
+        // Simulate frame where A replacement failed: A remains visible.
+        let replacement_failed_for_a = true;
+        assert!(replacement_failed_for_a);
+        assert!(visible_gpu_chunks.contains_key(&coord_a));
+
+        // In the same frame, B attempts to adopt A's slot and must be rejected.
+        let b_target_slot_is_acquirable =
+            Renderer::target_slot_owner_is_acquirable(visible_slots.get(&slot).copied(), coord_b);
+        assert!(!b_target_slot_is_acquirable);
+
+        assert!(visible_gpu_chunks.contains_key(&coord_a));
+        assert!(!visible_gpu_chunks.contains_key(&coord_b));
+        assert_eq!(visible_slots.get(&slot), Some(&coord_a));
     }
 
     #[test]
