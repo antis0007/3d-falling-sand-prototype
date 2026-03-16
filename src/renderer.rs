@@ -773,6 +773,10 @@ pub struct MeshRebuildStats {
     pub gpu_mesh_index_capacity: usize,
     pub gpu_mesh_largest_free_vertex_span: usize,
     pub gpu_mesh_largest_free_index_span: usize,
+    pub mesh_slot_pressure_visible: usize,
+    pub mesh_slot_pressure_pending_finalize: usize,
+    pub mesh_slot_pressure_reclaimable_no_fence: usize,
+    pub mesh_slot_pressure_lifecycle_blocked_no_fence: usize,
     pub gpu_readback_bytes: u64,
     pub allocator_bytes_allocated: usize,
     pub allocator_bytes_reused: usize,
@@ -810,10 +814,6 @@ pub struct MeshRebuildStats {
     pub resident_unknown: usize,
     pub mesh_reject_no_longer_desired: usize,
     pub mesh_slot_allocation_failures: usize,
-    pub mesh_slot_pressure_visible: usize,
-    pub mesh_slot_pressure_pending_finalize: usize,
-    pub mesh_slot_pressure_reclaimable_no_fence: usize,
-    pub mesh_slot_pressure_lifecycle_blocked_no_fence: usize,
     pub mesh_pending_total: usize,
     pub mesh_pending_finalize: usize,
     pub mesh_pending_promoted_to_drawable: usize,
@@ -878,7 +878,6 @@ pub struct MeshRebuildStats {
     pub pending_finalize_age_ms_p50: f32,
     pub pending_finalize_age_ms_p95: f32,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawSource {
     GpuArtifact,
@@ -3272,6 +3271,8 @@ impl Renderer {
         }
         stats.mesh_cache_entries = self.visible_gpu_chunks.len();
         stats.gpu_mesh_visible_count = self.visible_gpu_chunks.len();
+        stats.mesh_slot_pressure_visible = self.visible_gpu_chunks.len();
+        stats.mesh_slot_pressure_pending_finalize = self.pending_gpu_results.len();
         stats.startup_seed_zero_count_seen = self
             .startup_mesh_seed_state
             .values()
@@ -4233,6 +4234,7 @@ impl Renderer {
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
                 stats.finalize_status_not_ready_yet += 1;
+                stats.finalize_status_not_ready_yet += 1;
                 pending.finalize_revisit_count = pending.finalize_revisit_count.saturating_add(1);
                 pending.last_wait_reason = ready.wait_reason;
                 let age_frames = self
@@ -4288,6 +4290,7 @@ impl Renderer {
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 stats.finalize_status_ready_and_valid += 1;
+                stats.finalize_status_ready_and_valid += 1;
                 let promoted = Self::promote_pending_result_to_gpu_ready(pending, &ready);
                 let record = self.mesh_record_mut(ready.result.coord);
                 record.state = ChunkRenderState::CandidateReady;
@@ -4295,6 +4298,7 @@ impl Renderer {
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
+                stats.finalize_status_dropped_stale_version += 1;
                 stats.finalize_status_dropped_stale_version += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
@@ -4308,6 +4312,7 @@ impl Renderer {
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
                 stats.finalize_status_dropped_invalid_mapping += 1;
+                stats.finalize_status_dropped_invalid_mapping += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
                     ready.result.coord,
@@ -4319,6 +4324,7 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
+                stats.finalize_status_dropped_superseded_identity += 1;
                 stats.finalize_status_dropped_superseded_identity += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
@@ -4381,9 +4387,11 @@ impl Renderer {
             reason,
             preserve_gpu_finalize_identity,
         );
+
         if self.chunk_mesh_records.contains_key(&coord) {
             let _ = self.reject_candidate_preserve_current_for_coord(coord);
         }
+
         dropped
     }
 

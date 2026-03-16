@@ -14,9 +14,9 @@ use glam::Vec3;
 #[cfg(feature = "gpu-compute")]
 use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -161,8 +161,6 @@ struct ChunkPageAtlas {
     chunk_for_mesh_slot: HashMap<u32, ChunkCoord>,
     page_ownership_generation: HashMap<GpuPageIndex, u64>,
     mesh_slot_ownership_generation: HashMap<u32, u64>,
-    queued_page_reservations: HashMap<GpuPageIndex, u32>,
-    queued_mesh_slot_reservations: HashMap<u32, u32>,
     mesh_slot_last_used: HashMap<u32, u64>,
     mesh_slot_epoch: u64,
     next_mesh_slot: u32,
@@ -192,15 +190,11 @@ impl Default for ChunkPageAtlas {
             chunk_for_mesh_slot: HashMap::new(),
             page_ownership_generation: HashMap::new(),
             mesh_slot_ownership_generation: HashMap::new(),
-            queued_page_reservations: HashMap::new(),
-            queued_mesh_slot_reservations: HashMap::new(),
             mesh_slot_last_used: HashMap::new(),
             mesh_slot_epoch: 0,
             next_mesh_slot: 0,
-            mesh_slot_capacity_vertex_elements: mesh_layout::MeshBufferKind::Vertex
-                .slot_capacity_elements(),
-            mesh_slot_capacity_index_elements: mesh_layout::MeshBufferKind::Index
-                .slot_capacity_elements(),
+            mesh_slot_capacity_vertex_elements: MESH_VERTEX_ELEMENTS_PER_CHUNK,
+            mesh_slot_capacity_index_elements: MESH_INDEX_ELEMENTS_PER_CHUNK,
             next_page: GpuPageIndex(0),
             pending_mesh_finalize: HashMap::new(),
         }
@@ -214,7 +208,6 @@ enum MeshSliceAllocateOutcome {
     Saturated,
     NoProgress,
     InvalidState,
-    ContractUnsatisfiable,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -236,35 +229,6 @@ struct MeshPoolTelemetry {
     slots_pending_finalize: u32,
     reclaimable_without_fence: u32,
     lifecycle_blocked_without_fence: u32,
-}
-
-#[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug, Default)]
-struct MeshSlotPressureBreakdown {
-    visible: u32,
-    pending_finalize: u32,
-    reclaimable_without_fence: u32,
-    lifecycle_blocked_without_fence: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GpuRuntimeDebugSnapshot {
-    pub mesh_slots_used: usize,
-    pub mesh_slot_capacity: usize,
-    pub mesh_slot_in_flight_fences: usize,
-    pub mesh_vertex_used: usize,
-    pub mesh_vertex_capacity: usize,
-    pub mesh_index_used: usize,
-    pub mesh_index_capacity: usize,
-    pub mesh_largest_free_vertex_span: usize,
-    pub mesh_largest_free_index_span: usize,
-    pub mesh_slots_visible: usize,
-    pub mesh_slots_pending_finalize: usize,
-    pub mesh_slots_reclaimable_without_fence: usize,
-    pub mesh_slots_lifecycle_blocked_without_fence: usize,
-    pub queue_enqueued: usize,
-    pub queue_dequeued: usize,
-    pub queue_rx_backlog: usize,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -290,15 +254,6 @@ impl PagePriorityHint {
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StaleQueuedTaskReason {
-    PageOwnership,
-    PageGeneration,
-    SlotOwnership,
-    SlotGeneration,
-}
-
-#[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGpuMeshFinalize {
     version: ChunkVersion,
     task_id: u64,
@@ -308,62 +263,6 @@ struct PendingGpuMeshFinalize {
     page_generation: u64,
     slot_generation: u64,
     submission_serial: u64,
-}
-
-#[cfg(feature = "gpu-compute")]
-const FINALIZE_ORPHAN_SERIAL_GRACE: u64 = 64;
-
-#[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QueuedTaskOwnershipIdentity {
-    pub page_generation: u64,
-    pub slot_generation: Option<u64>,
-}
-
-#[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QueuedTaskOwnershipState {
-    pub page_generation: u64,
-    pub slot_generation: Option<u64>,
-}
-
-#[cfg(feature = "gpu-compute")]
-fn queued_task_identity_is_stale(
-    mapped_page_generation: u64,
-    mapped_slot_generation: Option<u64>,
-    task_page_generation: u64,
-    task_slot_generation: Option<u64>,
-) -> bool {
-    if mapped_page_generation != task_page_generation {
-        return true;
-    }
-
-    match (mapped_slot_generation, task_slot_generation) {
-        (Some(mapped), Some(task)) => mapped != task,
-        (None, None) => false,
-        _ => true,
-    }
-}
-
-#[cfg(feature = "gpu-compute")]
-pub fn queued_task_is_stale_for_dispatch(
-    state: QueuedTaskOwnershipState,
-    identity: QueuedTaskOwnershipIdentity,
-) -> bool {
-    queued_task_identity_is_stale(
-        state.page_generation,
-        state.slot_generation,
-        identity.page_generation,
-        identity.slot_generation,
-    )
-}
-
-#[cfg(feature = "gpu-compute")]
-pub fn invalidate_queued_task_ownership_state(state: &mut QueuedTaskOwnershipState) {
-    state.page_generation = state.page_generation.saturating_add(1);
-    if let Some(slot_generation) = state.slot_generation.as_mut() {
-        *slot_generation = slot_generation.saturating_add(1);
-    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -394,45 +293,6 @@ impl ChunkPageAtlas {
             .unwrap_or(0)
     }
 
-    fn reserve_queued_task_identity(
-        &mut self,
-        page_index: GpuPageIndex,
-        mesh_slice: Option<MeshBufferSlice>,
-    ) {
-        *self.queued_page_reservations.entry(page_index).or_insert(0) += 1;
-        if let Some(mesh_slice) = mesh_slice {
-            *self
-                .queued_mesh_slot_reservations
-                .entry(mesh_slice.slot_index)
-                .or_insert(0) += 1;
-        }
-    }
-
-    fn release_queued_task_identity(
-        &mut self,
-        page_index: GpuPageIndex,
-        mesh_slice: Option<MeshBufferSlice>,
-    ) {
-        if let Some(entry) = self.queued_page_reservations.get_mut(&page_index) {
-            *entry = entry.saturating_sub(1);
-            if *entry == 0 {
-                self.queued_page_reservations.remove(&page_index);
-            }
-        }
-        if let Some(mesh_slice) = mesh_slice {
-            if let Some(entry) = self
-                .queued_mesh_slot_reservations
-                .get_mut(&mesh_slice.slot_index)
-            {
-                *entry = entry.saturating_sub(1);
-                if *entry == 0 {
-                    self.queued_mesh_slot_reservations
-                        .remove(&mesh_slice.slot_index);
-                }
-            }
-        }
-    }
-
     fn page_for_chunk_or_allocate(
         &mut self,
         chunk: ChunkCoord,
@@ -445,6 +305,14 @@ impl ChunkPageAtlas {
         if self.next_page.0 < MESH_SLOT_COUNT {
             let page = self.next_page;
             self.next_page = GpuPageIndex(self.next_page.0.saturating_add(1));
+            self.page_for_chunk.insert(chunk, page);
+            self.chunk_for_page.insert(page, chunk);
+            self.bump_page_generation(page);
+            self.touch_page(page);
+            return Ok((page, true));
+        }
+
+        if let Some(page) = self.first_reusable_page() {
             self.page_for_chunk.insert(chunk, page);
             self.chunk_for_page.insert(page, chunk);
             self.bump_page_generation(page);
@@ -476,6 +344,16 @@ impl ChunkPageAtlas {
         }
     }
 
+    fn first_reusable_page(&self) -> Option<GpuPageIndex> {
+        (0..MESH_SLOT_COUNT)
+            .map(GpuPageIndex)
+            .find(|page| !self.chunk_for_page.contains_key(page))
+    }
+
+    fn first_reusable_mesh_slot(&self) -> Option<u32> {
+        (0..MESH_SLOT_COUNT).find(|slot| !self.chunk_for_mesh_slot.contains_key(slot))
+    }
+
     fn set_protected_chunks(&mut self, near_chunks: &[ChunkCoord], visible_chunks: &[ChunkCoord]) {
         self.priority_hint_for_chunk.clear();
         for &coord in near_chunks {
@@ -499,34 +377,46 @@ impl ChunkPageAtlas {
         }
 
         let _ = lod;
-        if mesh_layout::validate_gpu_mesh_slice_contract().is_err() {
-            return MeshSliceAllocateOutcome::ContractUnsatisfiable;
-        }
         let slot_capacity = MESH_SLOT_COUNT;
         if slot_capacity == 0 {
             return MeshSliceAllocateOutcome::InvalidState;
         }
 
-        if self.next_mesh_slot < slot_capacity {
-            let slot = self.next_mesh_slot;
+        let mut reused_slot = false;
+        let slot = if self.next_mesh_slot < slot_capacity {
+            let next = self.next_mesh_slot;
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
-            return self
-                .try_allocate_mesh_buffers(chunk, slot)
-                .map(MeshSliceAllocateOutcome::Success)
-                .unwrap_or(MeshSliceAllocateOutcome::InvalidState);
-        }
-
-        let Some(slot) = self.evictable_mesh_slot(slot_capacity) else {
-            return MeshSliceAllocateOutcome::Saturated;
+            next
+        } else if let Some(free_slot) = self.first_reusable_mesh_slot() {
+            free_slot
+        } else {
+            reused_slot = true;
+            match self.evictable_mesh_slot(slot_capacity) {
+                Some(evictable) => evictable,
+                None => return MeshSliceAllocateOutcome::Saturated,
+            }
         };
 
-        if !self.evict_mesh_slot(slot) {
+        if reused_slot && !self.evict_mesh_slot(slot) {
             return MeshSliceAllocateOutcome::NoProgress;
         }
 
-        self.try_allocate_mesh_buffers(chunk, slot)
-            .map(MeshSliceAllocateOutcome::Success)
-            .unwrap_or(MeshSliceAllocateOutcome::InvalidState)
+        if let Some(slice) = self.try_allocate_mesh_buffers(chunk, slot) {
+            return MeshSliceAllocateOutcome::Success(slice);
+        }
+
+        let Some(evict_slot) = self.evictable_mesh_slot(slot_capacity) else {
+            return MeshSliceAllocateOutcome::Saturated;
+        };
+        if !self.evict_mesh_slot(evict_slot) {
+            return MeshSliceAllocateOutcome::NoProgress;
+        }
+
+        if let Some(slice) = self.try_allocate_mesh_buffers(chunk, evict_slot) {
+            return MeshSliceAllocateOutcome::Success(slice);
+        }
+
+        MeshSliceAllocateOutcome::Saturated
     }
 
     fn try_allocate_mesh_buffers(
@@ -569,38 +459,6 @@ impl ChunkPageAtlas {
         self.assert_mesh_slot_chunk_mapping_invariants();
     }
 
-    fn reclaim_chunk_mesh_slot_if_stale(&mut self, chunk: ChunkCoord) -> bool {
-        if self.pending_mesh_finalize.contains_key(&chunk) {
-            return false;
-        }
-        if matches!(
-            self.priority_hint_for_chunk
-                .get(&chunk)
-                .copied()
-                .unwrap_or_default(),
-            PagePriorityHint::Visible
-        ) {
-            return false;
-        }
-        let Some(slice) = self.mesh_slice_for_chunk.get(&chunk).copied() else {
-            return false;
-        };
-        if self
-            .queued_mesh_slot_reservations
-            .get(&slice.slot_index)
-            .copied()
-            .unwrap_or(0)
-            > 0
-        {
-            return false;
-        }
-        if !self.is_mesh_slot_fence_safe(slice.slot_index) {
-            return false;
-        }
-        self.release_chunk_mesh_allocation(chunk);
-        true
-    }
-
     fn mesh_slot_protection_hint(&self, slot: u32) -> PagePriorityHint {
         self.chunk_for_mesh_slot
             .get(&slot)
@@ -610,14 +468,6 @@ impl ChunkPageAtlas {
     }
 
     fn evict_mesh_slot(&mut self, slot: u32) -> bool {
-        debug_assert_eq!(
-            self.queued_mesh_slot_reservations
-                .get(&slot)
-                .copied()
-                .unwrap_or(0),
-            0,
-            "attempted to evict mesh slot with queued reservation"
-        );
         if let Some(chunk) = self.chunk_for_mesh_slot.get(&slot).copied() {
             match self.mesh_slot_protection_hint(slot) {
                 PagePriorityHint::Far => {
@@ -654,34 +504,19 @@ impl ChunkPageAtlas {
     }
 
     fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
-        let mut selected: Option<((u8, u8, u8, u64), u32)> = None;
+        let mut selected: Option<((u8, u8, u64), u32)> = None;
         for (&slot, _) in &self.chunk_for_mesh_slot {
             if slot >= slot_capacity {
                 continue;
             }
-            if self
-                .queued_mesh_slot_reservations
-                .get(&slot)
-                .copied()
-                .unwrap_or(0)
-                > 0
-            {
-                GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let fence_safe = self.is_mesh_slot_fence_safe(slot);
             let protection_rank = self.mesh_slot_protection_hint(slot).eviction_rank();
-            let pending_rank = if self.has_pending_finalize_for_slot(slot) {
-                1
-            } else {
+            let fence_rank = if self.is_mesh_slot_fence_safe(slot) {
                 0
+            } else {
+                1
             };
-            let fence_rank = if fence_safe { 0 } else { 1 };
             let recency_rank = self.mesh_slot_last_used.get(&slot).copied().unwrap_or(0);
-            let candidate = (
-                (fence_rank, protection_rank, pending_rank, recency_rank),
-                slot,
-            );
+            let candidate = ((protection_rank, fence_rank, recency_rank), slot);
             if selected
                 .map(|(cur_rank, cur_slot)| {
                     candidate.0 < cur_rank || (candidate.0 == cur_rank && slot < cur_slot)
@@ -694,58 +529,8 @@ impl ChunkPageAtlas {
         selected.map(|(_, slot)| slot)
     }
 
-    fn has_pending_finalize_for_slot(&self, slot: u32) -> bool {
-        self.pending_mesh_finalize
-            .values()
-            .any(|pending| pending.draw_indirect_index == slot)
-    }
-
-    fn mesh_slot_pressure_breakdown(&self) -> MeshSlotPressureBreakdown {
-        let mut breakdown = MeshSlotPressureBreakdown::default();
-        for &slot in self.chunk_for_mesh_slot.keys() {
-            let fence_safe = self.is_mesh_slot_fence_safe(slot);
-            let reserved = self
-                .queued_mesh_slot_reservations
-                .get(&slot)
-                .copied()
-                .unwrap_or(0)
-                > 0;
-            let pending = self.has_pending_finalize_for_slot(slot);
-            let visible = matches!(
-                self.mesh_slot_protection_hint(slot),
-                PagePriorityHint::Visible
-            );
-
-            if visible {
-                breakdown.visible = breakdown.visible.saturating_add(1);
-            }
-            if pending {
-                breakdown.pending_finalize = breakdown.pending_finalize.saturating_add(1);
-            }
-            if fence_safe && !reserved && !visible && !pending {
-                breakdown.reclaimable_without_fence =
-                    breakdown.reclaimable_without_fence.saturating_add(1);
-            }
-            if fence_safe && (reserved || pending) {
-                breakdown.lifecycle_blocked_without_fence =
-                    breakdown.lifecycle_blocked_without_fence.saturating_add(1);
-            }
-        }
-        breakdown
-    }
-
     fn assert_mesh_slot_chunk_mapping_invariants(&self) {
-        let layout = mesh_layout::validate_gpu_mesh_slice_contract()
-            .expect("gpu mesh slice contract must remain satisfiable while allocator is live");
-        let contract = layout.contract;
-        assert_eq!(
-            self.mesh_slot_capacity_vertex_elements, layout.vertex_slot_capacity_elements,
-            "allocator/validator vertex-slot-capacity contract mismatch"
-        );
-        assert_eq!(
-            self.mesh_slot_capacity_index_elements, layout.index_slot_capacity_elements,
-            "allocator/validator index-slot-capacity contract mismatch"
-        );
+        let contract = mesh_layout::gpu_mesh_slice_contract();
         assert_eq!(
             self.mesh_slice_for_chunk.len(),
             self.chunk_for_mesh_slot.len(),
@@ -813,7 +598,22 @@ impl ChunkPageAtlas {
         let slots_used = self.mesh_slice_for_chunk.len() as u32;
         let vertex_capacity = MeshBufferKind::Vertex.global_capacity_elements();
         let index_capacity = MeshBufferKind::Index.global_capacity_elements();
-        let breakdown = self.mesh_slot_pressure_breakdown();
+        let slots_pending_finalize = self.pending_mesh_finalize.len() as u32;
+        let fence_safe_slots = self
+            .chunk_for_mesh_slot
+            .keys()
+            .filter(|slot| self.is_mesh_slot_fence_safe(**slot))
+            .count() as u32;
+        let reclaimable_without_fence = self
+            .chunk_for_mesh_slot
+            .iter()
+            .filter(|(slot, chunk)| {
+                self.is_mesh_slot_fence_safe(**slot)
+                    && !self.pending_mesh_finalize.contains_key(chunk)
+                    && matches!(self.mesh_slot_protection_hint(**slot), PagePriorityHint::Far)
+            })
+            .count() as u32;
+        let lifecycle_blocked_without_fence = fence_safe_slots.saturating_sub(reclaimable_without_fence);
         MeshPoolTelemetry {
             slot_capacity,
             slots_used,
@@ -845,10 +645,10 @@ impl ChunkPageAtlas {
             } else {
                 slots_used as f32 * 100.0 / slot_capacity as f32
             },
-            slots_visible: breakdown.visible,
-            slots_pending_finalize: breakdown.pending_finalize,
-            reclaimable_without_fence: breakdown.reclaimable_without_fence,
-            lifecycle_blocked_without_fence: breakdown.lifecycle_blocked_without_fence,
+            slots_visible: 0,
+            slots_pending_finalize,
+            reclaimable_without_fence,
+            lifecycle_blocked_without_fence,
         }
     }
 
@@ -861,36 +661,6 @@ impl ChunkPageAtlas {
             .resolve_chunk(page_index)
             .expect("gpu page must resolve to a chunk");
         assert_eq!(resolved, chunk, "gpu page/chunk mapping mismatch");
-    }
-
-    fn stale_queued_task_reason(&self, task: &GpuChunkTask) -> Option<StaleQueuedTaskReason> {
-        let mapped_page = self.page_for_chunk.get(&task.coord).copied();
-        if mapped_page != Some(task.page_index) {
-            return Some(StaleQueuedTaskReason::PageOwnership);
-        }
-
-        if self.page_generation(task.page_index) != task.page_generation {
-            return Some(StaleQueuedTaskReason::PageGeneration);
-        }
-
-        match (task.mesh_slice, task.slot_generation) {
-            (Some(mesh_slice), Some(slot_generation)) => {
-                let mapped_chunk = self
-                    .chunk_for_mesh_slot
-                    .get(&mesh_slice.slot_index)
-                    .copied();
-                if mapped_chunk != Some(task.coord) {
-                    return Some(StaleQueuedTaskReason::SlotOwnership);
-                }
-                if self.slot_generation(mesh_slice.slot_index) != slot_generation {
-                    return Some(StaleQueuedTaskReason::SlotGeneration);
-                }
-                None
-            }
-            (Some(_), None) => Some(StaleQueuedTaskReason::SlotOwnership),
-            (None, Some(_)) => Some(StaleQueuedTaskReason::SlotOwnership),
-            (None, None) => None,
-        }
     }
 
     fn validate_dispatch_ownership(
@@ -944,62 +714,11 @@ impl ChunkPageAtlas {
         for fence in self.page_fences.values_mut() {
             fence.last_completed = fence.last_completed.max(completed);
         }
-        self.reclaim_orphaned_pending_mesh_finalize(completed);
-    }
-
-    fn reclaim_orphaned_pending_mesh_finalize(&mut self, completed: u64) {
-        if self.pending_mesh_finalize.is_empty() {
-            return;
-        }
-
-        let stale = self
-            .pending_mesh_finalize
-            .iter()
-            .filter_map(|(&coord, pending)| {
-                let owner_is_current = self.page_for_chunk.get(&coord).copied()
-                    == Some(pending.page_index)
-                    && self
-                        .mesh_slice_for_chunk
-                        .get(&coord)
-                        .copied()
-                        .map(|slice| slice.slot_index)
-                        == Some(pending.draw_indirect_index);
-                let generations_match = self.page_generation(pending.page_index)
-                    == pending.page_generation
-                    && self.slot_generation(pending.draw_indirect_index) == pending.slot_generation;
-                let too_old = completed.saturating_sub(pending.submission_serial)
-                    > FINALIZE_ORPHAN_SERIAL_GRACE;
-                let fence_clear = self.is_page_fence_complete(pending.page_index);
-                if too_old && fence_clear && (!owner_is_current || !generations_match) {
-                    Some(coord)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for coord in stale {
-            self.pending_mesh_finalize.remove(&coord);
-        }
     }
 
     fn evictable_page(&self) -> Option<GpuPageIndex> {
-        // Queue-aware reservation policy: pages/slots referenced by queued (not-yet-dispatched)
-        // tasks are temporarily non-evictable so ownership cannot be silently reused while those
-        // tasks still carry enqueue-time identity snapshots. Reservations are released on dequeue,
-        // regardless of whether dispatch is skipped as stale or submitted.
         let mut selected: Option<(u8, u64, GpuPageIndex)> = None;
         for &page in self.chunk_for_page.keys() {
-            if self
-                .queued_page_reservations
-                .get(&page)
-                .copied()
-                .unwrap_or(0)
-                > 0
-            {
-                GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             let fence = self.page_fences.get(&page).copied().unwrap_or_default();
             if fence.last_completed < fence.last_submitted {
                 continue;
@@ -1032,14 +751,6 @@ impl ChunkPageAtlas {
     }
 
     fn evict_page(&mut self, page_index: GpuPageIndex) {
-        debug_assert_eq!(
-            self.queued_page_reservations
-                .get(&page_index)
-                .copied()
-                .unwrap_or(0),
-            0,
-            "attempted to evict page with queued reservation"
-        );
         if let Some(chunk) = self.chunk_for_page.remove(&page_index) {
             match self
                 .priority_hint_for_chunk
@@ -1387,10 +1098,7 @@ fn validate_mesh_slice_for_dispatch(
     page_index: GpuPageIndex,
     mesh_slice: MeshBufferSlice,
 ) -> anyhow::Result<()> {
-    let layout = mesh_layout::validate_gpu_mesh_slice_contract()
-        .map_err(anyhow::Error::msg)
-        .context("gpu mesh slice contract")?;
-    let contract = layout.contract;
+    let contract = mesh_layout::gpu_mesh_slice_contract();
     if page_index.0 >= contract.slot_count {
         anyhow::bail!(
             "invalid mesh dispatch page index for {:?}: page={} slot_capacity={}",
@@ -1569,12 +1277,7 @@ pub struct GpuComputeProfilerSnapshot {
     pub chunks_completed: u64,
     pub frontier_cap_events: u64,
     pub mesh_slot_alloc_failed: u64,
-    pub mesh_slot_alloc_failed_lod0: u64,
-    pub mesh_slot_alloc_failed_lod1: u64,
-    pub mesh_slot_alloc_failed_lod2_plus: u64,
     pub mesh_finalize_waiting_on_metadata: u64,
-    pub mesh_finalize_waiting_on_completion_serial: u64,
-    pub mesh_finalize_waiting_on_readback_snapshot: u64,
     pub mesh_finalize_promoted_ready: u64,
     pub mesh_finalize_ownership_invalidations: u64,
     pub mesh_finalize_superseded_results: u64,
@@ -1597,14 +1300,6 @@ pub struct GpuComputeProfilerSnapshot {
     pub finalize_invalid_count: u64,
     pub color_contract_mismatch_count: u64,
     pub zero_or_invalid_mesh_output_count: u64,
-    pub stale_queued_task_count: u64,
-    pub stale_queued_page_drop_count: u64,
-    pub stale_queued_slot_drop_count: u64,
-    pub queue_protected_page_eviction_skip_count: u64,
-    pub queue_protected_slot_eviction_skip_count: u64,
-    pub queue_invalidations_executed_count: u64,
-    pub pending_insert_finalize_identity_removed_count: u64,
-    pub finalize_missing_coord_entry_for_candidate_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1618,12 +1313,6 @@ static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_SLOT_ALLOC_FAILED: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_MESH_SLOT_ALLOC_FAILED_LOD0: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_MESH_SLOT_ALLOC_FAILED_LOD1: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_EVICT_NEAR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1651,10 +1340,6 @@ static GPU_MESH_FINALIZE_REQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_FINALIZE_WAITING_METADATA_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
-static GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
 static GPU_MESH_FINALIZE_PROMOTED_READY_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_FINALIZE_OWNERSHIP_INVALIDATED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1671,8 +1356,6 @@ static GPU_ALLOCATOR_NO_PROGRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_ALLOCATOR_SATURATED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
-static GPU_MESH_CAPACITY_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "gpu-compute")]
 static GPU_CANDIDATE_READY_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_CANDIDATE_FAILED_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -1683,22 +1366,6 @@ static GPU_COLOR_CONTRACT_MISMATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
-static GPU_STALE_QUEUED_TASK_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_STALE_QUEUED_PAGE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_STALE_QUEUED_SLOT_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
 #[cfg(feature = "gpu-compute")]
@@ -1706,83 +1373,69 @@ static GPU_TASK_TX: OnceLock<SyncSender<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
 static GPU_TASK_RX: OnceLock<Mutex<Receiver<GpuChunkTask>>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
-static GPU_TASKS_ENQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_TASK_ENQUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
-static GPU_TASK_ENQUEUE_DISCONNECTED_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "gpu-compute")]
 static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_ENQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuDispatchFrameStats {
     pub tasks_dequeued: usize,
     pub tasks_submitted: usize,
+    pub enqueue_submit_ms: f32,
+    pub wait_sync_ms: f32,
     pub stale_tasks_skipped: usize,
     pub ownership_validation_drops: usize,
     pub meshing_dispatch_failures: usize,
+    pub tasks_without_mesh_slice: usize,
     pub queue_empty_exits: usize,
     pub queue_disconnected_exits: usize,
-    pub tasks_without_mesh_slice: usize,
-    pub enqueue_submit_ms: f32,
-    pub wait_sync_ms: f32,
 }
 
-#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuRuntimeDebugSnapshot {
+    pub mesh_slots_used: usize,
+    pub mesh_slot_capacity: usize,
+    pub mesh_slot_in_flight_fences: usize,
+    pub mesh_vertex_used: usize,
+    pub mesh_vertex_capacity: usize,
+    pub mesh_index_used: usize,
+    pub mesh_index_capacity: usize,
+    pub mesh_largest_free_vertex_span: usize,
+    pub mesh_largest_free_index_span: usize,
+    pub mesh_slots_visible: usize,
+    pub mesh_slots_pending_finalize: usize,
+    pub mesh_slots_reclaimable_without_fence: usize,
+    pub mesh_slots_lifecycle_blocked_without_fence: usize,
+    pub queue_enqueued: usize,
+    pub queue_dequeued: usize,
+    pub queue_rx_backlog: usize,
+}
+
 pub fn gpu_task_rx_backlog_estimate() -> usize {
-    GPU_TASKS_ENQUEUED_COUNT
-        .load(Ordering::Relaxed)
-        .saturating_sub(GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed)) as usize
-}
-
-pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
     #[cfg(not(feature = "gpu-compute"))]
     {
-        GpuRuntimeDebugSnapshot::default()
+        0
     }
 
     #[cfg(feature = "gpu-compute")]
     {
-        let queue_enqueued = GPU_TASKS_ENQUEUED_COUNT.load(Ordering::Relaxed) as usize;
-        let queue_dequeued = GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed) as usize;
-
-        let mut snapshot = GpuRuntimeDebugSnapshot {
-            queue_enqueued,
-            queue_dequeued,
-            queue_rx_backlog: queue_enqueued.saturating_sub(queue_dequeued),
-            ..GpuRuntimeDebugSnapshot::default()
-        };
-
-        if let Some(state) = WORKER_STATE
-            .get()
-            .and_then(|state| state.as_ref().ok().map(Arc::clone))
-        {
-            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            let mesh_pool = atlas.mesh_pool_telemetry();
-            snapshot.mesh_slots_used = mesh_pool.slots_used as usize;
-            snapshot.mesh_slot_capacity = mesh_pool.slot_capacity as usize;
-            snapshot.mesh_slot_in_flight_fences = mesh_pool.in_flight_fences as usize;
-            snapshot.mesh_vertex_used = mesh_pool.vertex_used as usize;
-            snapshot.mesh_vertex_capacity = mesh_pool.vertex_capacity as usize;
-            snapshot.mesh_index_used = mesh_pool.index_used as usize;
-            snapshot.mesh_index_capacity = mesh_pool.index_capacity as usize;
-            snapshot.mesh_largest_free_vertex_span = mesh_pool.largest_free_vertex_span as usize;
-            snapshot.mesh_largest_free_index_span = mesh_pool.largest_free_index_span as usize;
-            snapshot.mesh_slots_visible = mesh_pool.slots_visible as usize;
-            snapshot.mesh_slots_pending_finalize = mesh_pool.slots_pending_finalize as usize;
-            snapshot.mesh_slots_reclaimable_without_fence =
-                mesh_pool.reclaimable_without_fence as usize;
-            snapshot.mesh_slots_lifecycle_blocked_without_fence =
-                mesh_pool.lifecycle_blocked_without_fence as usize;
-        }
-
-        snapshot
+        GPU_TASKS_ENQUEUED_COUNT
+            .load(Ordering::Relaxed)
+            .saturating_sub(GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed)) as usize
     }
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyGpuMeshFinalizeWaitReason {
+    WaitingOnCompletionSerial,
+    WaitingOnReadbackSnapshot,
+    WaitingOnMetadata,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1815,14 +1468,6 @@ pub enum ReadyGpuMeshFinalizeStatus {
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug)]
-pub enum ReadyGpuMeshFinalizeWaitReason {
-    WaitingOnCompletionSerial,
-    WaitingOnReadbackSnapshot,
-    WaitingOnMetadata,
-}
-
-#[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug)]
 pub struct ReadyGpuMeshFinalizeEvent {
     pub result: ReadyGpuMeshResult,
     pub status: ReadyGpuMeshFinalizeStatus,
@@ -1830,35 +1475,10 @@ pub struct ReadyGpuMeshFinalizeEvent {
 }
 
 #[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MissingIndexCountDisposition {
-    WaitOnReadbackSnapshot,
-    WaitOnMetadata,
-    DropInvalidMapping,
-}
-
-#[cfg(feature = "gpu-compute")]
-fn classify_missing_index_count_disposition(
-    snapshot_ready: bool,
-    slot_lookup_valid: bool,
-) -> MissingIndexCountDisposition {
-    if !snapshot_ready {
-        return MissingIndexCountDisposition::WaitOnReadbackSnapshot;
-    }
-
-    if !slot_lookup_valid {
-        return MissingIndexCountDisposition::DropInvalidMapping;
-    }
-
-    MissingIndexCountDisposition::WaitOnMetadata
-}
-
-#[cfg(feature = "gpu-compute")]
 #[derive(Clone)]
 pub struct GpuChunkTask {
     pub coord: ChunkCoord,
     pub page_index: GpuPageIndex,
-    pub page_generation: u64,
     pub frontier_count: u32,
     pub edit_commands: Vec<EditCommand>,
     pub jacobi_iterations: u32,
@@ -1867,7 +1487,6 @@ pub struct GpuChunkTask {
     pub current_state: u32,
     pub startup_seeding_mode: bool,
     pub mesh_slice: Option<MeshBufferSlice>,
-    pub slot_generation: Option<u64>,
     pub version: ChunkVersion,
     pub task_id: u64,
     pub lod: u8,
@@ -1936,12 +1555,6 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
         let frontier_cap_events = GPU_FRONTIER_CAP_EVENTS.swap(0, Ordering::Relaxed);
         let mesh_slot_alloc_failed = GPU_MESH_SLOT_ALLOC_FAILED.swap(0, Ordering::Relaxed);
-        let mesh_slot_alloc_failed_lod0 =
-            GPU_MESH_SLOT_ALLOC_FAILED_LOD0.swap(0, Ordering::Relaxed);
-        let mesh_slot_alloc_failed_lod1 =
-            GPU_MESH_SLOT_ALLOC_FAILED_LOD1.swap(0, Ordering::Relaxed);
-        let mesh_slot_alloc_failed_lod2_plus =
-            GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS.swap(0, Ordering::Relaxed);
         let evict_near_count = GPU_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
         let evict_visible_count = GPU_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
         let evict_far_count = GPU_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
@@ -1953,10 +1566,6 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let mesh_finalize_requeued = GPU_MESH_FINALIZE_REQUEUED_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_waiting_on_metadata =
             GPU_MESH_FINALIZE_WAITING_METADATA_COUNT.swap(0, Ordering::Relaxed);
-        let mesh_finalize_waiting_on_completion_serial =
-            GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT.swap(0, Ordering::Relaxed);
-        let mesh_finalize_waiting_on_readback_snapshot =
-            GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_promoted_ready =
             GPU_MESH_FINALIZE_PROMOTED_READY_COUNT.swap(0, Ordering::Relaxed);
         let mesh_finalize_ownership_invalidations =
@@ -1979,21 +1588,6 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             GPU_COLOR_CONTRACT_MISMATCH_COUNT.swap(0, Ordering::Relaxed);
         let zero_or_invalid_mesh_output_count =
             GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT.swap(0, Ordering::Relaxed);
-        let stale_queued_task_count = GPU_STALE_QUEUED_TASK_COUNT.swap(0, Ordering::Relaxed);
-        let stale_queued_page_drop_count =
-            GPU_STALE_QUEUED_PAGE_DROP_COUNT.swap(0, Ordering::Relaxed);
-        let stale_queued_slot_drop_count =
-            GPU_STALE_QUEUED_SLOT_DROP_COUNT.swap(0, Ordering::Relaxed);
-        let queue_protected_page_eviction_skip_count =
-            GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
-        let queue_protected_slot_eviction_skip_count =
-            GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
-        let queue_invalidations_executed_count =
-            GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.swap(0, Ordering::Relaxed);
-        let pending_insert_finalize_identity_removed_count =
-            GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT.swap(0, Ordering::Relaxed);
-        let finalize_missing_coord_entry_for_candidate_count =
-            GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -2001,12 +1595,7 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             chunks_completed,
             frontier_cap_events,
             mesh_slot_alloc_failed,
-            mesh_slot_alloc_failed_lod0,
-            mesh_slot_alloc_failed_lod1,
-            mesh_slot_alloc_failed_lod2_plus,
             mesh_finalize_waiting_on_metadata,
-            mesh_finalize_waiting_on_completion_serial,
-            mesh_finalize_waiting_on_readback_snapshot,
             mesh_finalize_promoted_ready,
             mesh_finalize_ownership_invalidations,
             mesh_finalize_superseded_results,
@@ -2029,14 +1618,6 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             finalize_invalid_count,
             color_contract_mismatch_count,
             zero_or_invalid_mesh_output_count,
-            stale_queued_task_count,
-            stale_queued_page_drop_count,
-            stale_queued_slot_drop_count,
-            queue_protected_page_eviction_skip_count,
-            queue_protected_slot_eviction_skip_count,
-            queue_invalidations_executed_count,
-            pending_insert_finalize_identity_removed_count,
-            finalize_missing_coord_entry_for_candidate_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -2581,19 +2162,6 @@ pub fn initialize_gpu_compute_worker(
             );
         }
         validate_gpu_vertex_contract().context("gpu mesh vertex host contract")?;
-        let mesh_layout = mesh_layout::validate_gpu_mesh_slice_contract()
-            .map_err(anyhow::Error::msg)
-            .context("gpu mesh slice contract")?;
-        log::info!(
-            "gpu mesh slice contract: slots={} vertex_per_chunk={} index_per_chunk={} vertex_slot_capacity={} index_slot_capacity={} vertex_global_capacity={} index_global_capacity={}",
-            mesh_layout.contract.slot_count,
-            mesh_layout.contract.vertex_elements_per_chunk,
-            mesh_layout.contract.index_elements_per_chunk,
-            mesh_layout.vertex_slot_capacity_elements,
-            mesh_layout.index_slot_capacity_elements,
-            mesh_layout.contract.vertex_global_capacity_elements,
-            mesh_layout.contract.index_global_capacity_elements
-        );
         let runtime = GpuComputeRuntime::new(&device).context("compute runtime")?;
         let page_capacity = MESH_SLOT_COUNT as u64;
         let page_len = CHUNK_VOLUME as u64;
@@ -2755,7 +2323,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
         atlas.assert_page_for_chunk(job.coord, page_index);
-        let page_generation = atlas.page_generation(page_index);
 
         let mesh_slice_outcome = atlas.mesh_slice_for_chunk_or_allocate(job.coord, job.lod as u8);
         let mesh_slice = match mesh_slice_outcome {
@@ -2772,12 +2339,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
                 None
             }
-            MeshSliceAllocateOutcome::ContractUnsatisfiable => {
-                GPU_ALLOCATOR_SATURATED_COUNT.fetch_add(1, Ordering::Relaxed);
-                None
-            }
         };
-        let slot_generation = mesh_slice.map(|slice| atlas.slot_generation(slice.slot_index));
         let mesh_pool_telemetry = atlas.mesh_pool_telemetry();
         let resident_usage = mesh_pool_telemetry
             .vertex_usage_percent
@@ -2800,7 +2362,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         }
 
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
-        atlas.reserve_queued_task_identity(page_index, mesh_slice);
 
         drop(atlas);
 
@@ -2838,48 +2399,29 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             state.runtime_config.max_jacobi_iterations
         };
 
-        // Queue GPU task
-        let task = GpuChunkTask {
-            coord: job.coord,
-            page_index,
-            page_generation,
-            frontier_count: active_frontier_count,
-            edit_commands,
-            jacobi_iterations,
-            neighbor_pages,
-            simulation_tick: tick,
-            current_state,
-            startup_seeding_mode,
-            mesh_slice,
-            slot_generation,
-            version: job.version,
-            task_id: job.task_id,
-            lod: job.lod as u8,
-        };
-
-        match GPU_TASK_TX.get().expect("gpu task queue").try_send(task) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_task)) => {
-                GPU_TASK_ENQUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
-                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.release_queued_task_identity(page_index, mesh_slice);
-                anyhow::bail!(
-                    "gpu task queue full while enqueueing chunk task for {:?} (rx backlog estimate={})",
-                    job.coord,
-                    gpu_task_rx_backlog_estimate()
-                );
-            }
-            Err(TrySendError::Disconnected(_task)) => {
-                GPU_TASK_ENQUEUE_DISCONNECTED_COUNT.fetch_add(1, Ordering::Relaxed);
-                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.release_queued_task_identity(page_index, mesh_slice);
-                anyhow::bail!(
-                    "gpu task queue disconnected while enqueueing chunk task for {:?}",
-                    job.coord
-                );
-            }
+        // Queue GPU work only when there is actual simulation or meshing work to do.
+        if ran_simulation || mesh_slice.is_some() {
+            GPU_TASK_TX
+                .get()
+                .expect("gpu task queue")
+                .try_send(GpuChunkTask {
+                    coord: job.coord,
+                    page_index,
+                    frontier_count: active_frontier_count,
+                    edit_commands,
+                    jacobi_iterations,
+                    neighbor_pages,
+                    simulation_tick: tick,
+                    current_state,
+                    startup_seeding_mode,
+                    mesh_slice,
+                    version: job.version,
+                    task_id: job.task_id,
+                    lod: job.lod as u8,
+                })
+                .context("failed to send GPU chunk task")?;
+            GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
 
         let diagnostics = ChunkSimulationDiagnostics::default();
 
@@ -2921,17 +2463,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     }
                 } else {
                     let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
-                    match job.lod as u8 {
-                        0 => {
-                            GPU_MESH_SLOT_ALLOC_FAILED_LOD0.fetch_add(1, Ordering::Relaxed);
-                        }
-                        1 => {
-                            GPU_MESH_SLOT_ALLOC_FAILED_LOD1.fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {
-                            GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
                     let pressure = mesh_pool_telemetry.slot_usage_percent >= 95.0
                         || mesh_pool_telemetry.vertex_usage_percent >= 95.0
                         || mesh_pool_telemetry.index_usage_percent >= 95.0;
@@ -2943,54 +2474,19 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         GPU_MESH_ALLOCATOR_FRAGMENTATION_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    if !GPU_MESH_CAPACITY_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
-                        let contract = mesh_layout::gpu_mesh_slice_contract();
-                        let vertex_slot_capacity = MeshBufferKind::Vertex.slot_capacity_elements();
-                        let index_slot_capacity = MeshBufferKind::Index.slot_capacity_elements();
-                        log::error!(
-                            "[mesh][capacity] mesh allocation failure: chunk={:?} lod={:?} reason=MeshSlotCapacitySaturated required[v/i]={}/{} slots_used={}/{} in_flight_fences={} per_slot_capacity[v/i]={}/{} total_capacity[v/i]={}/{} largest_free_span[v/i]={}/{} slots_visible={} slots_pending_finalize={} reclaimable_without_fence={} lifecycle_blocked_without_fence={}",
+                    log::debug!(
+                            "[mesh] skipping gpu meshing for {:?}: global mesh pool exhausted slots={}/{} in_flight_fences={} vertex={}/{} index={}/{} largest_free[v/i]={}/{}",
                             job.coord,
-                            job.lod,
-                            contract.vertex_elements_per_chunk,
-                            contract.index_elements_per_chunk,
                             mesh_pool_telemetry.slots_used,
                             mesh_pool_telemetry.slot_capacity,
                             mesh_pool_telemetry.in_flight_fences,
-                            vertex_slot_capacity,
-                            index_slot_capacity,
+                            mesh_pool_telemetry.vertex_used,
                             mesh_pool_telemetry.vertex_capacity,
+                            mesh_pool_telemetry.index_used,
                             mesh_pool_telemetry.index_capacity,
                             mesh_pool_telemetry.largest_free_vertex_span,
                             mesh_pool_telemetry.largest_free_index_span,
-                            mesh_pool_telemetry.slots_visible,
-                            mesh_pool_telemetry.slots_pending_finalize,
-                            mesh_pool_telemetry.reclaimable_without_fence,
-                            mesh_pool_telemetry.lifecycle_blocked_without_fence,
                         );
-                    }
-
-                    log::debug!(
-                        "[mesh] skipping gpu meshing for {:?}: reason=MeshSlotCapacitySaturated lod={:?} required[v/i]={}/{} slots={}/{} in_flight_fences={} per_slot[v/i]={}/{} used[v/i]={}/{} total[v/i]={}/{} largest_free[v/i]={}/{} slots_visible={} slots_pending_finalize={} reclaimable_without_fence={} lifecycle_blocked_without_fence={}",
-                        job.coord,
-                        job.lod,
-                        mesh_layout::MESH_VERTEX_ELEMENTS_PER_CHUNK,
-                        mesh_layout::MESH_INDEX_ELEMENTS_PER_CHUNK,
-                        mesh_pool_telemetry.slots_used,
-                        mesh_pool_telemetry.slot_capacity,
-                        mesh_pool_telemetry.in_flight_fences,
-                        MeshBufferKind::Vertex.slot_capacity_elements(),
-                        MeshBufferKind::Index.slot_capacity_elements(),
-                        mesh_pool_telemetry.vertex_used,
-                        mesh_pool_telemetry.index_used,
-                        mesh_pool_telemetry.vertex_capacity,
-                        mesh_pool_telemetry.index_capacity,
-                        mesh_pool_telemetry.largest_free_vertex_span,
-                        mesh_pool_telemetry.largest_free_index_span,
-                        mesh_pool_telemetry.slots_visible,
-                        mesh_pool_telemetry.slots_pending_finalize,
-                        mesh_pool_telemetry.reclaimable_without_fence,
-                        mesh_pool_telemetry.lifecycle_blocked_without_fence,
-                    );
 
                     ChunkMeshArtifact::Skipped {
                         reason: MeshSkipReason::MeshSlotCapacitySaturated {
@@ -3005,10 +2501,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             largest_free_index_span: mesh_pool_telemetry.largest_free_index_span,
                             slots_visible: mesh_pool_telemetry.slots_visible,
                             slots_pending_finalize: mesh_pool_telemetry.slots_pending_finalize,
-                            reclaimable_without_fence: mesh_pool_telemetry
-                                .reclaimable_without_fence,
-                            lifecycle_blocked_without_fence: mesh_pool_telemetry
-                                .lifecycle_blocked_without_fence,
+                            reclaimable_without_fence: mesh_pool_telemetry.reclaimable_without_fence,
+                            lifecycle_blocked_without_fence: mesh_pool_telemetry.lifecycle_blocked_without_fence,
                         },
                     }
                 }
@@ -3053,41 +2547,11 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 break;
             }
         };
-        GPU_TASKS_DEQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
         stats.tasks_dequeued += 1;
+        GPU_TASKS_DEQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
 
         let task_start = Instant::now();
         let task_wait_sync = Duration::ZERO;
-
-        let stale_reason = {
-            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.stale_queued_task_reason(&task)
-        };
-        if let Some(reason) = stale_reason {
-            {
-                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
-            }
-            GPU_STALE_QUEUED_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
-            match reason {
-                StaleQueuedTaskReason::PageOwnership | StaleQueuedTaskReason::PageGeneration => {
-                    GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                StaleQueuedTaskReason::SlotOwnership | StaleQueuedTaskReason::SlotGeneration => {
-                    GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            stats.stale_tasks_skipped += 1;
-            log::trace!(
-                "[gpu-mesh] stale queued task skipped coord={:?} version={} task_id={} page_index={} reason={:?}",
-                task.coord,
-                task.version,
-                task.task_id,
-                task.page_index.0,
-                reason,
-            );
-            continue;
-        }
 
         let scratch = &state.scratch;
 
@@ -3184,10 +2648,6 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                             err,
                         );
                         stats.ownership_validation_drops += 1;
-                        {
-                            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
-                        }
                         continue;
                     }
                 }
@@ -3221,19 +2681,11 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                             MeshBufferKind::Index.global_size_bytes(),
                             err,
                         );
-                        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                        atlas.pending_mesh_finalize.remove(&task.coord);
-                        atlas.reclaim_chunk_mesh_slot_if_stale(task.coord);
                     }
                 }
             } else {
                 stats.tasks_without_mesh_slice += 1;
             }
-        }
-
-        {
-            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
         }
 
         let serial = GPU_SUBMISSION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3243,9 +2695,6 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             atlas.mark_page_submitted(task.page_index, serial);
             atlas.touch_chunk_page(task.coord);
             if let Some(mesh_slice) = submitted_mesh_slice {
-                // Finalize identity is snapshotted from authoritative atlas ownership state at
-                // submit time, not from queued-task copies, so finalize/adoption checks stay
-                // aligned with post-submit ownership semantics.
                 let page_generation = atlas.page_generation(task.page_index);
                 let slot_generation = atlas.slot_generation(mesh_slice.slot_index);
                 atlas.pending_mesh_finalize.insert(
@@ -3281,6 +2730,41 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
 }
 
 #[cfg(feature = "gpu-compute")]
+pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
+    let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    else {
+        return GpuRuntimeDebugSnapshot::default();
+    };
+    let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = atlas.mesh_pool_telemetry();
+    GpuRuntimeDebugSnapshot {
+        mesh_slots_used: pool.slots_used as usize,
+        mesh_slot_capacity: pool.slot_capacity as usize,
+        mesh_slot_in_flight_fences: pool.in_flight_fences as usize,
+        mesh_vertex_used: pool.vertex_used as usize,
+        mesh_vertex_capacity: pool.vertex_capacity as usize,
+        mesh_index_used: pool.index_used as usize,
+        mesh_index_capacity: pool.index_capacity as usize,
+        mesh_largest_free_vertex_span: pool.largest_free_vertex_span as usize,
+        mesh_largest_free_index_span: pool.largest_free_index_span as usize,
+        mesh_slots_visible: pool.slots_visible as usize,
+        mesh_slots_pending_finalize: pool.slots_pending_finalize as usize,
+        mesh_slots_reclaimable_without_fence: pool.reclaimable_without_fence as usize,
+        mesh_slots_lifecycle_blocked_without_fence: pool.lifecycle_blocked_without_fence as usize,
+        queue_enqueued: GPU_TASKS_ENQUEUED_COUNT.load(Ordering::Relaxed) as usize,
+        queue_dequeued: GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed) as usize,
+        queue_rx_backlog: gpu_task_rx_backlog_estimate(),
+    }
+}
+
+#[cfg(not(feature = "gpu-compute"))]
+pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
+    GpuRuntimeDebugSnapshot::default()
+}
+
+#[cfg(feature = "gpu-compute")]
 pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEvent> {
     let Some(Ok(state)) = WORKER_STATE
         .get()
@@ -3300,6 +2784,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let candidates = {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         atlas.refresh_completed_serial(completed);
+
         atlas
             .pending_mesh_finalize
             .iter()
@@ -3314,40 +2799,31 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         Ordering::Relaxed,
     );
 
-    let (snapshot_ready, index_counts) = {
+    let finalize_probe = {
         let mut readback = state
             .draw_indirect_readback
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         readback.try_collect();
         readback.request_snapshot_if_needed(state, completed);
-
-        let snapshot_ready = candidates
+        candidates
             .iter()
             .map(|candidate| {
-                candidate.pending.submission_serial <= completed
-                    && readback.has_snapshot_for(candidate.pending.submission_serial)
-            })
-            .collect::<Vec<_>>();
-        let index_counts = candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, candidate)| {
-                if !snapshot_ready[idx] {
-                    None
-                } else {
+                let completed_ready = candidate.pending.submission_serial <= completed;
+                let snapshot_ready = readback.has_snapshot_for(candidate.pending.submission_serial);
+                let index_count = if snapshot_ready {
                     readback.index_count_for_slot(candidate.pending.draw_indirect_index)
-                }
+                } else {
+                    None
+                };
+                (completed_ready, snapshot_ready, index_count)
             })
-            .collect::<Vec<_>>();
-        (snapshot_ready, index_counts)
+            .collect::<Vec<_>>()
     };
 
     let mut out = Vec::with_capacity(candidates.len());
     let mut finalized_count = 0u64;
     let mut requeued_count = 0u64;
-    let mut waiting_completion_serial_count = 0u64;
-    let mut waiting_readback_snapshot_count = 0u64;
     let mut waiting_metadata_count = 0u64;
     let mut promoted_ready_count = 0u64;
     let mut ownership_invalidations = 0u64;
@@ -3359,11 +2835,17 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let phase3_lock_start = Instant::now();
     {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        for ((candidate, snapshot_ready), index_count) in candidates
-            .into_iter()
-            .zip(snapshot_ready.into_iter())
-            .zip(index_counts.into_iter())
-        {
+        for (candidate, (completed_ready, snapshot_ready, index_count)) in candidates.into_iter().zip(finalize_probe.into_iter()) {
+            let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
+            else {
+                continue;
+            };
+            if current_pending != candidate.pending {
+                requeued_count += 1;
+                superseded_count += 1;
+                continue;
+            }
+
             let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(candidate.coord);
             let result = ReadyGpuMeshResult {
                 coord: candidate.coord,
@@ -3381,40 +2863,21 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 chunk_origin_world,
             };
 
-            let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
-            else {
-                GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT
-                    .fetch_add(1, Ordering::Relaxed);
-                log::warn!(
-                    "[gpu-mesh] finalize_missing_coord_entry coord={:?} version={} task_id={} lod={} page={} draw_slot={} serial={}",
-                    candidate.coord,
-                    candidate.pending.version,
-                    candidate.pending.task_id,
-                    candidate.pending.lod,
-                    candidate.pending.page_index.0,
-                    candidate.pending.draw_indirect_index,
-                    candidate.pending.submission_serial,
-                );
+            if !completed_ready {
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
-                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
-                    wait_reason: None,
+                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                    wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial),
                 });
-                finalized_count += 1;
-                superseded_count += 1;
-                candidate_failed_count += 1;
                 continue;
-            };
-            if current_pending != candidate.pending {
+            }
+
+            if !snapshot_ready {
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
-                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
-                    wait_reason: None,
+                    status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
+                    wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot),
                 });
-                finalized_count += 1;
-                requeued_count += 1;
-                superseded_count += 1;
-                candidate_failed_count += 1;
                 continue;
             }
 
@@ -3422,7 +2885,6 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 != Some(candidate.pending.version.get())
             {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
-                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
@@ -3450,7 +2912,6 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 
             if !ownership_valid {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
-                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -3462,58 +2923,28 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 continue;
             }
 
-            if candidate.pending.submission_serial > completed {
+            let Some(index_count) = result.index_count else {
+                waiting_metadata_count += 1;
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
-                    wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial),
+                    wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata),
                 });
-                waiting_completion_serial_count += 1;
-                continue;
-            }
-
-            let Some(index_count) = result.index_count else {
-                match classify_missing_index_count_disposition(
-                    snapshot_ready,
-                    (candidate.pending.draw_indirect_index as usize) < MESH_SLOT_COUNT as usize,
-                ) {
-                    MissingIndexCountDisposition::WaitOnReadbackSnapshot => {
-                        out.push(ReadyGpuMeshFinalizeEvent {
-                            result,
-                            status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
-                            wait_reason: Some(
-                                ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot,
-                            ),
-                        });
-                        waiting_readback_snapshot_count += 1;
-                    }
-                    MissingIndexCountDisposition::WaitOnMetadata => {
-                        out.push(ReadyGpuMeshFinalizeEvent {
-                            result,
-                            status: ReadyGpuMeshFinalizeStatus::NotReadyYet,
-                            wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata),
-                        });
-                        waiting_metadata_count += 1;
-                    }
-                    MissingIndexCountDisposition::DropInvalidMapping => {
-                        atlas.pending_mesh_finalize.remove(&candidate.coord);
-                        atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
-                        out.push(ReadyGpuMeshFinalizeEvent {
-                            result,
-                            status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
-                            wait_reason: None,
-                        });
-                        finalized_count += 1;
-                        candidate_failed_count += 1;
-                        finalize_invalid_count += 1;
-                    }
-                }
                 continue;
             };
 
             if index_count == 0 {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
-                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
+                log::debug!(
+                    "[gpu-mesh] finalize_invalid_output coord={:?} version={} task_id={} page={} slot={} serial={} lod={} reason=zero_index_count",
+                    result.coord,
+                    result.version,
+                    result.task_id,
+                    result.page_index.0,
+                    result.draw_indirect_index,
+                    result.submission_serial,
+                    result.lod,
+                );
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -3543,10 +2974,6 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     );
     GPU_MESH_FINALIZE_COUNT.fetch_add(finalized_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_REQUEUED_COUNT.fetch_add(requeued_count, Ordering::Relaxed);
-    GPU_MESH_FINALIZE_WAITING_COMPLETION_SERIAL_COUNT
-        .fetch_add(waiting_completion_serial_count, Ordering::Relaxed);
-    GPU_MESH_FINALIZE_WAITING_READBACK_SNAPSHOT_COUNT
-        .fetch_add(waiting_readback_snapshot_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_WAITING_METADATA_COUNT.fetch_add(waiting_metadata_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_PROMOTED_READY_COUNT.fetch_add(promoted_ready_count, Ordering::Relaxed);
     GPU_MESH_FINALIZE_OWNERSHIP_INVALIDATED_COUNT
@@ -3559,6 +2986,79 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
         .fetch_add(zero_or_invalid_mesh_output_count, Ordering::Relaxed);
 
     out
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn invalidate_gpu_pending_finalize_on_renderer(
+    coord: ChunkCoord,
+    requested_version: Option<u64>,
+    reason: &'static str,
+) {
+    if let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+            log::debug!(
+                "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                reason,
+                coord,
+                pending.version,
+                pending.lod,
+                pending.page_index.0,
+                pending.draw_indirect_index,
+                pending.submission_serial,
+                requested_version,
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu-compute"))]
+pub fn invalidate_gpu_pending_finalize_on_renderer(
+    _coord: ChunkCoord,
+    _requested_version: Option<u64>,
+    _reason: &'static str,
+) {
+}
+
+pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
+    coord: ChunkCoord,
+    requested_version: Option<u64>,
+    reason: &'static str,
+    preserve_gpu_finalize_identity: bool,
+) {
+    if let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    {
+        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !preserve_gpu_finalize_identity {
+            if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+                log::debug!(
+                    "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                    reason,
+                    coord,
+                    pending.version,
+                    pending.lod,
+                    pending.page_index.0,
+                    pending.draw_indirect_index,
+                    pending.submission_serial,
+                    requested_version,
+                );
+            }
+        }
+
+        if let Some(page) = atlas.page_for_chunk.get(&coord).copied() {
+            atlas.bump_page_generation(page);
+        }
+
+        if let Some(slice) = atlas.mesh_slice_for_chunk.get(&coord).copied() {
+            atlas.bump_mesh_slot_generation(slice.slot_index);
+        }
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -3576,109 +3076,25 @@ pub fn renderer_pending_finalize_identity_exists(
     else {
         return false;
     };
-
     let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(pending) = atlas.pending_mesh_finalize.get(&coord).copied() else {
-        return false;
-    };
-    pending.version == version
-        && pending.task_id == task_id
-        && pending.lod == lod
-        && pending.page_index == page_index
-        && pending.draw_indirect_index == draw_indirect_index
-}
-
-#[cfg(feature = "gpu-compute")]
-pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
-    coord: ChunkCoord,
-    requested_version: Option<u64>,
-    reason: &'static str,
-    preserve_pending_finalize_identity: bool,
-) {
-    if let Some(Ok(state)) = WORKER_STATE
-        .get()
-        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
-    {
-        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        if preserve_pending_finalize_identity {
-            log::debug!(
-                "[gpu-mesh] preserve_pending_finalize_identity reason={} coord={:?} requested_version={:?}",
-                reason,
-                coord,
-                requested_version,
-            );
-        } else if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
-            atlas.reclaim_chunk_mesh_slot_if_stale(coord);
-            if reason == "pending_result_insert" {
-                GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT.fetch_add(1, Ordering::Relaxed);
-                log::error!(
-                    "[gpu-mesh] pending_insert_removed_finalize_identity coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
-                    coord,
-                    pending.version,
-                    pending.lod,
-                    pending.page_index.0,
-                    pending.draw_indirect_index,
-                    pending.submission_serial,
-                    requested_version,
-                );
-            } else {
-                log::debug!(
-                    "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
-                    reason,
-                    coord,
-                    pending.version,
-                    pending.lod,
-                    pending.page_index.0,
-                    pending.draw_indirect_index,
-                    pending.submission_serial,
-                    requested_version,
-                );
-            }
-        }
-
-        if !preserve_pending_finalize_identity {
-            if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
-                let old_page_generation = atlas.page_generation(page_index);
-                let new_page_generation = atlas.bump_page_generation(page_index);
-
-                let slot_generation = atlas
-                    .mesh_slice_for_chunk
-                    .get(&coord)
-                    .map(|slice| (slice.slot_index, atlas.slot_generation(slice.slot_index)))
-                    .map(|(slot_index, old_generation)| {
-                        (
-                            slot_index,
-                            old_generation,
-                            atlas.bump_mesh_slot_generation(slot_index),
-                        )
-                    });
-
-                GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.fetch_add(1, Ordering::Relaxed);
-                log::debug!(
-                "[gpu-mesh] invalidate_queued_tasks reason={} coord={:?} requested_version={:?} page={} page_generation={}=>{} slot={:?} slot_generation={:?}",
-                reason,
-                coord,
-                requested_version,
-                page_index.0,
-                old_page_generation,
-                new_page_generation,
-                slot_generation.map(|(slot_index, _, _)| slot_index),
-                slot_generation.map(|(_, old_generation, new_generation)| {
-                    (old_generation, new_generation)
-                }),
-            );
-            }
-        }
-    }
+    matches!(atlas.pending_mesh_finalize.get(&coord), Some(pending)
+        if pending.version == version
+            && pending.task_id == task_id
+            && pending.lod == lod
+            && pending.page_index == page_index
+            && pending.draw_indirect_index == draw_indirect_index)
 }
 
 #[cfg(not(feature = "gpu-compute"))]
-pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
+pub fn renderer_pending_finalize_identity_exists(
     _coord: ChunkCoord,
-    _requested_version: Option<u64>,
-    _reason: &'static str,
-    _preserve_pending_finalize_identity: bool,
-) {
+    _version: ChunkVersion,
+    _lod: u8,
+    _task_id: u64,
+    _page_index: GpuPageIndex,
+    _draw_indirect_index: u32,
+) -> bool {
+    false
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -3925,8 +3341,6 @@ pub(crate) fn cpu_generate_material_field(job: &MeshJob) -> ComputedChunkArtifac
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "gpu-compute")]
-    use super::{classify_missing_index_count_disposition, MissingIndexCountDisposition};
     use super::{ChunkPageAtlas, MeshSliceAllocateOutcome, MESH_SLOT_COUNT};
     use crate::chunk_store::ChunkStore;
     use crate::engine::world::ChunkVersion;
@@ -4009,34 +3423,6 @@ mod tests {
 
     #[cfg(feature = "gpu-compute")]
     #[test]
-    fn missing_index_count_snapshot_ready_with_invalid_slot_drops_mapping() {
-        let disposition = classify_missing_index_count_disposition(true, false);
-        assert_eq!(
-            disposition,
-            MissingIndexCountDisposition::DropInvalidMapping,
-            "snapshot-ready + invalid slot lookup must terminally drop, not remain pending"
-        );
-    }
-
-    #[cfg(feature = "gpu-compute")]
-    #[test]
-    fn missing_index_count_snapshot_ready_with_valid_slot_waits_on_metadata() {
-        let disposition = classify_missing_index_count_disposition(true, true);
-        assert_eq!(disposition, MissingIndexCountDisposition::WaitOnMetadata);
-    }
-
-    #[cfg(feature = "gpu-compute")]
-    #[test]
-    fn missing_index_count_snapshot_not_ready_waits_on_snapshot() {
-        let disposition = classify_missing_index_count_disposition(false, false);
-        assert_eq!(
-            disposition,
-            MissingIndexCountDisposition::WaitOnReadbackSnapshot
-        );
-    }
-
-    #[cfg(feature = "gpu-compute")]
-    #[test]
     fn reusing_slot_evicts_previous_owner_before_reallocation() {
         let mut atlas = ChunkPageAtlas::default();
         let owner_a = ChunkCoord { x: 0, y: 0, z: 0 };
@@ -4065,39 +3451,5 @@ mod tests {
             atlas.chunk_for_mesh_slot.len()
         );
         atlas.assert_mesh_slot_chunk_mapping_invariants();
-    }
-
-    #[cfg(feature = "gpu-compute")]
-    #[test]
-    fn stale_chunk_slot_is_reclaimed_when_not_visible() {
-        let mut atlas = ChunkPageAtlas::default();
-        let chunk = ChunkCoord { x: 2, y: 0, z: 0 };
-        let other = ChunkCoord { x: 3, y: 0, z: 0 };
-
-        let _ = atlas.page_for_chunk_or_allocate(chunk).expect("page");
-        let _ = atlas.page_for_chunk_or_allocate(other).expect("other page");
-        let slice = match atlas.mesh_slice_for_chunk_or_allocate(chunk, 0) {
-            MeshSliceAllocateOutcome::Success(slice) => slice,
-            other => panic!("expected allocation success, got {other:?}"),
-        };
-
-        atlas.pending_mesh_finalize.insert(
-            chunk,
-            super::PendingGpuMeshFinalize {
-                version: ChunkVersion(1),
-                task_id: 1,
-                lod: 0,
-                page_index: *atlas.page_for_chunk.get(&chunk).unwrap(),
-                draw_indirect_index: slice.slot_index,
-                page_generation: atlas.page_generation(*atlas.page_for_chunk.get(&chunk).unwrap()),
-                slot_generation: atlas.slot_generation(slice.slot_index),
-                submission_serial: 1,
-            },
-        );
-
-        assert!(!atlas.reclaim_chunk_mesh_slot_if_stale(chunk));
-        atlas.pending_mesh_finalize.remove(&chunk);
-        assert!(atlas.reclaim_chunk_mesh_slot_if_stale(chunk));
-        assert!(!atlas.mesh_slice_for_chunk.contains_key(&chunk));
     }
 }
