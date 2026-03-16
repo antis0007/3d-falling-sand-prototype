@@ -2745,6 +2745,10 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.mesh_pending_promoted_to_drawable;
                         ui.profiler.mesh_pending_waiting_on_fence =
                             mesh_stats.mesh_waiting_on_fence;
+                        ui.profiler.mesh_pending_waiting_on_readback_snapshot =
+                            mesh_stats.mesh_waiting_on_readback_snapshot;
+                        ui.profiler.mesh_pending_waiting_on_metadata =
+                            mesh_stats.mesh_waiting_on_metadata;
                         ui.profiler.mesh_pending_superseded = mesh_stats.mesh_pending_superseded;
                         ui.profiler.mesh_pending_rejected = mesh_stats.mesh_pending_rejected;
                         ui.profiler.mesh_completed_receive_budget_hits = mesh_stats.completed_receive_budget_hits;
