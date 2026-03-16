@@ -2751,6 +2751,8 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.mesh_waiting_on_metadata;
                         ui.profiler.mesh_pending_waiting_reason_unset =
                             mesh_stats.mesh_waiting_reason_unset;
+                        ui.profiler.mesh_pending_wait_reason_unset_stalled =
+                            mesh_stats.pending_finalize_wait_reason_unset_stalled;
                         ui.profiler.mesh_pending_superseded = mesh_stats.mesh_pending_superseded;
                         ui.profiler.mesh_pending_rejected = mesh_stats.mesh_pending_rejected;
                         ui.profiler.mesh_completed_receive_budget_hits = mesh_stats.completed_receive_budget_hits;
@@ -2764,6 +2766,22 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.mesh_pending_finalize_age_max = mesh_stats.pending_finalize_age_frames_max;
                         ui.profiler.mesh_pending_finalize_age_p50 = mesh_stats.pending_finalize_age_frames_p50;
                         ui.profiler.mesh_pending_finalize_age_p95 = mesh_stats.pending_finalize_age_frames_p95;
+                        ui.profiler.mesh_pending_insert_finalize_identity_invalidated =
+                            mesh_stats.pending_insert_finalize_identity_invalidated;
+                        ui.profiler.mesh_pending_missing_finalize_identity =
+                            mesh_stats.pending_missing_finalize_identity;
+                        ui.profiler.mesh_finalize_status_not_ready_yet =
+                            mesh_stats.finalize_status_not_ready_yet;
+                        ui.profiler.mesh_finalize_status_ready_and_valid =
+                            mesh_stats.finalize_status_ready_and_valid;
+                        ui.profiler.mesh_finalize_status_dropped_stale_version =
+                            mesh_stats.finalize_status_dropped_stale_version;
+                        ui.profiler.mesh_finalize_status_dropped_invalid_mapping =
+                            mesh_stats.finalize_status_dropped_invalid_mapping;
+                        ui.profiler.mesh_finalize_status_dropped_superseded_identity =
+                            mesh_stats.finalize_status_dropped_superseded_identity;
+                        ui.profiler.mesh_finalize_ready_not_promoted =
+                            mesh_stats.finalize_ready_not_promoted;
                         ui.profiler.mesh_drawable_filtered_under_load = mesh_stats.mesh_drawable_filtered_under_load;
                         ui.profiler.mesh_reject_stale = mesh_stats.mesh_reject_stale;
                         ui.profiler.mesh_reject_invalid_page = mesh_stats.mesh_reject_invalid_page;
@@ -2792,6 +2810,13 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.profiler.gpu_mesh_slot_capacity = mesh_stats.gpu_mesh_slot_capacity;
                         ui.profiler.gpu_mesh_slot_in_flight_fences =
                             mesh_stats.gpu_mesh_slot_in_flight_fences;
+                        ui.profiler.gpu_mesh_slots_visible = mesh_stats.mesh_slot_pressure_visible;
+                        ui.profiler.gpu_mesh_slots_pending_finalize =
+                            mesh_stats.mesh_slot_pressure_pending_finalize;
+                        ui.profiler.gpu_mesh_slots_reclaimable_without_fence =
+                            mesh_stats.mesh_slot_pressure_reclaimable_no_fence;
+                        ui.profiler.gpu_mesh_slots_lifecycle_blocked_without_fence =
+                            mesh_stats.mesh_slot_pressure_lifecycle_blocked_no_fence;
                         ui.profiler.gpu_mesh_vertex_used = mesh_stats.gpu_mesh_vertex_used;
                         ui.profiler.gpu_mesh_vertex_capacity = mesh_stats.gpu_mesh_vertex_capacity;
                         ui.profiler.gpu_mesh_index_used = mesh_stats.gpu_mesh_index_used;

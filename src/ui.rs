@@ -65,6 +65,7 @@ pub struct ProfilerStats {
     pub mesh_pending_waiting_on_readback_snapshot: usize,
     pub mesh_pending_waiting_on_metadata: usize,
     pub mesh_pending_waiting_reason_unset: usize,
+    pub mesh_pending_wait_reason_unset_stalled: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
     pub mesh_completed_receive_budget_hits: usize,
@@ -78,6 +79,14 @@ pub struct ProfilerStats {
     pub mesh_pending_finalize_age_max: u64,
     pub mesh_pending_finalize_age_p50: u64,
     pub mesh_pending_finalize_age_p95: u64,
+    pub mesh_pending_insert_finalize_identity_invalidated: usize,
+    pub mesh_pending_missing_finalize_identity: usize,
+    pub mesh_finalize_status_not_ready_yet: usize,
+    pub mesh_finalize_status_ready_and_valid: usize,
+    pub mesh_finalize_status_dropped_stale_version: usize,
+    pub mesh_finalize_status_dropped_invalid_mapping: usize,
+    pub mesh_finalize_status_dropped_superseded_identity: usize,
+    pub mesh_finalize_ready_not_promoted: usize,
     pub mesh_drawable_filtered_under_load: usize,
     pub mesh_reject_stale: usize,
     pub mesh_reject_invalid_page: usize,
@@ -168,6 +177,10 @@ pub struct ProfilerStats {
     pub gpu_mesh_slots_used: usize,
     pub gpu_mesh_slot_capacity: usize,
     pub gpu_mesh_slot_in_flight_fences: usize,
+    pub gpu_mesh_slots_visible: usize,
+    pub gpu_mesh_slots_pending_finalize: usize,
+    pub gpu_mesh_slots_reclaimable_without_fence: usize,
+    pub gpu_mesh_slots_lifecycle_blocked_without_fence: usize,
     pub gpu_mesh_vertex_used: usize,
     pub gpu_mesh_vertex_capacity: usize,
     pub gpu_mesh_index_used: usize,
@@ -1039,11 +1052,15 @@ pub fn draw(
                     ui_state.profiler.mesh_pending_rejected,
                 ));
                 ui.monospace(format!(
-                    "pending waits completion-serial/readback-snapshot/metadata/wait-unset: {}/{}/{}/{}",
+                    "pending waits serial/readback/metadata/unset: {}/{}/{}/{}",
                     ui_state.profiler.mesh_pending_waiting_on_fence,
                     ui_state.profiler.mesh_pending_waiting_on_readback_snapshot,
                     ui_state.profiler.mesh_pending_waiting_on_metadata,
                     ui_state.profiler.mesh_pending_waiting_reason_unset,
+                ));
+                ui.monospace(format!(
+                    "pending wait-unset stalled (>=120f): {}",
+                    ui_state.profiler.mesh_pending_wait_reason_unset_stalled,
                 ));
                 ui.monospace(format!(
                     "bookkeeping budget hits recv/finalize/adopt/retry: {}/{}/{}/{}",
@@ -1064,6 +1081,20 @@ pub fn draw(
                     ui_state.profiler.mesh_pending_finalize_age_p50,
                     ui_state.profiler.mesh_pending_finalize_age_p95,
                     ui_state.profiler.mesh_pending_finalize_age_max,
+                ));
+                ui.monospace(format!(
+                    "finalize status not-ready/ready/stale/map/superseded: {}/{}/{}/{}/{}",
+                    ui_state.profiler.mesh_finalize_status_not_ready_yet,
+                    ui_state.profiler.mesh_finalize_status_ready_and_valid,
+                    ui_state.profiler.mesh_finalize_status_dropped_stale_version,
+                    ui_state.profiler.mesh_finalize_status_dropped_invalid_mapping,
+                    ui_state.profiler.mesh_finalize_status_dropped_superseded_identity,
+                ));
+                ui.monospace(format!(
+                    "finalize handshake invalidated-insert/missing-identity/ready-not-promoted: {}/{}/{}",
+                    ui_state.profiler.mesh_pending_insert_finalize_identity_invalidated,
+                    ui_state.profiler.mesh_pending_missing_finalize_identity,
+                    ui_state.profiler.mesh_finalize_ready_not_promoted,
                 ));
                 ui.monospace(format!(
                     "reject reasons stale/invalid-page/zero-index/failed/unhandled | zero-index soft-retries: {}/{}/{}/{}/{} | {}",
@@ -1252,6 +1283,13 @@ pub fn draw(
                     ui_state.profiler.gpu_mesh_slots_used,
                     ui_state.profiler.gpu_mesh_slot_capacity,
                     ui_state.profiler.gpu_mesh_slot_in_flight_fences,
+                ));
+                ui.monospace(format!(
+                    "slot pressure visible/pending-finalize/reclaimable/lifecycle-blocked: {}/{}/{}/{}",
+                    ui_state.profiler.gpu_mesh_slots_visible,
+                    ui_state.profiler.gpu_mesh_slots_pending_finalize,
+                    ui_state.profiler.gpu_mesh_slots_reclaimable_without_fence,
+                    ui_state.profiler.gpu_mesh_slots_lifecycle_blocked_without_fence,
                 ));
                 ui.monospace(format!(
                     "gpu mesh pool vertex used/capacity: {}/{} | index used/capacity: {}/{} | largest free spans v/i: {}/{}",

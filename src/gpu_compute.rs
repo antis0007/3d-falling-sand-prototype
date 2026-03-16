@@ -258,6 +258,10 @@ pub struct GpuRuntimeDebugSnapshot {
     pub mesh_index_capacity: usize,
     pub mesh_largest_free_vertex_span: usize,
     pub mesh_largest_free_index_span: usize,
+    pub mesh_slots_visible: usize,
+    pub mesh_slots_pending_finalize: usize,
+    pub mesh_slots_reclaimable_without_fence: usize,
+    pub mesh_slots_lifecycle_blocked_without_fence: usize,
     pub queue_enqueued: usize,
     pub queue_dequeued: usize,
     pub queue_rx_backlog: usize,
@@ -1769,6 +1773,12 @@ pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
             snapshot.mesh_index_capacity = mesh_pool.index_capacity as usize;
             snapshot.mesh_largest_free_vertex_span = mesh_pool.largest_free_vertex_span as usize;
             snapshot.mesh_largest_free_index_span = mesh_pool.largest_free_index_span as usize;
+            snapshot.mesh_slots_visible = mesh_pool.slots_visible as usize;
+            snapshot.mesh_slots_pending_finalize = mesh_pool.slots_pending_finalize as usize;
+            snapshot.mesh_slots_reclaimable_without_fence =
+                mesh_pool.reclaimable_without_fence as usize;
+            snapshot.mesh_slots_lifecycle_blocked_without_fence =
+                mesh_pool.lifecycle_blocked_without_fence as usize;
         }
 
         snapshot
@@ -2993,6 +3003,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             index_capacity: mesh_pool_telemetry.index_capacity,
                             largest_free_vertex_span: mesh_pool_telemetry.largest_free_vertex_span,
                             largest_free_index_span: mesh_pool_telemetry.largest_free_index_span,
+                            slots_visible: mesh_pool_telemetry.slots_visible,
+                            slots_pending_finalize: mesh_pool_telemetry.slots_pending_finalize,
+                            reclaimable_without_fence: mesh_pool_telemetry
+                                .reclaimable_without_fence,
+                            lifecycle_blocked_without_fence: mesh_pool_telemetry
+                                .lifecycle_blocked_without_fence,
                         },
                     }
                 }

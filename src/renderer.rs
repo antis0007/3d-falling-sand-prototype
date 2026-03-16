@@ -810,6 +810,10 @@ pub struct MeshRebuildStats {
     pub resident_unknown: usize,
     pub mesh_reject_no_longer_desired: usize,
     pub mesh_slot_allocation_failures: usize,
+    pub mesh_slot_pressure_visible: usize,
+    pub mesh_slot_pressure_pending_finalize: usize,
+    pub mesh_slot_pressure_reclaimable_no_fence: usize,
+    pub mesh_slot_pressure_lifecycle_blocked_no_fence: usize,
     pub mesh_pending_total: usize,
     pub mesh_pending_finalize: usize,
     pub mesh_pending_promoted_to_drawable: usize,
@@ -825,8 +829,17 @@ pub struct MeshRebuildStats {
     pub pending_finalize_waiting_on_readback_snapshot: usize,
     pub pending_finalize_waiting_on_metadata: usize,
     pub pending_finalize_waiting_reason_unset: usize,
+    pub pending_finalize_wait_reason_unset_stalled: usize,
     pub pending_finalize_aged_out: usize,
     pub pending_finalize_orphan_timed_out: usize,
+    pub pending_insert_finalize_identity_invalidated: usize,
+    pub pending_missing_finalize_identity: usize,
+    pub finalize_status_not_ready_yet: usize,
+    pub finalize_status_ready_and_valid: usize,
+    pub finalize_status_dropped_stale_version: usize,
+    pub finalize_status_dropped_invalid_mapping: usize,
+    pub finalize_status_dropped_superseded_identity: usize,
+    pub finalize_ready_not_promoted: usize,
     pub terminal_superseded_total: usize,
     pub terminal_evicted_total: usize,
     pub mesh_pending_superseded: usize,
@@ -991,6 +1004,7 @@ const PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES: u64 = 480;
 const PENDING_GPU_FINALIZE_MAX_REVISITS: u32 = 240;
 const PENDING_GPU_FINALIZE_ORPHAN_MAX_WAIT_FRAMES: u64 = 120;
 const PENDING_GPU_FINALIZE_WAIT_REASON_UNSET_MAX_REVISITS: u32 = 8;
+const PENDING_GPU_FINALIZE_WAIT_REASON_UNSET_STALL_FRAMES: u64 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -1451,6 +1465,10 @@ pub(crate) enum MeshSkipReason {
         index_capacity: u32,
         largest_free_vertex_span: u32,
         largest_free_index_span: u32,
+        slots_visible: u32,
+        slots_pending_finalize: u32,
+        reclaimable_without_fence: u32,
+        lifecycle_blocked_without_fence: u32,
     },
     ZeroGeometry,
     StartupZeroGeometry,
@@ -2618,6 +2636,13 @@ impl Renderer {
             stats.gpu_mesh_slots_used = runtime_snapshot.mesh_slots_used;
             stats.gpu_mesh_slot_capacity = runtime_snapshot.mesh_slot_capacity;
             stats.gpu_mesh_slot_in_flight_fences = runtime_snapshot.mesh_slot_in_flight_fences;
+            stats.mesh_slot_pressure_visible = runtime_snapshot.mesh_slots_visible;
+            stats.mesh_slot_pressure_pending_finalize =
+                runtime_snapshot.mesh_slots_pending_finalize;
+            stats.mesh_slot_pressure_reclaimable_no_fence =
+                runtime_snapshot.mesh_slots_reclaimable_without_fence;
+            stats.mesh_slot_pressure_lifecycle_blocked_no_fence =
+                runtime_snapshot.mesh_slots_lifecycle_blocked_without_fence;
             stats.gpu_mesh_vertex_used = runtime_snapshot.mesh_vertex_used;
             stats.gpu_mesh_vertex_capacity = runtime_snapshot.mesh_vertex_capacity;
             stats.gpu_mesh_index_used = runtime_snapshot.mesh_index_used;
@@ -2669,7 +2694,8 @@ impl Renderer {
         for (completed_index, result) in completed_results.into_iter().enumerate() {
             if let ChunkMeshArtifact::GpuPending { .. } = &result.artifact {
                 stats.mesh_pending_finalize += 1;
-                self.queue_pending_gpu_result_for_finalize(result, completed_index);
+                stats.pending_insert_finalize_identity_invalidated +=
+                    self.queue_pending_gpu_result_for_finalize(result, completed_index);
                 continue;
             }
 
@@ -2788,6 +2814,10 @@ impl Renderer {
                         index_capacity,
                         largest_free_vertex_span,
                         largest_free_index_span,
+                        slots_visible,
+                        slots_pending_finalize,
+                        reclaimable_without_fence,
+                        lifecycle_blocked_without_fence,
                     } = reason
                     {
                         stats.gpu_mesh_slot_capacity = *slot_capacity as usize;
@@ -2800,6 +2830,13 @@ impl Renderer {
                         stats.gpu_mesh_largest_free_vertex_span =
                             *largest_free_vertex_span as usize;
                         stats.gpu_mesh_largest_free_index_span = *largest_free_index_span as usize;
+                        stats.mesh_slot_pressure_visible = *slots_visible as usize;
+                        stats.mesh_slot_pressure_pending_finalize =
+                            *slots_pending_finalize as usize;
+                        stats.mesh_slot_pressure_reclaimable_no_fence =
+                            *reclaimable_without_fence as usize;
+                        stats.mesh_slot_pressure_lifecycle_blocked_no_fence =
+                            *lifecycle_blocked_without_fence as usize;
                     }
                     Self::record_rebuild_outcome(
                         &mut stats,
@@ -2885,7 +2922,8 @@ impl Renderer {
             }
             if let ChunkMeshArtifact::GpuPending { .. } = &result.artifact {
                 stats.mesh_pending_finalize += 1;
-                self.queue_pending_gpu_result_for_finalize(result, completed_index);
+                stats.pending_insert_finalize_identity_invalidated +=
+                    self.queue_pending_gpu_result_for_finalize(result, completed_index);
                 continue;
             }
 
@@ -3263,6 +3301,9 @@ impl Renderer {
                 }
                 None => {
                     stats.mesh_waiting_reason_unset += 1;
+                    if age_frames >= PENDING_GPU_FINALIZE_WAIT_REASON_UNSET_STALL_FRAMES {
+                        stats.pending_finalize_wait_reason_unset_stalled += 1;
+                    }
                 }
             }
             oldest_pending = match oldest_pending {
@@ -3773,14 +3814,14 @@ impl Renderer {
         &mut self,
         result: MeshResult,
         completed_index: usize,
-    ) {
+    ) -> usize {
         debug_assert!(matches!(
             result.artifact,
             ChunkMeshArtifact::GpuPending { .. }
         ));
         self.mesh_lifecycle
             .insert(result.coord, MeshLifecycleState::AwaitingFinalize);
-        self.invalidate_pending_gpu_entries_for_coord(
+        let dropped_on_insert = self.invalidate_pending_gpu_entries_for_coord(
             result.coord,
             Some(result.version.get()),
             "pending_result_insert",
@@ -3811,6 +3852,7 @@ impl Renderer {
             finalize_revisit_count: 0,
             last_wait_reason: Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial),
         });
+        dropped_on_insert
     }
 
     fn remove_pending_gpu_result(
@@ -4106,6 +4148,8 @@ impl Renderer {
             .get(&lookup_key)
             .copied()
         else {
+            stats.pending_missing_finalize_identity += 1;
+            stats.finalize_ready_not_promoted += 1;
             log::debug!(
                 "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
                 ready.result.coord,
@@ -4133,6 +4177,8 @@ impl Renderer {
             } => Some((*page_index, *draw_indirect_index, *lod)),
             _ => None,
         }) else {
+            stats.pending_missing_finalize_identity += 1;
+            stats.finalize_ready_not_promoted += 1;
             log::debug!(
                 "[mesh] drop_finalize reason=missing_pending_identity coord={:?} pending_version={} ready_version={} ready_page={} ready_draw_slot={} ready_lod={} status={:?}",
                 ready.result.coord,
@@ -4157,6 +4203,8 @@ impl Renderer {
             || pending_draw_slot != ready.result.draw_indirect_index
             || pending_lod != ready.result.lod
         {
+            stats.finalize_status_dropped_superseded_identity += 1;
+            stats.finalize_ready_not_promoted += 1;
             log::debug!(
                 "[mesh] drop_finalize reason=superseded_identity coord={:?} pending_coord={:?} ready_coord={:?} pending_version={} ready_version={} pending_page={} ready_page={} pending_draw_slot={} ready_draw_slot={} pending_lod={} ready_lod={} pending_task_id={} ready_task_id={} ready_serial={} status={:?}",
                 ready.result.coord,
@@ -4184,6 +4232,7 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
+                stats.finalize_status_not_ready_yet += 1;
                 pending.finalize_revisit_count = pending.finalize_revisit_count.saturating_add(1);
                 pending.last_wait_reason = ready.wait_reason;
                 let age_frames = self
@@ -4238,6 +4287,7 @@ impl Renderer {
                 None
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
+                stats.finalize_status_ready_and_valid += 1;
                 let promoted = Self::promote_pending_result_to_gpu_ready(pending, &ready);
                 let record = self.mesh_record_mut(ready.result.coord);
                 record.state = ChunkRenderState::CandidateReady;
@@ -4245,6 +4295,8 @@ impl Renderer {
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
+                stats.finalize_status_dropped_stale_version += 1;
+                stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
                     ready.result.coord,
                     stats,
@@ -4255,6 +4307,8 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
+                stats.finalize_status_dropped_invalid_mapping += 1;
+                stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
                     ready.result.coord,
                     stats,
@@ -4265,6 +4319,8 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
+                stats.finalize_status_dropped_superseded_identity += 1;
+                stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
                     ready.result.coord,
                     stats,
@@ -4828,6 +4884,10 @@ impl Renderer {
                         index_capacity,
                         largest_free_vertex_span,
                         largest_free_index_span,
+                        slots_visible: _,
+                        slots_pending_finalize: _,
+                        reclaimable_without_fence: _,
+                        lifecycle_blocked_without_fence: _,
                     } = reason
                     {
                         log::warn!(
