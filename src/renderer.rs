@@ -33,8 +33,8 @@ use crate::gpu_compute::{
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
     gpu_page_capacity, required_storage_buffer_binding_size_bytes, ReadyGpuMeshFinalizeEvent,
-    ReadyGpuMeshFinalizeStatus, COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
-    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason, COMPUTE_STORAGE_BINDING_COUNT,
+    GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
 use crate::mesh_layout;
 use crate::sim::{material, Phase};
@@ -809,6 +809,10 @@ pub struct MeshRebuildStats {
     pub newly_drawable_this_frame: usize,
     pub pending_finalize_total: usize,
     pub waiting_on_fence_total: usize,
+    pub pending_finalize_waiting_on_completion_serial: usize,
+    pub pending_finalize_waiting_on_readback_snapshot: usize,
+    pub pending_finalize_waiting_on_metadata: usize,
+    pub pending_finalize_aged_out: usize,
     pub terminal_superseded_total: usize,
     pub terminal_evicted_total: usize,
     pub mesh_pending_superseded: usize,
@@ -968,6 +972,8 @@ const MAX_RETRY_DEFERRED_PROMOTIONS_PER_FRAME: usize = 128;
 const MAX_FRESH_PRIORITY_SCAN_WINDOW: usize = 16;
 const FINALIZE_FAIRNESS_AGE_BOOST_FRAMES: u64 = 24;
 const ESTIMATED_FRAME_MS: f32 = 16.67;
+const PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES: u64 = 480;
+const PENDING_GPU_FINALIZE_MAX_REVISITS: u32 = 240;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -1239,6 +1245,8 @@ struct PendingGpuMeshResult {
     result: MeshResult,
     first_seen_frame: u64,
     first_seen_completed_index: usize,
+    finalize_revisit_count: u32,
+    last_wait_reason: Option<ReadyGpuMeshFinalizeWaitReason>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2627,6 +2635,8 @@ impl Renderer {
                     result,
                     first_seen_frame: self.mesh_rebuild_frame_index,
                     first_seen_completed_index: completed_index,
+                    finalize_revisit_count: 0,
+                    last_wait_reason: None,
                 });
                 continue;
             }
@@ -2854,6 +2864,8 @@ impl Renderer {
                     result,
                     first_seen_frame: self.mesh_rebuild_frame_index,
                     first_seen_completed_index: completed_index,
+                    finalize_revisit_count: 0,
+                    last_wait_reason: None,
                 });
                 continue;
             }
@@ -3853,6 +3865,61 @@ impl Renderer {
 
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
+                pending.finalize_revisit_count = pending.finalize_revisit_count.saturating_add(1);
+                pending.last_wait_reason = ready.wait_reason;
+                let age_frames = self
+                    .mesh_rebuild_frame_index
+                    .saturating_sub(pending.first_seen_frame);
+                if age_frames >= PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES
+                    || pending.finalize_revisit_count >= PENDING_GPU_FINALIZE_MAX_REVISITS
+                {
+                    let has_current = self
+                        .chunk_mesh_records
+                        .get(&ready.result.coord)
+                        .and_then(|record| record.current_drawable)
+                        .is_some()
+                        || self.visible_gpu_chunks.contains_key(&ready.result.coord);
+                    if has_current {
+                        stats.continuity_keepalive_count += 1;
+                    } else {
+                        stats.void_drop_count += 1;
+                    }
+                    let _ = self.reject_candidate_preserve_current_for_coord(ready.result.coord);
+                    self.mesh_lifecycle
+                        .insert(ready.result.coord, MeshLifecycleState::Rejected);
+                    stats.pending_finalize_aged_out += 1;
+                    log::warn!(
+                        "[mesh] finalize_timeout coord={:?} version={} task_id={} lod={} page={} draw_slot={} serial={} age_frames={} revisits={} wait_reason={:?}",
+                        ready.result.coord,
+                        ready.result.version,
+                        ready.result.task_id,
+                        ready.result.lod,
+                        ready.result.page_index.0,
+                        ready.result.draw_indirect_index,
+                        ready.result.submission_serial,
+                        age_frames,
+                        pending.finalize_revisit_count,
+                        pending.last_wait_reason,
+                    );
+                    self.schedule_mesh_retry(ready.result.coord, MeshRetryKind::Failed);
+                    return had_prior_visible.then_some(ready.result.coord);
+                }
+
+                match ready.wait_reason {
+                    Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial) => {
+                        stats.pending_finalize_waiting_on_completion_serial += 1;
+                    }
+                    Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot) => {
+                        stats.pending_finalize_waiting_on_readback_snapshot += 1;
+                    }
+                    Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata) => {
+                        stats.pending_finalize_waiting_on_metadata += 1;
+                    }
+                    None => {
+                        stats.pending_finalize_waiting_on_metadata += 1;
+                    }
+                }
+
                 let record = self.mesh_record_mut(ready.result.coord);
                 record.state = ChunkRenderState::CandidatePending;
                 self.index_pending_gpu_result(pending);
