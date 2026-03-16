@@ -24,11 +24,11 @@ use crate::engine::render::{FrameEpoch, RenderLifecycleState};
 use crate::engine::visibility::debug_assert_not_rejected_before_drawable;
 use crate::engine::world::ChunkVersion;
 use crate::gpu_compute::{
-    dispatch_gpu_chunk_tasks_on_renderer, initialize_gpu_compute_worker,
-    invalidate_gpu_pending_finalize_and_queued_on_renderer, run_chunk_job_on_worker,
-    set_gpu_protected_chunks_on_renderer, take_ready_gpu_mesh_results_on_renderer,
-    update_gpu_page_fences_on_renderer, DrawIndirectArgs, GpuComputeRuntime, MeshPipelineBackend,
-    SharedMeshBuffers,
+    dispatch_gpu_chunk_tasks_on_renderer, gpu_task_rx_backlog_estimate,
+    initialize_gpu_compute_worker, invalidate_gpu_pending_finalize_and_queued_on_renderer,
+    run_chunk_job_on_worker, set_gpu_protected_chunks_on_renderer,
+    take_ready_gpu_mesh_results_on_renderer, update_gpu_page_fences_on_renderer, DrawIndirectArgs,
+    GpuComputeRuntime, MeshPipelineBackend, SharedMeshBuffers,
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
@@ -741,9 +741,17 @@ pub struct MeshRebuildStats {
     pub gpu_dispatch_ms: f32,
     pub gpu_dispatch_enqueue_submit_ms: f32,
     pub gpu_dispatch_wait_sync_ms: f32,
+    pub gpu_dispatch_tasks_dequeued: usize,
     pub gpu_dispatch_tasks_submitted: usize,
     pub gpu_dispatch_task_budget: usize,
-    pub gpu_dispatch_queue_depth: usize,
+    pub gpu_dispatch_rx_backlog: usize,
+    pub gpu_dispatch_source_queue_depth: usize,
+    pub gpu_dispatch_stale_drops: usize,
+    pub gpu_dispatch_ownership_drops: usize,
+    pub gpu_dispatch_meshing_failures: usize,
+    pub gpu_dispatch_no_mesh_slice: usize,
+    pub gpu_dispatch_queue_empty_exits: usize,
+    pub gpu_dispatch_queue_disconnected_exits: usize,
     pub gpu_dispatch_headroom: f32,
     pub gpu_mesh_adopted_count: usize,
     pub gpu_mesh_adoption_latency_ms: f32,
@@ -2544,17 +2552,28 @@ impl Renderer {
                 self.visible_gpu_chunks.keys().copied().collect();
             set_gpu_protected_chunks_on_renderer(&protected_near, &protected_visible);
 
-            let queue_depth_for_dispatch = self.dirty_queues.total_len() + self.mesh_queue.inflight;
+            let source_queue_depth_for_dispatch =
+                self.dirty_queues.total_len() + self.mesh_queue.inflight;
+            let rx_backlog_for_dispatch = gpu_task_rx_backlog_estimate();
             let (task_budget, dispatch_budget, dispatch_headroom) =
-                self.dynamic_gpu_dispatch_budget(mesh_budget, queue_depth_for_dispatch);
+                self.dynamic_gpu_dispatch_budget(mesh_budget, source_queue_depth_for_dispatch);
             stats.gpu_dispatch_task_budget = task_budget;
-            stats.gpu_dispatch_queue_depth = queue_depth_for_dispatch;
+            stats.gpu_dispatch_source_queue_depth = source_queue_depth_for_dispatch;
+            stats.gpu_dispatch_rx_backlog = rx_backlog_for_dispatch;
             stats.gpu_dispatch_headroom = dispatch_headroom;
             match dispatch_gpu_chunk_tasks_on_renderer(task_budget, dispatch_budget) {
                 Ok(dispatch_stats) => {
                     stats.gpu_dispatch_enqueue_submit_ms += dispatch_stats.enqueue_submit_ms;
                     stats.gpu_dispatch_wait_sync_ms += dispatch_stats.wait_sync_ms;
+                    stats.gpu_dispatch_tasks_dequeued += dispatch_stats.tasks_dequeued;
                     stats.gpu_dispatch_tasks_submitted += dispatch_stats.tasks_submitted;
+                    stats.gpu_dispatch_stale_drops += dispatch_stats.stale_tasks_skipped;
+                    stats.gpu_dispatch_ownership_drops += dispatch_stats.ownership_validation_drops;
+                    stats.gpu_dispatch_meshing_failures += dispatch_stats.meshing_dispatch_failures;
+                    stats.gpu_dispatch_no_mesh_slice += dispatch_stats.tasks_without_mesh_slice;
+                    stats.gpu_dispatch_queue_empty_exits += dispatch_stats.queue_empty_exits;
+                    stats.gpu_dispatch_queue_disconnected_exits +=
+                        dispatch_stats.queue_disconnected_exits;
                     stats.gpu_dispatch_ms +=
                         dispatch_stats.enqueue_submit_ms + dispatch_stats.wait_sync_ms;
                 }
