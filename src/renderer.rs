@@ -32,7 +32,8 @@ use crate::gpu_compute::{
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
-    gpu_page_capacity, required_storage_buffer_binding_size_bytes, ReadyGpuMeshFinalizeEvent,
+    gpu_page_capacity, renderer_pending_finalize_identity_exists,
+    required_storage_buffer_binding_size_bytes, ReadyGpuMeshFinalizeEvent,
     ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason, COMPUTE_STORAGE_BINDING_COUNT,
     GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
@@ -821,6 +822,7 @@ pub struct MeshRebuildStats {
     pub pending_finalize_waiting_on_readback_snapshot: usize,
     pub pending_finalize_waiting_on_metadata: usize,
     pub pending_finalize_aged_out: usize,
+    pub pending_finalize_orphan_timed_out: usize,
     pub terminal_superseded_total: usize,
     pub terminal_evicted_total: usize,
     pub mesh_pending_superseded: usize,
@@ -982,6 +984,7 @@ const FINALIZE_FAIRNESS_AGE_BOOST_FRAMES: u64 = 24;
 const ESTIMATED_FRAME_MS: f32 = 16.67;
 const PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES: u64 = 480;
 const PENDING_GPU_FINALIZE_MAX_REVISITS: u32 = 240;
+const PENDING_GPU_FINALIZE_ORPHAN_MAX_WAIT_FRAMES: u64 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum DirtyTier {
@@ -2595,6 +2598,7 @@ impl Renderer {
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
             self.drain_finalize_events_bounded(&mut stats, &mut replacement_failed_coords);
+            self.sweep_stale_pending_gpu_results(&mut stats, &mut replacement_failed_coords);
         }
 
         self.trim_completed_backlog_bounded(&mut stats);
@@ -3779,6 +3783,86 @@ impl Renderer {
         }
         if !self.deferred_finalize_ready_events.is_empty() {
             stats.finalize_budget_hits += 1;
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    fn sweep_stale_pending_gpu_results(
+        &mut self,
+        stats: &mut MeshRebuildStats,
+        replacement_failed_coords: &mut HashSet<ChunkCoord>,
+    ) {
+        let mut expired = Vec::new();
+        for (identity, pending) in &self.pending_gpu_results {
+            let age_frames = self
+                .mesh_rebuild_frame_index
+                .saturating_sub(pending.first_seen_frame);
+            if age_frames < PENDING_GPU_FINALIZE_ORPHAN_MAX_WAIT_FRAMES
+                && age_frames < PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES
+            {
+                continue;
+            }
+            let Some((page_index, draw_indirect_index, lod)) = (match pending.result.artifact {
+                ChunkMeshArtifact::GpuPending {
+                    page_index,
+                    draw_indirect_index,
+                    lod,
+                    ..
+                } => Some((page_index, draw_indirect_index, lod)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let gpu_still_tracks_identity = renderer_pending_finalize_identity_exists(
+                pending.result.coord,
+                pending.result.version,
+                lod,
+                pending.result.task_id,
+                page_index,
+                draw_indirect_index,
+            );
+            let orphaned = !gpu_still_tracks_identity;
+            if orphaned || age_frames >= PENDING_GPU_FINALIZE_MAX_WAIT_FRAMES {
+                expired.push((*identity, orphaned, age_frames));
+            }
+        }
+
+        for (identity, orphaned, age_frames) in expired {
+            let Some(pending) = self.remove_pending_gpu_result(&identity) else {
+                continue;
+            };
+            let has_current = self
+                .chunk_mesh_records
+                .get(&pending.result.coord)
+                .and_then(|record| record.current_drawable)
+                .is_some()
+                || self.visible_gpu_chunks.contains_key(&pending.result.coord);
+            if has_current {
+                stats.continuity_keepalive_count += 1;
+            } else {
+                stats.void_drop_count += 1;
+            }
+            let _ = self.reject_candidate_preserve_current_for_coord(pending.result.coord);
+            if orphaned {
+                self.mesh_lifecycle
+                    .insert(pending.result.coord, MeshLifecycleState::Superseded);
+                self.terminal_superseded_total += 1;
+                stats.pending_finalize_orphan_timed_out += 1;
+            } else {
+                self.mesh_lifecycle
+                    .insert(pending.result.coord, MeshLifecycleState::Rejected);
+                stats.pending_finalize_aged_out += 1;
+            }
+            log::warn!(
+                "[mesh] finalize_pending_timeout kind={} coord={:?} version={} task_id={} age_frames={}",
+                if orphaned { "orphaned" } else { "slow" },
+                pending.result.coord,
+                pending.result.version,
+                pending.result.task_id,
+                age_frames,
+            );
+            self.schedule_mesh_retry(pending.result.coord, MeshRetryKind::Failed);
+            replacement_failed_coords.insert(pending.result.coord);
         }
     }
 

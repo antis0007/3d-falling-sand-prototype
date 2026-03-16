@@ -3262,6 +3262,33 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 }
 
 #[cfg(feature = "gpu-compute")]
+pub fn renderer_pending_finalize_identity_exists(
+    coord: ChunkCoord,
+    version: ChunkVersion,
+    lod: u8,
+    task_id: u64,
+    page_index: GpuPageIndex,
+    draw_indirect_index: u32,
+) -> bool {
+    let Some(Ok(state)) = WORKER_STATE
+        .get()
+        .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
+    else {
+        return false;
+    };
+
+    let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pending) = atlas.pending_mesh_finalize.get(&coord).copied() else {
+        return false;
+    };
+    pending.version == version
+        && pending.task_id == task_id
+        && pending.lod == lod
+        && pending.page_index == page_index
+        && pending.draw_indirect_index == draw_indirect_index
+}
+
+#[cfg(feature = "gpu-compute")]
 pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
     coord: ChunkCoord,
     requested_version: Option<u64>,

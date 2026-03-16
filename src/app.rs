@@ -2650,7 +2650,8 @@ pub async fn run() -> anyhow::Result<()> {
                                     current_mesh_stats.pending_finalize_waiting_on_completion_serial,
                                     current_mesh_stats.pending_finalize_waiting_on_readback_snapshot,
                                     current_mesh_stats.pending_finalize_waiting_on_metadata,
-                                    current_mesh_stats.pending_finalize_aged_out,
+                                    current_mesh_stats.pending_finalize_aged_out
+                                        + current_mesh_stats.pending_finalize_orphan_timed_out,
                                     ownership_invalidations,
                                     current_mesh_stats.outcome_skipped_startup_zero_geometry,
                                     zero_waiting,
