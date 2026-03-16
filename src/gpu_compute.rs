@@ -232,6 +232,19 @@ struct MeshPoolTelemetry {
     vertex_usage_percent: f32,
     index_usage_percent: f32,
     slot_usage_percent: f32,
+    slots_visible: u32,
+    slots_pending_finalize: u32,
+    reclaimable_without_fence: u32,
+    lifecycle_blocked_without_fence: u32,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, Default)]
+struct MeshSlotPressureBreakdown {
+    visible: u32,
+    pending_finalize: u32,
+    reclaimable_without_fence: u32,
+    lifecycle_blocked_without_fence: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -292,6 +305,9 @@ struct PendingGpuMeshFinalize {
     slot_generation: u64,
     submission_serial: u64,
 }
+
+#[cfg(feature = "gpu-compute")]
+const FINALIZE_ORPHAN_SERIAL_GRACE: u64 = 64;
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,39 +503,26 @@ impl ChunkPageAtlas {
             return MeshSliceAllocateOutcome::InvalidState;
         }
 
-        let mut reused_slot = false;
-        let slot = if self.next_mesh_slot < slot_capacity {
-            let next = self.next_mesh_slot;
+        if self.next_mesh_slot < slot_capacity {
+            let slot = self.next_mesh_slot;
             self.next_mesh_slot = self.next_mesh_slot.saturating_add(1);
-            next
-        } else {
-            reused_slot = true;
-            match self.evictable_mesh_slot(slot_capacity) {
-                Some(evictable) => evictable,
-                None => return MeshSliceAllocateOutcome::Saturated,
-            }
-        };
-
-        if reused_slot && !self.evict_mesh_slot(slot) {
-            return MeshSliceAllocateOutcome::NoProgress;
+            return self
+                .try_allocate_mesh_buffers(chunk, slot)
+                .map(MeshSliceAllocateOutcome::Success)
+                .unwrap_or(MeshSliceAllocateOutcome::InvalidState);
         }
 
-        if let Some(slice) = self.try_allocate_mesh_buffers(chunk, slot) {
-            return MeshSliceAllocateOutcome::Success(slice);
-        }
-
-        let Some(evict_slot) = self.evictable_mesh_slot(slot_capacity) else {
+        let Some(slot) = self.evictable_mesh_slot(slot_capacity) else {
             return MeshSliceAllocateOutcome::Saturated;
         };
-        if !self.evict_mesh_slot(evict_slot) {
+
+        if !self.evict_mesh_slot(slot) {
             return MeshSliceAllocateOutcome::NoProgress;
         }
 
-        if let Some(slice) = self.try_allocate_mesh_buffers(chunk, evict_slot) {
-            return MeshSliceAllocateOutcome::Success(slice);
-        }
-
-        MeshSliceAllocateOutcome::Saturated
+        self.try_allocate_mesh_buffers(chunk, slot)
+            .map(MeshSliceAllocateOutcome::Success)
+            .unwrap_or(MeshSliceAllocateOutcome::InvalidState)
     }
 
     fn try_allocate_mesh_buffers(
@@ -560,6 +563,38 @@ impl ChunkPageAtlas {
         }
 
         self.assert_mesh_slot_chunk_mapping_invariants();
+    }
+
+    fn reclaim_chunk_mesh_slot_if_stale(&mut self, chunk: ChunkCoord) -> bool {
+        if self.pending_mesh_finalize.contains_key(&chunk) {
+            return false;
+        }
+        if matches!(
+            self.priority_hint_for_chunk
+                .get(&chunk)
+                .copied()
+                .unwrap_or_default(),
+            PagePriorityHint::Visible
+        ) {
+            return false;
+        }
+        let Some(slice) = self.mesh_slice_for_chunk.get(&chunk).copied() else {
+            return false;
+        };
+        if self
+            .queued_mesh_slot_reservations
+            .get(&slice.slot_index)
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            return false;
+        }
+        if !self.is_mesh_slot_fence_safe(slice.slot_index) {
+            return false;
+        }
+        self.release_chunk_mesh_allocation(chunk);
+        true
     }
 
     fn mesh_slot_protection_hint(&self, slot: u32) -> PagePriorityHint {
@@ -615,7 +650,7 @@ impl ChunkPageAtlas {
     }
 
     fn evictable_mesh_slot(&self, slot_capacity: u32) -> Option<u32> {
-        let mut selected: Option<((u8, u8, u64), u32)> = None;
+        let mut selected: Option<((u8, u8, u8, u64), u32)> = None;
         for (&slot, _) in &self.chunk_for_mesh_slot {
             if slot >= slot_capacity {
                 continue;
@@ -630,14 +665,19 @@ impl ChunkPageAtlas {
                 GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            let fence_safe = self.is_mesh_slot_fence_safe(slot);
             let protection_rank = self.mesh_slot_protection_hint(slot).eviction_rank();
-            let fence_rank = if self.is_mesh_slot_fence_safe(slot) {
-                0
-            } else {
+            let pending_rank = if self.has_pending_finalize_for_slot(slot) {
                 1
+            } else {
+                0
             };
+            let fence_rank = if fence_safe { 0 } else { 1 };
             let recency_rank = self.mesh_slot_last_used.get(&slot).copied().unwrap_or(0);
-            let candidate = ((protection_rank, fence_rank, recency_rank), slot);
+            let candidate = (
+                (fence_rank, protection_rank, pending_rank, recency_rank),
+                slot,
+            );
             if selected
                 .map(|(cur_rank, cur_slot)| {
                     candidate.0 < cur_rank || (candidate.0 == cur_rank && slot < cur_slot)
@@ -648,6 +688,46 @@ impl ChunkPageAtlas {
             }
         }
         selected.map(|(_, slot)| slot)
+    }
+
+    fn has_pending_finalize_for_slot(&self, slot: u32) -> bool {
+        self.pending_mesh_finalize
+            .values()
+            .any(|pending| pending.draw_indirect_index == slot)
+    }
+
+    fn mesh_slot_pressure_breakdown(&self) -> MeshSlotPressureBreakdown {
+        let mut breakdown = MeshSlotPressureBreakdown::default();
+        for &slot in self.chunk_for_mesh_slot.keys() {
+            let fence_safe = self.is_mesh_slot_fence_safe(slot);
+            let reserved = self
+                .queued_mesh_slot_reservations
+                .get(&slot)
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            let pending = self.has_pending_finalize_for_slot(slot);
+            let visible = matches!(
+                self.mesh_slot_protection_hint(slot),
+                PagePriorityHint::Visible
+            );
+
+            if visible {
+                breakdown.visible = breakdown.visible.saturating_add(1);
+            }
+            if pending {
+                breakdown.pending_finalize = breakdown.pending_finalize.saturating_add(1);
+            }
+            if fence_safe && !reserved && !visible && !pending {
+                breakdown.reclaimable_without_fence =
+                    breakdown.reclaimable_without_fence.saturating_add(1);
+            }
+            if fence_safe && (reserved || pending) {
+                breakdown.lifecycle_blocked_without_fence =
+                    breakdown.lifecycle_blocked_without_fence.saturating_add(1);
+            }
+        }
+        breakdown
     }
 
     fn assert_mesh_slot_chunk_mapping_invariants(&self) {
@@ -729,6 +809,7 @@ impl ChunkPageAtlas {
         let slots_used = self.mesh_slice_for_chunk.len() as u32;
         let vertex_capacity = MeshBufferKind::Vertex.global_capacity_elements();
         let index_capacity = MeshBufferKind::Index.global_capacity_elements();
+        let breakdown = self.mesh_slot_pressure_breakdown();
         MeshPoolTelemetry {
             slot_capacity,
             slots_used,
@@ -760,6 +841,10 @@ impl ChunkPageAtlas {
             } else {
                 slots_used as f32 * 100.0 / slot_capacity as f32
             },
+            slots_visible: breakdown.visible,
+            slots_pending_finalize: breakdown.pending_finalize,
+            reclaimable_without_fence: breakdown.reclaimable_without_fence,
+            lifecycle_blocked_without_fence: breakdown.lifecycle_blocked_without_fence,
         }
     }
 
@@ -854,6 +939,43 @@ impl ChunkPageAtlas {
     fn refresh_completed_serial(&mut self, completed: u64) {
         for fence in self.page_fences.values_mut() {
             fence.last_completed = fence.last_completed.max(completed);
+        }
+        self.reclaim_orphaned_pending_mesh_finalize(completed);
+    }
+
+    fn reclaim_orphaned_pending_mesh_finalize(&mut self, completed: u64) {
+        if self.pending_mesh_finalize.is_empty() {
+            return;
+        }
+
+        let stale = self
+            .pending_mesh_finalize
+            .iter()
+            .filter_map(|(&coord, pending)| {
+                let owner_is_current = self.page_for_chunk.get(&coord).copied()
+                    == Some(pending.page_index)
+                    && self
+                        .mesh_slice_for_chunk
+                        .get(&coord)
+                        .copied()
+                        .map(|slice| slice.slot_index)
+                        == Some(pending.draw_indirect_index);
+                let generations_match = self.page_generation(pending.page_index)
+                    == pending.page_generation
+                    && self.slot_generation(pending.draw_indirect_index) == pending.slot_generation;
+                let too_old = completed.saturating_sub(pending.submission_serial)
+                    > FINALIZE_ORPHAN_SERIAL_GRACE;
+                let fence_clear = self.is_page_fence_complete(pending.page_index);
+                if too_old && fence_clear && (!owner_is_current || !generations_match) {
+                    Some(coord)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for coord in stale {
+            self.pending_mesh_finalize.remove(&coord);
         }
     }
 
@@ -1443,6 +1565,9 @@ pub struct GpuComputeProfilerSnapshot {
     pub chunks_completed: u64,
     pub frontier_cap_events: u64,
     pub mesh_slot_alloc_failed: u64,
+    pub mesh_slot_alloc_failed_lod0: u64,
+    pub mesh_slot_alloc_failed_lod1: u64,
+    pub mesh_slot_alloc_failed_lod2_plus: u64,
     pub mesh_finalize_waiting_on_metadata: u64,
     pub mesh_finalize_waiting_on_completion_serial: u64,
     pub mesh_finalize_waiting_on_readback_snapshot: u64,
@@ -1489,6 +1614,12 @@ static GPU_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static GPU_FRONTIER_CAP_EVENTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_MESH_SLOT_ALLOC_FAILED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_SLOT_ALLOC_FAILED_LOD0: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_SLOT_ALLOC_FAILED_LOD1: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_EVICT_NEAR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1795,6 +1926,12 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
         let chunks_completed = GPU_CHUNKS.swap(0, Ordering::Relaxed);
         let frontier_cap_events = GPU_FRONTIER_CAP_EVENTS.swap(0, Ordering::Relaxed);
         let mesh_slot_alloc_failed = GPU_MESH_SLOT_ALLOC_FAILED.swap(0, Ordering::Relaxed);
+        let mesh_slot_alloc_failed_lod0 =
+            GPU_MESH_SLOT_ALLOC_FAILED_LOD0.swap(0, Ordering::Relaxed);
+        let mesh_slot_alloc_failed_lod1 =
+            GPU_MESH_SLOT_ALLOC_FAILED_LOD1.swap(0, Ordering::Relaxed);
+        let mesh_slot_alloc_failed_lod2_plus =
+            GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS.swap(0, Ordering::Relaxed);
         let evict_near_count = GPU_EVICT_NEAR_COUNT.swap(0, Ordering::Relaxed);
         let evict_visible_count = GPU_EVICT_VISIBLE_COUNT.swap(0, Ordering::Relaxed);
         let evict_far_count = GPU_EVICT_FAR_COUNT.swap(0, Ordering::Relaxed);
@@ -1854,6 +1991,9 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             chunks_completed,
             frontier_cap_events,
             mesh_slot_alloc_failed,
+            mesh_slot_alloc_failed_lod0,
+            mesh_slot_alloc_failed_lod1,
+            mesh_slot_alloc_failed_lod2_plus,
             mesh_finalize_waiting_on_metadata,
             mesh_finalize_waiting_on_completion_serial,
             mesh_finalize_waiting_on_readback_snapshot,
@@ -2771,6 +2911,17 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                     }
                 } else {
                     let _ = GPU_MESH_SLOT_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
+                    match job.lod as u8 {
+                        0 => {
+                            GPU_MESH_SLOT_ALLOC_FAILED_LOD0.fetch_add(1, Ordering::Relaxed);
+                        }
+                        1 => {
+                            GPU_MESH_SLOT_ALLOC_FAILED_LOD1.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {
+                            GPU_MESH_SLOT_ALLOC_FAILED_LOD2_PLUS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let pressure = mesh_pool_telemetry.slot_usage_percent >= 95.0
                         || mesh_pool_telemetry.vertex_usage_percent >= 95.0
                         || mesh_pool_telemetry.index_usage_percent >= 95.0;
@@ -2787,7 +2938,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         let vertex_slot_capacity = MeshBufferKind::Vertex.slot_capacity_elements();
                         let index_slot_capacity = MeshBufferKind::Index.slot_capacity_elements();
                         log::error!(
-                            "[mesh][capacity] mesh allocation failure: chunk={:?} lod={:?} reason=MeshSlotCapacitySaturated required[v/i]={}/{} slots_used={}/{} in_flight_fences={} per_slot_capacity[v/i]={}/{} total_capacity[v/i]={}/{} largest_free_span[v/i]={}/{}",
+                            "[mesh][capacity] mesh allocation failure: chunk={:?} lod={:?} reason=MeshSlotCapacitySaturated required[v/i]={}/{} slots_used={}/{} in_flight_fences={} per_slot_capacity[v/i]={}/{} total_capacity[v/i]={}/{} largest_free_span[v/i]={}/{} slots_visible={} slots_pending_finalize={} reclaimable_without_fence={} lifecycle_blocked_without_fence={}",
                             job.coord,
                             job.lod,
                             contract.vertex_elements_per_chunk,
@@ -2801,11 +2952,15 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             mesh_pool_telemetry.index_capacity,
                             mesh_pool_telemetry.largest_free_vertex_span,
                             mesh_pool_telemetry.largest_free_index_span,
+                            mesh_pool_telemetry.slots_visible,
+                            mesh_pool_telemetry.slots_pending_finalize,
+                            mesh_pool_telemetry.reclaimable_without_fence,
+                            mesh_pool_telemetry.lifecycle_blocked_without_fence,
                         );
                     }
 
                     log::debug!(
-                        "[mesh] skipping gpu meshing for {:?}: reason=MeshSlotCapacitySaturated lod={:?} required[v/i]={}/{} slots={}/{} in_flight_fences={} per_slot[v/i]={}/{} used[v/i]={}/{} total[v/i]={}/{} largest_free[v/i]={}/{}",
+                        "[mesh] skipping gpu meshing for {:?}: reason=MeshSlotCapacitySaturated lod={:?} required[v/i]={}/{} slots={}/{} in_flight_fences={} per_slot[v/i]={}/{} used[v/i]={}/{} total[v/i]={}/{} largest_free[v/i]={}/{} slots_visible={} slots_pending_finalize={} reclaimable_without_fence={} lifecycle_blocked_without_fence={}",
                         job.coord,
                         job.lod,
                         mesh_layout::MESH_VERTEX_ELEMENTS_PER_CHUNK,
@@ -2821,6 +2976,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                         mesh_pool_telemetry.index_capacity,
                         mesh_pool_telemetry.largest_free_vertex_span,
                         mesh_pool_telemetry.largest_free_index_span,
+                        mesh_pool_telemetry.slots_visible,
+                        mesh_pool_telemetry.slots_pending_finalize,
+                        mesh_pool_telemetry.reclaimable_without_fence,
+                        mesh_pool_telemetry.lifecycle_blocked_without_fence,
                     );
 
                     ChunkMeshArtifact::Skipped {
@@ -3046,6 +3205,9 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                             MeshBufferKind::Index.global_size_bytes(),
                             err,
                         );
+                        let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                        atlas.pending_mesh_finalize.remove(&task.coord);
+                        atlas.reclaim_chunk_mesh_slot_if_stale(task.coord);
                     }
                 }
             } else {
@@ -3244,6 +3406,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                 != Some(candidate.pending.version.get())
             {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
+                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedStaleVersion,
@@ -3271,6 +3434,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 
             if !ownership_valid {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
+                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -3317,6 +3481,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
                     }
                     MissingIndexCountDisposition::DropInvalidMapping => {
                         atlas.pending_mesh_finalize.remove(&candidate.coord);
+                        atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                         out.push(ReadyGpuMeshFinalizeEvent {
                             result,
                             status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -3332,6 +3497,7 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 
             if index_count == 0 {
                 atlas.pending_mesh_finalize.remove(&candidate.coord);
+                atlas.reclaim_chunk_mesh_slot_if_stale(candidate.coord);
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping,
@@ -3426,6 +3592,7 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
                 requested_version,
             );
         } else if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+            atlas.reclaim_chunk_mesh_slot_if_stale(coord);
             if reason == "pending_result_insert" {
                 GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT.fetch_add(1, Ordering::Relaxed);
                 log::error!(
@@ -3882,5 +4049,39 @@ mod tests {
             atlas.chunk_for_mesh_slot.len()
         );
         atlas.assert_mesh_slot_chunk_mapping_invariants();
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn stale_chunk_slot_is_reclaimed_when_not_visible() {
+        let mut atlas = ChunkPageAtlas::default();
+        let chunk = ChunkCoord { x: 2, y: 0, z: 0 };
+        let other = ChunkCoord { x: 3, y: 0, z: 0 };
+
+        let _ = atlas.page_for_chunk_or_allocate(chunk).expect("page");
+        let _ = atlas.page_for_chunk_or_allocate(other).expect("other page");
+        let slice = match atlas.mesh_slice_for_chunk_or_allocate(chunk, 0) {
+            MeshSliceAllocateOutcome::Success(slice) => slice,
+            other => panic!("expected allocation success, got {other:?}"),
+        };
+
+        atlas.pending_mesh_finalize.insert(
+            chunk,
+            super::PendingGpuMeshFinalize {
+                version: ChunkVersion::new(1).unwrap(),
+                task_id: 1,
+                lod: 0,
+                page_index: *atlas.page_for_chunk.get(&chunk).unwrap(),
+                draw_indirect_index: slice.slot_index,
+                page_generation: atlas.page_generation(*atlas.page_for_chunk.get(&chunk).unwrap()),
+                slot_generation: atlas.slot_generation(slice.slot_index),
+                submission_serial: 1,
+            },
+        );
+
+        assert!(!atlas.reclaim_chunk_mesh_slot_if_stale(chunk));
+        atlas.pending_mesh_finalize.remove(&chunk);
+        assert!(atlas.reclaim_chunk_mesh_slot_if_stale(chunk));
+        assert!(!atlas.mesh_slice_for_chunk.contains_key(&chunk));
     }
 }
