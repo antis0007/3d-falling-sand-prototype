@@ -234,6 +234,22 @@ struct MeshPoolTelemetry {
     slot_usage_percent: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuRuntimeDebugSnapshot {
+    pub mesh_slots_used: usize,
+    pub mesh_slot_capacity: usize,
+    pub mesh_slot_in_flight_fences: usize,
+    pub mesh_vertex_used: usize,
+    pub mesh_vertex_capacity: usize,
+    pub mesh_index_used: usize,
+    pub mesh_index_capacity: usize,
+    pub mesh_largest_free_vertex_span: usize,
+    pub mesh_largest_free_index_span: usize,
+    pub queue_enqueued: usize,
+    pub queue_dequeued: usize,
+    pub queue_rx_backlog: usize,
+}
+
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PagePriorityHint {
@@ -1581,6 +1597,45 @@ pub fn gpu_task_rx_backlog_estimate() -> usize {
     GPU_TASKS_ENQUEUED_COUNT
         .load(Ordering::Relaxed)
         .saturating_sub(GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed)) as usize
+}
+
+pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
+    #[cfg(not(feature = "gpu-compute"))]
+    {
+        GpuRuntimeDebugSnapshot::default()
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    {
+        let queue_enqueued = GPU_TASKS_ENQUEUED_COUNT.load(Ordering::Relaxed) as usize;
+        let queue_dequeued = GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed) as usize;
+
+        let mut snapshot = GpuRuntimeDebugSnapshot {
+            queue_enqueued,
+            queue_dequeued,
+            queue_rx_backlog: queue_enqueued.saturating_sub(queue_dequeued),
+            ..GpuRuntimeDebugSnapshot::default()
+        };
+
+        if let Some(state) = WORKER_STATE
+            .get()
+            .and_then(|state| state.as_ref().ok().map(Arc::clone))
+        {
+            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+            let mesh_pool = atlas.mesh_pool_telemetry();
+            snapshot.mesh_slots_used = mesh_pool.slots_used as usize;
+            snapshot.mesh_slot_capacity = mesh_pool.slot_capacity as usize;
+            snapshot.mesh_slot_in_flight_fences = mesh_pool.in_flight_fences as usize;
+            snapshot.mesh_vertex_used = mesh_pool.vertex_used as usize;
+            snapshot.mesh_vertex_capacity = mesh_pool.vertex_capacity as usize;
+            snapshot.mesh_index_used = mesh_pool.index_used as usize;
+            snapshot.mesh_index_capacity = mesh_pool.index_capacity as usize;
+            snapshot.mesh_largest_free_vertex_span = mesh_pool.largest_free_vertex_span as usize;
+            snapshot.mesh_largest_free_index_span = mesh_pool.largest_free_index_span as usize;
+        }
+
+        snapshot
+    }
 }
 
 #[cfg(feature = "gpu-compute")]
