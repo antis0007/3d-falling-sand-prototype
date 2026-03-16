@@ -2608,7 +2608,8 @@ impl Renderer {
             stats.gpu_mesh_vertex_capacity = runtime_snapshot.mesh_vertex_capacity;
             stats.gpu_mesh_index_used = runtime_snapshot.mesh_index_used;
             stats.gpu_mesh_index_capacity = runtime_snapshot.mesh_index_capacity;
-            stats.gpu_mesh_largest_free_vertex_span = runtime_snapshot.mesh_largest_free_vertex_span;
+            stats.gpu_mesh_largest_free_vertex_span =
+                runtime_snapshot.mesh_largest_free_vertex_span;
             stats.gpu_mesh_largest_free_index_span = runtime_snapshot.mesh_largest_free_index_span;
         }
 
@@ -2660,6 +2661,7 @@ impl Renderer {
                     result.coord,
                     Some(result.version.get()),
                     "pending_result_insert",
+                    true,
                 );
                 let pending_lod = match &result.artifact {
                     ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
@@ -2706,6 +2708,7 @@ impl Renderer {
                 result.coord,
                 Some(result.version.get()),
                 "new_result_received",
+                false,
             ) > 0;
             if pending_replaced {
                 pending_superseded += 1;
@@ -2896,6 +2899,7 @@ impl Renderer {
                     result.coord,
                     Some(result.version.get()),
                     "pending_result_insert",
+                    true,
                 );
                 let pending_lod = match &result.artifact {
                     ChunkMeshArtifact::GpuPending { lod, .. } => *lod,
@@ -3171,7 +3175,10 @@ impl Renderer {
                     );
                 }
                 Some(ReplacementLossCause::LifecycleInvalidated(state)) => {
-                    if matches!(state, MeshLifecycleState::Superseded | MeshLifecycleState::Evicted) {
+                    if matches!(
+                        state,
+                        MeshLifecycleState::Superseded | MeshLifecycleState::Evicted
+                    ) {
                         replacement_failed_lost_but_superseded_or_evicted += 1;
                         log::debug!(
                             "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?} has_current_record_drawable={}",
@@ -4267,6 +4274,7 @@ impl Renderer {
         coord: ChunkCoord,
         requested_version: Option<u64>,
         reason: &'static str,
+        preserve_gpu_finalize_identity: bool,
     ) -> usize {
         let mut dropped = 0usize;
         let keys = self
@@ -4300,7 +4308,15 @@ impl Renderer {
             dropped += 1;
         }
         #[cfg(feature = "gpu-compute")]
-        invalidate_gpu_pending_finalize_and_queued_on_renderer(coord, requested_version, reason);
+        // Handshake contract: when renderer inserts a new GpuPending result, it may purge stale
+        // renderer-side pending rows for the coord, but must not erase the producer finalize
+        // identity that is expected to satisfy the just-inserted pending entry.
+        invalidate_gpu_pending_finalize_and_queued_on_renderer(
+            coord,
+            requested_version,
+            reason,
+            preserve_gpu_finalize_identity,
+        );
         if self.chunk_mesh_records.contains_key(&coord) {
             let _ = self.reject_candidate_preserve_current_for_coord(coord);
         }
