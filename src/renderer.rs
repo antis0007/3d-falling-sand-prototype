@@ -3091,48 +3091,124 @@ impl Renderer {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
 
+        let mut replacement_failed_lost_drawable = 0usize;
+        let mut replacement_failed_lost_but_superseded_or_evicted = 0usize;
         for &coord in &replacement_failed_coords {
-            let Some(loss_cause) = Self::replacement_loss_cause_for_coord(
+            let still_visible = self.visible_gpu_chunks.contains_key(&coord);
+            if still_visible {
+                stats.mesh_last_good_visible_end_of_frame += 1;
+                continue;
+            }
+
+            let has_current_record_drawable = self
+                .chunk_mesh_records
+                .get(&coord)
+                .and_then(|record| record.current_drawable)
+                .is_some();
+
+            let lifecycle = self
+                .mesh_lifecycle
+                .get(&coord)
+                .copied()
+                .unwrap_or(MeshLifecycleState::Rejected);
+
+            let displacement_is_expected = matches!(
+                lifecycle,
+                MeshLifecycleState::Superseded | MeshLifecycleState::Evicted
+            );
+
+            let loss_cause = Self::replacement_loss_cause_for_coord(
                 coord,
                 &self.visible_gpu_chunks,
                 &self.mesh_lifecycle,
                 &replacement_distance_evicted_coords,
-            ) else {
-                stats.mesh_last_good_visible_end_of_frame += 1;
-                continue;
-            };
+            );
 
             match loss_cause {
-                ReplacementLossCause::Unexplained => {
-                    log::error!(
-                        "[renderer] invariant violated: replacement failed for coord={coord:?} but visible draw was lost cause=unexplained"
+                None => {
+                    stats.mesh_last_good_visible_end_of_frame += 1;
+                }
+                Some(ReplacementLossCause::Superseded | ReplacementLossCause::DistanceEvicted) => {
+                    replacement_failed_lost_but_superseded_or_evicted += 1;
+
+                    match loss_cause {
+                        Some(ReplacementLossCause::Superseded) => {
+                            log::debug!(
+                                "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was superseded in-frame cause=superseded lifecycle={lifecycle:?} has_current_record_drawable={}",
+                                has_current_record_drawable,
+                            );
+                        }
+                        Some(ReplacementLossCause::DistanceEvicted) => {
+                            log::debug!(
+                                "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was evicted in-frame cause=distance_evicted lifecycle={lifecycle:?} has_current_record_drawable={}",
+                                has_current_record_drawable,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Some(ReplacementLossCause::OwnershipInvalidated) => {
+                    replacement_failed_lost_drawable += 1;
+                    log::warn!(
+                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was invalidated cause=ownership lifecycle={lifecycle:?} has_current_record_drawable={}",
+                        has_current_record_drawable,
                     );
                     debug_assert!(
-                        false,
-                        "replacement failed for {coord:?} but visible draw was lost cause=unexplained"
+                        has_current_record_drawable || displacement_is_expected,
+                        "replacement failed for {coord:?} and continuity was dropped (cause=ownership, lifecycle={lifecycle:?})"
                     );
                 }
-                ReplacementLossCause::Superseded => {
-                    log::debug!(
-                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was superseded in-frame cause=superseded"
-                    );
+                Some(ReplacementLossCause::LifecycleInvalidated(state)) => {
+                    if matches!(state, MeshLifecycleState::Superseded | MeshLifecycleState::Evicted) {
+                        replacement_failed_lost_but_superseded_or_evicted += 1;
+                        log::debug!(
+                            "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                    } else {
+                        replacement_failed_lost_drawable += 1;
+                        log::warn!(
+                            "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                        debug_assert!(
+                            has_current_record_drawable || matches!(state, MeshLifecycleState::Superseded | MeshLifecycleState::Evicted),
+                            "replacement failed for {coord:?} and continuity was dropped (cause=lifecycle, state={state:?})"
+                        );
+                    }
                 }
-                ReplacementLossCause::DistanceEvicted => {
-                    log::debug!(
-                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was evicted in-frame cause=distance_evicted"
-                    );
-                }
-                ReplacementLossCause::OwnershipInvalidated => {
-                    log::warn!(
-                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw was invalidated cause=ownership"
-                    );
-                }
-                ReplacementLossCause::LifecycleInvalidated(state) => {
-                    log::warn!(
-                        "[renderer] continuity transition: replacement failed for coord={coord:?} then draw transitioned cause=lifecycle state={state:?}"
-                    );
+                Some(ReplacementLossCause::Unexplained) => {
+                    if has_current_record_drawable || displacement_is_expected {
+                        replacement_failed_lost_but_superseded_or_evicted += 1;
+                        log::debug!(
+                            "[renderer] continuity drop after replacement failure coord={coord:?} lifecycle={lifecycle:?} has_current_record_drawable={} cause=unexplained_but_record_or_lifecycle_allows_drop",
+                            has_current_record_drawable,
+                        );
+                    } else {
+                        replacement_failed_lost_drawable += 1;
+                        log::error!(
+                            "[renderer] invariant violated: replacement failed for coord={coord:?} but visible draw was lost cause=unexplained lifecycle={lifecycle:?} has_current_record_drawable={}",
+                            has_current_record_drawable,
+                        );
+                        debug_assert!(
+                            has_current_record_drawable || displacement_is_expected,
+                            "replacement failed for {coord:?} and continuity was dropped (cause=unexplained, lifecycle={lifecycle:?})"
+                        );
+                    }
                 }
             }
+        }
+        if replacement_failed_lost_but_superseded_or_evicted > 0 {
+            log::debug!(
+                "[renderer] replacement failures with non-void displacement: count={} (superseded/evicted while replacement failed)",
+                replacement_failed_lost_but_superseded_or_evicted,
+            );
+        }
+        if replacement_failed_lost_drawable > 0 {
+            stats.void_drop_count += replacement_failed_lost_drawable;
+            stats.dropped_to_void_count_by_reason
+                [VoidDropReason::ReplacementRejected.as_index()] +=
+                replacement_failed_lost_drawable;
         }
 
         stats.upload_count = uploaded;
