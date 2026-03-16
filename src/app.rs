@@ -3131,6 +3131,47 @@ pub async fn run() -> anyhow::Result<()> {
                         frame.present();
                         ui.profiler.render_submit_ms = render_submit_t0.elapsed().as_secs_f32() * 1000.0;
                         ui.profiler.frame_ms = now.elapsed().as_secs_f32() * 1000.0;
+                        ui.push_debug_rolling_sample();
+                        if ui.chunks_drawn == 0
+                            && ui.profiler.mesh_pending_total > 0
+                            && ui.profiler.mesh_pending_waiting_on_metadata > 0
+                        {
+                            let pending_total = ui.profiler.mesh_pending_total;
+                            let waiting_meta = ui.profiler.mesh_pending_waiting_on_metadata;
+                            let waiting_fence = ui.profiler.mesh_pending_waiting_on_fence;
+                            let waiting_readback = ui.profiler.mesh_pending_waiting_on_readback_snapshot;
+                            let promoted = ui.profiler.mesh_pending_promoted_to_drawable;
+                            let dispatch_submitted = ui.profiler.mesh_gpu_dispatch_tasks_submitted;
+                            let dispatch_dequeued = ui.profiler.mesh_gpu_dispatch_tasks_dequeued;
+                            let source_queue = ui.profiler.mesh_gpu_dispatch_source_queue_depth;
+                            let resident_gpu = ui.profiler.mesh_resident_gpu_artifact;
+                            let resident_cpu = ui.profiler.mesh_resident_cpu_uploaded;
+                            let resident_stale = ui.profiler.mesh_resident_stale_cached;
+                            let resident_fallback = ui.profiler.mesh_resident_fallback;
+                            let resident_unknown = ui.profiler.mesh_resident_unknown;
+                            ui.log_once_per_second(
+                                "render_stall_metadata_wait",
+                                start.elapsed().as_secs_f32(),
+                                || {
+                                    format!(
+                                        "draw stall: chunks_drawn=0 pending={} waiting_meta={} waiting_fence={} waiting_readback={} promoted={} gpu_dispatch submitted/dequeued={}/{} source_queue={} resident gpu/cpu/stale/fallback/unknown={}/{}/{}/{}/{}",
+                                        pending_total,
+                                        waiting_meta,
+                                        waiting_fence,
+                                        waiting_readback,
+                                        promoted,
+                                        dispatch_submitted,
+                                        dispatch_dequeued,
+                                        source_queue,
+                                        resident_gpu,
+                                        resident_cpu,
+                                        resident_stale,
+                                        resident_fallback,
+                                        resident_unknown,
+                                    )
+                                },
+                            );
+                        }
                         frame_counter = frame_counter.wrapping_add(1);
 
                         for id in &out.textures_delta.free {
