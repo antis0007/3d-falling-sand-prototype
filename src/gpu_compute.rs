@@ -1474,6 +1474,8 @@ pub struct GpuComputeProfilerSnapshot {
     pub queue_protected_page_eviction_skip_count: u64,
     pub queue_protected_slot_eviction_skip_count: u64,
     pub queue_invalidations_executed_count: u64,
+    pub pending_insert_finalize_identity_removed_count: u64,
+    pub finalize_missing_coord_entry_for_candidate_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1557,6 +1559,10 @@ static GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(
 static GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
@@ -1837,6 +1843,10 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             GPU_QUEUE_PROTECTED_SLOT_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
         let queue_invalidations_executed_count =
             GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.swap(0, Ordering::Relaxed);
+        let pending_insert_finalize_identity_removed_count =
+            GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT.swap(0, Ordering::Relaxed);
+        let finalize_missing_coord_entry_for_candidate_count =
+            GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT.swap(0, Ordering::Relaxed);
         let frame = frame_seconds.max(0.000_1);
         GpuComputeProfilerSnapshot {
             dispatch_ms: dispatch_ns as f32 / 1_000_000.0,
@@ -1875,6 +1885,8 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             queue_protected_page_eviction_skip_count,
             queue_protected_slot_eviction_skip_count,
             queue_invalidations_executed_count,
+            pending_insert_finalize_identity_removed_count,
+            finalize_missing_coord_entry_for_candidate_count,
             chunks_per_sec: chunks_completed as f32 / frame,
         }
     }
@@ -3193,6 +3205,18 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 
             let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
             else {
+                GPU_FINALIZE_MISSING_COORD_ENTRY_FOR_CANDIDATE_COUNT
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "[gpu-mesh] finalize_missing_coord_entry coord={:?} version={} task_id={} lod={} page={} draw_slot={} serial={}",
+                    candidate.coord,
+                    candidate.pending.version,
+                    candidate.pending.task_id,
+                    candidate.pending.lod,
+                    candidate.pending.page_index.0,
+                    candidate.pending.draw_indirect_index,
+                    candidate.pending.submission_serial,
+                );
                 out.push(ReadyGpuMeshFinalizeEvent {
                     result,
                     status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
@@ -3387,44 +3411,67 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
     coord: ChunkCoord,
     requested_version: Option<u64>,
     reason: &'static str,
+    preserve_pending_finalize_identity: bool,
 ) {
     if let Some(Ok(state)) = WORKER_STATE
         .get()
         .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
     {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+        if preserve_pending_finalize_identity {
             log::debug!(
-                "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                "[gpu-mesh] preserve_pending_finalize_identity reason={} coord={:?} requested_version={:?}",
                 reason,
                 coord,
-                pending.version,
-                pending.lod,
-                pending.page_index.0,
-                pending.draw_indirect_index,
-                pending.submission_serial,
                 requested_version,
             );
+        } else if let Some(pending) = atlas.pending_mesh_finalize.remove(&coord) {
+            if reason == "pending_result_insert" {
+                GPU_PENDING_INSERT_FINALIZE_IDENTITY_REMOVED_COUNT.fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "[gpu-mesh] pending_insert_removed_finalize_identity coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                    coord,
+                    pending.version,
+                    pending.lod,
+                    pending.page_index.0,
+                    pending.draw_indirect_index,
+                    pending.submission_serial,
+                    requested_version,
+                );
+            } else {
+                log::debug!(
+                    "[gpu-mesh] invalidate_pending_finalize reason={} coord={:?} pending_version={} pending_lod={:?} pending_page={} pending_draw_slot={} serial={} requested_version={:?}",
+                    reason,
+                    coord,
+                    pending.version,
+                    pending.lod,
+                    pending.page_index.0,
+                    pending.draw_indirect_index,
+                    pending.submission_serial,
+                    requested_version,
+                );
+            }
         }
 
-        if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
-            let old_page_generation = atlas.page_generation(page_index);
-            let new_page_generation = atlas.bump_page_generation(page_index);
+        if !preserve_pending_finalize_identity {
+            if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
+                let old_page_generation = atlas.page_generation(page_index);
+                let new_page_generation = atlas.bump_page_generation(page_index);
 
-            let slot_generation = atlas
-                .mesh_slice_for_chunk
-                .get(&coord)
-                .map(|slice| (slice.slot_index, atlas.slot_generation(slice.slot_index)))
-                .map(|(slot_index, old_generation)| {
-                    (
-                        slot_index,
-                        old_generation,
-                        atlas.bump_mesh_slot_generation(slot_index),
-                    )
-                });
+                let slot_generation = atlas
+                    .mesh_slice_for_chunk
+                    .get(&coord)
+                    .map(|slice| (slice.slot_index, atlas.slot_generation(slice.slot_index)))
+                    .map(|(slot_index, old_generation)| {
+                        (
+                            slot_index,
+                            old_generation,
+                            atlas.bump_mesh_slot_generation(slot_index),
+                        )
+                    });
 
-            GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.fetch_add(1, Ordering::Relaxed);
-            log::debug!(
+                GPU_QUEUE_INVALIDATIONS_EXECUTED_COUNT.fetch_add(1, Ordering::Relaxed);
+                log::debug!(
                 "[gpu-mesh] invalidate_queued_tasks reason={} coord={:?} requested_version={:?} page={} page_generation={}=>{} slot={:?} slot_generation={:?}",
                 reason,
                 coord,
@@ -3437,6 +3484,7 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
                     (old_generation, new_generation)
                 }),
             );
+            }
         }
     }
 }
@@ -3446,6 +3494,7 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
     _coord: ChunkCoord,
     _requested_version: Option<u64>,
     _reason: &'static str,
+    _preserve_pending_finalize_identity: bool,
 ) {
 }
 
