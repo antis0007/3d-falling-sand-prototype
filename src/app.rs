@@ -2561,7 +2561,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                         let force_maintenance = should_force_maintenance_tick(
                             last_mesh_stats.pending_finalize_total,
-                            last_mesh_stats.gpu_dispatch_queue_depth,
+                            last_mesh_stats.gpu_dispatch_rx_backlog,
                             last_mesh_stats.meshing_completed_depth,
                         );
                         let startup_burst_active = startup_burst_budget_frames > 0
@@ -2620,10 +2620,16 @@ pub async fn run() -> anyhow::Result<()> {
                             );
                             ui.log_once_per_second("mesh_dispatch_pressure", now_secs, || {
                                 format!(
-                                    "mesh dispatch submitted/budget={}/{} queue={} headroom={:.2} adopt_latency_ms={:.2} dropped_before_drawable={} filtered_drawable={}",
+                                    "mesh dispatch dequeued/submitted/budget={}/{}/{} rx_backlog={} source_queue={} drops(stale/ownership/meshing/no_mesh)={}/{}/{}/{} headroom={:.2} adopt_latency_ms={:.2} dropped_before_drawable={} filtered_drawable={}",
+                                    current_mesh_stats.gpu_dispatch_tasks_dequeued,
                                     current_mesh_stats.gpu_dispatch_tasks_submitted,
                                     current_mesh_stats.gpu_dispatch_task_budget,
-                                    current_mesh_stats.gpu_dispatch_queue_depth,
+                                    current_mesh_stats.gpu_dispatch_rx_backlog,
+                                    current_mesh_stats.gpu_dispatch_source_queue_depth,
+                                    current_mesh_stats.gpu_dispatch_stale_drops,
+                                    current_mesh_stats.gpu_dispatch_ownership_drops,
+                                    current_mesh_stats.gpu_dispatch_meshing_failures,
+                                    current_mesh_stats.gpu_dispatch_no_mesh_slice,
                                     current_mesh_stats.gpu_dispatch_headroom,
                                     current_mesh_stats.gpu_mesh_adoption_latency_ms,
                                     current_mesh_stats.mesh_dropped_before_drawable,
@@ -2664,7 +2670,7 @@ pub async fn run() -> anyhow::Result<()> {
                         };
                         let maintenance_interval_ms = adaptive_maintenance_interval_ms(
                             mesh_stats.pending_finalize_total,
-                            mesh_stats.gpu_dispatch_queue_depth,
+                            mesh_stats.gpu_dispatch_rx_backlog,
                             mesh_stats.meshing_completed_depth,
                             ui.profiler.frame_ms,
                             maintenance_throttle_state.interval_scale,
@@ -2715,9 +2721,15 @@ pub async fn run() -> anyhow::Result<()> {
                             mesh_stats.upload_budget_deferred_chunks;
                         ui.profiler.mesh_gpu_adopt_count = mesh_stats.gpu_mesh_adopted_count;
                         ui.profiler.mesh_gpu_adopt_latency_ms = mesh_stats.gpu_mesh_adoption_latency_ms;
+                        ui.profiler.mesh_gpu_dispatch_tasks_dequeued = mesh_stats.gpu_dispatch_tasks_dequeued;
                         ui.profiler.mesh_gpu_dispatch_tasks_submitted = mesh_stats.gpu_dispatch_tasks_submitted;
                         ui.profiler.mesh_gpu_dispatch_task_budget = mesh_stats.gpu_dispatch_task_budget;
-                        ui.profiler.mesh_gpu_dispatch_queue_depth = mesh_stats.gpu_dispatch_queue_depth;
+                        ui.profiler.mesh_gpu_dispatch_rx_backlog = mesh_stats.gpu_dispatch_rx_backlog;
+                        ui.profiler.mesh_gpu_dispatch_source_queue_depth = mesh_stats.gpu_dispatch_source_queue_depth;
+                        ui.profiler.mesh_gpu_dispatch_stale_drops = mesh_stats.gpu_dispatch_stale_drops;
+                        ui.profiler.mesh_gpu_dispatch_ownership_drops = mesh_stats.gpu_dispatch_ownership_drops;
+                        ui.profiler.mesh_gpu_dispatch_meshing_failures = mesh_stats.gpu_dispatch_meshing_failures;
+                        ui.profiler.mesh_gpu_dispatch_no_mesh_slice = mesh_stats.gpu_dispatch_no_mesh_slice;
                         ui.profiler.mesh_gpu_dispatch_headroom = mesh_stats.gpu_dispatch_headroom;
                         ui.profiler.mesh_gpu_visible_count = mesh_stats.gpu_mesh_visible_count;
                         ui.profiler.mesh_gpu_visible_slot_min = mesh_stats.gpu_mesh_visible_slot_min;
@@ -3134,7 +3146,7 @@ pub async fn run() -> anyhow::Result<()> {
                 let now = Instant::now();
                 let force_redraw = should_force_maintenance_tick(
                     last_mesh_stats.pending_finalize_total,
-                    last_mesh_stats.gpu_dispatch_queue_depth,
+                    last_mesh_stats.gpu_dispatch_rx_backlog,
                     last_mesh_stats.meshing_completed_depth,
                 );
                 if force_redraw || now >= next_redraw_at {

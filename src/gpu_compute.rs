@@ -16,7 +16,7 @@ use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1549,6 +1549,10 @@ static GPU_TASK_TX: OnceLock<SyncSender<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
 static GPU_TASK_RX: OnceLock<Mutex<Receiver<GpuChunkTask>>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
+static GPU_TASKS_ENQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
 static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -1556,10 +1560,23 @@ static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuDispatchFrameStats {
+    pub tasks_dequeued: usize,
     pub tasks_submitted: usize,
     pub stale_tasks_skipped: usize,
+    pub ownership_validation_drops: usize,
+    pub meshing_dispatch_failures: usize,
+    pub queue_empty_exits: usize,
+    pub queue_disconnected_exits: usize,
+    pub tasks_without_mesh_slice: usize,
     pub enqueue_submit_ms: f32,
     pub wait_sync_ms: f32,
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn gpu_task_rx_backlog_estimate() -> usize {
+    GPU_TASKS_ENQUEUED_COUNT
+        .load(Ordering::Relaxed)
+        .saturating_sub(GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed)) as usize
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -2602,6 +2619,7 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             atlas.release_queued_task_identity(page_index, mesh_slice);
             return Err(err).context("failed to send GPU chunk task");
         }
+        GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
 
         let diagnostics = ChunkSimulationDiagnostics::default();
 
@@ -2741,38 +2759,49 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
 
         let task = match rx.try_recv() {
             Ok(t) => t,
-            Err(_) => break,
+            Err(TryRecvError::Empty) => {
+                stats.queue_empty_exits += 1;
+                break;
+            }
+            Err(TryRecvError::Disconnected) => {
+                stats.queue_disconnected_exits += 1;
+                break;
+            }
         };
+        GPU_TASKS_DEQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
+        stats.tasks_dequeued += 1;
 
         let task_start = Instant::now();
         let task_wait_sync = Duration::ZERO;
 
-        {
-            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
-            if let Some(reason) = atlas.stale_queued_task_reason(&task) {
-                GPU_STALE_QUEUED_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
-                match reason {
-                    StaleQueuedTaskReason::PageOwnership
-                    | StaleQueuedTaskReason::PageGeneration => {
-                        GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    StaleQueuedTaskReason::SlotOwnership
-                    | StaleQueuedTaskReason::SlotGeneration => {
-                        GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                stats.stale_tasks_skipped += 1;
-                log::trace!(
-                    "[gpu-mesh] stale queued task skipped coord={:?} version={} task_id={} page_index={} reason={:?}",
-                    task.coord,
-                    task.version,
-                    task.task_id,
-                    task.page_index.0,
-                    reason,
-                );
-                continue;
+        let stale_reason = {
+            let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+            atlas.stale_queued_task_reason(&task)
+        };
+        if let Some(reason) = stale_reason {
+            {
+                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
             }
+            GPU_STALE_QUEUED_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
+            match reason {
+                StaleQueuedTaskReason::PageOwnership | StaleQueuedTaskReason::PageGeneration => {
+                    GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                StaleQueuedTaskReason::SlotOwnership | StaleQueuedTaskReason::SlotGeneration => {
+                    GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            stats.stale_tasks_skipped += 1;
+            log::trace!(
+                "[gpu-mesh] stale queued task skipped coord={:?} version={} task_id={} page_index={} reason={:?}",
+                task.coord,
+                task.version,
+                task.task_id,
+                task.page_index.0,
+                reason,
+            );
+            continue;
         }
 
         let scratch = &state.scratch;
@@ -2869,6 +2898,11 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                             mesh_slice.slot_index,
                             err,
                         );
+                        stats.ownership_validation_drops += 1;
+                        {
+                            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
+                        }
                         continue;
                     }
                 }
@@ -2886,6 +2920,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                         submitted_mesh_slice = Some(mesh_slice);
                     }
                     Err(err) => {
+                        stats.meshing_dispatch_failures += 1;
                         log::error!(
                             "[gpu-mesh] rejecting gpu mesh dispatch coord={:?} version={} task_id={} page_index={} slot_index={} vertex_offset={} index_offset={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={} error={:#}",
                             task.coord,
@@ -2903,7 +2938,14 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                         );
                     }
                 }
+            } else {
+                stats.tasks_without_mesh_slice += 1;
             }
+        }
+
+        {
+            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
         }
 
         let serial = GPU_SUBMISSION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;

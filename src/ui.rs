@@ -41,9 +41,15 @@ pub struct ProfilerStats {
     pub mesh_upload_budget_deferred_chunks: usize,
     pub mesh_gpu_adopt_count: usize,
     pub mesh_gpu_adopt_latency_ms: f32,
+    pub mesh_gpu_dispatch_tasks_dequeued: usize,
     pub mesh_gpu_dispatch_tasks_submitted: usize,
     pub mesh_gpu_dispatch_task_budget: usize,
-    pub mesh_gpu_dispatch_queue_depth: usize,
+    pub mesh_gpu_dispatch_rx_backlog: usize,
+    pub mesh_gpu_dispatch_source_queue_depth: usize,
+    pub mesh_gpu_dispatch_stale_drops: usize,
+    pub mesh_gpu_dispatch_ownership_drops: usize,
+    pub mesh_gpu_dispatch_meshing_failures: usize,
+    pub mesh_gpu_dispatch_no_mesh_slice: usize,
     pub mesh_gpu_dispatch_headroom: f32,
     pub mesh_gpu_visible_count: usize,
     pub mesh_gpu_visible_slot_min: i32,
@@ -751,11 +757,20 @@ pub fn draw(
                     ui_state.profiler.dirty_queue_drop_count,
                 ));
                 ui.monospace(format!(
-                    "gpu dispatch submitted/budget: {}/{} | queue={} | headroom={:.2}",
+                    "gpu dispatch dequeued/submitted/budget: {}/{}/{} | rx backlog={} | source queue={} | headroom={:.2}",
+                    ui_state.profiler.mesh_gpu_dispatch_tasks_dequeued,
                     ui_state.profiler.mesh_gpu_dispatch_tasks_submitted,
                     ui_state.profiler.mesh_gpu_dispatch_task_budget,
-                    ui_state.profiler.mesh_gpu_dispatch_queue_depth,
+                    ui_state.profiler.mesh_gpu_dispatch_rx_backlog,
+                    ui_state.profiler.mesh_gpu_dispatch_source_queue_depth,
                     ui_state.profiler.mesh_gpu_dispatch_headroom,
+                ));
+                ui.monospace(format!(
+                    "gpu dispatch drops stale/ownership/meshing-fail/no-mesh-slice: {}/{}/{}/{}",
+                    ui_state.profiler.mesh_gpu_dispatch_stale_drops,
+                    ui_state.profiler.mesh_gpu_dispatch_ownership_drops,
+                    ui_state.profiler.mesh_gpu_dispatch_meshing_failures,
+                    ui_state.profiler.mesh_gpu_dispatch_no_mesh_slice,
                 ));
                 ui.monospace(format!(
                     "gpu adoption latency: {:.2} ms | drawable filtered/dropped under load: {}",
