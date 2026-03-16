@@ -4068,7 +4068,7 @@ mod tests {
         atlas.pending_mesh_finalize.insert(
             chunk,
             super::PendingGpuMeshFinalize {
-                version: ChunkVersion::new(1).unwrap(),
+                version: ChunkVersion(1),
                 task_id: 1,
                 lod: 0,
                 page_index: *atlas.page_for_chunk.get(&chunk).unwrap(),
