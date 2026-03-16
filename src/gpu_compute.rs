@@ -287,9 +287,11 @@ impl PagePriorityHint {
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StaleQueuedTaskReason {
-    PageOwnership,
+    MissingCoordPageMapping,
+    PageOwnerChanged,
     PageGeneration,
-    SlotOwnership,
+    MissingSlotOwner,
+    SlotOwnerChanged,
     SlotGeneration,
 }
 
@@ -722,7 +724,7 @@ impl ChunkPageAtlas {
                 breakdown.reclaimable_without_fence =
                     breakdown.reclaimable_without_fence.saturating_add(1);
             }
-            if fence_safe && (reserved || pending) {
+            if fence_safe && !visible && (reserved || pending) {
                 breakdown.lifecycle_blocked_without_fence =
                     breakdown.lifecycle_blocked_without_fence.saturating_add(1);
             }
@@ -860,9 +862,11 @@ impl ChunkPageAtlas {
     }
 
     fn stale_queued_task_reason(&self, task: &GpuChunkTask) -> Option<StaleQueuedTaskReason> {
-        let mapped_page = self.page_for_chunk.get(&task.coord).copied();
-        if mapped_page != Some(task.page_index) {
-            return Some(StaleQueuedTaskReason::PageOwnership);
+        let Some(mapped_page) = self.page_for_chunk.get(&task.coord).copied() else {
+            return Some(StaleQueuedTaskReason::MissingCoordPageMapping);
+        };
+        if mapped_page != task.page_index {
+            return Some(StaleQueuedTaskReason::PageOwnerChanged);
         }
 
         if self.page_generation(task.page_index) != task.page_generation {
@@ -871,20 +875,22 @@ impl ChunkPageAtlas {
 
         match (task.mesh_slice, task.slot_generation) {
             (Some(mesh_slice), Some(slot_generation)) => {
-                let mapped_chunk = self
+                let Some(mapped_chunk) = self
                     .chunk_for_mesh_slot
                     .get(&mesh_slice.slot_index)
-                    .copied();
-                if mapped_chunk != Some(task.coord) {
-                    return Some(StaleQueuedTaskReason::SlotOwnership);
+                    .copied()
+                else {
+                    return Some(StaleQueuedTaskReason::MissingSlotOwner);
+                };
+                if mapped_chunk != task.coord {
+                    return Some(StaleQueuedTaskReason::SlotOwnerChanged);
                 }
                 if self.slot_generation(mesh_slice.slot_index) != slot_generation {
                     return Some(StaleQueuedTaskReason::SlotGeneration);
                 }
                 None
             }
-            (Some(_), None) => Some(StaleQueuedTaskReason::SlotOwnership),
-            (None, Some(_)) => Some(StaleQueuedTaskReason::SlotOwnership),
+            (Some(_), None) | (None, Some(_)) => Some(StaleQueuedTaskReason::MissingSlotOwner),
             (None, None) => None,
         }
     }
@@ -1596,6 +1602,10 @@ pub struct GpuComputeProfilerSnapshot {
     pub stale_queued_task_count: u64,
     pub stale_queued_page_drop_count: u64,
     pub stale_queued_slot_drop_count: u64,
+    pub stale_queued_missing_coord_mapping_count: u64,
+    pub stale_queued_page_owner_changed_count: u64,
+    pub stale_queued_missing_slot_owner_count: u64,
+    pub stale_queued_slot_owner_changed_count: u64,
     pub queue_protected_page_eviction_skip_count: u64,
     pub queue_protected_slot_eviction_skip_count: u64,
     pub queue_invalidations_executed_count: u64,
@@ -1684,6 +1694,14 @@ static GPU_STALE_QUEUED_TASK_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_STALE_QUEUED_PAGE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_STALE_QUEUED_SLOT_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_MISSING_COORD_MAPPING_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_PAGE_OWNER_CHANGED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_MISSING_SLOT_OWNER_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_STALE_QUEUED_SLOT_OWNER_CHANGED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1974,6 +1992,14 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             GPU_STALE_QUEUED_PAGE_DROP_COUNT.swap(0, Ordering::Relaxed);
         let stale_queued_slot_drop_count =
             GPU_STALE_QUEUED_SLOT_DROP_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_missing_coord_mapping_count =
+            GPU_STALE_QUEUED_MISSING_COORD_MAPPING_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_page_owner_changed_count =
+            GPU_STALE_QUEUED_PAGE_OWNER_CHANGED_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_missing_slot_owner_count =
+            GPU_STALE_QUEUED_MISSING_SLOT_OWNER_COUNT.swap(0, Ordering::Relaxed);
+        let stale_queued_slot_owner_changed_count =
+            GPU_STALE_QUEUED_SLOT_OWNER_CHANGED_COUNT.swap(0, Ordering::Relaxed);
         let queue_protected_page_eviction_skip_count =
             GPU_QUEUE_PROTECTED_PAGE_EVICTION_SKIP_COUNT.swap(0, Ordering::Relaxed);
         let queue_protected_slot_eviction_skip_count =
@@ -2022,6 +2048,10 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             stale_queued_task_count,
             stale_queued_page_drop_count,
             stale_queued_slot_drop_count,
+            stale_queued_missing_coord_mapping_count,
+            stale_queued_page_owner_changed_count,
+            stale_queued_missing_slot_owner_count,
+            stale_queued_slot_owner_changed_count,
             queue_protected_page_eviction_skip_count,
             queue_protected_slot_eviction_skip_count,
             queue_invalidations_executed_count,
@@ -3054,10 +3084,26 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             }
             GPU_STALE_QUEUED_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
             match reason {
-                StaleQueuedTaskReason::PageOwnership | StaleQueuedTaskReason::PageGeneration => {
+                StaleQueuedTaskReason::MissingCoordPageMapping => {
+                    GPU_STALE_QUEUED_MISSING_COORD_MAPPING_COUNT.fetch_add(1, Ordering::Relaxed);
                     GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
-                StaleQueuedTaskReason::SlotOwnership | StaleQueuedTaskReason::SlotGeneration => {
+                StaleQueuedTaskReason::PageOwnerChanged => {
+                    GPU_STALE_QUEUED_PAGE_OWNER_CHANGED_COUNT.fetch_add(1, Ordering::Relaxed);
+                    GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                StaleQueuedTaskReason::PageGeneration => {
+                    GPU_STALE_QUEUED_PAGE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                StaleQueuedTaskReason::MissingSlotOwner => {
+                    GPU_STALE_QUEUED_MISSING_SLOT_OWNER_COUNT.fetch_add(1, Ordering::Relaxed);
+                    GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                StaleQueuedTaskReason::SlotOwnerChanged => {
+                    GPU_STALE_QUEUED_SLOT_OWNER_CHANGED_COUNT.fetch_add(1, Ordering::Relaxed);
+                    GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                StaleQueuedTaskReason::SlotGeneration => {
                     GPU_STALE_QUEUED_SLOT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
             }

@@ -827,6 +827,8 @@ pub struct MeshRebuildStats {
     pub pending_finalize_waiting_reason_unset: usize,
     pub pending_finalize_aged_out: usize,
     pub pending_finalize_orphan_timed_out: usize,
+    pub pending_finalize_lookup_miss_exact: usize,
+    pub pending_finalize_lookup_miss_recovered: usize,
     pub terminal_superseded_total: usize,
     pub terminal_evicted_total: usize,
     pub mesh_pending_superseded: usize,
@@ -4101,23 +4103,53 @@ impl Renderer {
         stats: &mut MeshRebuildStats,
     ) -> Option<ChunkCoord> {
         let lookup_key = Self::finalize_ready_lookup_key(&ready);
-        let Some(key) = self
+        let key = if let Some(exact) = self
             .pending_gpu_results_by_finalize_key
             .get(&lookup_key)
             .copied()
-        else {
-            log::debug!(
-                "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
-                ready.result.coord,
-                ready.result.version,
-                ready.result.task_id,
-                ready.result.page_index.0,
-                ready.result.draw_indirect_index,
-                ready.result.lod,
-                ready.result.submission_serial,
-                ready.status,
-            );
-            return None;
+        {
+            exact
+        } else {
+            stats.pending_finalize_lookup_miss_exact += 1;
+            let recovered = self
+                .pending_gpu_result_keys_by_coord
+                .get(&ready.result.coord)
+                .and_then(|keys| {
+                    keys.iter().copied().find(|identity| {
+                        let Some(pending) = self.pending_gpu_results.get(identity) else {
+                            return false;
+                        };
+                        let ChunkMeshArtifact::GpuPending {
+                            page_index,
+                            draw_indirect_index,
+                            lod,
+                            ..
+                        } = pending.result.artifact
+                        else {
+                            return false;
+                        };
+                        pending.result.version == ready.result.version
+                            && page_index == ready.result.page_index
+                            && draw_indirect_index == ready.result.draw_indirect_index
+                            && lod == ready.result.lod
+                    })
+                });
+            let Some(recovered) = recovered else {
+                log::debug!(
+                    "[mesh] drop_finalize reason=missing_pending coord={:?} version={} task_id={} page={} draw_slot={} lod={} serial={} status={:?}",
+                    ready.result.coord,
+                    ready.result.version,
+                    ready.result.task_id,
+                    ready.result.page_index.0,
+                    ready.result.draw_indirect_index,
+                    ready.result.lod,
+                    ready.result.submission_serial,
+                    ready.status,
+                );
+                return None;
+            };
+            stats.pending_finalize_lookup_miss_recovered += 1;
+            recovered
         };
         let Some(mut pending) = self.remove_pending_gpu_result(&key) else {
             return None;
