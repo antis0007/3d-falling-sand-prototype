@@ -62,6 +62,8 @@ pub struct ProfilerStats {
     pub mesh_pending_total: usize,
     pub mesh_pending_promoted_to_drawable: usize,
     pub mesh_pending_waiting_on_fence: usize,
+    pub mesh_pending_waiting_on_readback_snapshot: usize,
+    pub mesh_pending_waiting_on_metadata: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
     pub mesh_completed_receive_budget_hits: usize,
@@ -841,12 +843,17 @@ pub fn draw(
                     ui_state.profiler.mesh_upload_budget_deferred_chunks,
                 ));
                 ui.monospace(format!(
-                    "pending lifecycle total/promoted/waiting/superseded/rejected: {}/{}/{}/{}/{}",
+                    "pending lifecycle total/promoted/superseded/rejected: {}/{}/{}/{}",
                     ui_state.profiler.mesh_pending_total,
                     ui_state.profiler.mesh_pending_promoted_to_drawable,
-                    ui_state.profiler.mesh_pending_waiting_on_fence,
                     ui_state.profiler.mesh_pending_superseded,
                     ui_state.profiler.mesh_pending_rejected,
+                ));
+                ui.monospace(format!(
+                    "pending waits fence/readback/metadata: {}/{}/{}",
+                    ui_state.profiler.mesh_pending_waiting_on_fence,
+                    ui_state.profiler.mesh_pending_waiting_on_readback_snapshot,
+                    ui_state.profiler.mesh_pending_waiting_on_metadata,
                 ));
                 ui.monospace(format!(
                     "bookkeeping budget hits recv/finalize/adopt/retry: {}/{}/{}/{}",

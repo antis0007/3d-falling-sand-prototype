@@ -814,6 +814,8 @@ pub struct MeshRebuildStats {
     pub mesh_pending_finalize: usize,
     pub mesh_pending_promoted_to_drawable: usize,
     pub mesh_waiting_on_fence: usize,
+    pub mesh_waiting_on_readback_snapshot: usize,
+    pub mesh_waiting_on_metadata: usize,
     pub drawable_resident_total: usize,
     pub newly_drawable_this_frame: usize,
     pub pending_finalize_total: usize,
@@ -3144,7 +3146,17 @@ impl Renderer {
                 .mesh_rebuild_frame_index
                 .saturating_sub(pending.first_seen_frame);
             pending_ages.push(age_frames);
-            stats.mesh_waiting_on_fence += 1;
+            match pending.last_wait_reason {
+                Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnCompletionSerial) => {
+                    stats.mesh_waiting_on_fence += 1;
+                }
+                Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot) => {
+                    stats.mesh_waiting_on_readback_snapshot += 1;
+                }
+                Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata) | None => {
+                    stats.mesh_waiting_on_metadata += 1;
+                }
+            }
             oldest_pending = match oldest_pending {
                 Some((old_age, old_idx, old_coord)) if old_age > age_frames => {
                     Some((old_age, old_idx, old_coord))
