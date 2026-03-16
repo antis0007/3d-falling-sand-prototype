@@ -268,6 +268,7 @@ pub struct UiState {
     pub startup_required_limits: String,
     pub startup_adapter_limits: String,
     pub startup_error_message: Option<String>,
+    pub debug_rolling: DebugRollingStats,
 
     log_last_seconds: HashMap<String, f32>,
     drag_source: Option<DragSource>,
@@ -275,6 +276,172 @@ pub struct UiState {
     biome_hint_state: BiomeHintState,
     ui_frame_counter: u64,
     biome_hint_last_update_frame: u64,
+}
+
+#[derive(Clone, Default)]
+pub struct DebugRollingStats {
+    samples: VecDeque<DebugRollingSample>,
+    max_samples: usize,
+    sum_chunks_drawn: u64,
+    sum_total_indices: u64,
+    sum_mesh_pending_total: u64,
+    sum_mesh_waiting_metadata: u64,
+    sum_mesh_promoted_to_drawable: u64,
+    sum_gpu_dispatch_submitted: u64,
+    sum_gpu_dispatch_dequeued: u64,
+    sum_gpu_dispatch_source_queue: u64,
+    sum_loaded_chunks: u64,
+    sum_resident_chunks: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DebugRollingSample {
+    chunks_drawn: usize,
+    total_indices: u64,
+    mesh_pending_total: usize,
+    mesh_waiting_metadata: usize,
+    mesh_promoted_to_drawable: usize,
+    gpu_dispatch_submitted: usize,
+    gpu_dispatch_dequeued: usize,
+    gpu_dispatch_source_queue: usize,
+    loaded_chunks: usize,
+    resident_chunks: usize,
+}
+
+impl DebugRollingStats {
+    const DEFAULT_MAX_SAMPLES: usize = 120;
+
+    fn with_default_window() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(Self::DEFAULT_MAX_SAMPLES),
+            max_samples: Self::DEFAULT_MAX_SAMPLES,
+            ..Self::default()
+        }
+    }
+
+    fn push_from_profiler(
+        &mut self,
+        profiler: &ProfilerStats,
+        chunks_drawn: usize,
+        total_indices: u64,
+    ) {
+        let sample = DebugRollingSample {
+            chunks_drawn,
+            total_indices,
+            mesh_pending_total: profiler.mesh_pending_total,
+            mesh_waiting_metadata: profiler.mesh_pending_waiting_on_metadata,
+            mesh_promoted_to_drawable: profiler.mesh_pending_promoted_to_drawable,
+            gpu_dispatch_submitted: profiler.mesh_gpu_dispatch_tasks_submitted,
+            gpu_dispatch_dequeued: profiler.mesh_gpu_dispatch_tasks_dequeued,
+            gpu_dispatch_source_queue: profiler.mesh_gpu_dispatch_source_queue_depth,
+            loaded_chunks: profiler.loaded_chunks,
+            resident_chunks: profiler.resident_chunks,
+        };
+        self.samples.push_back(sample);
+        self.sum_chunks_drawn = self
+            .sum_chunks_drawn
+            .saturating_add(sample.chunks_drawn as u64);
+        self.sum_total_indices = self.sum_total_indices.saturating_add(sample.total_indices);
+        self.sum_mesh_pending_total = self
+            .sum_mesh_pending_total
+            .saturating_add(sample.mesh_pending_total as u64);
+        self.sum_mesh_waiting_metadata = self
+            .sum_mesh_waiting_metadata
+            .saturating_add(sample.mesh_waiting_metadata as u64);
+        self.sum_mesh_promoted_to_drawable = self
+            .sum_mesh_promoted_to_drawable
+            .saturating_add(sample.mesh_promoted_to_drawable as u64);
+        self.sum_gpu_dispatch_submitted = self
+            .sum_gpu_dispatch_submitted
+            .saturating_add(sample.gpu_dispatch_submitted as u64);
+        self.sum_gpu_dispatch_dequeued = self
+            .sum_gpu_dispatch_dequeued
+            .saturating_add(sample.gpu_dispatch_dequeued as u64);
+        self.sum_gpu_dispatch_source_queue = self
+            .sum_gpu_dispatch_source_queue
+            .saturating_add(sample.gpu_dispatch_source_queue as u64);
+        self.sum_loaded_chunks = self
+            .sum_loaded_chunks
+            .saturating_add(sample.loaded_chunks as u64);
+        self.sum_resident_chunks = self
+            .sum_resident_chunks
+            .saturating_add(sample.resident_chunks as u64);
+
+        while self.samples.len() > self.max_samples {
+            if let Some(oldest) = self.samples.pop_front() {
+                self.sum_chunks_drawn = self
+                    .sum_chunks_drawn
+                    .saturating_sub(oldest.chunks_drawn as u64);
+                self.sum_total_indices =
+                    self.sum_total_indices.saturating_sub(oldest.total_indices);
+                self.sum_mesh_pending_total = self
+                    .sum_mesh_pending_total
+                    .saturating_sub(oldest.mesh_pending_total as u64);
+                self.sum_mesh_waiting_metadata = self
+                    .sum_mesh_waiting_metadata
+                    .saturating_sub(oldest.mesh_waiting_metadata as u64);
+                self.sum_mesh_promoted_to_drawable = self
+                    .sum_mesh_promoted_to_drawable
+                    .saturating_sub(oldest.mesh_promoted_to_drawable as u64);
+                self.sum_gpu_dispatch_submitted = self
+                    .sum_gpu_dispatch_submitted
+                    .saturating_sub(oldest.gpu_dispatch_submitted as u64);
+                self.sum_gpu_dispatch_dequeued = self
+                    .sum_gpu_dispatch_dequeued
+                    .saturating_sub(oldest.gpu_dispatch_dequeued as u64);
+                self.sum_gpu_dispatch_source_queue = self
+                    .sum_gpu_dispatch_source_queue
+                    .saturating_sub(oldest.gpu_dispatch_source_queue as u64);
+                self.sum_loaded_chunks = self
+                    .sum_loaded_chunks
+                    .saturating_sub(oldest.loaded_chunks as u64);
+                self.sum_resident_chunks = self
+                    .sum_resident_chunks
+                    .saturating_sub(oldest.resident_chunks as u64);
+            }
+        }
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+    fn avg(sum: u64, n: usize) -> f32 {
+        if n == 0 {
+            0.0
+        } else {
+            sum as f32 / n as f32
+        }
+    }
+    pub fn avg_chunks_drawn(&self) -> f32 {
+        Self::avg(self.sum_chunks_drawn, self.sample_count())
+    }
+    pub fn avg_indices_drawn(&self) -> f32 {
+        Self::avg(self.sum_total_indices, self.sample_count())
+    }
+    pub fn avg_pending_total(&self) -> f32 {
+        Self::avg(self.sum_mesh_pending_total, self.sample_count())
+    }
+    pub fn avg_waiting_metadata(&self) -> f32 {
+        Self::avg(self.sum_mesh_waiting_metadata, self.sample_count())
+    }
+    pub fn avg_promoted_to_drawable(&self) -> f32 {
+        Self::avg(self.sum_mesh_promoted_to_drawable, self.sample_count())
+    }
+    pub fn avg_dispatch_submitted(&self) -> f32 {
+        Self::avg(self.sum_gpu_dispatch_submitted, self.sample_count())
+    }
+    pub fn avg_dispatch_dequeued(&self) -> f32 {
+        Self::avg(self.sum_gpu_dispatch_dequeued, self.sample_count())
+    }
+    pub fn avg_dispatch_source_queue(&self) -> f32 {
+        Self::avg(self.sum_gpu_dispatch_source_queue, self.sample_count())
+    }
+    pub fn avg_loaded_chunks(&self) -> f32 {
+        Self::avg(self.sum_loaded_chunks, self.sample_count())
+    }
+    pub fn avg_resident_chunks(&self) -> f32 {
+        Self::avg(self.sum_resident_chunks, self.sample_count())
+    }
 }
 
 #[derive(Clone)]
@@ -376,6 +543,14 @@ impl UiState {
         self.profiler.mesh_drawn_unknown_indices = draw_stats.drawn_unknown_indices;
     }
 
+    pub fn push_debug_rolling_sample(&mut self) {
+        self.debug_rolling.push_from_profiler(
+            &self.profiler,
+            self.chunks_drawn,
+            self.total_indices,
+        );
+    }
+
     pub fn set_biome_hint(&mut self, biome_name: &str, world_x: i32, world_z: i32) {
         self.biome_hint_state = BiomeHintState::Known {
             biome_name: biome_name.to_string(),
@@ -465,6 +640,7 @@ impl Default for UiState {
             startup_required_limits: "n/a".to_string(),
             startup_adapter_limits: "n/a".to_string(),
             startup_error_message: None,
+            debug_rolling: DebugRollingStats::with_default_window(),
 
             log_last_seconds: HashMap::new(),
             drag_source: None,
@@ -984,6 +1160,39 @@ pub fn draw(
                 ui.monospace(format!(
                     "chunks_drawn: {} | total_indices: {}",
                     ui_state.chunks_drawn, ui_state.total_indices
+                ));
+                let rolling = &ui_state.debug_rolling;
+                let n = rolling.sample_count();
+                ui.monospace(format!(
+                    "rolling avg ({n}f): drawn_chunks {:.2} | indices {:.1} | pending {:.1} | pending(meta) {:.1} | promoted {:.2}",
+                    rolling.avg_chunks_drawn(),
+                    rolling.avg_indices_drawn(),
+                    rolling.avg_pending_total(),
+                    rolling.avg_waiting_metadata(),
+                    rolling.avg_promoted_to_drawable(),
+                ));
+                ui.monospace(format!(
+                    "rolling avg dispatch ({n}f): dequeued {:.2} | submitted {:.2} | source queue {:.2} | loaded {:.2} | resident {:.2}",
+                    rolling.avg_dispatch_dequeued(),
+                    rolling.avg_dispatch_submitted(),
+                    rolling.avg_dispatch_source_queue(),
+                    rolling.avg_loaded_chunks(),
+                    rolling.avg_resident_chunks(),
+                ));
+                let draw_promotion_ratio = if rolling.avg_pending_total() > 0.0 {
+                    rolling.avg_promoted_to_drawable() / rolling.avg_pending_total()
+                } else {
+                    0.0
+                };
+                let metadata_wait_share = if rolling.avg_pending_total() > 0.0 {
+                    rolling.avg_waiting_metadata() / rolling.avg_pending_total()
+                } else {
+                    0.0
+                };
+                ui.monospace(format!(
+                    "rolling diagnosis: promotion ratio {:.2}% | metadata wait share {:.2}%",
+                    draw_promotion_ratio * 100.0,
+                    metadata_wait_share * 100.0,
                 ));
                 ui.monospace(format!(
                     "drawn this frame gpu/cpu/stale/fallback/unknown chunks: {}/{}/{}/{}/{}",
