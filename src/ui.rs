@@ -64,6 +64,7 @@ pub struct ProfilerStats {
     pub mesh_pending_waiting_on_fence: usize,
     pub mesh_pending_waiting_on_readback_snapshot: usize,
     pub mesh_pending_waiting_on_metadata: usize,
+    pub mesh_pending_waiting_reason_unset: usize,
     pub mesh_pending_superseded: usize,
     pub mesh_pending_rejected: usize,
     pub mesh_completed_receive_budget_hits: usize,
@@ -286,6 +287,7 @@ pub struct DebugRollingStats {
     sum_total_indices: u64,
     sum_mesh_pending_total: u64,
     sum_mesh_waiting_metadata: u64,
+    sum_mesh_waiting_reason_unset: u64,
     sum_mesh_promoted_to_drawable: u64,
     sum_gpu_dispatch_submitted: u64,
     sum_gpu_dispatch_dequeued: u64,
@@ -300,6 +302,7 @@ struct DebugRollingSample {
     total_indices: u64,
     mesh_pending_total: usize,
     mesh_waiting_metadata: usize,
+    mesh_waiting_reason_unset: usize,
     mesh_promoted_to_drawable: usize,
     gpu_dispatch_submitted: usize,
     gpu_dispatch_dequeued: usize,
@@ -330,6 +333,7 @@ impl DebugRollingStats {
             total_indices,
             mesh_pending_total: profiler.mesh_pending_total,
             mesh_waiting_metadata: profiler.mesh_pending_waiting_on_metadata,
+            mesh_waiting_reason_unset: profiler.mesh_pending_waiting_reason_unset,
             mesh_promoted_to_drawable: profiler.mesh_pending_promoted_to_drawable,
             gpu_dispatch_submitted: profiler.mesh_gpu_dispatch_tasks_submitted,
             gpu_dispatch_dequeued: profiler.mesh_gpu_dispatch_tasks_dequeued,
@@ -348,6 +352,9 @@ impl DebugRollingStats {
         self.sum_mesh_waiting_metadata = self
             .sum_mesh_waiting_metadata
             .saturating_add(sample.mesh_waiting_metadata as u64);
+        self.sum_mesh_waiting_reason_unset = self
+            .sum_mesh_waiting_reason_unset
+            .saturating_add(sample.mesh_waiting_reason_unset as u64);
         self.sum_mesh_promoted_to_drawable = self
             .sum_mesh_promoted_to_drawable
             .saturating_add(sample.mesh_promoted_to_drawable as u64);
@@ -380,6 +387,9 @@ impl DebugRollingStats {
                 self.sum_mesh_waiting_metadata = self
                     .sum_mesh_waiting_metadata
                     .saturating_sub(oldest.mesh_waiting_metadata as u64);
+                self.sum_mesh_waiting_reason_unset = self
+                    .sum_mesh_waiting_reason_unset
+                    .saturating_sub(oldest.mesh_waiting_reason_unset as u64);
                 self.sum_mesh_promoted_to_drawable = self
                     .sum_mesh_promoted_to_drawable
                     .saturating_sub(oldest.mesh_promoted_to_drawable as u64);
@@ -432,6 +442,9 @@ impl DebugRollingStats {
     }
     pub fn avg_dispatch_dequeued(&self) -> f32 {
         Self::avg(self.sum_gpu_dispatch_dequeued, self.sample_count())
+    }
+    pub fn avg_waiting_reason_unset(&self) -> f32 {
+        Self::avg(self.sum_mesh_waiting_reason_unset, self.sample_count())
     }
     pub fn avg_dispatch_source_queue(&self) -> f32 {
         Self::avg(self.sum_gpu_dispatch_source_queue, self.sample_count())
@@ -935,7 +948,7 @@ pub fn draw(
                     ui_state.profiler.dirty_queue_drop_count,
                 ));
                 ui.monospace(format!(
-                    "gpu dispatch dequeued/submitted/budget: {}/{}/{} | rx backlog={} | source queue={} | headroom={:.2}",
+                    "gpu dispatch dequeued/submitted/budget: {}/{}/{} | gpu rx backlog={} | renderer source backlog={} | headroom={:.2}",
                     ui_state.profiler.mesh_gpu_dispatch_tasks_dequeued,
                     ui_state.profiler.mesh_gpu_dispatch_tasks_submitted,
                     ui_state.profiler.mesh_gpu_dispatch_task_budget,
@@ -1026,10 +1039,11 @@ pub fn draw(
                     ui_state.profiler.mesh_pending_rejected,
                 ));
                 ui.monospace(format!(
-                    "pending waits fence/readback/metadata: {}/{}/{}",
+                    "pending waits completion-serial/readback-snapshot/metadata/wait-unset: {}/{}/{}/{}",
                     ui_state.profiler.mesh_pending_waiting_on_fence,
                     ui_state.profiler.mesh_pending_waiting_on_readback_snapshot,
                     ui_state.profiler.mesh_pending_waiting_on_metadata,
+                    ui_state.profiler.mesh_pending_waiting_reason_unset,
                 ));
                 ui.monospace(format!(
                     "bookkeeping budget hits recv/finalize/adopt/retry: {}/{}/{}/{}",
@@ -1164,15 +1178,16 @@ pub fn draw(
                 let rolling = &ui_state.debug_rolling;
                 let n = rolling.sample_count();
                 ui.monospace(format!(
-                    "rolling avg ({n}f): drawn_chunks {:.2} | indices {:.1} | pending {:.1} | pending(meta) {:.1} | promoted {:.2}",
+                    "rolling avg ({n}f): drawn_chunks {:.2} | indices {:.1} | pending {:.1} | pending(metadata) {:.1} | pending(wait-unset) {:.1} | promoted {:.2}",
                     rolling.avg_chunks_drawn(),
                     rolling.avg_indices_drawn(),
                     rolling.avg_pending_total(),
                     rolling.avg_waiting_metadata(),
+                    rolling.avg_waiting_reason_unset(),
                     rolling.avg_promoted_to_drawable(),
                 ));
                 ui.monospace(format!(
-                    "rolling avg dispatch ({n}f): dequeued {:.2} | submitted {:.2} | source queue {:.2} | loaded {:.2} | resident {:.2}",
+                    "rolling avg dispatch ({n}f): gpu dispatch dequeued {:.2} | gpu dispatch submitted {:.2} | renderer source backlog {:.2} | loaded {:.2} | resident {:.2}",
                     rolling.avg_dispatch_dequeued(),
                     rolling.avg_dispatch_submitted(),
                     rolling.avg_dispatch_source_queue(),

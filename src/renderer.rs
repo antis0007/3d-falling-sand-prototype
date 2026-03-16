@@ -24,7 +24,7 @@ use crate::engine::render::{FrameEpoch, RenderLifecycleState};
 use crate::engine::visibility::debug_assert_not_rejected_before_drawable;
 use crate::engine::world::ChunkVersion;
 use crate::gpu_compute::{
-    dispatch_gpu_chunk_tasks_on_renderer, gpu_task_rx_backlog_estimate,
+    dispatch_gpu_chunk_tasks_on_renderer, gpu_runtime_debug_snapshot,
     initialize_gpu_compute_worker, invalidate_gpu_pending_finalize_and_queued_on_renderer,
     run_chunk_job_on_worker, set_gpu_protected_chunks_on_renderer,
     take_ready_gpu_mesh_results_on_renderer, update_gpu_page_fences_on_renderer, DrawIndirectArgs,
@@ -816,6 +816,7 @@ pub struct MeshRebuildStats {
     pub mesh_waiting_on_fence: usize,
     pub mesh_waiting_on_readback_snapshot: usize,
     pub mesh_waiting_on_metadata: usize,
+    pub mesh_waiting_reason_unset: usize,
     pub drawable_resident_total: usize,
     pub newly_drawable_this_frame: usize,
     pub pending_finalize_total: usize,
@@ -823,6 +824,7 @@ pub struct MeshRebuildStats {
     pub pending_finalize_waiting_on_completion_serial: usize,
     pub pending_finalize_waiting_on_readback_snapshot: usize,
     pub pending_finalize_waiting_on_metadata: usize,
+    pub pending_finalize_waiting_reason_unset: usize,
     pub pending_finalize_aged_out: usize,
     pub pending_finalize_orphan_timed_out: usize,
     pub terminal_superseded_total: usize,
@@ -2567,14 +2569,12 @@ impl Renderer {
                 self.visible_gpu_chunks.keys().copied().collect();
             set_gpu_protected_chunks_on_renderer(&protected_near, &protected_visible);
 
-            let source_queue_depth_for_dispatch =
+            let renderer_source_backlog_for_dispatch =
                 self.dirty_queues.total_len() + self.mesh_queue.inflight;
-            let rx_backlog_for_dispatch = gpu_task_rx_backlog_estimate();
             let (task_budget, dispatch_budget, dispatch_headroom) =
-                self.dynamic_gpu_dispatch_budget(mesh_budget, source_queue_depth_for_dispatch);
+                self.dynamic_gpu_dispatch_budget(mesh_budget, renderer_source_backlog_for_dispatch);
             stats.gpu_dispatch_task_budget = task_budget;
-            stats.gpu_dispatch_source_queue_depth = source_queue_depth_for_dispatch;
-            stats.gpu_dispatch_rx_backlog = rx_backlog_for_dispatch;
+            stats.gpu_dispatch_source_queue_depth = renderer_source_backlog_for_dispatch;
             stats.gpu_dispatch_headroom = dispatch_headroom;
             match dispatch_gpu_chunk_tasks_on_renderer(task_budget, dispatch_budget) {
                 Ok(dispatch_stats) => {
@@ -2598,6 +2598,18 @@ impl Renderer {
                     );
                 }
             }
+
+            let runtime_snapshot = gpu_runtime_debug_snapshot();
+            stats.gpu_dispatch_rx_backlog = runtime_snapshot.queue_rx_backlog;
+            stats.gpu_mesh_slots_used = runtime_snapshot.mesh_slots_used;
+            stats.gpu_mesh_slot_capacity = runtime_snapshot.mesh_slot_capacity;
+            stats.gpu_mesh_slot_in_flight_fences = runtime_snapshot.mesh_slot_in_flight_fences;
+            stats.gpu_mesh_vertex_used = runtime_snapshot.mesh_vertex_used;
+            stats.gpu_mesh_vertex_capacity = runtime_snapshot.mesh_vertex_capacity;
+            stats.gpu_mesh_index_used = runtime_snapshot.mesh_index_used;
+            stats.gpu_mesh_index_capacity = runtime_snapshot.mesh_index_capacity;
+            stats.gpu_mesh_largest_free_vertex_span = runtime_snapshot.mesh_largest_free_vertex_span;
+            stats.gpu_mesh_largest_free_index_span = runtime_snapshot.mesh_largest_free_index_span;
         }
 
         let mut pending_promoted_to_drawable = 0usize;
@@ -3272,8 +3284,11 @@ impl Renderer {
                 Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnReadbackSnapshot) => {
                     stats.mesh_waiting_on_readback_snapshot += 1;
                 }
-                Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata) | None => {
+                Some(ReadyGpuMeshFinalizeWaitReason::WaitingOnMetadata) => {
                     stats.mesh_waiting_on_metadata += 1;
+                }
+                None => {
+                    stats.mesh_waiting_reason_unset += 1;
                 }
             }
             oldest_pending = match oldest_pending {
@@ -4150,7 +4165,7 @@ impl Renderer {
                         stats.pending_finalize_waiting_on_metadata += 1;
                     }
                     None => {
-                        stats.pending_finalize_waiting_on_metadata += 1;
+                        stats.pending_finalize_waiting_reason_unset += 1;
                     }
                 }
 
