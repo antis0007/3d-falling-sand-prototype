@@ -3080,17 +3080,56 @@ impl Renderer {
             self.enqueue_dirty_chunk(coord, player_chunk, chunk_priority_scores);
         }
 
+        let mut replacement_failed_lost_drawable = 0usize;
+        let mut replacement_failed_lost_but_superseded_or_evicted = 0usize;
         for &coord in &replacement_failed_coords {
             let still_visible = self.visible_gpu_chunks.contains_key(&coord);
-            if !still_visible {
-                log::error!(
-                    "[renderer] invariant violated: replacement failed for coord={coord:?} but visible draw was lost"
-                );
+            if still_visible {
+                continue;
             }
-            debug_assert!(
-                still_visible,
-                "replacement failed for {coord:?} but visible draw was lost"
+
+            let has_current_record_drawable = self
+                .chunk_mesh_records
+                .get(&coord)
+                .and_then(|record| record.current_drawable)
+                .is_some();
+            let lifecycle = self
+                .mesh_lifecycle
+                .get(&coord)
+                .copied()
+                .unwrap_or(MeshLifecycleState::Rejected);
+            let displacement_is_expected = matches!(
+                lifecycle,
+                MeshLifecycleState::Superseded | MeshLifecycleState::Evicted
             );
+
+            if has_current_record_drawable || displacement_is_expected {
+                replacement_failed_lost_but_superseded_or_evicted += 1;
+                continue;
+            }
+
+            replacement_failed_lost_drawable += 1;
+            log::error!(
+                "[renderer] continuity drop after replacement failure coord={coord:?} lifecycle={:?} has_current_record_drawable={}",
+                lifecycle,
+                has_current_record_drawable,
+            );
+            debug_assert!(
+                has_current_record_drawable || displacement_is_expected,
+                "replacement failed for {coord:?} and continuity was dropped (lifecycle={lifecycle:?})"
+            );
+        }
+        if replacement_failed_lost_but_superseded_or_evicted > 0 {
+            log::debug!(
+                "[renderer] replacement failures with non-void displacement: count={} (superseded/evicted while replacement failed)",
+                replacement_failed_lost_but_superseded_or_evicted,
+            );
+        }
+        if replacement_failed_lost_drawable > 0 {
+            stats.void_drop_count += replacement_failed_lost_drawable;
+            stats.dropped_to_void_count_by_reason
+                [VoidDropReason::ReplacementRejected.as_index()] +=
+                replacement_failed_lost_drawable;
         }
 
         stats.upload_count = uploaded;
