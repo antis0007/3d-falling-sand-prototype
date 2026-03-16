@@ -16,7 +16,7 @@ use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1553,6 +1553,10 @@ static GPU_TASKS_ENQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
+static GPU_TASK_ENQUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASK_ENQUEUE_DISCONNECTED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
 static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
@@ -2594,30 +2598,45 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         };
 
         // Queue GPU task
-        if let Err(err) = GPU_TASK_TX
-            .get()
-            .expect("gpu task queue")
-            .send(GpuChunkTask {
-                coord: job.coord,
-                page_index,
-                page_generation,
-                frontier_count: active_frontier_count,
-                edit_commands,
-                jacobi_iterations,
-                neighbor_pages,
-                simulation_tick: tick,
-                current_state,
-                startup_seeding_mode,
-                mesh_slice,
-                slot_generation,
-                version: job.version,
-                task_id: job.task_id,
-                lod: job.lod as u8,
-            })
-        {
-            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.release_queued_task_identity(page_index, mesh_slice);
-            return Err(err).context("failed to send GPU chunk task");
+        let task = GpuChunkTask {
+            coord: job.coord,
+            page_index,
+            page_generation,
+            frontier_count: active_frontier_count,
+            edit_commands,
+            jacobi_iterations,
+            neighbor_pages,
+            simulation_tick: tick,
+            current_state,
+            startup_seeding_mode,
+            mesh_slice,
+            slot_generation,
+            version: job.version,
+            task_id: job.task_id,
+            lod: job.lod as u8,
+        };
+
+        match GPU_TASK_TX.get().expect("gpu task queue").try_send(task) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_task)) => {
+                GPU_TASK_ENQUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
+                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                atlas.release_queued_task_identity(page_index, mesh_slice);
+                anyhow::bail!(
+                    "gpu task queue full while enqueueing chunk task for {:?} (rx backlog estimate={})",
+                    job.coord,
+                    gpu_task_rx_backlog_estimate()
+                );
+            }
+            Err(TrySendError::Disconnected(_task)) => {
+                GPU_TASK_ENQUEUE_DISCONNECTED_COUNT.fetch_add(1, Ordering::Relaxed);
+                let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                atlas.release_queued_task_identity(page_index, mesh_slice);
+                anyhow::bail!(
+                    "gpu task queue disconnected while enqueueing chunk task for {:?}",
+                    job.coord
+                );
+            }
         }
         GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
 
