@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::engine2::gpu::Engine2Gpu;
+use crate::engine2::phases::{SimInput, SimOutput};
 
 #[derive(Debug)]
 pub struct SimScheduler {
@@ -31,16 +31,35 @@ impl SimScheduler {
         self.quiet_ticks.insert(page_slot, 0);
     }
 
-    pub fn advance_frame(&mut self, gpu: &mut Engine2Gpu) {
+    pub fn advance_frame(&mut self, input: SimInput) -> SimOutput {
         self.tick_index = self.tick_index.saturating_add(1);
+
+        for page in input.upload.active_pages {
+            self.wake_brick(page);
+        }
+        for page in input.edit.wake_pages {
+            self.wake_brick(page);
+        }
+
         self.active_this_frame.clear();
         self.active_this_frame
             .extend(self.next_frame_active.iter().copied());
         self.next_frame_active.clear();
 
-        gpu.queues.clear_active();
+        let mut sim_output = SimOutput {
+            active_pages: Vec::with_capacity(self.active_this_frame.len()),
+            dirty_pages: input.upload.dirty_pages,
+            remesh_pages: input.upload.remesh_pages,
+        };
+        sim_output.remesh_pages.extend(sim_output.dirty_pages.iter().copied());
+
+        for page in input.edit.dirty_pages {
+            sim_output.dirty_pages.push(page);
+            sim_output.remesh_pages.push(page);
+        }
+
         for page in &self.active_this_frame {
-            gpu.queues.push_active(*page);
+            sim_output.active_pages.push(*page);
 
             let quiet_entry = self.quiet_ticks.entry(*page).or_default();
             *quiet_entry = quiet_entry.saturating_add(1);
@@ -51,6 +70,8 @@ impl SimScheduler {
                 self.quiet_ticks.remove(page);
             }
         }
+
+        sim_output
     }
 
     pub fn active_this_frame(&self) -> &[u32] {

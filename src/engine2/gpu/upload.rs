@@ -4,7 +4,7 @@ use bytemuck::bytes_of;
 
 use crate::engine2::gpu::buffers::{BrickHeader, BufferPool, DrawIndirectArgs};
 use crate::engine2::gpu::context::GpuContext;
-use crate::engine2::gpu::queues::HotQueues;
+use crate::engine2::phases::UploadOutput;
 use crate::engine2::types::{BrickKey, GpuPageHandle};
 use crate::engine2::world::brick::{BrickPayload, BRICK_VOXEL_CAPACITY};
 
@@ -34,15 +34,16 @@ impl UploadQueue {
         self.pending.push(upload);
     }
 
-    pub fn flush(&mut self, gpu: &GpuContext, buffers: &BufferPool, queues: &mut HotQueues) {
+    pub fn flush(&mut self, gpu: &GpuContext, buffers: &BufferPool) -> UploadOutput {
         if self.pending.is_empty() {
-            return;
+            return UploadOutput::default();
         }
 
         let header_size = std::mem::size_of::<BrickHeader>() as u64;
         let page_bytes = buffers.brick_state_page_bytes();
         let zero_payload = vec![0u16; BRICK_VOXEL_CAPACITY];
 
+        let mut output = UploadOutput::default();
         for upload in self.pending.drain(..) {
             let page_slot = upload.page.0;
             let header = BrickHeader {
@@ -67,10 +68,10 @@ impl UploadQueue {
                 bytemuck::cast_slice(payload),
             );
 
-            queues.push_active(page_slot);
+            output.active_pages.push(page_slot);
             if upload.mark_dirty {
-                queues.push_dirty(page_slot);
-                queues.push_remesh(page_slot);
+                output.dirty_pages.push(page_slot);
+                output.remesh_pages.push(page_slot);
             }
         }
 
@@ -84,5 +85,6 @@ impl UploadQueue {
             .write_buffer(&buffers.indirect_draw, 0, bytes_of(&indirect));
 
         self.pending_bytes = 0;
+        output
     }
 }

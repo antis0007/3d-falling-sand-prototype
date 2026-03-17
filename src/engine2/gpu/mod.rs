@@ -13,6 +13,7 @@ use crate::engine2::gpu::context::GpuContext;
 use crate::engine2::gpu::page_table::BrickPageTable;
 use crate::engine2::gpu::queues::HotQueues;
 use crate::engine2::gpu::upload::{PendingBrickUpload, UploadQueue};
+use crate::engine2::phases::{SimOutput, UploadOutput};
 use crate::engine2::types::BrickKey;
 use crate::engine2::world::brick::BrickPayload;
 
@@ -21,7 +22,7 @@ pub struct Engine2Gpu {
     context: Option<GpuContext>,
     buffers: Option<BufferPool>,
     pub page_table: BrickPageTable,
-    pub queues: HotQueues,
+    queues: HotQueues,
     pub uploads: UploadQueue,
 }
 
@@ -70,11 +71,21 @@ impl Engine2Gpu {
         Some((self.context.as_ref()?, self.buffers.as_ref()?))
     }
 
-    pub fn flush(&mut self) {
+    pub fn flush_uploads(&mut self) -> UploadOutput {
+        let (Some(context), Some(buffers)) = (&self.context, &self.buffers) else {
+            return UploadOutput::default();
+        };
+        self.uploads.flush(context, buffers)
+    }
+
+    pub fn upload_sim_queues(&mut self, sim: &SimOutput) {
         let (Some(context), Some(buffers)) = (&self.context, &self.buffers) else {
             return;
         };
-        self.uploads.flush(context, buffers, &mut self.queues);
-        self.queues.upload(context, buffers);
+        self.queues.upload(context, buffers, sim);
+    }
+
+    pub fn set_draw_indirect_count(&mut self, count: u32) {
+        self.queues.set_draw_indirect_count(count);
     }
 }

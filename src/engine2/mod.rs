@@ -4,6 +4,7 @@
 pub mod app_bridge;
 pub mod commands;
 pub mod gpu;
+pub mod phases;
 pub mod render;
 pub mod sim;
 pub mod types;
@@ -14,8 +15,9 @@ use std::sync::Arc;
 use crate::engine2::commands::CommandQueue;
 use crate::engine2::gpu::buffers::BufferPoolConfig;
 use crate::engine2::gpu::Engine2Gpu;
+use crate::engine2::phases::{EditOutput, SimInput, SimOutput, UploadOutput};
 use crate::engine2::render::camera::CameraState;
-use crate::engine2::render::draw::{DrawPacket, Engine2Drawer};
+use crate::engine2::render::draw::{DrawInput, DrawPacket, Engine2Drawer};
 use crate::engine2::render::extract::{Engine2Extractor, ExtractInput, ExtractOutput};
 use crate::engine2::sim::edit_apply::EditApplier;
 use crate::engine2::sim::scheduler::SimScheduler;
@@ -84,37 +86,42 @@ impl Engine2State {
     }
 
     /// Frame phase 2: flush staged uploads/page-table metadata to GPU buffers.
-    pub fn upload_step(&mut self) {
-        self.gpu.flush();
+    pub fn upload_step(&mut self) -> UploadOutput {
+        self.gpu.flush_uploads()
     }
 
     /// Frame phase 3: apply pending edit commands.
-    pub fn command_application_step(&mut self) {
+    pub fn command_application_step(&mut self) -> EditOutput {
         self.edit_applier.apply_pending_edits(
             &mut self.commands,
             &mut self.residency,
             &mut self.gpu,
             &mut self.scheduler,
-        );
+        )
     }
 
     /// Frame phase 4: advance active/sleep scheduling.
-    pub fn active_scheduling_step(&mut self) {
-        self.scheduler.advance_frame(&mut self.gpu);
+    pub fn active_scheduling_step(&mut self, sim_input: SimInput) -> SimOutput {
+        self.scheduler.advance_frame(sim_input)
     }
 
     /// Frame phase 5: run engine2 extraction ownership.
-    pub fn render_extraction_step(&mut self, camera: CameraState) -> ExtractOutput {
-        let extract_input = ExtractInput { camera };
-        self.extractor.extract(&mut self.gpu.queues, &extract_input)
+    pub fn render_extraction_step(&mut self, camera: CameraState, sim: SimOutput) -> ExtractOutput {
+        let extract_input = ExtractInput { camera, sim };
+        self.extractor.extract(extract_input)
     }
 
     /// Frame phase 6: prepare draw packet and upload indirect draw arguments.
     pub fn draw_step(&mut self, extract_output: ExtractOutput) -> DrawPacket {
-        let draw_packet = self.drawer.prepare(&mut self.gpu.queues, extract_output);
+        let draw_packet = self.drawer.prepare(DrawInput::from(extract_output));
+        self.gpu.set_draw_indirect_count(draw_packet.indirect_count);
         if let Some(gpu_handles) = self.gpu.context_and_buffers() {
             self.drawer.upload_indirect(gpu_handles, &draw_packet);
         }
         draw_packet
+    }
+
+    pub fn queue_upload_step(&mut self, sim_output: &SimOutput) {
+        self.gpu.upload_sim_queues(sim_output);
     }
 }
