@@ -4,7 +4,6 @@ use bytemuck::bytes_of;
 
 use crate::engine2::gpu::buffers::{BufferPool, DrawIndirectArgs};
 use crate::engine2::gpu::context::GpuContext;
-use crate::engine2::gpu::queues::HotQueues;
 use crate::engine2::render::extract::{ExtractOutput, ExtractedPrimitive};
 
 #[derive(Debug, Clone, Copy)]
@@ -28,18 +27,29 @@ pub struct DrawPacket {
     pub indirect_count: u32,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct DrawInput {
+    pub extracted: Vec<ExtractedPrimitive>,
+}
+
+impl From<ExtractOutput> for DrawInput {
+    fn from(value: ExtractOutput) -> Self {
+        Self {
+            extracted: value.extracted,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Engine2Drawer;
 
 impl Engine2Drawer {
-    pub fn prepare(&mut self, queues: &mut HotQueues, extract_output: ExtractOutput) -> DrawPacket {
-        let commands: Vec<DrawCommand> = extract_output
+    pub fn prepare(&mut self, draw_input: DrawInput) -> DrawPacket {
+        let commands: Vec<DrawCommand> = draw_input
             .extracted
             .into_iter()
             .map(DrawCommand::from)
             .collect();
-
-        queues.set_draw_indirect_count(commands.len() as u32);
 
         DrawPacket {
             indirect_count: commands.len() as u32,
@@ -68,21 +78,20 @@ impl Engine2Drawer {
 #[cfg(test)]
 mod tests {
     use super::Engine2Drawer;
-    use crate::engine2::gpu::queues::HotQueues;
-    use crate::engine2::render::extract::{ExtractOutput, ExtractedPrimitive};
+    use crate::engine2::render::draw::DrawInput;
+    use crate::engine2::render::extract::ExtractedPrimitive;
 
     #[test]
     fn stages_indirect_count_without_gpu_context() {
         let mut drawer = Engine2Drawer;
-        let mut queues = HotQueues::default();
-        let output = ExtractOutput {
+        let output = DrawInput {
             extracted: vec![ExtractedPrimitive {
                 page_slot: 4,
                 vertex_count: 36,
             }],
         };
 
-        let packet = drawer.prepare(&mut queues, output);
+        let packet = drawer.prepare(output);
 
         assert_eq!(packet.indirect_count, 1);
         assert_eq!(packet.commands[0].page_slot, 4);

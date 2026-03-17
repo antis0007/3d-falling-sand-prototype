@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use crate::engine2::commands::{CommandQueue, EditCommand, PackedEditCommands};
 use crate::engine2::gpu::Engine2Gpu;
+use crate::engine2::phases::EditOutput;
 use crate::engine2::sim::scheduler::SimScheduler;
 use crate::engine2::types::{voxel_to_brick_key, BrickKey, VoxelCoord};
 use crate::engine2::world::residency::ResidencyStateMap;
@@ -41,10 +42,10 @@ impl EditApplier {
         residency: &mut ResidencyStateMap,
         gpu: &mut Engine2Gpu,
         scheduler: &mut SimScheduler,
-    ) {
+    ) -> EditOutput {
         let edits = commands.drain_edit_commands(MAX_EDIT_COMMANDS_PER_FRAME);
         if edits.is_empty() {
-            return;
+            return EditOutput::default();
         }
 
         let packed = PackedEditCommands::from_edits(&edits);
@@ -54,6 +55,7 @@ impl EditApplier {
         }
 
         let mut touched_pages = HashSet::new();
+        let mut output = EditOutput::default();
         for edit in &edits {
             let (min, max) = touched_brick_bounds(*edit);
             for z in min.z..=max.z {
@@ -65,8 +67,9 @@ impl EditApplier {
                         };
                         residency.mark_dirty(key);
                         if touched_pages.insert(page.0) {
-                            gpu.queues.push_dirty(page.0);
                             scheduler.wake_brick(page.0);
+                            output.dirty_pages.push(page.0);
+                            output.wake_pages.push(page.0);
                         }
                     }
                 }
@@ -76,6 +79,7 @@ impl EditApplier {
         self.applied_commands = self
             .applied_commands
             .saturating_add(packed.header.command_count as u64);
+        output
     }
 
     fn dispatch_placeholder(
