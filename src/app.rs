@@ -1136,11 +1136,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     event_loop
         .run(move |event, elwt| {
+            // Renderer init is advanced from AboutToWait only, so redraw cadence has a single
+            // scheduling source and never recursively re-enters via RedrawRequested.
             let mut poll_renderer_init = || {
                 if app_state == AppState::Uninitialized {
                     renderer_init_future = Some(Box::pin(Renderer::new(window)));
                     app_state = AppState::Initializing;
-                    window.request_redraw();
                 }
 
                 if app_state != AppState::Initializing {
@@ -1196,7 +1197,6 @@ pub async fn run() -> anyhow::Result<()> {
                             tool_textures = Some(load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR));
                             renderer = Some(ready_renderer);
                             app_state = AppState::Ready;
-                            window.request_redraw();
                         }
                         Err(err) => {
                             let msg = format!("Renderer initialization failed: {err:#}");
@@ -1211,9 +1211,6 @@ pub async fn run() -> anyhow::Result<()> {
 
             match &event {
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
-                if matches!(event, WindowEvent::RedrawRequested) {
-                    poll_renderer_init();
-                }
                 match event {
                     WindowEvent::CursorMoved { .. } => cursor_position_known = true,
                     WindowEvent::CursorLeft { .. } => cursor_position_known = false,
@@ -1417,8 +1414,6 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     WindowEvent::RedrawRequested => {
                         if app_state != AppState::Ready {
-                            next_redraw_at = Instant::now() + Duration::from_millis(16);
-                            window.request_redraw();
                             input.end_frame();
                             return;
                         }
@@ -3355,6 +3350,8 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
             Event::AboutToWait => {
+                // AboutToWait is the single place where we both poll async init progress and
+                // schedule the next redraw for startup/steady-state maintenance cadence.
                 poll_renderer_init();
                 let now = Instant::now();
                 let force_redraw = should_force_maintenance_tick(
@@ -3363,6 +3360,9 @@ pub async fn run() -> anyhow::Result<()> {
                     last_mesh_stats.meshing_completed_depth,
                 );
                 if force_redraw || now >= next_redraw_at {
+                    if app_state != AppState::Ready {
+                        next_redraw_at = now + Duration::from_millis(16);
+                    }
                     window.request_redraw();
                 }
             }
