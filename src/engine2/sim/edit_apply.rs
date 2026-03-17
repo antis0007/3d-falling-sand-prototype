@@ -7,6 +7,7 @@ use crate::engine2::gpu::Engine2Gpu;
 use crate::engine2::phases::EditOutput;
 use crate::engine2::sim::scheduler::SimScheduler;
 use crate::engine2::types::{voxel_to_brick_key, BrickKey, VoxelCoord};
+use crate::engine2::world::brick::BrickPayload;
 use crate::engine2::world::residency::ResidencyStateMap;
 
 const MAX_EDIT_COMMANDS_PER_FRAME: usize = 4096;
@@ -57,6 +58,7 @@ impl EditApplier {
         let mut touched_pages = HashSet::new();
         let mut output = EditOutput::default();
         for edit in &edits {
+            let material = edit_material(*edit);
             let (min, max) = touched_brick_bounds(*edit);
             for z in min.z..=max.z {
                 for y in min.y..=max.y {
@@ -65,6 +67,9 @@ impl EditApplier {
                         let Some(page) = gpu.page_table.page_for(key) else {
                             continue;
                         };
+                        let mut payload = BrickPayload::default();
+                        payload.material_ids.fill(material);
+                        gpu.enqueue_page_update(key, page, 1, payload, true);
                         residency.mark_dirty(key);
                         if touched_pages.insert(page.0) {
                             scheduler.wake_brick(page.0);
@@ -170,6 +175,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         self.bind_group_layout = Some(bind_group_layout);
         self.pipeline = Some(pipeline);
+    }
+}
+
+fn edit_material(edit: EditCommand) -> u16 {
+    match edit {
+        EditCommand::Sphere(sphere) => sphere.material,
+        EditCommand::Box(edit_box) => edit_box.material,
     }
 }
 

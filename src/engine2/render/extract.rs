@@ -1,5 +1,7 @@
 //! GPU extraction pass input and dirty-brick extraction output.
 
+use std::collections::BTreeSet;
+
 use crate::engine2::phases::SimOutput;
 use crate::engine2::render::camera::CameraState;
 
@@ -40,9 +42,17 @@ impl Engine2Extractor {
     pub fn extract(&mut self, input: ExtractInput) -> ExtractOutput {
         let _camera = input.camera;
 
-        let mut extracted = Vec::with_capacity(input.sim.remesh_pages.len());
-        let mut extracted_pages = Vec::with_capacity(input.sim.remesh_pages.len());
-        for page_slot in input.sim.remesh_pages {
+        let mut page_set = BTreeSet::new();
+        for page in input.sim.active_pages {
+            page_set.insert(page);
+        }
+        for page in input.sim.remesh_pages {
+            page_set.insert(page);
+        }
+
+        let mut extracted = Vec::with_capacity(page_set.len());
+        let mut extracted_pages = Vec::with_capacity(page_set.len());
+        for page_slot in page_set {
             // Placeholder geometry for phase 4: one cube (36 vertices) per changed brick.
             extracted.push(ExtractedPrimitive {
                 page_slot,
@@ -75,6 +85,6 @@ mod tests {
         });
 
         assert_eq!(output.extracted.len(), 2);
-        assert_eq!(output.extracted_pages, vec![9, 7]);
+        assert_eq!(output.extracted_pages, vec![7, 9]);
     }
 }

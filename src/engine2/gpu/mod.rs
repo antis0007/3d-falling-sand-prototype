@@ -67,6 +67,23 @@ impl Engine2Gpu {
         self.page_table.evict(key)
     }
 
+    pub fn enqueue_page_update(
+        &mut self,
+        key: BrickKey,
+        page: crate::engine2::types::GpuPageHandle,
+        revision: u32,
+        payload: BrickPayload,
+        mark_dirty: bool,
+    ) {
+        self.uploads.enqueue(PendingBrickUpload {
+            key,
+            page,
+            revision,
+            init_payload: Some(payload),
+            mark_dirty,
+        });
+    }
+
     pub fn context_and_buffers(&self) -> Option<(&GpuContext, &BufferPool)> {
         Some((self.context.as_ref()?, self.buffers.as_ref()?))
     }
