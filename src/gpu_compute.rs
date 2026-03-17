@@ -237,7 +237,7 @@ struct SimulationBindResources<'a> {
 #[cfg(feature = "gpu-compute")]
 struct MeshingBindResources<'a> {
     atlas_voxels: &'a wgpu::Buffer,
-    meshing_params: &'a wgpu::Buffer,
+    page_params: &'a wgpu::Buffer,
     face_mask_buffer: &'a wgpu::Buffer,
     face_offset_buffer: &'a wgpu::Buffer,
     face_count_buffer: &'a wgpu::Buffer,
@@ -1237,7 +1237,6 @@ impl DrawIndirectReadbackState {
 #[cfg(feature = "gpu-compute")]
 pub struct GpuScratchPool {
     page_params: wgpu::Buffer,
-    meshing_params: wgpu::Buffer,
     active_tiles: wgpu::Buffer,
     active_tile_counter: wgpu::Buffer,
     edit_commands: wgpu::Buffer,
@@ -1292,12 +1291,6 @@ fn create_gpu_scratch_pool(device: &wgpu::Device, plan: GpuWorkerStartupPlan) ->
         page_params: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk page params"),
             size: std::mem::size_of::<FrameParams>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }),
-        meshing_params: device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk meshing params"),
-            size: std::mem::size_of::<MeshingFrameParams>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -2360,12 +2353,20 @@ impl GpuComputeRuntime {
             lod,
         );
 
-        let meshing_params = device_meshing_page_params(page_index, current_state, [u32::MAX; 6]);
-        state.queue.write_buffer(
-            &scratch.meshing_params,
+        let page_params = device_page_params(
+            sim_job,
+            page_index,
+            sim_job.active_frontier_count,
+            current_state,
             0,
-            bytemuck::cast_slice(&meshing_params),
+            state.runtime_config,
+            0,
+            0,
+            [u32::MAX; 6],
         );
+        state
+            .queue
+            .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&page_params));
 
         let chunk_span_world = CHUNK_SIZE_VOXELS as f32 * VOXEL_SIZE;
         let origin = [
@@ -2516,7 +2517,7 @@ impl GpuComputeRuntime {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: resources.meshing_params.as_entire_binding(),
+                    resource: resources.page_params.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
@@ -2657,7 +2658,7 @@ pub fn initialize_gpu_compute_worker(
             &device,
             MeshingBindResources {
                 atlas_voxels: &atlas_voxels,
-                meshing_params: &scratch.meshing_params,
+                page_params: &scratch.page_params,
                 face_mask_buffer: &shared_mesh_buffers.face_mask_buffer,
                 face_offset_buffer: &shared_mesh_buffers.face_offset_buffer,
                 face_count_buffer: &shared_mesh_buffers.face_count_buffer,
@@ -3794,21 +3795,6 @@ struct FrameParams {
     neighbor_pages: [u32; 6],
     _pad: [u32; 2],
 }
-
-#[derive(Clone, Copy, Pod, Zeroable)]
-#[repr(C)]
-struct MeshingFrameParams {
-    page_index: u32,
-    voxel_count: u32,
-    state_index: u32,
-    _pad0: u32,
-    neighbor_pages: [u32; 4],
-    neighbor_pages_tail: [u32; 2],
-    _pad1: [u32; 2],
-}
-
-const _: [(); 84] = [(); std::mem::size_of::<FrameParams>()];
-const _: [(); 48] = [(); std::mem::size_of::<MeshingFrameParams>()];
 #[cfg(feature = "gpu-compute")]
 fn device_page_params(
     sim_job: &SimulationJob,
@@ -3845,28 +3831,6 @@ fn device_page_params(
         "encoded jacobi iteration count drifted"
     );
     [params]
-}
-
-#[cfg(feature = "gpu-compute")]
-fn device_meshing_page_params(
-    page_index: GpuPageIndex,
-    state_index: u32,
-    neighbor_pages: [u32; 6],
-) -> [MeshingFrameParams; 1] {
-    [MeshingFrameParams {
-        page_index: page_index.0,
-        voxel_count: CHUNK_VOLUME as u32,
-        state_index,
-        _pad0: 0,
-        neighbor_pages: [
-            neighbor_pages[0],
-            neighbor_pages[1],
-            neighbor_pages[2],
-            neighbor_pages[3],
-        ],
-        neighbor_pages_tail: [neighbor_pages[4], neighbor_pages[5]],
-        _pad1: [0; 2],
-    }]
 }
 
 #[derive(Clone, Copy, Default, Pod, Zeroable)]

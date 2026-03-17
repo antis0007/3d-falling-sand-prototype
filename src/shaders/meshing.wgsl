@@ -16,11 +16,22 @@ const DEBUG_COLOR_OVERRIDE_PAGE: u32 = 0u;
 struct FrameParams {
     page_index: u32,
     voxel_count: u32,
+    frontier_len: u32,
+    simulation_tick: u32,
     state_index: u32,
-    _pad0: u32,
+    edit_count: u32,
+    active_tile_budget: u32,
+    jacobi_iterations: u32,
+    jacobi_iteration: u32,
+    // Fields below are written by Rust (`gpu_compute::FrameParams`) and kept here
+    // to preserve a byte-for-byte storage-buffer contract across simulation/meshing.
+    cell_size: f32,
+    max_velocity: f32,
+    velocity_damping: f32,
+    viscosity: f32,
     neighbor_pages: vec4<u32>,
     neighbor_pages_tail: vec2<u32>,
-    _pad1: vec2<u32>,
+    _pad: vec2<u32>,
 };
 
 struct GpuVertex {
