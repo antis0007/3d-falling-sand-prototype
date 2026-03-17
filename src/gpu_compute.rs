@@ -5,18 +5,20 @@ use crate::mesh_layout::{
 };
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason, VOXEL_SIZE};
+use crate::startup_gpu_budget::{finalize_startup_budget, StartupGpuBudget};
 use crate::types::{ChunkCoord, GpuPageIndex, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "gpu-compute")]
+use crossbeam_channel as cbc;
 #[cfg(feature = "gpu-compute")]
 use glam::Vec3;
 #[cfg(feature = "gpu-compute")]
 use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::Receiver;
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -113,6 +115,109 @@ pub struct SharedMeshBuffers {
     pub face_mask_buffer: Arc<wgpu::Buffer>,
     pub face_offset_buffer: Arc<wgpu::Buffer>,
     pub face_count_buffer: Arc<wgpu::Buffer>,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuWorkerStartupPlan {
+    pub reduce_scratch_footprint: bool,
+    pub disable_draw_indirect_readback: bool,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+pub struct GpuComputeStartupBufferSizes {
+    pub atlas_voxels: u64,
+    pub velocity_mac: u64,
+    pub pressure: u64,
+    pub divergence: u64,
+    pub material_density: u64,
+    pub scratch_total: u64,
+    pub draw_indirect_readback: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn compute_startup_buffer_sizes(plan: GpuWorkerStartupPlan) -> GpuComputeStartupBufferSizes {
+    let page_len = CHUNK_VOLUME as u64;
+    let page_capacity = MESH_SLOT_COUNT as u64;
+    let scratch_active_tiles = page_len * std::mem::size_of::<u32>() as u64;
+    let scratch_edit_commands =
+        MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64;
+    let scratch_total = std::mem::size_of::<FrameParams>() as u64
+        + if plan.reduce_scratch_footprint {
+            scratch_active_tiles / 2
+        } else {
+            scratch_active_tiles
+        }
+        + 16
+        + if plan.reduce_scratch_footprint {
+            scratch_edit_commands / 2
+        } else {
+            scratch_edit_commands
+        }
+        + page_capacity * std::mem::size_of::<u32>() as u64
+        + 16
+        + 16;
+
+    GpuComputeStartupBufferSizes {
+        atlas_voxels: atlas_voxel_size_bytes(),
+        velocity_mac: velocity_mac_size_bytes(),
+        pressure: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        divergence: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        material_density: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        scratch_total,
+        draw_indirect_readback: if plan.disable_draw_indirect_readback {
+            0
+        } else {
+            std::mem::size_of::<DrawIndexedIndirectArgs>() as u64 * MESH_SLOT_COUNT as u64
+        },
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn plan_gpu_worker_startup(
+    device_max_buffer_size: u64,
+) -> anyhow::Result<GpuWorkerStartupPlan> {
+    let mut plan = GpuWorkerStartupPlan::default();
+    for pass in 0..=2 {
+        let sizes = compute_startup_buffer_sizes(plan);
+        let mut budget = StartupGpuBudget::new(device_max_buffer_size, device_max_buffer_size / 3);
+        budget.register_plan("compute_atlas", sizes.atlas_voxels);
+        budget.register_plan("compute_velocity", sizes.velocity_mac);
+        budget.register_plan("compute_pressure", sizes.pressure);
+        budget.register_plan("compute_divergence", sizes.divergence);
+        budget.register_plan("compute_material", sizes.material_density);
+        budget.register_plan("compute_scratch", sizes.scratch_total);
+        budget.register_plan("compute_readback", sizes.draw_indirect_readback);
+        for category in [
+            "compute_atlas",
+            "compute_velocity",
+            "compute_pressure",
+            "compute_divergence",
+            "compute_material",
+            "compute_scratch",
+            "compute_readback",
+        ] {
+            budget.grant_planned(category);
+        }
+
+        if let Ok(decision) = finalize_startup_budget(budget, device_max_buffer_size / 8) {
+            log::info!(
+                "gpu worker startup budget plan: downgraded={} planned={}B granted={}B",
+                decision.downgraded,
+                decision.budget.planned_total(),
+                decision.budget.granted_total(),
+            );
+            return Ok(plan);
+        }
+
+        if pass == 0 {
+            plan.reduce_scratch_footprint = true;
+        } else if pass == 1 {
+            plan.disable_draw_indirect_readback = true;
+        }
+    }
+    anyhow::bail!("gpu worker startup planning exceeded budget after downgrade attempts")
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -1023,13 +1128,13 @@ struct DrawIndirectReadbackState {
 
 #[cfg(feature = "gpu-compute")]
 impl DrawIndirectReadbackState {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, disabled: bool) -> Self {
         let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
         let slot_capacity = MESH_SLOT_COUNT as u64;
         let size = draw_stride * slot_capacity;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu draw indirect frame readback"),
-            size,
+            size: if disabled { 16 } else { size },
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1039,7 +1144,11 @@ impl DrawIndirectReadbackState {
             map_result_rx: None,
             requested_serial: 0,
             ready_serial: 0,
-            cached_index_counts: vec![0; MESH_SLOT_COUNT as usize],
+            cached_index_counts: if disabled {
+                Vec::new()
+            } else {
+                vec![0; MESH_SLOT_COUNT as usize]
+            },
         }
     }
 
@@ -1074,7 +1183,8 @@ impl DrawIndirectReadbackState {
     }
 
     fn request_snapshot_if_needed(&mut self, state: &WorkerGpuState, completed_serial: u64) {
-        if completed_serial == 0
+        if self.cached_index_counts.is_empty()
+            || completed_serial == 0
             || self.map_result_rx.is_some()
             || self.ready_serial >= completed_serial
         {
@@ -1163,7 +1273,7 @@ fn clear_page_buffers(
 }
 
 #[cfg(feature = "gpu-compute")]
-fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
+fn create_gpu_scratch_pool(device: &wgpu::Device, plan: GpuWorkerStartupPlan) -> GpuScratchPool {
     let page_len = CHUNK_VOLUME as u64;
     let page_capacity = MESH_SLOT_COUNT as u64;
     GpuScratchPool {
@@ -1175,7 +1285,14 @@ fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
         }),
         active_tiles: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk active frontier"),
-            size: page_len * std::mem::size_of::<u32>() as u64,
+            size: {
+                let base = page_len * std::mem::size_of::<u32>() as u64;
+                if plan.reduce_scratch_footprint {
+                    base / 2
+                } else {
+                    base
+                }
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -1187,7 +1304,14 @@ fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
         }),
         edit_commands: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("edit command buffer"),
-            size: MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64,
+            size: {
+                let base = MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64;
+                if plan.reduce_scratch_footprint {
+                    base / 2
+                } else {
+                    base
+                }
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -1572,9 +1696,9 @@ static GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
 #[cfg(feature = "gpu-compute")]
-static GPU_TASK_TX: OnceLock<SyncSender<GpuChunkTask>> = OnceLock::new();
+static GPU_TASK_TX: OnceLock<cbc::Sender<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
-static GPU_TASK_RX: OnceLock<Mutex<Receiver<GpuChunkTask>>> = OnceLock::new();
+static GPU_TASK_RX: OnceLock<cbc::Receiver<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
 static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1637,7 +1761,7 @@ pub struct GpuRuntimeDebugSnapshot {
 
 #[cfg(feature = "gpu-compute")]
 fn try_enqueue_gpu_chunk_task(
-    tx: &SyncSender<GpuChunkTask>,
+    tx: &cbc::Sender<GpuChunkTask>,
     mut task: GpuChunkTask,
 ) -> Result<(), GpuTaskQueuePressureReason> {
     let mut deferred_attempts = 0u32;
@@ -1650,7 +1774,7 @@ fn try_enqueue_gpu_chunk_task(
                 }
                 return Ok(());
             }
-            Err(TrySendError::Full(returned_task)) => {
+            Err(cbc::TrySendError::Full(returned_task)) => {
                 task = returned_task;
                 if deferred_attempts < GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS {
                     deferred_attempts += 1;
@@ -1662,7 +1786,7 @@ fn try_enqueue_gpu_chunk_task(
                     max_defer_attempts: GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS,
                 });
             }
-            Err(TrySendError::Disconnected(_returned_task)) => {
+            Err(cbc::TrySendError::Disconnected(_returned_task)) => {
                 GPU_TASK_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
                 return Err(GpuTaskQueuePressureReason::QueueDisconnected);
             }
@@ -2420,11 +2544,12 @@ pub fn initialize_gpu_compute_worker(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     shared_mesh_buffers: SharedMeshBuffers,
+    startup_plan: GpuWorkerStartupPlan,
 ) -> anyhow::Result<()> {
     if GPU_TASK_TX.get().is_none() {
-        let (tx, rx) = sync_channel(4096);
+        let (tx, rx) = cbc::bounded(4096);
         let _ = GPU_TASK_TX.set(tx);
-        let _ = GPU_TASK_RX.set(Mutex::new(rx));
+        let _ = GPU_TASK_RX.set(rx);
     }
     let state_result = WORKER_STATE.get_or_init(|| {
         let limits = device.limits();
@@ -2496,7 +2621,7 @@ pub fn initialize_gpu_compute_worker(
             mapped_at_creation: false,
         });
 
-        let scratch = create_gpu_scratch_pool(&device);
+        let scratch = create_gpu_scratch_pool(&device, startup_plan);
         let simulation_bg = runtime.create_simulation_bind_group(
             &device,
             SimulationBindResources {
@@ -2527,7 +2652,10 @@ pub fn initialize_gpu_compute_worker(
                 chunk_origin_buffer: &shared_mesh_buffers.chunk_origin_buffer,
             },
         );
-        let draw_indirect_readback = DrawIndirectReadbackState::new(&device);
+        let draw_indirect_readback = DrawIndirectReadbackState::new(
+            &device,
+            startup_plan.disable_draw_indirect_readback,
+        );
 
         Ok(Arc::new(WorkerGpuState {
             device,
@@ -2824,11 +2952,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .clone();
 
-    let rx = GPU_TASK_RX
-        .get()
-        .context("gpu task receiver missing")?
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let rx = GPU_TASK_RX.get().context("gpu task receiver missing")?;
 
     let frame_dispatch_start = Instant::now();
     let mut stats = GpuDispatchFrameStats::default();
@@ -2844,11 +2968,11 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 stats.tasks_dequeued += 1;
                 t
             }
-            Err(TryRecvError::Empty) => {
+            Err(cbc::TryRecvError::Empty) => {
                 stats.queue_empty_exits += 1;
                 break;
             }
-            Err(TryRecvError::Disconnected) => {
+            Err(cbc::TryRecvError::Disconnected) => {
                 stats.queue_disconnected_exits += 1;
                 break;
             }
