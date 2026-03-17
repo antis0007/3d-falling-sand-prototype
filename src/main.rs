@@ -14,6 +14,7 @@ mod renderer;
 mod sim;
 mod sim_world;
 mod simulation;
+mod startup_gpu_budget;
 mod streaming;
 mod types;
 mod ui;
