@@ -13,7 +13,10 @@ pub struct PendingBrickUpload {
     pub key: BrickKey,
     pub page: GpuPageHandle,
     pub revision: u32,
-    pub payload: Option<BrickPayload>,
+    /// One-shot page initialization payload.
+    ///
+    /// This staging copy is consumed at flush and is not a CPU authoritative resident state.
+    pub init_payload: Option<BrickPayload>,
     pub mark_dirty: bool,
 }
 
@@ -54,7 +57,7 @@ impl UploadQueue {
                 .write_buffer(&buffers.brick_headers, header_offset, bytes_of(&header));
 
             let payload = upload
-                .payload
+                .init_payload
                 .as_ref()
                 .map_or(&zero_payload, |p| &p.material_ids);
             let page_offset = u64::from(page_slot) * page_bytes;

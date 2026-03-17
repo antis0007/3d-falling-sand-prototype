@@ -48,7 +48,7 @@ impl Engine2Gpu {
         &mut self,
         key: BrickKey,
         revision: u32,
-        payload: Option<BrickPayload>,
+        init_payload: Option<BrickPayload>,
         mark_dirty: bool,
     ) -> Option<crate::engine2::types::GpuPageHandle> {
         let page = self.page_table.allocate(key)?;
@@ -56,7 +56,7 @@ impl Engine2Gpu {
             key,
             page,
             revision,
-            payload,
+            init_payload,
             mark_dirty,
         });
         Some(page)

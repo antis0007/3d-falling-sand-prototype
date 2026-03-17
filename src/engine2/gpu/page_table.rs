@@ -1,4 +1,6 @@
 //! Brick-key to GPU-page table.
+//!
+//! This mapping is the canonical hot-state location for resident bricks in engine2.
 
 use std::collections::HashMap;
 
