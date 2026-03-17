@@ -1244,16 +1244,6 @@ fn clear_meshing_outputs_for_page(
     page_index: GpuPageIndex,
     mesh_slice: MeshBufferSlice,
 ) {
-    let zero_indirect = DrawIndirectArgs::default();
-    let indirect_stride = std::mem::size_of::<DrawIndirectArgs>() as u64;
-    let indirect_offset = page_index.0 as u64 * indirect_stride;
-
-    state.queue.write_buffer(
-        &state.page_indirect,
-        indirect_offset,
-        bytemuck::bytes_of(&zero_indirect),
-    );
-
     let zero_draw_indirect = DrawIndexedIndirectArgs::default();
     let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
     let draw_offset = mesh_slice.slot_index as u64 * draw_stride;
