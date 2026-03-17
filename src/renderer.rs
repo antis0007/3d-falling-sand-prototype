@@ -58,6 +58,7 @@ use winit::dpi::PhysicalSize;
 pub const VOXEL_SIZE: f32 = 0.5;
 const MAX_PENDING_DIRTY_CHUNKS: usize = 16_384;
 const CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.5;
+const URGENT_CHUNK_SNAPSHOT_BUILD_BUDGET_MS: f32 = 1.0;
 const MESH_RETRY_MAX_ATTEMPTS: u32 = 6;
 const MESH_RETRY_BASE_BACKOFF_FRAMES: u64 = 2;
 const MESH_RETRY_SKIPPED_MAX_BACKOFF_FRAMES: u64 = 64;
@@ -1693,11 +1694,20 @@ impl BackgroundMeshQueue {
                             }
                         }
 
-                        let job = {
-                            let lock = worker_rx.lock().expect("mesh worker rx lock");
-                            lock.recv()
+                        let job = loop {
+                            let recv_result = {
+                                let lock = worker_rx.lock().expect("mesh worker rx lock");
+                                lock.try_recv()
+                            };
+                            match recv_result {
+                                Ok(job) => break Some(job),
+                                Err(TryRecvError::Empty) => {
+                                    thread::yield_now();
+                                }
+                                Err(TryRecvError::Disconnected) => break None,
+                            }
                         };
-                        let Ok(job) = job else {
+                        let Some(job) = job else {
                             break;
                         };
                         worker_telemetry
@@ -2517,13 +2527,19 @@ impl Renderer {
         let mut far_jobs = Vec::new();
         let mut ultra_jobs = Vec::new();
         let mut frame_jobs: HashMap<ChunkCoord, MeshJob> = HashMap::new();
+        let chunk_snapshot_budget = mesh_budget.max(1);
 
-        let mut urgent_jobs = self.pop_urgent_mesh_jobs(store, &mut stats, player_chunk, lod_radii);
+        let mut urgent_jobs = self.pop_urgent_mesh_jobs(
+            store,
+            &mut stats,
+            player_chunk,
+            lod_radii,
+            chunk_snapshot_budget,
+        );
         for job in urgent_jobs.drain(..) {
             Self::enqueue_frame_job(&mut frame_jobs, job);
         }
 
-        let chunk_snapshot_budget = mesh_budget.max(1);
         let mut snapshot_coords = self.pop_priority_dirty_chunks(
             chunk_snapshot_budget,
             player_chunk,
@@ -5031,9 +5047,21 @@ impl Renderer {
         stats: &mut MeshRebuildStats,
         player_chunk: ChunkCoord,
         lod_radii: LodRadii,
+        mesh_budget: usize,
     ) -> Vec<MeshJob> {
         let mut jobs = Vec::new();
+        let urgent_frame_start = Instant::now();
+        let urgent_mesh_budget = mesh_budget.max(1);
         while let Some(coord) = self.urgent_mesh_queue.pop_front() {
+            if jobs.len() >= urgent_mesh_budget {
+                self.urgent_mesh_queue.push_front(coord);
+                break;
+            }
+            let elapsed_ms = urgent_frame_start.elapsed().as_secs_f32() * 1000.0;
+            if elapsed_ms >= URGENT_CHUNK_SNAPSHOT_BUILD_BUDGET_MS {
+                self.urgent_mesh_queue.push_front(coord);
+                break;
+            }
             self.urgent_mesh_set.remove(&coord);
             self.pending_lod_remesh.remove(&coord);
             self.pending_lod_remesh_since.remove(&coord);
@@ -7934,11 +7962,8 @@ mod tests {
 
     #[test]
     fn adaptive_receive_budget_scales_up_with_backlog_pressure() {
-        let (low_budget, ..) = Renderer::adaptive_receive_budget(
-            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
-            0,
-            0,
-        );
+        let (low_budget, ..) =
+            Renderer::adaptive_receive_budget(GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME, 0, 0);
         let (high_budget, ..) = Renderer::adaptive_receive_budget(
             GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
             MAX_MESH_RESULTS_RECEIVED_PER_FRAME * 2,
