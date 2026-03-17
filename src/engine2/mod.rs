@@ -27,7 +27,7 @@ use crate::engine2::world::storage::WorldStorage;
 ///
 /// Ownership boundary:
 /// - CPU residency/storage remain the cold-state authority for what should be loaded.
-/// - Engine2 GPU owns hot resident page layout, upload staging, and active/dirty/remesh queues.
+/// - Engine2 GPU owns canonical mutable hot-state once uploads are initialized.
 #[derive(Debug, Default)]
 pub struct Engine2State {
     pub residency: ResidencyStateMap,
@@ -61,15 +61,17 @@ impl Engine2State {
         for decision in decisions {
             match decision {
                 ResidencyDecision::Load(key) => {
-                    let resident_record = self.storage.resident.get(&key);
-                    let payload = resident_record.and_then(|record| record.payload.clone());
-                    let revision = resident_record
-                        .map(|record| record.meta.revision as u32)
-                        .unwrap_or(0);
-                    if let Some(page) = self
-                        .gpu
-                        .enqueue_resident_brick(key, revision, payload, false)
-                    {
+                    let pending_materialization = self.storage.take_pending_materialization(key);
+                    let revision = pending_materialization
+                        .as_ref()
+                        .map(|staged| staged.revision)
+                        .unwrap_or_else(|| self.storage.resident_revision(key));
+                    if let Some(page) = self.gpu.enqueue_resident_brick(
+                        key,
+                        revision,
+                        pending_materialization.map(|staged| staged.payload),
+                        false,
+                    ) {
                         self.residency.mark_resident(key, Some(page));
                     }
                 }

@@ -1,7 +1,8 @@
 //! Residency source of truth for sparse 16^3 bricks.
 //!
 //! Ownership boundary: this module owns desired/current residency state transitions and
-//! sparse per-brick residency metadata. It does not own payload storage or procgen logic.
+//! sparse per-brick residency metadata. It does not own payload storage or materialization.
+//! GPU page state is canonical after resident pages are initialized.
 
 use std::collections::{HashMap, HashSet};
 
