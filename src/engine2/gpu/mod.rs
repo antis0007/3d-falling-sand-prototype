@@ -66,6 +66,10 @@ impl Engine2Gpu {
         self.page_table.evict(key)
     }
 
+    pub fn context_and_buffers(&self) -> Option<(&GpuContext, &BufferPool)> {
+        Some((self.context.as_ref()?, self.buffers.as_ref()?))
+    }
+
     pub fn flush(&mut self) {
         let (Some(context), Some(buffers)) = (&self.context, &self.buffers) else {
             return;
