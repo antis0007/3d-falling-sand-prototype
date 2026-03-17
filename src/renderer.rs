@@ -32,10 +32,11 @@ use crate::gpu_compute::{
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
-    gpu_page_capacity, renderer_pending_finalize_identity_exists,
-    required_storage_buffer_binding_size_bytes, ReadyGpuMeshFinalizeEvent,
-    ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason, COMPUTE_STORAGE_BINDING_COUNT,
-    GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES, GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    gpu_page_capacity, invalidate_gpu_pending_finalize_on_renderer,
+    renderer_pending_finalize_identity_exists, required_storage_buffer_binding_size_bytes,
+    ReadyGpuMeshFinalizeEvent, ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason,
+    COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
 };
 use crate::mesh_layout;
 use crate::sim::{material, Phase};
@@ -4117,6 +4118,8 @@ impl Renderer {
             stats.void_drop_count += 1;
         }
         let _ = self.reject_candidate_preserve_current_for_coord(coord);
+        #[cfg(feature = "gpu-compute")]
+        invalidate_gpu_pending_finalize_on_renderer(coord, None, "finalize_terminal_reject");
         self.mesh_lifecycle.insert(coord, lifecycle);
         if matches!(lifecycle, MeshLifecycleState::Superseded) {
             self.terminal_superseded_total += 1;
