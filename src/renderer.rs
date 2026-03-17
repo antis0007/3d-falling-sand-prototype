@@ -47,6 +47,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -875,6 +876,14 @@ pub struct MeshRebuildStats {
     pub deferred_completed_meshes_count: usize,
     pub deferred_retry_failed_count: usize,
     pub deferred_retry_skipped_count: usize,
+    pub queue_submit_full: usize,
+    pub queue_submit_disconnected: usize,
+    pub queue_worker_jobs_picked: usize,
+    pub queue_result_send_full: usize,
+    pub queue_result_deferred_total: usize,
+    pub queue_result_deferred_current: usize,
+    pub queue_result_sent: usize,
+    pub queue_result_send_disconnected: usize,
     pub pending_finalize_age_ms_max: f32,
     pub pending_finalize_age_ms_p50: f32,
     pub pending_finalize_age_ms_p95: f32,
@@ -1540,6 +1549,50 @@ struct BackgroundMeshQueue {
     tx: SyncSender<MeshJob>,
     rx: Receiver<MeshResult>,
     inflight: usize,
+    telemetry: Arc<BackgroundMeshQueueTelemetry>,
+}
+
+#[derive(Default)]
+struct BackgroundMeshQueueTelemetry {
+    submit_full: AtomicUsize,
+    submit_disconnected: AtomicUsize,
+    worker_jobs_picked: AtomicUsize,
+    worker_result_send_full: AtomicUsize,
+    worker_results_deferred: AtomicUsize,
+    worker_results_deferred_current: AtomicUsize,
+    worker_results_sent: AtomicUsize,
+    worker_result_send_disconnected: AtomicUsize,
+}
+
+#[derive(Default, Clone, Copy)]
+struct BackgroundMeshQueueTelemetrySnapshot {
+    submit_full: usize,
+    submit_disconnected: usize,
+    worker_jobs_picked: usize,
+    worker_result_send_full: usize,
+    worker_results_deferred: usize,
+    worker_results_deferred_current: usize,
+    worker_results_sent: usize,
+    worker_result_send_disconnected: usize,
+}
+
+impl BackgroundMeshQueueTelemetry {
+    fn snapshot(&self) -> BackgroundMeshQueueTelemetrySnapshot {
+        BackgroundMeshQueueTelemetrySnapshot {
+            submit_full: self.submit_full.load(Ordering::Relaxed),
+            submit_disconnected: self.submit_disconnected.load(Ordering::Relaxed),
+            worker_jobs_picked: self.worker_jobs_picked.load(Ordering::Relaxed),
+            worker_result_send_full: self.worker_result_send_full.load(Ordering::Relaxed),
+            worker_results_deferred: self.worker_results_deferred.load(Ordering::Relaxed),
+            worker_results_deferred_current: self
+                .worker_results_deferred_current
+                .load(Ordering::Relaxed),
+            worker_results_sent: self.worker_results_sent.load(Ordering::Relaxed),
+            worker_result_send_disconnected: self
+                .worker_result_send_disconnected
+                .load(Ordering::Relaxed),
+        }
+    }
 }
 
 fn build_mesh_artifact(mesh_backend: MeshPipelineBackend, job: &MeshJob) -> ChunkMeshArtifact {
@@ -1590,64 +1643,124 @@ impl BackgroundMeshQueue {
         let (tx, job_rx) = sync_channel::<MeshJob>(queue_bound);
         let (result_tx, rx) = sync_channel::<MeshResult>(queue_bound);
         let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let telemetry = Arc::new(BackgroundMeshQueueTelemetry::default());
 
         for i in 0..worker_count {
             let worker_rx = std::sync::Arc::clone(&job_rx);
             let worker_tx = result_tx.clone();
+            let worker_telemetry = Arc::clone(&telemetry);
             thread::Builder::new()
                 .name(format!("mesh-worker-{i}"))
-                .spawn(move || loop {
-                    let job = {
-                        let lock = worker_rx.lock().expect("mesh worker rx lock");
-                        lock.recv()
-                    };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    log::info!("[mesh-worker] picked job chunk={:?}", job.coord);
-
-                    let artifact = catch_unwind(AssertUnwindSafe(|| {
-                        build_mesh_artifact(mesh_backend, &job)
-                    }))
-                    .unwrap_or_else(|panic_payload| {
-                        let panic_reason = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        ChunkMeshArtifact::Failed {
-                            reason: format!(
-                                "chunk={:?} lod={:?}: worker panic while building mesh artifact: {}",
-                                job.coord, job.lod, panic_reason
-                            ),
+                .spawn(move || {
+                    let mut deferred_result: Option<MeshResult> = None;
+                    loop {
+                        if let Some(result) = deferred_result.take() {
+                            match worker_tx.try_send(result) {
+                                Ok(()) => {
+                                    worker_telemetry
+                                        .worker_results_deferred_current
+                                        .fetch_sub(1, Ordering::Relaxed);
+                                    worker_telemetry
+                                        .worker_results_sent
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(TrySendError::Full(result)) => {
+                                    deferred_result = Some(result);
+                                    worker_telemetry
+                                        .worker_result_send_full
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    thread::yield_now();
+                                    continue;
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    worker_telemetry
+                                        .worker_results_deferred_current
+                                        .fetch_sub(1, Ordering::Relaxed);
+                                    worker_telemetry
+                                        .worker_result_send_disconnected
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
                         }
-                    });
-                    if let ChunkMeshArtifact::Failed { reason } = &artifact {
-                        log::warn!(
-                            "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
-                            job.coord,
-                            job.lod,
-                            short_error_message(reason)
-                        );
+
+                        let job = {
+                            let lock = worker_rx.lock().expect("mesh worker rx lock");
+                            lock.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        worker_telemetry
+                            .worker_jobs_picked
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::trace!("[mesh-worker] picked job chunk={:?}", job.coord);
+
+                        let artifact = catch_unwind(AssertUnwindSafe(|| {
+                            build_mesh_artifact(mesh_backend, &job)
+                        }))
+                        .unwrap_or_else(|panic_payload| {
+                            let panic_reason = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            ChunkMeshArtifact::Failed {
+                                reason: format!(
+                                    "chunk={:?} lod={:?}: worker panic while building mesh artifact: {}",
+                                    job.coord, job.lod, panic_reason
+                                ),
+                            }
+                        });
+                        if let ChunkMeshArtifact::Failed { reason } = &artifact {
+                            log::warn!(
+                                "[mesh-worker] gpu job failed chunk={:?} lod={:?} error={}",
+                                job.coord,
+                                job.lod,
+                                short_error_message(reason)
+                            );
+                        }
+                        let result = MeshResult {
+                            coord: job.coord,
+                            lod: job.lod,
+                            version: job.version,
+                            task_id: job.task_id,
+                            queued_at: job.queued_at,
+                            artifact,
+                            urgent: job.urgent,
+                            from_pending_finalize: false,
+                            bookkeeping_first_seen_frame: 0,
+                        };
+                        log::trace!("[mesh-worker] sending result chunk={:?}", result.coord);
+                        match worker_tx.try_send(result) {
+                            Ok(()) => {
+                                worker_telemetry
+                                    .worker_results_sent
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(TrySendError::Full(result)) => {
+                                deferred_result = Some(result);
+                                worker_telemetry
+                                    .worker_result_send_full
+                                    .fetch_add(1, Ordering::Relaxed);
+                                worker_telemetry
+                                    .worker_results_deferred
+                                    .fetch_add(1, Ordering::Relaxed);
+                                worker_telemetry
+                                    .worker_results_deferred_current
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                worker_telemetry
+                                    .worker_result_send_disconnected
+                                    .fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        log::trace!("[mesh-worker] send completed chunk={:?}", job.coord);
                     }
-                    let result = MeshResult {
-                        coord: job.coord,
-                        lod: job.lod,
-                        version: job.version,
-                        task_id: job.task_id,
-                        queued_at: job.queued_at,
-                        artifact,
-                        urgent: job.urgent,
-                        from_pending_finalize: false,
-                        bookkeeping_first_seen_frame: 0,
-                    };
-                    log::info!("[mesh-worker] sending result chunk={:?}", result.coord);
-                    if worker_tx.send(result).is_err() {
-                        break;
-                    }
-                    log::info!("[mesh-worker] send completed chunk={:?}", job.coord);
                 })
                 .expect("spawn mesh worker");
         }
@@ -1656,11 +1769,12 @@ impl BackgroundMeshQueue {
             tx,
             rx,
             inflight: 0,
+            telemetry,
         }
     }
 
     fn try_submit(&mut self, job: MeshJob) -> Result<(), TrySendError<MeshJob>> {
-        log::info!(
+        log::trace!(
             "[mesh] submit job chunk={:?} version={}",
             job.coord,
             job.version
@@ -1670,7 +1784,16 @@ impl BackgroundMeshQueue {
                 self.inflight += 1;
                 Ok(())
             }
-            Err(err) => Err(err),
+            Err(err @ TrySendError::Full(_)) => {
+                self.telemetry.submit_full.fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+            Err(err @ TrySendError::Disconnected(_)) => {
+                self.telemetry
+                    .submit_disconnected
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
         }
     }
 
@@ -1680,6 +1803,10 @@ impl BackgroundMeshQueue {
             self.inflight = self.inflight.saturating_sub(1);
         }
         result
+    }
+
+    fn telemetry_snapshot(&self) -> BackgroundMeshQueueTelemetrySnapshot {
+        self.telemetry.snapshot()
     }
 }
 
@@ -3413,6 +3540,15 @@ impl Renderer {
             .iter()
             .filter(|(_, kind)| matches!(kind, MeshRetryKind::Skipped(_)))
             .count();
+        let queue_telemetry = self.mesh_queue.telemetry_snapshot();
+        stats.queue_submit_full = queue_telemetry.submit_full;
+        stats.queue_submit_disconnected = queue_telemetry.submit_disconnected;
+        stats.queue_worker_jobs_picked = queue_telemetry.worker_jobs_picked;
+        stats.queue_result_send_full = queue_telemetry.worker_result_send_full;
+        stats.queue_result_deferred_total = queue_telemetry.worker_results_deferred;
+        stats.queue_result_deferred_current = queue_telemetry.worker_results_deferred_current;
+        stats.queue_result_sent = queue_telemetry.worker_results_sent;
+        stats.queue_result_send_disconnected = queue_telemetry.worker_result_send_disconnected;
         stats.flow_received = stats.mesh_artifacts_received;
         stats.flow_adopted = stats.gpu_mesh_adopted_count;
         stats.flow_uploaded = stats.upload_count;
@@ -7668,6 +7804,137 @@ mod tests {
         let accepted = MAX_MESH_RESULTS_RECEIVED_PER_FRAME;
         let deferred = MAX_MESH_RESULTS_RECEIVED_PER_FRAME + 3;
         assert!(accepted < deferred);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-compute")]
+    fn background_queue_submit_full_updates_telemetry_without_blocking() {
+        let mut queue = BackgroundMeshQueue::new(1, 1, MeshPipelineBackend::Gpu);
+        let snapshot = build_chunk_snapshot(
+            &ChunkStore::new(),
+            coord(),
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+        let job = MeshJob {
+            coord: coord(),
+            lod: ChunkLod::Near,
+            version: ChunkVersion(1),
+            task_id: 1,
+            snapshot,
+            queued_at: Instant::now(),
+            greedy: false,
+            urgent: false,
+        };
+        let mut saw_full = false;
+        for _ in 0..128 {
+            match queue.try_submit(job.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    saw_full = true;
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    panic!("mesh queue disconnected unexpectedly")
+                }
+            }
+        }
+        assert!(
+            saw_full,
+            "expected to observe at least one full queue condition"
+        );
+
+        let telemetry = queue.telemetry_snapshot();
+        assert!(telemetry.submit_full >= 1);
+        assert_eq!(telemetry.submit_disconnected, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-compute")]
+    fn background_queue_worker_defers_result_when_result_channel_is_full() {
+        let mut queue = BackgroundMeshQueue::new(1, 1, MeshPipelineBackend::Gpu);
+        let snapshot = build_chunk_snapshot(
+            &ChunkStore::new(),
+            coord(),
+            UnknownNeighborOcclusionPolicy::Aggressive,
+        );
+        let make_job = |task_id: u64| MeshJob {
+            coord: ChunkCoord {
+                x: task_id as i32,
+                y: 0,
+                z: 0,
+            },
+            lod: ChunkLod::Near,
+            version: ChunkVersion(task_id),
+            task_id,
+            snapshot: snapshot.clone(),
+            queued_at: Instant::now(),
+            greedy: false,
+            urgent: false,
+        };
+
+        assert!(queue.try_submit(make_job(1)).is_ok());
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut submitted_second = false;
+        while Instant::now() < deadline {
+            match queue.try_submit(make_job(2)) {
+                Ok(()) => {
+                    submitted_second = true;
+                    break;
+                }
+                Err(TrySendError::Full(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(TrySendError::Disconnected(_)) => panic!("mesh queue disconnected"),
+            }
+        }
+        assert!(submitted_second, "second job should eventually submit");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut observed_deferred = false;
+        while Instant::now() < deadline {
+            let telemetry = queue.telemetry_snapshot();
+            if telemetry.worker_results_deferred_current > 0
+                || telemetry.worker_result_send_full > 0
+                || telemetry.worker_results_deferred > 0
+            {
+                observed_deferred = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            observed_deferred,
+            "expected to observe at least one deferred worker result"
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut first = None;
+        while Instant::now() < deadline {
+            if let Ok(result) = queue.try_recv() {
+                first = Some(result);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(first.is_some(), "first result should arrive promptly");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut second = None;
+        while Instant::now() < deadline {
+            if let Ok(result) = queue.try_recv() {
+                second = Some(result);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(second.is_some(), "deferred result should eventually flush");
+
+        let telemetry = queue.telemetry_snapshot();
+        assert!(telemetry.worker_jobs_picked >= 2);
+        assert!(telemetry.worker_result_send_full >= 1);
+        assert!(telemetry.worker_results_deferred >= 1);
+        assert_eq!(telemetry.worker_results_deferred_current, 0);
+        assert!(telemetry.worker_results_sent >= 2);
     }
 
     #[test]
