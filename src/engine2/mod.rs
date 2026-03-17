@@ -14,6 +14,9 @@ use std::sync::Arc;
 use crate::engine2::commands::CommandQueue;
 use crate::engine2::gpu::buffers::BufferPoolConfig;
 use crate::engine2::gpu::Engine2Gpu;
+use crate::engine2::render::camera::CameraState;
+use crate::engine2::render::draw::{DrawPacket, Engine2Drawer};
+use crate::engine2::render::extract::{Engine2Extractor, ExtractInput};
 use crate::engine2::sim::edit_apply::EditApplier;
 use crate::engine2::sim::scheduler::SimScheduler;
 use crate::engine2::world::procgen::ProcgenInterface;
@@ -32,6 +35,8 @@ pub struct Engine2State {
     pub storage: WorldStorage,
     pub procgen: ProcgenInterface,
     pub gpu: Engine2Gpu,
+    pub extractor: Engine2Extractor,
+    pub drawer: Engine2Drawer,
     pub edit_applier: EditApplier,
     pub scheduler: SimScheduler,
 }
@@ -86,5 +91,16 @@ impl Engine2State {
         self.scheduler.advance_frame(&mut self.gpu);
 
         self.gpu.flush();
+    }
+
+    /// Runs engine2-owned render extraction and draw packet preparation.
+    pub fn prepare_render_packet(&mut self, camera: CameraState) -> DrawPacket {
+        let extract_input = ExtractInput { camera };
+        let extract_output = self.extractor.extract(&mut self.gpu.queues, &extract_input);
+        let draw_packet = self.drawer.prepare(&mut self.gpu.queues, extract_output);
+        if let Some(gpu_handles) = self.gpu.context_and_buffers() {
+            self.drawer.upload_indirect(gpu_handles, &draw_packet);
+        }
+        draw_packet
     }
 }

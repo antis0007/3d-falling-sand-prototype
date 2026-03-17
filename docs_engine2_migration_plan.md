@@ -36,8 +36,12 @@
    - Added engine2 page table ownership for brick-key -> GPU page-slot mapping with explicit allocation/eviction semantics.
    - Added residency -> GPU upload plumbing: load decisions allocate page slots, enqueue placeholder/real payload upload, update residency page handles, and flush queue metadata.
    - Kept rendering switchover out of scope and did not reuse legacy renderer/gpu_compute architecture.
-4. **Phase 4: render extraction switchover**
-   - Bind engine2 extraction/draw to GPU indirect buffers and retire legacy mesh finalize path.
+4. **Phase 4: render extraction switchover** ✅
+   - Added an engine2-owned extraction path (`render/extract.rs`) that consumes dirty/remesh queue state and emits minimal placeholder surface primitives per changed resident brick page.
+   - Added an engine2-owned draw preparation path (`render/draw.rs`) that transforms extracted primitives into draw commands and writes indirect draw args into `engine2.indirect_draw`.
+   - Added minimal render camera plumbing (`render/camera.rs`) and engine-state integration (`Engine2State::prepare_render_packet`) so extraction and draw preparation are invoked through engine2 ownership.
+   - Added queue flow ownership updates (`gpu/queues.rs`) for dirty -> remesh -> extracted progression without legacy mesh finalize/orchestration dependencies.
+   - Kept scope intentionally minimal (placeholder cube output) to prove architecture and ownership boundaries ahead of feature-complete terrain rendering.
 5. **Phase 5: app loop simplification**
    - Remove legacy orchestration branches and move scheduling concerns into engine2 bridge/schedulers.
 
