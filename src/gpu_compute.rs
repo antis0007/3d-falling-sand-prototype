@@ -1132,6 +1132,7 @@ struct WorkerGpuState {
 struct DrawIndirectReadbackState {
     staging: wgpu::Buffer,
     map_result_rx: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    disabled: bool,
     requested_serial: u64,
     ready_serial: u64,
     cached_index_counts: Vec<u32>,
@@ -1153,6 +1154,7 @@ impl DrawIndirectReadbackState {
         Self {
             staging,
             map_result_rx: None,
+            disabled,
             requested_serial: 0,
             ready_serial: 0,
             cached_index_counts: if disabled {
@@ -1224,10 +1226,18 @@ impl DrawIndirectReadbackState {
     }
 
     fn has_snapshot_for(&self, submission_serial: u64) -> bool {
+        if self.disabled {
+            return true;
+        }
         self.ready_serial >= submission_serial
     }
 
     fn index_count_for_slot(&self, draw_indirect_index: u32) -> Option<u32> {
+        if self.disabled {
+            // Readback-disabled mode still allows finalization to proceed. We cannot inspect the
+            // true count on CPU, so return a non-zero sentinel and trust indirect draw args.
+            return Some(1);
+        }
         self.cached_index_counts
             .get(draw_indirect_index as usize)
             .copied()
@@ -1380,7 +1390,6 @@ fn clear_meshing_outputs_for_page(
     mesh_slice: MeshBufferSlice,
     encoder: &mut wgpu::CommandEncoder,
 ) {
-    let zero_draw_indirect = DrawIndexedIndirectArgs::default();
     let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
     let draw_offset = mesh_slice.slot_index as u64 * draw_stride;
     encoder.clear_buffer(&state.draw_indirect_buffer, draw_offset, Some(draw_stride));
@@ -2669,12 +2678,12 @@ pub fn initialize_gpu_compute_worker(
                 chunk_origin_buffer: &shared_mesh_buffers.chunk_origin_buffer,
             },
         );
-        let draw_indirect_readback = DrawIndirectReadbackState::new(&device);
-        log::info!(
-            "[gpu-mesh] meshing binding contract active: bindings=[0:atlas_voxels,1:face_mask,2:face_offset,3:chunk_vertex,4:chunk_index,5:draw_indirect,6:frame_params,7:face_count,8:mesh_meta,9:chunk_origin] page_indirect_required=false"
         let draw_indirect_readback = DrawIndirectReadbackState::new(
             &device,
             startup_plan.disable_draw_indirect_readback,
+        );
+        log::info!(
+            "[gpu-mesh] meshing binding contract active: bindings=[0:atlas_voxels,1:face_mask,2:face_offset,3:chunk_vertex,4:chunk_index,5:draw_indirect,6:frame_params,7:face_count,8:mesh_meta,9:chunk_origin] page_indirect_required=false"
         );
 
         Ok(Arc::new(WorkerGpuState {
