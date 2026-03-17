@@ -1694,18 +1694,9 @@ impl BackgroundMeshQueue {
                             }
                         }
 
-                        let job = loop {
-                            let recv_result = {
-                                let lock = worker_rx.lock().expect("mesh worker rx lock");
-                                lock.try_recv()
-                            };
-                            match recv_result {
-                                Ok(job) => break Some(job),
-                                Err(TryRecvError::Empty) => {
-                                    thread::yield_now();
-                                }
-                                Err(TryRecvError::Disconnected) => break None,
-                            }
+                        let job = {
+                            let lock = worker_rx.lock().expect("mesh worker rx lock");
+                            lock.recv().ok()
                         };
                         let Some(job) = job else {
                             break;
