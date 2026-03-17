@@ -42,8 +42,23 @@
    - Added minimal render camera plumbing (`render/camera.rs`) and engine-state integration (`Engine2State::prepare_render_packet`) so extraction and draw preparation are invoked through engine2 ownership.
    - Added queue flow ownership updates (`gpu/queues.rs`) for dirty -> remesh -> extracted progression without legacy mesh finalize/orchestration dependencies.
    - Kept scope intentionally minimal (placeholder cube output) to prove architecture and ownership boundaries ahead of feature-complete terrain rendering.
-5. **Phase 5: app loop simplification**
-   - Remove legacy orchestration branches and move scheduling concerns into engine2 bridge/schedulers.
+5. **Phase 5: app loop simplification** ✅
+   - Reworked `engine2/app_bridge/loop.rs` into an explicit frame orchestrator that runs residency update, upload, command application, active scheduling, render extraction, and draw preparation in engine2-owned order.
+   - Slimmed `app::run()` to a single engine2 bridge call with a legacy fallback callback, reducing top-level branching/policy.
+   - Replaced coarse `Engine2State` helper calls with explicit per-frame phase methods to make cross-module orchestration visible and auditable.
+
+## Remaining legacy dependencies (frozen, pending retirement)
+- **Legacy streaming + procgen orchestration in `app.rs`**
+  - Still owns desired chunk set computation, generator worker dispatch/drain, tuning pressure controls, and chunk lifetime policy.
+- **Legacy renderer/presentation stack in `renderer.rs` + `app.rs`**
+  - Still owns swapchain/frame acquisition, mesh upload/finalize, draw pass setup, and egui integration.
+- **Legacy input + UI tool/runtime flow in `app.rs`/`ui.rs`**
+  - Still owns event handling, brush/tool state transitions, and runtime edit UX control.
+
+## Next retirement targets after phase 5
+1. Move chunk residency request/release policy from `app.rs` streaming sections into `engine2::world::residency` + `engine2::world::procgen` bridge APIs.
+2. Introduce an engine2 render backend bridge to replace direct `renderer.rs` mesh finalize/draw orchestration and let app only present.
+3. Route edit/tool command generation through an engine2 command ingress adapter so `app.rs` no longer owns simulation command scheduling policy.
 
 ## Phase 2 design decisions
 - Brick edge size is fixed at 16 to preserve a consistent sparse page unit for later GPU residency.
