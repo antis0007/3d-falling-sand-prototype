@@ -1,3 +1,4 @@
+// Preferred startup targets; renderer validates these against runtime device limits before allocation.
 pub const GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub const GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 // Surgical contract repair: keep current global buffers and per-chunk maxima,

@@ -35,8 +35,7 @@ use crate::gpu_compute::{
     gpu_page_capacity, invalidate_gpu_pending_finalize_on_renderer,
     renderer_pending_finalize_identity_exists, required_storage_buffer_binding_size_bytes,
     ReadyGpuMeshFinalizeEvent, ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason,
-    COMPUTE_STORAGE_BINDING_COUNT, GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
-    GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+    COMPUTE_STORAGE_BINDING_COUNT,
 };
 use crate::mesh_layout;
 use crate::sim::{material, Phase};
@@ -80,6 +79,50 @@ const DRAW_CONTINUITY_MAX_FRAMES: u64 = 64;
 const DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS: f32 = 2.0;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
+const GLOBAL_MESH_BUFFER_STARTUP_BUDGET_DIVISOR: u64 = 2;
+
+#[derive(Clone, Copy, Debug)]
+struct GlobalMeshBufferSizes {
+    vertex_bytes: u64,
+    index_bytes: u64,
+}
+
+fn compute_global_mesh_buffer_sizes(
+    device_max_buffer_size: u64,
+) -> anyhow::Result<GlobalMeshBufferSizes> {
+    let preferred_vertex_bytes = mesh_layout::GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES;
+    let preferred_index_bytes = mesh_layout::GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES;
+
+    if preferred_vertex_bytes > device_max_buffer_size
+        || preferred_index_bytes > device_max_buffer_size
+    {
+        anyhow::bail!(
+            "renderer startup aborted: global mesh buffers exceed device max buffer size (vertex={}B, index={}B, device_max={}B)",
+            preferred_vertex_bytes,
+            preferred_index_bytes,
+            device_max_buffer_size,
+        );
+    }
+
+    let preferred_combined = preferred_vertex_bytes
+        .checked_add(preferred_index_bytes)
+        .context("renderer startup aborted: global mesh buffer size overflow")?;
+    let startup_budget = device_max_buffer_size / GLOBAL_MESH_BUFFER_STARTUP_BUDGET_DIVISOR;
+    if preferred_combined > startup_budget {
+        anyhow::bail!(
+            "renderer startup aborted: global mesh buffers need {}B but startup budget is {}B (device_max={}B, policy=1/{} reserved for mesh buffers)",
+            preferred_combined,
+            startup_budget,
+            device_max_buffer_size,
+            GLOBAL_MESH_BUFFER_STARTUP_BUDGET_DIVISOR,
+        );
+    }
+
+    Ok(GlobalMeshBufferSizes {
+        vertex_bytes: preferred_vertex_bytes,
+        index_bytes: preferred_index_bytes,
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnknownNeighborOcclusionPolicy {
@@ -1931,7 +1974,7 @@ impl Renderer {
             .await?;
 
         let device_limits = device.limits();
-        let required_limits_summary = {
+        let mut required_limits_summary = {
             #[cfg(feature = "gpu-compute")]
             {
                 let required_storage_size = required_storage_buffer_binding_size_bytes();
@@ -2011,6 +2054,17 @@ impl Renderer {
                 );
             }
         };
+        let global_mesh_buffer_sizes =
+            compute_global_mesh_buffer_sizes(device_limits.max_buffer_size)?;
+        required_limits_summary = format!(
+            "{} | global_mesh_buffers chosen(vertex={}B,index={}B) target(vertex={}B,index={}B) device_max_buffer={}B",
+            required_limits_summary,
+            global_mesh_buffer_sizes.vertex_bytes,
+            global_mesh_buffer_sizes.index_bytes,
+            mesh_layout::GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+            mesh_layout::GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+            device_limits.max_buffer_size,
+        );
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
 
@@ -2107,7 +2161,7 @@ impl Renderer {
         let mesh_slot_capacity = mesh_layout::MESH_SLOT_COUNT as u64;
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
-            size: GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES,
+            size: global_mesh_buffer_sizes.vertex_bytes,
             usage: wgpu::BufferUsages::VERTEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -2115,7 +2169,7 @@ impl Renderer {
         }));
         let global_gpu_index_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh index buffer"),
-            size: GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES,
+            size: global_mesh_buffer_sizes.index_bytes,
             usage: wgpu::BufferUsages::INDEX
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST,
@@ -2184,10 +2238,11 @@ impl Renderer {
             "mesh pool must support at least one slot"
         );
         log::info!(
-            "gpu mesh pool initialized: vertex={} MiB index={} MiB slots={}",
-            GLOBAL_MESH_VERTEX_BUFFER_SIZE_BYTES / (1024 * 1024),
-            GLOBAL_MESH_INDEX_BUFFER_SIZE_BYTES / (1024 * 1024),
-            mesh_slot_capacity
+            "gpu mesh pool initialized: vertex={} MiB index={} MiB slots={} (device_max_buffer={} MiB)",
+            global_mesh_buffer_sizes.vertex_bytes / (1024 * 1024),
+            global_mesh_buffer_sizes.index_bytes / (1024 * 1024),
+            mesh_slot_capacity,
+            device_limits.max_buffer_size / (1024 * 1024),
         );
 
         let device = Arc::new(device);
