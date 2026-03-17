@@ -27,9 +27,12 @@
    - Added desired-vs-current residency tracking with `request`, `release`, `mark_resident`, `mark_dirty`, and load/evict decision collection.
    - Added compact explicit command queue types (`load`, `unload`, `edit sphere`, `edit box`, `inject material`).
    - Extended engine2 app bridge to construct `Engine2State` (residency + commands + storage + procgen) while still returning legacy fallback.
-3. **Phase 3: GPU hot-state bring-up**
-   - Allocate resident brick pools/page tables/queues/indirect buffers in engine2 gpu modules.
-   - Route edit/load/unload commands through command stream; no CPU meshing.
+3. **Phase 3: GPU hot-state bring-up** ✅
+   - Added an engine2-owned GPU subsystem (`engine2/gpu`) with a thin context adapter over externally-owned `wgpu::Device`/`wgpu::Queue`.
+   - Added explicit storage buffers for brick headers, brick state pages, command upload staging, active/dirty/remesh queues, queue counters, and indirect draw placeholder args.
+   - Added engine2 page table ownership for brick-key -> GPU page-slot mapping with explicit allocation/eviction semantics.
+   - Added residency -> GPU upload plumbing: load decisions allocate page slots, enqueue placeholder/real payload upload, update residency page handles, and flush queue metadata.
+   - Kept rendering switchover out of scope and did not reuse legacy renderer/gpu_compute architecture.
 4. **Phase 4: render extraction switchover**
    - Bind engine2 extraction/draw to GPU indirect buffers and retire legacy mesh finalize path.
 5. **Phase 5: app loop simplification**
