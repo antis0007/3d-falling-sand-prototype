@@ -2190,6 +2190,26 @@ impl Renderer {
         )
     }
 
+    fn authoritative_drawable_coords(&self) -> Vec<ChunkCoord> {
+        Self::collect_authoritative_drawable_coords(
+            &self.visible_gpu_chunks,
+            &self.chunk_mesh_records,
+        )
+    }
+
+    fn collect_authoritative_drawable_coords(
+        visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
+        chunk_mesh_records: &HashMap<ChunkCoord, ChunkMeshRecord>,
+    ) -> Vec<ChunkCoord> {
+        let mut coords: HashSet<ChunkCoord> = visible_gpu_chunks.keys().copied().collect();
+        coords.extend(chunk_mesh_records.iter().filter_map(|(&coord, record)| {
+            (record.current_drawable.is_some() || record.fallback.is_some()).then_some(coord)
+        }));
+        let mut ordered: Vec<ChunkCoord> = coords.into_iter().collect();
+        ordered.sort_by_key(|coord| (coord.x, coord.y, coord.z));
+        ordered
+    }
+
     pub fn cull_stats(&self, camera: &Camera) -> CullStats {
         let visibility = DrawVisibilityInput {
             frustum_culling: self.settings.frustum_culling,
@@ -2198,7 +2218,7 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut stats = CullStats::default();
-        for &coord in self.visible_gpu_chunks.keys() {
+        for coord in self.authoritative_drawable_coords() {
             match self.choose_drawable_for_chunk(coord, visibility) {
                 Some(chosen) => {
                     if matches!(chosen.freshness, DrawableFreshness::StaleDrawable) {
@@ -2225,7 +2245,7 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut visible = Vec::new();
-        for &coord in self.visible_gpu_chunks.keys() {
+        for coord in self.authoritative_drawable_coords() {
             if self.choose_drawable_for_chunk(coord, visibility).is_some() {
                 visible.push(coord);
             }
@@ -2597,8 +2617,7 @@ impl Renderer {
                 .iter()
                 .filter_map(|(&coord, &lod)| matches!(lod, ChunkLod::Near).then_some(coord))
                 .collect();
-            let protected_visible: Vec<ChunkCoord> =
-                self.visible_gpu_chunks.keys().copied().collect();
+            let protected_visible = self.authoritative_drawable_coords();
             set_gpu_protected_chunks_on_renderer(&protected_near, &protected_visible);
 
             let renderer_source_backlog_for_dispatch =
@@ -3037,13 +3056,20 @@ impl Renderer {
                 if !adopted {
                     stats.mesh_artifacts_rejected += 1;
                     stats.mesh_reject_unhandled += 1;
+                    let has_current =
+                        self.reject_candidate_preserve_current_for_coord(result.coord);
                     if had_prior_mesh {
                         replacement_failed_coords.insert(result.coord);
-                        self.record_candidate_rejected_preserving_current(
-                            result.coord,
-                            &mut stats,
-                            VoidDropReason::ReplacementRejected,
-                        );
+                    }
+                    if has_current {
+                        stats.continuity_kept_count += 1;
+                        stats.continuity_keepalive_count += 1;
+                        stats.candidate_rejected_but_drawable_preserved_count += 1;
+                        stats.candidate_rejected_current_preserved += 1;
+                    } else {
+                        stats.void_drop_count += 1;
+                        stats.dropped_to_void_count_by_reason
+                            [VoidDropReason::ReplacementRejected.as_index()] += 1;
                     }
                     self.mesh_lifecycle
                         .insert(result.coord, MeshLifecycleState::Rejected);
@@ -3499,7 +3525,7 @@ impl Renderer {
             screen_h: self.size.height,
         };
         let mut stats = MeshDrawStats::default();
-        for &coord in self.visible_gpu_chunks.keys() {
+        for coord in self.authoritative_drawable_coords() {
             if let Some(chosen) = self.choose_drawable_for_chunk(coord, visibility) {
                 match chosen.freshness {
                     DrawableFreshness::FreshDrawable => stats.draw_source_fresh_count += 1,
@@ -3561,15 +3587,14 @@ impl Renderer {
             screen_h: self.size.height,
         };
 
-        let mut drawable_chunks: Vec<(ChunkCoord, ChosenDrawable)> = self
-            .visible_gpu_chunks
-            .keys()
-            .filter_map(|&coord| {
+        let drawable_chunks: Vec<(ChunkCoord, ChosenDrawable)> = self
+            .authoritative_drawable_coords()
+            .into_iter()
+            .filter_map(|coord| {
                 self.choose_drawable_for_chunk(coord, visibility)
                     .map(|chosen| (coord, chosen))
             })
             .collect();
-        drawable_chunks.sort_by_key(|(coord, _)| (coord.x, coord.y, coord.z));
 
         if !drawable_chunks.is_empty() {
             pass.set_vertex_buffer(0, self.global_gpu_vertex_buffer.slice(..));
@@ -4165,7 +4190,14 @@ impl Renderer {
                 ready.result.submission_serial,
                 ready.status,
             );
-            return None;
+            let has_current = self.finalize_terminal_reject_preserve_current(
+                ready.result.coord,
+                stats,
+                MeshLifecycleState::Superseded,
+                MeshRetryKind::Failed,
+            );
+            stats.candidate_superseded_current_preserved += usize::from(has_current);
+            return has_current.then_some(ready.result.coord);
         };
         let Some(mut pending) = self.remove_pending_gpu_result(&key) else {
             return None;
@@ -4292,7 +4324,6 @@ impl Renderer {
             }
             ReadyGpuMeshFinalizeStatus::ReadyAndValid => {
                 stats.finalize_status_ready_and_valid += 1;
-                stats.finalize_status_ready_and_valid += 1;
                 let promoted = Self::promote_pending_result_to_gpu_ready(pending, &ready);
                 let record = self.mesh_record_mut(ready.result.coord);
                 record.state = ChunkRenderState::CandidateReady;
@@ -4300,7 +4331,6 @@ impl Renderer {
                 None
             }
             ReadyGpuMeshFinalizeStatus::DroppedStaleVersion => {
-                stats.finalize_status_dropped_stale_version += 1;
                 stats.finalize_status_dropped_stale_version += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
@@ -4314,7 +4344,6 @@ impl Renderer {
             }
             ReadyGpuMeshFinalizeStatus::DroppedInvalidMapping => {
                 stats.finalize_status_dropped_invalid_mapping += 1;
-                stats.finalize_status_dropped_invalid_mapping += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
                     ready.result.coord,
@@ -4326,7 +4355,6 @@ impl Renderer {
                 had_prior_visible.then_some(ready.result.coord)
             }
             ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity => {
-                stats.finalize_status_dropped_superseded_identity += 1;
                 stats.finalize_status_dropped_superseded_identity += 1;
                 stats.finalize_ready_not_promoted += 1;
                 let has_current = self.finalize_terminal_reject_preserve_current(
@@ -4380,15 +4408,18 @@ impl Renderer {
             dropped += 1;
         }
         #[cfg(feature = "gpu-compute")]
-        // Handshake contract: when renderer inserts a new GpuPending result, it may purge stale
-        // renderer-side pending rows for the coord, but must not erase the producer finalize
-        // identity that is expected to satisfy the just-inserted pending entry.
-        invalidate_gpu_pending_finalize_and_queued_on_renderer(
-            coord,
-            requested_version,
-            reason,
-            preserve_gpu_finalize_identity,
-        );
+        {
+            // During pending insertion/replacement, keep producer-side finalize identity intact;
+            // only renderer-local stale rows are dropped.
+            if !preserve_gpu_finalize_identity {
+                invalidate_gpu_pending_finalize_and_queued_on_renderer(
+                    coord,
+                    requested_version,
+                    reason,
+                    false,
+                );
+            }
+        }
 
         if self.chunk_mesh_records.contains_key(&coord) {
             let _ = self.reject_candidate_preserve_current_for_coord(coord);
@@ -4471,8 +4502,13 @@ impl Renderer {
             .get(&coord)
             .map(|existing| existing.draw_indirect_index);
 
-        let target_slot_is_acquirable =
-            Self::target_slot_owner_is_acquirable(previous_owner, coord);
+        let target_slot_is_acquirable = Self::target_slot_owner_is_acquirable(
+            previous_owner,
+            coord,
+            target_slot,
+            &self.visible_gpu_chunks,
+            &self.slot_ownership_generation,
+        );
         let coord_old_slot_is_owned = match coord_old_slot {
             None => true,
             Some(old_slot) => {
@@ -4557,10 +4593,23 @@ impl Renderer {
     fn target_slot_owner_is_acquirable(
         previous_owner: Option<ChunkCoord>,
         coord: ChunkCoord,
+        target_slot: u32,
+        visible_gpu_chunks: &HashMap<ChunkCoord, GpuChunkDraw>,
+        slot_ownership_generation: &HashMap<u32, u64>,
     ) -> bool {
         match previous_owner {
             None => true,
-            Some(owner) => owner == coord,
+            Some(owner) if owner == coord => true,
+            Some(owner) => {
+                let Some(owner_draw) = visible_gpu_chunks.get(&owner) else {
+                    return true;
+                };
+                owner_draw.draw_indirect_index != target_slot
+                    || slot_ownership_generation
+                        .get(&target_slot)
+                        .map(|generation| *generation != owner_draw.ownership_generation)
+                        .unwrap_or(true)
+            }
         }
     }
 
@@ -7203,8 +7252,13 @@ mod tests {
         let mut slot_ownership_generation = HashMap::new();
         slot_ownership_generation.insert(slot, draw_a.ownership_generation);
 
-        let target_slot_is_acquirable =
-            Renderer::target_slot_owner_is_acquirable(visible_slots.get(&slot).copied(), coord_b);
+        let target_slot_is_acquirable = Renderer::target_slot_owner_is_acquirable(
+            visible_slots.get(&slot).copied(),
+            coord_b,
+            slot,
+            &visible_gpu_chunks,
+            &slot_ownership_generation,
+        );
         assert!(!target_slot_is_acquirable);
 
         if target_slot_is_acquirable {
@@ -7242,6 +7296,8 @@ mod tests {
         visible_gpu_chunks.insert(coord_a, draw_a);
         let mut visible_slots = HashMap::new();
         visible_slots.insert(slot, coord_a);
+        let mut slot_ownership_generation = HashMap::new();
+        slot_ownership_generation.insert(slot, draw_a.ownership_generation);
 
         // Simulate frame where A replacement failed: A remains visible.
         let replacement_failed_for_a = true;
@@ -7249,8 +7305,13 @@ mod tests {
         assert!(visible_gpu_chunks.contains_key(&coord_a));
 
         // In the same frame, B attempts to adopt A's slot and must be rejected.
-        let b_target_slot_is_acquirable =
-            Renderer::target_slot_owner_is_acquirable(visible_slots.get(&slot).copied(), coord_b);
+        let b_target_slot_is_acquirable = Renderer::target_slot_owner_is_acquirable(
+            visible_slots.get(&slot).copied(),
+            coord_b,
+            slot,
+            &visible_gpu_chunks,
+            &slot_ownership_generation,
+        );
         assert!(!b_target_slot_is_acquirable);
 
         assert!(visible_gpu_chunks.contains_key(&coord_a));
@@ -7340,6 +7401,81 @@ mod tests {
         assert!(!visible_draw_mappings_are_bijective(
             &visible_gpu_chunks,
             &visible_slots,
+        ));
+    }
+
+    #[test]
+    fn authoritative_coords_include_continuity_preserved_drawables() {
+        let visible_coord = ChunkCoord { x: 1, y: 0, z: 0 };
+        let continuity_coord = ChunkCoord { x: 2, y: 0, z: 0 };
+        let mut visible_gpu_chunks = HashMap::new();
+        visible_gpu_chunks.insert(
+            visible_coord,
+            GpuChunkDraw {
+                page_index: GpuPageIndex(2),
+                draw_indirect_index: 2,
+                lod: ChunkLod::Mid as u8,
+                origin: Vec3::ZERO,
+                world_aabb_min: Vec3::ZERO,
+                world_aabb_max: Vec3::splat(16.0),
+                draw_source: DrawSource::GpuArtifact,
+                artifact_key: None,
+                ownership_generation: 1,
+                index_count: Some(12),
+            },
+        );
+
+        let mut records = HashMap::new();
+        let mut continuity = ChunkMeshRecord::default();
+        continuity.fallback = Some(GpuChunkDraw {
+            page_index: GpuPageIndex(3),
+            draw_indirect_index: 3,
+            lod: ChunkLod::Far as u8,
+            origin: Vec3::ZERO,
+            world_aabb_min: Vec3::ZERO,
+            world_aabb_max: Vec3::splat(16.0),
+            draw_source: DrawSource::Fallback,
+            artifact_key: None,
+            ownership_generation: 2,
+            index_count: Some(8),
+        });
+        records.insert(continuity_coord, continuity);
+
+        let coords = Renderer::collect_authoritative_drawable_coords(&visible_gpu_chunks, &records);
+        assert!(coords.contains(&visible_coord));
+        assert!(coords.contains(&continuity_coord));
+        assert_eq!(coords.len(), 2);
+    }
+
+    #[test]
+    fn target_slot_owner_is_acquirable_when_reverse_mapping_is_stale() {
+        let slot = 5;
+        let owner = ChunkCoord { x: 1, y: 0, z: 0 };
+        let contender = ChunkCoord { x: 2, y: 0, z: 0 };
+        let mut visible_gpu_chunks = HashMap::new();
+        // Owner exists but no longer claims this slot -> stale reverse mapping is acquirable.
+        visible_gpu_chunks.insert(
+            owner,
+            GpuChunkDraw {
+                page_index: GpuPageIndex(4),
+                draw_indirect_index: 4,
+                lod: ChunkLod::Mid as u8,
+                origin: Vec3::ZERO,
+                world_aabb_min: Vec3::ZERO,
+                world_aabb_max: Vec3::splat(16.0),
+                draw_source: DrawSource::GpuArtifact,
+                artifact_key: None,
+                ownership_generation: 7,
+                index_count: Some(12),
+            },
+        );
+        let slot_ownership_generation = HashMap::from([(slot, 99)]);
+        assert!(Renderer::target_slot_owner_is_acquirable(
+            Some(owner),
+            contender,
+            slot,
+            &visible_gpu_chunks,
+            &slot_ownership_generation,
         ));
     }
 
