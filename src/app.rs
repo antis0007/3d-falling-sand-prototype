@@ -93,6 +93,7 @@ const COLLISION_TIMEOUT_DAMPING_FACTOR: f32 = 0.78;
 const HITCH_CAPTURE_FRAME_MS: f32 = 120.0;
 const HITCH_CAPTURE_RING_SIZE: usize = 64;
 const SPAWN_SEARCH_RADIUS: i32 = 48;
+const SPAWN_SEARCH_RINGS_PER_FRAME: i32 = 2;
 const SPAWN_HEADROOM: i32 = 4;
 const SPAWN_FALLBACK_EXTRA_HEIGHT: i32 = 12;
 const SPAWN_CEILING_PROBE_HEIGHT: i32 = 20;
@@ -1119,6 +1120,8 @@ pub async fn run() -> anyhow::Result<()> {
     let mut spawn_pending = true;
     let mut spawn_pending_reason = SpawnPendingReason::Searching;
     let mut spawn_fallback_cursor: Option<VoxelCoord> = None;
+    let mut spawn_search_radius_cursor = 0;
+    let mut spawn_search_best: Option<SpawnCandidate> = None;
     let mut last_mesh_stats = MeshRebuildStats::default();
     let mut next_maintenance_tick_at = Instant::now();
     let mut next_redraw_at = Instant::now();
@@ -1446,11 +1449,26 @@ pub async fn run() -> anyhow::Result<()> {
                         gen_request_count = 0;
 
                         if spawn_pending {
-                            if let Some(candidate) = find_safe_spawn_in_loaded_chunks(
-                                &store,
-                                streaming.seed,
-                                spawn_fallback_cursor,
-                            ) {
+                            for _ in 0..SPAWN_SEARCH_RINGS_PER_FRAME {
+                                if spawn_search_radius_cursor > SPAWN_SEARCH_RADIUS {
+                                    break;
+                                }
+                                if let Some(candidate) = find_safe_spawn_in_loaded_ring(
+                                    &store,
+                                    streaming.seed,
+                                    spawn_search_radius_cursor,
+                                ) {
+                                    if spawn_search_best
+                                        .map(|best| candidate.surface_y > best.surface_y)
+                                        .unwrap_or(true)
+                                    {
+                                        spawn_search_best = Some(candidate);
+                                    }
+                                }
+                                spawn_search_radius_cursor += 1;
+                            }
+
+                            if let Some(candidate) = spawn_search_best {
                                 let candidate_local =
                                     world_spawn_to_local_pos(candidate.voxel, origin_voxel);
                                 if is_spawn_collision_free(&store, candidate_local, origin_voxel) {
@@ -1468,6 +1486,8 @@ pub async fn run() -> anyhow::Result<()> {
                                     };
                                     if !spawn_pending {
                                         ctrl.position = candidate_local;
+                                        spawn_search_radius_cursor = 0;
+                                        spawn_search_best = None;
                                         spawn_fallback_cursor = None;
                                         last_player_chunk = None;
                                         cached_desired = DesiredChunks::default();
@@ -1476,7 +1496,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 } else {
                                     spawn_pending_reason = SpawnPendingReason::BlockedCapsule;
                                 }
-                            } else {
+                            } else if spawn_search_radius_cursor > SPAWN_SEARCH_RADIUS {
                                 spawn_pending_reason = SpawnPendingReason::NoValidColumn;
                                 spawn_fallback_cursor = highest_loaded_surface(&store).map(|surface| VoxelCoord {
                                     x: 0,
@@ -1500,12 +1520,16 @@ pub async fn run() -> anyhow::Result<()> {
                                         };
                                         if !spawn_pending {
                                             ctrl.position = cursor_local;
+                                            spawn_search_radius_cursor = 0;
+                                            spawn_search_best = None;
                                             last_player_chunk = None;
                                             cached_desired = DesiredChunks::default();
                                             cached_sim_region.clear();
                                         }
                                     }
                                 }
+                            } else {
+                                spawn_pending_reason = SpawnPendingReason::Searching;
                             }
                         }
 
@@ -3056,6 +3080,8 @@ pub async fn run() -> anyhow::Result<()> {
                                 spawn_pending = true;
                                 spawn_pending_reason = SpawnPendingReason::Searching;
                                 spawn_fallback_cursor = None;
+                                spawn_search_radius_cursor = 0;
+                                spawn_search_best = None;
                                 println!(
                                     "[world] {} world seed {}",
                                     if actions.new_procedural {
@@ -3363,61 +3389,41 @@ fn world_spawn_to_local_pos(spawn_world: VoxelCoord, origin: VoxelCoord) -> Vec3
     )
 }
 
-fn find_safe_spawn_in_loaded_chunks(
+fn find_safe_spawn_in_loaded_ring(
     store: &ChunkStore,
     seed: u64,
-    fallback_cursor: Option<VoxelCoord>,
+    radius: i32,
 ) -> Option<SpawnCandidate> {
     let center = VoxelCoord { x: 0, y: 0, z: 0 };
     let mut best_candidate: Option<SpawnCandidate> = None;
 
-    for r in 0..=SPAWN_SEARCH_RADIUS {
-        for dz in -r..=r {
-            for dx in -r..=r {
-                if r > 0 && dx.abs() < r && dz.abs() < r {
-                    continue;
-                }
-                let x = center.x + dx;
-                let z = center.z + dz;
-                let bias = spawn_bias(seed, x, z);
-                if bias < 0.08 {
-                    continue;
-                }
-                if let Some(y) = valid_loaded_spawn_y(store, x, z) {
-                    let candidate = SpawnCandidate {
-                        voxel: VoxelCoord { x, y, z },
-                        surface_y: y,
-                    };
-                    if best_candidate
-                        .map(|best| candidate.surface_y > best.surface_y)
-                        .unwrap_or(true)
-                    {
-                        best_candidate = Some(candidate);
-                    }
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            if radius > 0 && dx.abs() < radius && dz.abs() < radius {
+                continue;
+            }
+            let x = center.x + dx;
+            let z = center.z + dz;
+            let bias = spawn_bias(seed, x, z);
+            if bias < 0.08 {
+                continue;
+            }
+            if let Some(y) = valid_loaded_spawn_y(store, x, z) {
+                let candidate = SpawnCandidate {
+                    voxel: VoxelCoord { x, y, z },
+                    surface_y: y,
+                };
+                if best_candidate
+                    .map(|best| candidate.surface_y > best.surface_y)
+                    .unwrap_or(true)
+                {
+                    best_candidate = Some(candidate);
                 }
             }
         }
     }
 
-    if best_candidate.is_some() {
-        return best_candidate;
-    }
-
-    if let Some(cursor) = fallback_cursor {
-        return Some(SpawnCandidate {
-            voxel: cursor,
-            surface_y: cursor.y,
-        });
-    }
-
-    highest_loaded_surface(store).map(|surface| SpawnCandidate {
-        voxel: VoxelCoord {
-            x: center.x,
-            y: surface + SPAWN_FALLBACK_EXTRA_HEIGHT,
-            z: center.z,
-        },
-        surface_y: surface,
-    })
+    best_candidate
 }
 
 fn valid_loaded_spawn_y(store: &ChunkStore, x: i32, z: i32) -> Option<i32> {
