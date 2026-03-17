@@ -47,6 +47,8 @@ const MESH_UPLOAD_BYTES_MIN_PER_FRAME: usize = 512 * 1024;
 const MESH_UPLOAD_BYTES_BASE_PER_FRAME: usize = 2 * 1024 * 1024;
 const MESH_UPLOAD_BYTES_MAX_PER_FRAME: usize = 8 * 1024 * 1024;
 const FRAME_TIME_TARGET_MS: f32 = 1000.0 / 60.0;
+const INIT_REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+const INIT_TIMEOUT: Duration = Duration::from_secs(12);
 const MAINTENANCE_TICK_MIN_MS: f32 = 8.0;
 const MAINTENANCE_TICK_MAX_MS: f32 = 48.0;
 const MAINTENANCE_PRESSURE_PENDING_FINALIZE_START: usize = 32;
@@ -1125,6 +1127,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut last_mesh_stats = MeshRebuildStats::default();
     let mut next_maintenance_tick_at = Instant::now();
     let mut next_redraw_at = Instant::now();
+    let mut init_started_at: Option<Instant> = None;
     let mut finalize_low_progress_streak = 0u32;
     let mut maintenance_throttle_state = MaintenanceThrottleState::default();
     let mut startup_burst_budget_frames = 180u32;
@@ -1142,10 +1145,28 @@ pub async fn run() -> anyhow::Result<()> {
                 if app_state == AppState::Uninitialized {
                     renderer_init_future = Some(Box::pin(Renderer::new(window)));
                     app_state = AppState::Initializing;
+                    init_started_at = Some(Instant::now());
+                    next_redraw_at = Instant::now();
                 }
 
                 if app_state != AppState::Initializing {
                     return;
+                }
+
+                if let Some(started_at) = init_started_at {
+                    if started_at.elapsed() > INIT_TIMEOUT {
+                        renderer_init_future = None;
+                        let msg = format!(
+                            "Renderer initialization timed out after {:.1}s",
+                            INIT_TIMEOUT.as_secs_f32()
+                        );
+                        eprintln!("{msg}");
+                        ui.startup_error_message = Some(msg.clone());
+                        window.set_title(&format!("3D Falling Sand Prototype - Startup Failed ({msg})"));
+                        app_state = AppState::Failed;
+                        window.request_redraw();
+                        return;
+                    }
                 }
 
                 let mut init_complete = None;
@@ -1197,12 +1218,16 @@ pub async fn run() -> anyhow::Result<()> {
                             tool_textures = Some(load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR));
                             renderer = Some(ready_renderer);
                             app_state = AppState::Ready;
+                            init_started_at = None;
+                            next_redraw_at = Instant::now();
+                            window.request_redraw();
                         }
                         Err(err) => {
                             let msg = format!("Renderer initialization failed: {err:#}");
                             eprintln!("{msg}");
                             ui.startup_error_message = Some(msg);
                             app_state = AppState::Failed;
+                            init_started_at = None;
                             elwt.exit();
                         }
                     }
@@ -3354,15 +3379,19 @@ pub async fn run() -> anyhow::Result<()> {
                 // schedule the next redraw for startup/steady-state maintenance cadence.
                 poll_renderer_init();
                 let now = Instant::now();
+                if app_state == AppState::Initializing {
+                    if now >= next_redraw_at {
+                        next_redraw_at = now + INIT_REDRAW_INTERVAL;
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 let force_redraw = should_force_maintenance_tick(
                     last_mesh_stats.pending_finalize_total,
                     last_mesh_stats.gpu_dispatch_rx_backlog,
                     last_mesh_stats.meshing_completed_depth,
                 );
                 if force_redraw || now >= next_redraw_at {
-                    if app_state != AppState::Ready {
-                        next_redraw_at = now + Duration::from_millis(16);
-                    }
                     window.request_redraw();
                 }
             }
