@@ -32,13 +32,16 @@ use crate::gpu_compute::{
 };
 #[cfg(feature = "gpu-compute")]
 use crate::gpu_compute::{
-    gpu_page_capacity, invalidate_gpu_pending_finalize_on_renderer,
+    gpu_page_capacity, invalidate_gpu_pending_finalize_on_renderer, plan_gpu_worker_startup,
     renderer_pending_finalize_identity_exists, required_storage_buffer_binding_size_bytes,
     ReadyGpuMeshFinalizeEvent, ReadyGpuMeshFinalizeStatus, ReadyGpuMeshFinalizeWaitReason,
     COMPUTE_STORAGE_BINDING_COUNT,
 };
 use crate::mesh_layout;
 use crate::sim::{material, Phase};
+use crate::startup_gpu_budget::{
+    finalize_startup_budget, StartupGpuBudget, StartupGpuBudgetDecision,
+};
 use crate::types::{chunk_to_world_min, ChunkCoord, GpuPageIndex, VoxelCoord, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
@@ -47,10 +50,8 @@ use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{
-    sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
-};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
@@ -80,6 +81,47 @@ const DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS: f32 = 2.0;
 const BUSH_ID: MaterialId = 18;
 const GRASS_ID: MaterialId = 19;
 const GLOBAL_MESH_BUFFER_STARTUP_BUDGET_DIVISOR: u64 = 2;
+const STARTUP_GPU_RESERVED_HEADROOM_DIVISOR: u64 = 3;
+const STARTUP_GPU_MIN_HEADROOM_DIVISOR: u64 = 8;
+
+#[derive(Clone, Copy, Debug)]
+struct SurfaceSelection {
+    format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+}
+
+fn choose_surface_selection(caps: &wgpu::SurfaceCapabilities) -> anyhow::Result<SurfaceSelection> {
+    let preferred_formats = [
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ];
+    let preferred_alpha = [
+        wgpu::CompositeAlphaMode::Opaque,
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+        wgpu::CompositeAlphaMode::Auto,
+    ];
+
+    let format = preferred_formats
+        .iter()
+        .find(|candidate| caps.formats.contains(candidate))
+        .copied()
+        .or_else(|| caps.formats.first().copied())
+        .context(format!(
+            "surface has no texture formats; capabilities={caps:?}"
+        ))?;
+
+    let alpha_mode = preferred_alpha
+        .iter()
+        .find(|candidate| caps.alpha_modes.contains(candidate))
+        .copied()
+        .or_else(|| caps.alpha_modes.first().copied())
+        .context(format!("surface has no alpha modes; capabilities={caps:?}"))?;
+
+    Ok(SurfaceSelection { format, alpha_mode })
+}
 
 #[derive(Clone, Copy, Debug)]
 struct GlobalMeshBufferSizes {
@@ -1601,10 +1643,76 @@ impl ChunkMeshArtifact {
 }
 
 struct BackgroundMeshQueue {
-    tx: SyncSender<MeshJob>,
+    intake: Arc<ConcurrentMeshIntake>,
     rx: Receiver<MeshResult>,
     inflight: usize,
     telemetry: Arc<BackgroundMeshQueueTelemetry>,
+}
+
+struct ConcurrentMeshIntake {
+    state: Mutex<ConcurrentMeshIntakeState>,
+    cv_not_empty: Condvar,
+}
+
+struct ConcurrentMeshIntakeState {
+    queue: VecDeque<MeshJob>,
+    capacity: usize,
+    closed: bool,
+}
+
+impl ConcurrentMeshIntake {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(ConcurrentMeshIntakeState {
+                queue: VecDeque::with_capacity(capacity),
+                capacity,
+                closed: false,
+            }),
+            cv_not_empty: Condvar::new(),
+        }
+    }
+
+    fn try_push(&self, job: MeshJob) -> Result<(), TrySendError<MeshJob>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(TrySendError::Disconnected(job));
+        }
+        if state.queue.len() >= state.capacity {
+            return Err(TrySendError::Full(job));
+        }
+        state.queue.push_back(job);
+        self.cv_not_empty.notify_one();
+        Ok(())
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Option<MeshJob>, ()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = state.queue.pop_front() {
+                return Ok(Some(job));
+            }
+            if state.closed {
+                return Err(());
+            }
+            let (next_state, wait_result) = self
+                .cv_not_empty
+                .wait_timeout(state, timeout)
+                .unwrap_or_else(|e| e.into_inner());
+            state = next_state;
+            if wait_result.timed_out() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+impl Drop for ConcurrentMeshIntake {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+        self.cv_not_empty.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -1695,13 +1803,12 @@ fn prune_pending_identity_coord_index(
 
 impl BackgroundMeshQueue {
     fn new(worker_count: usize, queue_bound: usize, mesh_backend: MeshPipelineBackend) -> Self {
-        let (tx, job_rx) = sync_channel::<MeshJob>(queue_bound);
+        let intake = Arc::new(ConcurrentMeshIntake::new(queue_bound));
         let (result_tx, rx) = sync_channel::<MeshResult>(queue_bound);
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
         let telemetry = Arc::new(BackgroundMeshQueueTelemetry::default());
 
         for i in 0..worker_count {
-            let worker_rx = std::sync::Arc::clone(&job_rx);
+            let worker_intake = Arc::clone(&intake);
             let worker_tx = result_tx.clone();
             let worker_telemetry = Arc::clone(&telemetry);
             thread::Builder::new()
@@ -1739,13 +1846,9 @@ impl BackgroundMeshQueue {
                             }
                         }
 
-                        let job = {
-                            let lock = worker_rx.lock().expect("mesh worker rx lock");
-                            match lock.recv_timeout(Duration::from_millis(2)) {
-                                Ok(job) => Some(job),
-                                Err(RecvTimeoutError::Timeout) => None,
-                                Err(RecvTimeoutError::Disconnected) => break,
-                            }
+                        let job = match worker_intake.recv_timeout(Duration::from_millis(2)) {
+                            Ok(job) => job,
+                            Err(()) => break,
                         };
                         let Some(job) = job else {
                             continue;
@@ -1825,7 +1928,7 @@ impl BackgroundMeshQueue {
         }
 
         Self {
-            tx,
+            intake,
             rx,
             inflight: 0,
             telemetry,
@@ -1838,9 +1941,11 @@ impl BackgroundMeshQueue {
             job.coord,
             job.version
         );
-        match self.tx.try_send(job) {
+        let task_id = job.task_id;
+        match self.intake.try_push(job) {
             Ok(()) => {
                 self.inflight += 1;
+                log::trace!("[mesh] enqueued task_id={task_id}");
                 Ok(())
             }
             Err(err @ TrySendError::Full(_)) => {
@@ -2056,6 +2161,8 @@ impl Renderer {
         };
         let global_mesh_buffer_sizes =
             compute_global_mesh_buffer_sizes(device_limits.max_buffer_size)?;
+        #[cfg(feature = "gpu-compute")]
+        let worker_startup_plan = plan_gpu_worker_startup(device_limits.max_buffer_size)?;
         required_limits_summary = format!(
             "{} | global_mesh_buffers chosen(vertex={}B,index={}B) target(vertex={}B,index={}B) device_max_buffer={}B",
             required_limits_summary,
@@ -2066,7 +2173,8 @@ impl Renderer {
             device_limits.max_buffer_size,
         );
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats[0];
+        let selected_surface = choose_surface_selection(&caps)?;
+        let format = selected_surface.format;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2074,7 +2182,7 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: selected_surface.alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -2159,6 +2267,66 @@ impl Renderer {
         let (depth_texture, depth_view) = create_depth_texture(&device, &config);
         let page_capacity = gpu_page_capacity() as u64;
         let mesh_slot_capacity = mesh_layout::MESH_SLOT_COUNT as u64;
+        let face_entries_per_slot =
+            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
+        let face_mask_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_offset_bytes =
+            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
+        let face_count_bytes = page_capacity * std::mem::size_of::<u32>() as u64;
+
+        let mut startup_budget = StartupGpuBudget::new(
+            device_limits.max_buffer_size,
+            device_limits.max_buffer_size / STARTUP_GPU_RESERVED_HEADROOM_DIVISOR,
+        );
+        startup_budget.register_plan("global_mesh_vertex", global_mesh_buffer_sizes.vertex_bytes);
+        startup_budget.register_plan("global_mesh_index", global_mesh_buffer_sizes.index_bytes);
+        startup_budget.register_plan(
+            "global_draw_indirect",
+            mesh_slot_capacity * std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+        );
+        startup_budget.register_plan(
+            "global_page_indirect",
+            page_capacity * std::mem::size_of::<DrawIndirectArgs>() as u64,
+        );
+        startup_budget.register_plan(
+            "global_mesh_meta",
+            page_capacity * std::mem::size_of::<crate::gpu_compute::ChunkMeshMeta>() as u64,
+        );
+        startup_budget.register_plan(
+            "global_chunk_origin",
+            page_capacity * std::mem::size_of::<[f32; 4]>() as u64,
+        );
+        startup_budget.register_plan("global_face_mask", face_mask_bytes);
+        startup_budget.register_plan("global_face_offset", face_offset_bytes);
+        startup_budget.register_plan("global_face_count", face_count_bytes);
+        for category in [
+            "global_mesh_vertex",
+            "global_mesh_index",
+            "global_draw_indirect",
+            "global_page_indirect",
+            "global_mesh_meta",
+            "global_chunk_origin",
+            "global_face_mask",
+            "global_face_offset",
+            "global_face_count",
+        ] {
+            startup_budget.grant_planned(category);
+        }
+        let budget_decision: StartupGpuBudgetDecision = finalize_startup_budget(
+            startup_budget,
+            device_limits.max_buffer_size / STARTUP_GPU_MIN_HEADROOM_DIVISOR,
+        )
+        .map_err(anyhow::Error::from)?;
+        log::info!(
+            "renderer startup gpu budget: downgraded={} planned={}B granted={}B reserved_headroom={}B categories={:?}",
+            budget_decision.downgraded,
+            budget_decision.budget.planned_total(),
+            budget_decision.budget.granted_total(),
+            budget_decision.budget.reserved_headroom_bytes,
+            budget_decision.budget.planned_by_category,
+        );
+
         let global_gpu_vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu mesh vertex buffer"),
             size: global_mesh_buffer_sizes.vertex_bytes,
@@ -2205,13 +2373,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
-        let face_entries_per_slot =
-            (CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS * CHUNK_SIZE_VOXELS) as u64;
-        let face_mask_bytes =
-            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
-        let face_offset_bytes =
-            mesh_slot_capacity * face_entries_per_slot * std::mem::size_of::<u32>() as u64;
-        let face_count_bytes = page_capacity * std::mem::size_of::<u32>() as u64;
         let global_gpu_face_mask_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("global gpu face mask buffer"),
             size: face_mask_bytes,
@@ -2263,6 +2424,7 @@ impl Renderer {
                     face_offset_buffer: Arc::clone(&global_gpu_face_offset_buffer),
                     face_count_buffer: Arc::clone(&global_gpu_face_count_buffer),
                 },
+                worker_startup_plan,
             )?;
         }
 
