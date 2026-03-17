@@ -998,6 +998,20 @@ enum AppState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPhase {
+    Booting,
+    InitializingRenderer,
+    Ready,
+    Failed,
+}
+
+impl StartupPhase {
+    fn is_startup(self) -> bool {
+        matches!(self, StartupPhase::Booting | StartupPhase::InitializingRenderer)
+    }
+}
+
 fn noop_waker() -> Waker {
     fn clone(_: *const ()) -> RawWaker {
         RawWaker::new(std::ptr::null(), &VTABLE)
@@ -1128,6 +1142,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut next_maintenance_tick_at = Instant::now();
     let mut next_redraw_at = Instant::now();
     let mut init_started_at: Option<Instant> = None;
+    let mut startup_phase = StartupPhase::Booting;
+    let mut needs_redraw = true;
+    let mut redraw_requested_this_turn = false;
     let mut finalize_low_progress_streak = 0u32;
     let mut maintenance_throttle_state = MaintenanceThrottleState::default();
     let mut startup_burst_budget_frames = 180u32;
@@ -1139,14 +1156,40 @@ pub async fn run() -> anyhow::Result<()> {
 
     event_loop
         .run(move |event, elwt| {
+            let mut set_needs_redraw = |reason: &str| {
+                if !needs_redraw {
+                    log::trace!("[startup-scheduler] needs_redraw=true reason={reason}");
+                } else {
+                    log::trace!(
+                        "[startup-scheduler] needs_redraw already true; reason={reason}"
+                    );
+                }
+                needs_redraw = true;
+            };
+            let mut transition_startup_phase = |next: StartupPhase, reason: &str| {
+                if startup_phase != next {
+                    log::trace!(
+                        "[startup-scheduler] startup_phase {:?} -> {:?} reason={reason}",
+                        startup_phase,
+                        next
+                    );
+                    startup_phase = next;
+                }
+            };
+
             // Renderer init is advanced from AboutToWait only, so redraw cadence has a single
             // scheduling source and never recursively re-enters via RedrawRequested.
             let mut poll_renderer_init = || {
                 if app_state == AppState::Uninitialized {
                     renderer_init_future = Some(Box::pin(Renderer::new(window)));
                     app_state = AppState::Initializing;
+                    transition_startup_phase(
+                        StartupPhase::InitializingRenderer,
+                        "renderer init future created",
+                    );
                     init_started_at = Some(Instant::now());
                     next_redraw_at = Instant::now();
+                    set_needs_redraw("renderer init started");
                 }
 
                 if app_state != AppState::Initializing {
@@ -1164,7 +1207,8 @@ pub async fn run() -> anyhow::Result<()> {
                         ui.startup_error_message = Some(msg.clone());
                         window.set_title(&format!("3D Falling Sand Prototype - Startup Failed ({msg})"));
                         app_state = AppState::Failed;
-                        window.request_redraw();
+                        transition_startup_phase(StartupPhase::Failed, "renderer init timeout");
+                        set_needs_redraw("renderer init timeout");
                         return;
                     }
                 }
@@ -1218,15 +1262,23 @@ pub async fn run() -> anyhow::Result<()> {
                             tool_textures = Some(load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR));
                             renderer = Some(ready_renderer);
                             app_state = AppState::Ready;
+                            transition_startup_phase(
+                                StartupPhase::Ready,
+                                "renderer init completed",
+                            );
                             init_started_at = None;
                             next_redraw_at = Instant::now();
-                            window.request_redraw();
+                            set_needs_redraw("renderer init completed");
                         }
                         Err(err) => {
                             let msg = format!("Renderer initialization failed: {err:#}");
                             eprintln!("{msg}");
                             ui.startup_error_message = Some(msg);
                             app_state = AppState::Failed;
+                            transition_startup_phase(
+                                StartupPhase::Failed,
+                                "renderer init failed with error",
+                            );
                             init_started_at = None;
                             elwt.exit();
                         }
@@ -1235,6 +1287,9 @@ pub async fn run() -> anyhow::Result<()> {
             };
 
             match &event {
+            Event::NewEvents(_) => {
+                redraw_requested_this_turn = false;
+            }
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
                 match event {
                     WindowEvent::CursorMoved { .. } => cursor_position_known = true,
@@ -1278,14 +1333,14 @@ pub async fn run() -> anyhow::Result<()> {
                         .unwrap_or(false)
                 };
 
-                let apply_cursor_mode =
+                let mut apply_cursor_mode =
                     |window: &winit::window::Window, ui: &UiState, unlocked: &mut bool| {
                         let should_unlock = should_unlock_cursor(ui, ui.show_tool_quick_menu, ui.tab_palette_open);
                         if should_unlock != *unlocked {
                             let _ = set_cursor(window, should_unlock);
                             *unlocked = should_unlock;
                         }
-                        window.request_redraw();
+                        set_needs_redraw("cursor mode changed");
                     };
 
                 input.on_window_event(event);
@@ -1306,7 +1361,7 @@ pub async fn run() -> anyhow::Result<()> {
                             let _ = set_cursor(window, should_unlock);
                             cursor_is_unlocked = should_unlock;
                         }
-                        window.request_redraw();
+                        set_needs_redraw("window focus changed");
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
                         if let PhysicalKey::Code(key) = event.physical_key {
@@ -3379,20 +3434,50 @@ pub async fn run() -> anyhow::Result<()> {
                 // schedule the next redraw for startup/steady-state maintenance cadence.
                 poll_renderer_init();
                 let now = Instant::now();
-                if app_state == AppState::Initializing {
+                if startup_phase.is_startup() {
                     if now >= next_redraw_at {
                         next_redraw_at = now + INIT_REDRAW_INTERVAL;
-                        window.request_redraw();
+                        log::trace!(
+                            "[startup-scheduler] startup tick due now={:?} next_redraw_at={:?}",
+                            now,
+                            next_redraw_at
+                        );
+                        set_needs_redraw("startup redraw interval elapsed");
                     }
-                    return;
+                } else {
+                    let force_redraw = should_force_maintenance_tick(
+                        last_mesh_stats.pending_finalize_total,
+                        last_mesh_stats.gpu_dispatch_rx_backlog,
+                        last_mesh_stats.meshing_completed_depth,
+                    );
+                    if force_redraw {
+                        set_needs_redraw("maintenance pressure forced redraw");
+                    }
+                    if now >= next_redraw_at {
+                        log::trace!(
+                            "[startup-scheduler] redraw deadline reached now={:?} next_redraw_at={:?}",
+                            now,
+                            next_redraw_at
+                        );
+                        set_needs_redraw("steady-state redraw deadline elapsed");
+                    }
                 }
-                let force_redraw = should_force_maintenance_tick(
-                    last_mesh_stats.pending_finalize_total,
-                    last_mesh_stats.gpu_dispatch_rx_backlog,
-                    last_mesh_stats.meshing_completed_depth,
-                );
-                if force_redraw || now >= next_redraw_at {
-                    window.request_redraw();
+
+                if needs_redraw {
+                    log::trace!(
+                        "[startup-scheduler] AboutToWait request decision startup_phase={:?} already_requested_this_turn={} next_redraw_at={:?}",
+                        startup_phase,
+                        redraw_requested_this_turn,
+                        next_redraw_at
+                    );
+                    if !redraw_requested_this_turn {
+                        window.request_redraw();
+                        redraw_requested_this_turn = true;
+                        needs_redraw = false;
+                        log::trace!(
+                            "[startup-scheduler] AboutToWait issued request_redraw and cleared needs_redraw"
+                        );
+                    }
                 }
             }
             _ => {}
