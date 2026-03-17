@@ -48,10 +48,12 @@ use glam::{Mat4, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{
+    sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 
@@ -1694,21 +1696,16 @@ impl BackgroundMeshQueue {
                             }
                         }
 
-                        let job = loop {
-                            let recv_result = {
-                                let lock = worker_rx.lock().expect("mesh worker rx lock");
-                                lock.try_recv()
-                            };
-                            match recv_result {
-                                Ok(job) => break Some(job),
-                                Err(TryRecvError::Empty) => {
-                                    thread::yield_now();
-                                }
-                                Err(TryRecvError::Disconnected) => break None,
+                        let job = {
+                            let lock = worker_rx.lock().expect("mesh worker rx lock");
+                            match lock.recv_timeout(Duration::from_millis(2)) {
+                                Ok(job) => Some(job),
+                                Err(RecvTimeoutError::Timeout) => None,
+                                Err(RecvTimeoutError::Disconnected) => break,
                             }
                         };
                         let Some(job) = job else {
-                            break;
+                            continue;
                         };
                         worker_telemetry
                             .worker_jobs_picked
