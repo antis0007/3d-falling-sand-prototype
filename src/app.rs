@@ -1030,7 +1030,7 @@ fn noop_waker() -> Waker {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    crate::engine2::app_bridge::r#loop::run(legacy_run).await
+    crate::engine2::app_bridge::r#loop::run().await
 }
 
 async fn legacy_run() -> anyhow::Result<()> {

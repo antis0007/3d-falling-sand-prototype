@@ -25,4 +25,3 @@ pub struct SimOutput {
     pub dirty_pages: Vec<u32>,
     pub remesh_pages: Vec<u32>,
 }
-

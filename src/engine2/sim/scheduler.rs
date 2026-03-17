@@ -51,7 +51,9 @@ impl SimScheduler {
             dirty_pages: input.upload.dirty_pages,
             remesh_pages: input.upload.remesh_pages,
         };
-        sim_output.remesh_pages.extend(sim_output.dirty_pages.iter().copied());
+        sim_output
+            .remesh_pages
+            .extend(sim_output.dirty_pages.iter().copied());
 
         for page in input.edit.dirty_pages {
             sim_output.dirty_pages.push(page);

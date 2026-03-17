@@ -21,6 +21,7 @@ use crate::engine2::render::draw::{DrawInput, DrawPacket, Engine2Drawer};
 use crate::engine2::render::extract::{Engine2Extractor, ExtractInput, ExtractOutput};
 use crate::engine2::sim::edit_apply::EditApplier;
 use crate::engine2::sim::scheduler::SimScheduler;
+use crate::engine2::types::{voxel_to_brick_key, BrickKey, VoxelCoord};
 use crate::engine2::world::procgen::ProcgenInterface;
 use crate::engine2::world::residency::{ResidencyDecision, ResidencyStateMap};
 use crate::engine2::world::storage::WorldStorage;
@@ -123,5 +124,45 @@ impl Engine2State {
 
     pub fn queue_upload_step(&mut self, sim_output: &SimOutput) {
         self.gpu.upload_sim_queues(sim_output);
+    }
+
+    pub fn request_minimum_world(&mut self, camera: CameraState) {
+        let center = voxel_to_brick_key(VoxelCoord {
+            x: camera.world_x as i32,
+            y: camera.world_y as i32,
+            z: camera.world_z as i32,
+        });
+
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let key = BrickKey {
+                    x: center.x + dx,
+                    y: center.y - 1,
+                    z: center.z + dz,
+                };
+                self.residency.request(key);
+                if self.storage.resident.contains_key(&key) {
+                    continue;
+                }
+                self.procgen.request(key);
+            }
+        }
+    }
+
+    pub fn materialization_step(&mut self, budget: usize) {
+        for _ in 0..budget {
+            let Some(request) = self.procgen.pop_request() else {
+                break;
+            };
+            self.procgen.synthesize_placeholder(request);
+        }
+
+        while let Some(result) = self.procgen.pop_completed() {
+            self.storage.stage_materialized_brick(
+                result.brick,
+                result.payload,
+                crate::engine2::world::storage::MaterializationSource::Procedural,
+            );
+        }
     }
 }
