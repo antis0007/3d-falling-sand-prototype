@@ -23,6 +23,15 @@ struct FrameParams {
     active_tile_budget: u32,
     jacobi_iterations: u32,
     jacobi_iteration: u32,
+    // Fields below are written by Rust (`gpu_compute::FrameParams`) and kept here
+    // to preserve a byte-for-byte storage-buffer contract across simulation/meshing.
+    cell_size: f32,
+    max_velocity: f32,
+    velocity_damping: f32,
+    viscosity: f32,
+    neighbor_pages: vec4<u32>,
+    neighbor_pages_tail: vec2<u32>,
+    _pad: vec2<u32>,
 };
 
 struct GpuVertex {
@@ -45,6 +54,18 @@ struct ChunkMeshMeta {
     _pad: u32,
 };
 
+// Meshing bind-group contract (must match `GpuComputeRuntime::create_meshing_bind_group`):
+//  0 atlas_voxels        (read)
+//  1 face_mask           (read_write)
+//  2 face_offset         (read_write)
+//  3 chunk_vertex_buffer (read_write)
+//  4 chunk_index_buffer  (read_write)
+//  5 draw_indirect       (read_write)
+//  6 frame/page params   (read)
+//  7 face_count          (read_write)
+//  8 mesh_meta           (read_write)
+//  9 chunk_origin        (read)
+// NOTE: legacy `page_indirect` is intentionally NOT part of this meshing WGSL contract.
 @group(0) @binding(0) var<storage, read> atlas_voxels: array<u32>;
 @group(0) @binding(1) var<storage, read_write> face_mask: array<u32>;
 @group(0) @binding(2) var<storage, read_write> face_offset: array<u32>;
@@ -87,9 +108,39 @@ fn neighbor_dir(i: u32) -> vec3<i32> {
     }
 }
 
-fn voxel_at(base_off: u32, p: vec3<i32>) -> u32 {
-    if (!in_bounds(p)) { return EMPTY; }
-    return atlas_voxels[base_off + pack(vec3<u32>(p))];
+fn neighbor_page_for_dir(params: FrameParams, dir: u32) -> u32 {
+    // Host packs neighbor_pages as [-X, +X, -Y, +Y, -Z, +Z].
+    switch dir {
+        case 0u: { return params.neighbor_pages.y; } // +X
+        case 1u: { return params.neighbor_pages.x; } // -X
+        case 2u: { return params.neighbor_pages.w; } // +Y
+        case 3u: { return params.neighbor_pages.z; } // -Y
+        case 4u: { return params.neighbor_pages_tail.y; } // +Z
+        default: { return params.neighbor_pages_tail.x; } // -Z
+    }
+}
+
+fn voxel_at(params: FrameParams, base_off: u32, p: vec3<i32>, dir: u32) -> u32 {
+    if (in_bounds(p)) {
+        return atlas_voxels[base_off + pack(vec3<u32>(p))];
+    }
+
+    let neighbor_page = neighbor_page_for_dir(params, dir);
+    if (neighbor_page == 0xffffffffu) {
+        // Missing neighbors are treated as empty to keep border faces visible.
+        return EMPTY;
+    }
+
+    var wrapped = p;
+    if (wrapped.x < 0) { wrapped.x = i32(CHUNK_SIDE) - 1; }
+    if (wrapped.x >= i32(CHUNK_SIDE)) { wrapped.x = 0; }
+    if (wrapped.y < 0) { wrapped.y = i32(CHUNK_SIDE) - 1; }
+    if (wrapped.y >= i32(CHUNK_SIDE)) { wrapped.y = 0; }
+    if (wrapped.z < 0) { wrapped.z = i32(CHUNK_SIDE) - 1; }
+    if (wrapped.z >= i32(CHUNK_SIDE)) { wrapped.z = 0; }
+
+    let neighbor_off = atlas_state_offset(neighbor_page, params.state_index);
+    return atlas_voxels[neighbor_off + pack(vec3<u32>(wrapped))];
 }
 
 fn write_face_quad(
@@ -97,7 +148,7 @@ fn write_face_quad(
     base: vec3<f32>,
     chunk_origin: vec3<f32>,
     color: u32,
-    global_vertex_offset: u32,
+    local_vertex_offset: u32,
     global_index_offset: u32,
 ) {
     var c0: vec3<f32>;
@@ -114,22 +165,22 @@ fn write_face_quad(
         default:{ c0 = base + vec3<f32>(0,0,0); c1 = base + vec3<f32>(0,1,0); c2 = base + vec3<f32>(1,1,0); c3 = base + vec3<f32>(1,0,0); }
     }
 
-    let v0 = global_vertex_offset;
-    let v1 = global_vertex_offset + 1u;
-    let v2 = global_vertex_offset + 2u;
-    let v3 = global_vertex_offset + 3u;
+    let v0 = local_vertex_offset;
+    let v1 = local_vertex_offset + 1u;
+    let v2 = local_vertex_offset + 2u;
+    let v3 = local_vertex_offset + 3u;
 
     chunk_vertex_buffer[v0] = GpuVertex(chunk_origin + c0 * VOXEL_SIZE, color);
     chunk_vertex_buffer[v1] = GpuVertex(chunk_origin + c1 * VOXEL_SIZE, color);
     chunk_vertex_buffer[v2] = GpuVertex(chunk_origin + c2 * VOXEL_SIZE, color);
     chunk_vertex_buffer[v3] = GpuVertex(chunk_origin + c3 * VOXEL_SIZE, color);
 
-    chunk_index_buffer[global_index_offset + 0u] = v0;
-    chunk_index_buffer[global_index_offset + 1u] = v1;
-    chunk_index_buffer[global_index_offset + 2u] = v2;
-    chunk_index_buffer[global_index_offset + 3u] = v0;
-    chunk_index_buffer[global_index_offset + 4u] = v2;
-    chunk_index_buffer[global_index_offset + 5u] = v3;
+    chunk_index_buffer[global_index_offset + 0u] = local_vertex_offset + 0u;
+    chunk_index_buffer[global_index_offset + 1u] = local_vertex_offset + 1u;
+    chunk_index_buffer[global_index_offset + 2u] = local_vertex_offset + 2u;
+    chunk_index_buffer[global_index_offset + 3u] = local_vertex_offset + 0u;
+    chunk_index_buffer[global_index_offset + 4u] = local_vertex_offset + 2u;
+    chunk_index_buffer[global_index_offset + 5u] = local_vertex_offset + 3u;
 }
 
 fn pack_rgba8(r: u32, g: u32, b: u32, a: u32) -> u32 {
@@ -177,6 +228,29 @@ fn debug_override_color(page: u32, dir: u32, material_id: u32) -> u32 {
     return material_color(material_id);
 }
 
+
+fn is_billboard_material(material_id: u32) -> bool {
+    return material_id == BUSH || material_id == GRASS;
+}
+
+fn material_occludes(self_id: u32, neighbor_id: u32) -> bool {
+    if (neighbor_id == EMPTY) { return false; }
+    if (neighbor_id == self_id) { return true; }
+    if (is_billboard_material(neighbor_id)) { return false; }
+    // Match CPU meshing intent for non-solid/transient media.
+    if (
+        neighbor_id == WATER ||
+        neighbor_id == LAVA ||
+        neighbor_id == ACID ||
+        neighbor_id == SMOKE ||
+        neighbor_id == STEAM ||
+        neighbor_id == FIRE_GAS
+    ) {
+        return false;
+    }
+    return true;
+}
+
 @compute @workgroup_size(128)
 fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
 
@@ -199,7 +273,7 @@ fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let id = atlas_voxels[src_off + voxel_idx];
-    if (id == EMPTY) {
+    if (id == EMPTY || is_billboard_material(id)) {
         face_mask[mask_base + voxel_idx] = 0u;
         return;
     }
@@ -208,12 +282,12 @@ fn detect_faces(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var mask = 0u;
 
-    if (voxel_at(src_off, p + neighbor_dir(0u)) == EMPTY) { mask |= FACE_MASK_POS_X; }
-    if (voxel_at(src_off, p + neighbor_dir(1u)) == EMPTY) { mask |= FACE_MASK_NEG_X; }
-    if (voxel_at(src_off, p + neighbor_dir(2u)) == EMPTY) { mask |= FACE_MASK_POS_Y; }
-    if (voxel_at(src_off, p + neighbor_dir(3u)) == EMPTY) { mask |= FACE_MASK_NEG_Y; }
-    if (voxel_at(src_off, p + neighbor_dir(4u)) == EMPTY) { mask |= FACE_MASK_POS_Z; }
-    if (voxel_at(src_off, p + neighbor_dir(5u)) == EMPTY) { mask |= FACE_MASK_NEG_Z; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(0u), 0u))) { mask |= FACE_MASK_POS_X; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(1u), 1u))) { mask |= FACE_MASK_NEG_X; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(2u), 2u))) { mask |= FACE_MASK_POS_Y; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(3u), 3u))) { mask |= FACE_MASK_NEG_Y; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(4u), 4u))) { mask |= FACE_MASK_POS_Z; }
+    if (!material_occludes(id, voxel_at(params, src_off, p + neighbor_dir(5u), 5u))) { mask |= FACE_MASK_NEG_Z; }
 
     face_mask[mask_base + voxel_idx] = mask;
 }
@@ -242,8 +316,7 @@ fn prefix_scan() {
 
 @compute @workgroup_size(128)
 fn emit_mesh(
-    @builtin(global_invocation_id) gid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
+    @builtin(global_invocation_id) gid: vec3<u32>
 ) {
 
     let params = frame_params[0];
@@ -262,7 +335,7 @@ fn emit_mesh(
     let chunk_origin = chunk_origin_buffer[page].xyz;
 
     // --- always write draw command ---
-    if (lid.x == 0u) {
+    if (gid.x == 0u) {
 
         draw_indirect_buffer[chunk_slot].index_count = total_faces * 6u;
         draw_indirect_buffer[chunk_slot].instance_count = 1u;
@@ -270,10 +343,6 @@ fn emit_mesh(
         draw_indirect_buffer[chunk_slot].base_vertex = i32(vertex_base);
         draw_indirect_buffer[chunk_slot].first_instance = 0u;
     }
-
-    // --- ensure all threads see face_count ---
-    workgroupBarrier();
-    storageBarrier();
 
     let voxel_idx = gid.x;
     if (voxel_idx >= CHUNK_VOLUME) { return; }
@@ -303,7 +372,7 @@ fn emit_mesh(
         if (DEBUG_COLOR_OVERRIDE_ENABLED) {
             color = debug_override_color(page, dir, id);
         }
-        write_face_quad(dir, base, chunk_origin, color, vertex_base + vo, index_base + io);
+        write_face_quad(dir, base, chunk_origin, color, vo, index_base + io);
 
         write_face = write_face + 1u;
     }
