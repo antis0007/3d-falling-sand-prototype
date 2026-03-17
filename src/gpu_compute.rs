@@ -275,6 +275,7 @@ struct PendingGpuMeshFinalize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QueuedTaskReservation {
     task_id: u64,
+    version: ChunkVersion,
     page_index: GpuPageIndex,
     mesh_slice: Option<MeshBufferSlice>,
 }
@@ -596,6 +597,16 @@ impl ChunkPageAtlas {
         let vertex_capacity = MeshBufferKind::Vertex.global_capacity_elements();
         let index_capacity = MeshBufferKind::Index.global_capacity_elements();
         let slots_pending_finalize = self.pending_mesh_finalize.len() as u32;
+        let slots_visible = self
+            .chunk_for_mesh_slot
+            .iter()
+            .filter(|(_, chunk)| {
+                matches!(
+                    self.priority_hint_for_chunk.get(chunk),
+                    Some(PagePriorityHint::Visible)
+                )
+            })
+            .count() as u32;
         let fence_safe_slots = self
             .chunk_for_mesh_slot
             .keys()
@@ -646,7 +657,7 @@ impl ChunkPageAtlas {
             } else {
                 slots_used as f32 * 100.0 / slot_capacity as f32
             },
-            slots_visible: 0,
+            slots_visible,
             slots_pending_finalize,
             reclaimable_without_fence,
             lifecycle_blocked_without_fence,
@@ -733,6 +744,7 @@ impl ChunkPageAtlas {
         &mut self,
         coord: ChunkCoord,
         task_id: u64,
+        version: ChunkVersion,
         page_index: GpuPageIndex,
         mesh_slice: Option<MeshBufferSlice>,
     ) -> (u64, Option<u64>) {
@@ -740,6 +752,7 @@ impl ChunkPageAtlas {
         let slot_generation = mesh_slice.map(|slice| self.slot_generation(slice.slot_index));
         let next = QueuedTaskReservation {
             task_id,
+            version,
             page_index,
             mesh_slice,
         };
@@ -800,6 +813,28 @@ impl ChunkPageAtlas {
             _ => return Some(StaleQueuedTaskReason::SlotGeneration),
         }
         None
+    }
+
+
+    fn pending_finalize_identity_matches(
+        &self,
+        coord: ChunkCoord,
+        version: ChunkVersion,
+        lod: u8,
+        task_id: u64,
+        page_index: GpuPageIndex,
+        draw_indirect_index: u32,
+    ) -> bool {
+        self.pending_mesh_finalize
+            .get(&coord)
+            .map(|pending| {
+                pending.version == version
+                    && pending.lod == lod
+                    && pending.task_id == task_id
+                    && pending.page_index == page_index
+                    && pending.draw_indirect_index == draw_indirect_index
+            })
+            .unwrap_or(false)
     }
 
     fn validate_dispatch_ownership(
@@ -1252,9 +1287,11 @@ fn clear_meshing_outputs_for_page(
         bytemuck::cast_slice(&zero_origin),
     );
 
+    let face_count_stride = std::mem::size_of::<u32>() as u64;
+    let face_count_offset = page_index.0 as u64 * face_count_stride;
     state.queue.write_buffer(
         &state.face_count_buffer,
-        0,
+        face_count_offset,
         bytemuck::cast_slice(&[0u32; 1]),
     );
 }
@@ -1667,6 +1704,11 @@ pub struct GpuChunkTask {
     pub version: ChunkVersion,
     pub task_id: u64,
     pub lod: u8,
+    pub next_cached_materials: Vec<MaterialId>,
+    pub next_state: u32,
+    pub next_tick: u32,
+    pub next_frontier_len: u32,
+    pub next_diagnostics: ChunkSimulationDiagnostics,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -2095,11 +2137,18 @@ impl GpuComputeRuntime {
         sim_job: &SimulationJob,
         page_index: GpuPageIndex,
         current_state: u32,
-        _lod: u8,
+        lod: u8,
         mesh_slice: MeshBufferSlice,
     ) -> anyhow::Result<()> {
         validate_mesh_slice_for_dispatch(sim_job.chunk_coord, page_index, mesh_slice)?;
         clear_meshing_outputs_for_page(state, page_index, mesh_slice);
+        log::trace!(
+            "[gpu-mesh] meshing_dispatch coord={:?} page={} slot={} lod={}",
+            sim_job.chunk_coord,
+            page_index.0,
+            mesh_slice.slot_index,
+            lod,
+        );
 
         let page_params = device_page_params(
             sim_job,
@@ -2539,8 +2588,13 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         }
 
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
-        let (page_generation, slot_generation) =
-            atlas.reserve_queued_task_identity(job.coord, job.task_id, page_index, mesh_slice);
+        let (page_generation, slot_generation) = atlas.reserve_queued_task_identity(
+            job.coord,
+            job.task_id,
+            job.version,
+            page_index,
+            mesh_slice,
+        );
 
         drop(atlas);
 
@@ -2577,6 +2631,12 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         } else {
             state.runtime_config.max_jacobi_iterations
         };
+        let diagnostics = ChunkSimulationDiagnostics::default();
+        let next_state = if ran_simulation {
+            current_state ^ 1
+        } else {
+            current_state
+        };
 
         // Queue GPU task
         if let Err(err) = GPU_TASK_TX
@@ -2598,6 +2658,11 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 version: job.version,
                 task_id: job.task_id,
                 lod: job.lod as u8,
+                next_cached_materials: incoming.to_vec(),
+                next_state,
+                next_tick: tick.wrapping_add(1),
+                next_frontier_len: active_frontier_count,
+                next_diagnostics: diagnostics,
             })
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
@@ -2605,29 +2670,6 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
             return Err(err).context("failed to send GPU chunk task");
         }
         GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
-
-        let diagnostics = ChunkSimulationDiagnostics::default();
-
-        let next_state = if ran_simulation {
-            current_state ^ 1
-        } else {
-            current_state
-        };
-
-        {
-            let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-
-            atlas.version_for_chunk.insert(job.coord, job.version.get());
-            atlas.state_for_chunk.insert(job.coord, next_state);
-            atlas.tick_for_chunk.insert(job.coord, tick.wrapping_add(1));
-
-            atlas
-                .frontier_len_for_chunk
-                .insert(job.coord, active_frontier_count);
-
-            atlas.diagnostics_for_chunk.insert(job.coord, diagnostics);
-            atlas.cached_materials.insert(job.coord, incoming.to_vec());
-        }
 
         // Authoritative runtime meshing path (GPU).
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(job.coord);
@@ -2695,6 +2737,23 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         })
     }
 }
+
+#[cfg(feature = "gpu-compute")]
+fn commit_dispatched_chunk_state(atlas: &mut ChunkPageAtlas, task: &GpuChunkTask) {
+    atlas.version_for_chunk.insert(task.coord, task.version.get());
+    atlas.state_for_chunk.insert(task.coord, task.next_state);
+    atlas.tick_for_chunk.insert(task.coord, task.next_tick);
+    atlas
+        .frontier_len_for_chunk
+        .insert(task.coord, task.next_frontier_len);
+    atlas
+        .diagnostics_for_chunk
+        .insert(task.coord, task.next_diagnostics);
+    atlas
+        .cached_materials
+        .insert(task.coord, task.next_cached_materials.clone());
+}
+
 #[cfg(feature = "gpu-compute")]
 pub fn dispatch_gpu_chunk_tasks_on_renderer(
     max_tasks: usize,
@@ -2837,7 +2896,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         }
 
         if task.frontier_count > 0 || !task.edit_commands.is_empty() {
-            state.runtime.run_active_frontier(
+            if let Err(err) = state.runtime.run_active_frontier(
                 &state,
                 scratch,
                 &sim_job,
@@ -2846,7 +2905,19 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 &task.edit_commands,
                 task.jacobi_iterations,
                 task.neighbor_pages,
-            )?;
+            ) {
+                stats.meshing_dispatch_failures += 1;
+                log::error!(
+                    "[gpu-sim] rejecting gpu simulation dispatch coord={:?} version={} task_id={} page_index={} error={:#}",
+                    task.coord,
+                    task.version,
+                    task.task_id,
+                    task.page_index.0,
+                    err,
+                );
+                task_identity_guard.release_now();
+                continue;
+            }
         }
 
         let mut submitted_mesh_slice = None;
@@ -2895,7 +2966,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                     &sim_job,
                     task.page_index,
                     meshing_state,
-                    0,
+                    task.lod,
                     mesh_slice,
                 ) {
                     Ok(()) => {
@@ -2931,6 +3002,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.mark_page_submitted(task.page_index, serial);
             atlas.touch_chunk_page(task.coord);
+            commit_dispatched_chunk_state(&mut atlas, &task);
             if let Some(mesh_slice) = submitted_mesh_slice {
                 let page_generation = atlas.page_generation(task.page_index);
                 let slot_generation = atlas.slot_generation(mesh_slice.slot_index);
@@ -3085,6 +3157,28 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
             if current_pending != candidate.pending {
                 requeued_count += 1;
                 superseded_count += 1;
+                let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(candidate.coord);
+                out.push(ReadyGpuMeshFinalizeEvent {
+                    result: ReadyGpuMeshResult {
+                        coord: candidate.coord,
+                        version: candidate.pending.version,
+                        task_id: candidate.pending.task_id,
+                        submission_serial: candidate.pending.submission_serial,
+                        page_index: candidate.pending.page_index,
+                        draw_indirect_index: candidate.pending.draw_indirect_index,
+                        page_generation: candidate.pending.page_generation,
+                        slot_generation: candidate.pending.slot_generation,
+                        index_count,
+                        lod: candidate.pending.lod,
+                        aabb_min,
+                        aabb_max,
+                        chunk_origin_world,
+                    },
+                    status: ReadyGpuMeshFinalizeStatus::DroppedSupersededIdentity,
+                    wait_reason: None,
+                });
+                finalized_count += 1;
+                candidate_failed_count += 1;
                 continue;
             }
 
@@ -3236,18 +3330,25 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
 #[cfg(feature = "gpu-compute")]
 pub fn renderer_pending_finalize_identity_exists(
     coord: ChunkCoord,
-    _version: ChunkVersion,
-    _lod: u8,
-    _task_id: u64,
-    _page_index: GpuPageIndex,
-    _draw_indirect_index: u32,
+    version: ChunkVersion,
+    lod: u8,
+    task_id: u64,
+    page_index: GpuPageIndex,
+    draw_indirect_index: u32,
 ) -> bool {
     if let Some(Ok(state)) = WORKER_STATE
         .get()
         .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
     {
         let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        return atlas.pending_mesh_finalize.contains_key(&coord);
+        return atlas.pending_finalize_identity_matches(
+            coord,
+            version,
+            lod,
+            task_id,
+            page_index,
+            draw_indirect_index,
+        );
     }
     false
 }
@@ -3276,17 +3377,45 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
         .map(|v| v.as_ref().map_err(|e| anyhow::anyhow!(e.to_string())))
     {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        if !preserve_gpu_finalize_identity {
-            let _ = atlas.pending_mesh_finalize.remove(&coord);
+        let keep_live_finalize_identity = preserve_gpu_finalize_identity
+            && atlas
+                .pending_mesh_finalize
+                .get(&coord)
+                .map(|pending| {
+                    requested_version
+                        .map(|version| pending.version.get() == version)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false);
+
+        let removed_pending = if keep_live_finalize_identity {
+            None
+        } else {
+            atlas.pending_mesh_finalize.remove(&coord)
+        };
+
+        let remove_queued = atlas
+            .queued_task_reservations
+            .get(&coord)
+            .map(|reservation| {
+                requested_version
+                    .map(|version| reservation.version.get() <= version)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+        if remove_queued {
             atlas.release_queued_task_identity_for_coord(coord);
         }
+
         if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
-            if !preserve_gpu_finalize_identity {
+            let should_bump_page = removed_pending.is_some() || remove_queued;
+            if should_bump_page {
                 atlas.bump_page_generation(page_index);
             }
         }
         if let Some(mesh_slice) = atlas.mesh_slice_for_chunk.get(&coord).copied() {
-            if !preserve_gpu_finalize_identity {
+            let should_bump_slot = removed_pending.is_some() || remove_queued;
+            if should_bump_slot {
                 atlas.bump_mesh_slot_generation(mesh_slice.slot_index);
             }
         }
