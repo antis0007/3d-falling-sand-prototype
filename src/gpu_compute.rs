@@ -170,6 +170,7 @@ struct ChunkPageAtlas {
     mesh_slot_capacity_index_elements: u32,
     next_page: GpuPageIndex,
     pending_mesh_finalize: HashMap<ChunkCoord, PendingGpuMeshFinalize>,
+    queued_task_reservations: HashMap<ChunkCoord, QueuedTaskReservation>,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -201,6 +202,7 @@ impl Default for ChunkPageAtlas {
             mesh_slot_capacity_index_elements: MESH_INDEX_ELEMENTS_PER_CHUNK,
             next_page: GpuPageIndex(0),
             pending_mesh_finalize: HashMap::new(),
+            queued_task_reservations: HashMap::new(),
         }
     }
 }
@@ -267,6 +269,14 @@ struct PendingGpuMeshFinalize {
     page_generation: u64,
     slot_generation: u64,
     submission_serial: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedTaskReservation {
+    task_id: u64,
+    page_index: GpuPageIndex,
+    mesh_slice: Option<MeshBufferSlice>,
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -597,10 +607,14 @@ impl ChunkPageAtlas {
             .filter(|(slot, chunk)| {
                 self.is_mesh_slot_fence_safe(**slot)
                     && !self.pending_mesh_finalize.contains_key(chunk)
-                    && matches!(self.mesh_slot_protection_hint(**slot), PagePriorityHint::Far)
+                    && matches!(
+                        self.mesh_slot_protection_hint(**slot),
+                        PagePriorityHint::Far
+                    )
             })
             .count() as u32;
-        let lifecycle_blocked_without_fence = fence_safe_slots.saturating_sub(reclaimable_without_fence);
+        let lifecycle_blocked_without_fence =
+            fence_safe_slots.saturating_sub(reclaimable_without_fence);
         MeshPoolTelemetry {
             slot_capacity,
             slots_used,
@@ -666,26 +680,21 @@ impl ChunkPageAtlas {
             > 0
     }
 
-    fn reserve_queued_task_identity(
+    fn increment_queued_task_identity(
         &mut self,
         page_index: GpuPageIndex,
         mesh_slice: Option<MeshBufferSlice>,
-    ) -> (u64, Option<u64>) {
-        let page_generation = self.page_generation(page_index);
+    ) {
         *self.queued_page_reservations.entry(page_index).or_insert(0) += 1;
-        let slot_generation = if let Some(mesh_slice) = mesh_slice {
+        if let Some(mesh_slice) = mesh_slice {
             *self
                 .queued_slot_reservations
                 .entry(mesh_slice.slot_index)
                 .or_insert(0) += 1;
-            Some(self.slot_generation(mesh_slice.slot_index))
-        } else {
-            None
-        };
-        (page_generation, slot_generation)
+        }
     }
 
-    fn release_queued_task_identity(
+    fn decrement_queued_task_identity(
         &mut self,
         page_index: GpuPageIndex,
         mesh_slice: Option<MeshBufferSlice>,
@@ -703,7 +712,10 @@ impl ChunkPageAtlas {
         }
 
         if let Some(mesh_slice) = mesh_slice {
-            let remove_slot = match self.queued_slot_reservations.get_mut(&mesh_slice.slot_index) {
+            let remove_slot = match self
+                .queued_slot_reservations
+                .get_mut(&mesh_slice.slot_index)
+            {
                 Some(count) if *count > 1 => {
                     *count -= 1;
                     false
@@ -717,7 +729,53 @@ impl ChunkPageAtlas {
         }
     }
 
+    fn reserve_queued_task_identity(
+        &mut self,
+        coord: ChunkCoord,
+        task_id: u64,
+        page_index: GpuPageIndex,
+        mesh_slice: Option<MeshBufferSlice>,
+    ) -> (u64, Option<u64>) {
+        let page_generation = self.page_generation(page_index);
+        let slot_generation = mesh_slice.map(|slice| self.slot_generation(slice.slot_index));
+        let next = QueuedTaskReservation {
+            task_id,
+            page_index,
+            mesh_slice,
+        };
+        if let Some(previous) = self.queued_task_reservations.insert(coord, next) {
+            if previous != next {
+                self.decrement_queued_task_identity(previous.page_index, previous.mesh_slice);
+            }
+        }
+        self.increment_queued_task_identity(page_index, mesh_slice);
+        (page_generation, slot_generation)
+    }
+
+    fn release_queued_task_identity(&mut self, coord: ChunkCoord, task_id: u64) {
+        let Some(reservation) = self.queued_task_reservations.get(&coord).copied() else {
+            return;
+        };
+        if reservation.task_id != task_id {
+            return;
+        }
+        self.queued_task_reservations.remove(&coord);
+        self.decrement_queued_task_identity(reservation.page_index, reservation.mesh_slice);
+    }
+
+    fn release_queued_task_identity_for_coord(&mut self, coord: ChunkCoord) {
+        if let Some(reservation) = self.queued_task_reservations.remove(&coord) {
+            self.decrement_queued_task_identity(reservation.page_index, reservation.mesh_slice);
+        }
+    }
+
     fn stale_queued_task_reason(&self, task: &GpuChunkTask) -> Option<StaleQueuedTaskReason> {
+        let Some(reservation) = self.queued_task_reservations.get(&task.coord) else {
+            return Some(StaleQueuedTaskReason::PageOwnership);
+        };
+        if reservation.task_id != task.task_id {
+            return Some(StaleQueuedTaskReason::PageGeneration);
+        }
         if self.page_for_chunk.get(&task.coord).copied() != Some(task.page_index) {
             return Some(StaleQueuedTaskReason::PageOwnership);
         }
@@ -726,7 +784,12 @@ impl ChunkPageAtlas {
         }
         match (task.mesh_slice, task.slot_generation) {
             (Some(mesh_slice), Some(slot_generation)) => {
-                if self.chunk_for_mesh_slot.get(&mesh_slice.slot_index).copied() != Some(task.coord) {
+                if self
+                    .chunk_for_mesh_slot
+                    .get(&mesh_slice.slot_index)
+                    .copied()
+                    != Some(task.coord)
+                {
                     return Some(StaleQueuedTaskReason::SlotOwnership);
                 }
                 if self.slot_generation(mesh_slice.slot_index) != slot_generation {
@@ -818,7 +881,8 @@ impl ChunkPageAtlas {
         let mut selected: Option<(u8, u64, GpuPageIndex)> = None;
         for &page in self.chunk_for_page.keys() {
             let fence = self.page_fences.get(&page).copied().unwrap_or_default();
-            if fence.last_completed < fence.last_submitted || self.has_queued_page_reservation(page) {
+            if fence.last_completed < fence.last_submitted || self.has_queued_page_reservation(page)
+            {
                 continue;
             }
             let rank = self
@@ -879,6 +943,7 @@ impl ChunkPageAtlas {
             self.cached_materials.remove(&chunk);
             self.release_chunk_mesh_allocation(chunk);
             self.pending_mesh_finalize.remove(&chunk);
+            self.release_queued_task_identity_for_coord(chunk);
             self.priority_hint_for_chunk.remove(&chunk);
             self.page_fences.remove(&page_index);
             self.page_last_used.remove(&page_index);
@@ -1605,7 +1670,7 @@ pub struct GpuChunkTask {
 }
 
 #[cfg(feature = "gpu-compute")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshBufferSlice {
     pub slot_index: u32,
     /// Global vertex buffer offset in elements (not bytes).
@@ -2474,7 +2539,8 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         }
 
         let neighbor_pages = neighbor_pages_for_chunk(&atlas, job.coord);
-        let (page_generation, slot_generation) = atlas.reserve_queued_task_identity(page_index, mesh_slice);
+        let (page_generation, slot_generation) =
+            atlas.reserve_queued_task_identity(job.coord, job.task_id, page_index, mesh_slice);
 
         drop(atlas);
 
@@ -2532,9 +2598,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 version: job.version,
                 task_id: job.task_id,
                 lod: job.lod as u8,
-            }) {
+            })
+        {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.release_queued_task_identity(page_index, mesh_slice);
+            atlas.release_queued_task_identity(job.coord, job.task_id);
             return Err(err).context("failed to send GPU chunk task");
         }
         GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2617,8 +2684,10 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                             largest_free_index_span: mesh_pool_telemetry.largest_free_index_span,
                             slots_visible: mesh_pool_telemetry.slots_visible,
                             slots_pending_finalize: mesh_pool_telemetry.slots_pending_finalize,
-                            reclaimable_without_fence: mesh_pool_telemetry.reclaimable_without_fence,
-                            lifecycle_blocked_without_fence: mesh_pool_telemetry.lifecycle_blocked_without_fence,
+                            reclaimable_without_fence: mesh_pool_telemetry
+                                .reclaimable_without_fence,
+                            lifecycle_blocked_without_fence: mesh_pool_telemetry
+                                .lifecycle_blocked_without_fence,
                         },
                     }
                 }
@@ -2673,32 +2742,38 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
 
         struct TaskIdentityReleaseGuard {
             state: Arc<WorkerGpuState>,
-            page_index: GpuPageIndex,
-            mesh_slice: Option<MeshBufferSlice>,
+            coord: ChunkCoord,
+            task_id: u64,
             active: bool,
         }
 
         impl TaskIdentityReleaseGuard {
-            fn new(state: Arc<WorkerGpuState>, page_index: GpuPageIndex, mesh_slice: Option<MeshBufferSlice>) -> Self {
-                Self { state, page_index, mesh_slice, active: true }
+            fn new(state: Arc<WorkerGpuState>, coord: ChunkCoord, task_id: u64) -> Self {
+                Self {
+                    state,
+                    coord,
+                    task_id,
+                    active: true,
+                }
             }
             fn release_now(&mut self) {
-                if !self.active { return; }
+                if !self.active {
+                    return;
+                }
                 let mut atlas = self.state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                atlas.release_queued_task_identity(self.page_index, self.mesh_slice);
+                atlas.release_queued_task_identity(self.coord, self.task_id);
                 self.active = false;
             }
         }
 
         impl Drop for TaskIdentityReleaseGuard {
-            fn drop(&mut self) { self.release_now(); }
+            fn drop(&mut self) {
+                self.release_now();
+            }
         }
 
-        let mut task_identity_guard = TaskIdentityReleaseGuard::new(
-            state.clone(),
-            task.page_index,
-            task.mesh_slice,
-        );
+        let mut task_identity_guard =
+            TaskIdentityReleaseGuard::new(state.clone(), task.coord, task.task_id);
 
         {
             let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
@@ -2796,7 +2871,8 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                         task.page_index,
                         task.page_generation,
                         mesh_slice,
-                        task.slot_generation.expect("mesh slice task missing slot generation"),
+                        task.slot_generation
+                            .expect("mesh slice task missing slot generation"),
                     ) {
                         stats.ownership_validation_drops += 1;
                         task_identity_guard.release_now();
@@ -2872,7 +2948,7 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                     },
                 );
             }
-            atlas.release_queued_task_identity(task.page_index, task.mesh_slice);
+            atlas.release_queued_task_identity(task.coord, task.task_id);
             task_identity_guard.active = false;
         }
 
@@ -2999,7 +3075,9 @@ pub fn take_ready_gpu_mesh_results_on_renderer() -> Vec<ReadyGpuMeshFinalizeEven
     let phase3_lock_start = Instant::now();
     {
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-        for (candidate, (completed_ready, snapshot_ready, index_count)) in candidates.into_iter().zip(index_counts.into_iter()) {
+        for (candidate, (completed_ready, snapshot_ready, index_count)) in
+            candidates.into_iter().zip(index_counts.into_iter())
+        {
             let Some(current_pending) = atlas.pending_mesh_finalize.get(&candidate.coord).copied()
             else {
                 continue;
@@ -3200,6 +3278,7 @@ pub fn invalidate_gpu_pending_finalize_and_queued_on_renderer(
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
         if !preserve_gpu_finalize_identity {
             let _ = atlas.pending_mesh_finalize.remove(&coord);
+            atlas.release_queued_task_identity_for_coord(coord);
         }
         if let Some(page_index) = atlas.page_for_chunk.get(&coord).copied() {
             if !preserve_gpu_finalize_identity {
