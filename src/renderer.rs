@@ -68,8 +68,10 @@ const MESH_BACKPRESSURE_START: usize = 80;
 const MESH_BACKPRESSURE_HIGH: usize = 180;
 const GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME: usize = 96;
 const GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME: usize = 192;
+const GPU_RENDER_DISPATCH_MIN_TASKS_PER_FRAME: usize = 48;
 const GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS: f32 = 1.25;
 const GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS: f32 = 3.0;
+const GPU_RENDER_DISPATCH_MIN_TIME_BUDGET_MS: f32 = 0.6;
 const LOD_MISMATCH_GRACE_MAX_FRAMES: u64 = 8;
 const DRAW_CONTINUITY_MAX_FRAMES: u64 = 64;
 const DRAW_CONTINUITY_NEAR_DISTANCE_CHUNKS: f32 = 2.0;
@@ -756,6 +758,8 @@ pub struct MeshRebuildStats {
     pub gpu_dispatch_queue_empty_exits: usize,
     pub gpu_dispatch_queue_disconnected_exits: usize,
     pub gpu_dispatch_headroom: f32,
+    pub gpu_dispatch_pressure: f32,
+    pub gpu_dispatch_budget_ms: f32,
     pub gpu_mesh_adopted_count: usize,
     pub gpu_mesh_adoption_latency_ms: f32,
     pub gpu_mesh_visible_count: usize,
@@ -861,6 +865,10 @@ pub struct MeshRebuildStats {
     pub void_drop_count: usize,
     pub dropped_to_void_count_by_reason: [usize; 5],
     pub completed_receive_budget_hits: usize,
+    pub completed_receive_budget: usize,
+    pub completed_receive_pressure: f32,
+    pub completed_receive_inflight_pressure: f32,
+    pub completed_receive_backlog_pressure: f32,
     pub finalize_budget_hits: usize,
     pub adopt_budget_hits: usize,
     pub retry_budget_hits: usize,
@@ -1000,6 +1008,7 @@ const DIRTY_VISIBLE_URGENT_SCORE: f32 = 0.8;
 const MAX_LOD_REMESH_PER_FRAME: usize = 64;
 // Hard caps for renderer-side bookkeeping to avoid frame-time spikes during backlog churn.
 const MAX_MESH_RESULTS_RECEIVED_PER_FRAME: usize = 96;
+const MIN_MESH_RESULTS_RECEIVED_PER_FRAME: usize = 24;
 const MAX_GPU_FINALIZE_EVENTS_PER_FRAME: usize = 96;
 const MAX_COMPLETED_ADOPTIONS_PER_FRAME: usize = 96;
 const MAX_RETRY_SCHEDULES_PER_FRAME: usize = 64;
@@ -2384,7 +2393,33 @@ impl Renderer {
         &mut self,
         mesh_budget: usize,
         queue_depth: usize,
-    ) -> (usize, std::time::Duration, f32) {
+        completion_backlog: usize,
+        inflight_backlog: usize,
+    ) -> (usize, std::time::Duration, f32, f32) {
+        let (task_budget, time_budget_ms, headroom, pressure) = Self::compute_dispatch_budget(
+            mesh_budget,
+            queue_depth,
+            completion_backlog,
+            inflight_backlog,
+        );
+
+        self.gpu_dispatch_budget_tasks_last = task_budget;
+        self.gpu_dispatch_budget_ms_last = time_budget_ms;
+
+        (
+            task_budget,
+            std::time::Duration::from_secs_f32(time_budget_ms / 1000.0),
+            headroom,
+            pressure,
+        )
+    }
+
+    fn compute_dispatch_budget(
+        mesh_budget: usize,
+        queue_depth: usize,
+        completion_backlog: usize,
+        inflight_backlog: usize,
+    ) -> (usize, f32, f32, f32) {
         let queue_scale = if queue_depth <= MESH_BACKPRESSURE_START {
             1.0
         } else {
@@ -2399,34 +2434,37 @@ impl Renderer {
         let headroom = ((mesh_budget as f32 - queue_depth as f32) / mesh_budget.max(1) as f32)
             .clamp(-1.0, 1.0);
         let headroom_scale = (1.0 + headroom * 0.45).clamp(0.7, 1.5);
+        let completion_pressure = (completion_backlog as f32
+            / COMPLETED_MESH_BACKLOG_THRESHOLD.max(1) as f32)
+            .clamp(0.0, 2.0);
+        let inflight_pressure = (inflight_backlog as f32
+            / MAX_MESH_RESULTS_RECEIVED_PER_FRAME.max(1) as f32)
+            .clamp(0.0, 2.0);
+        let pressure = (completion_pressure * 0.6 + inflight_pressure * 0.4).clamp(0.0, 2.0);
+        let pressure_clamp = (1.0 - pressure * 0.45).clamp(0.5, 1.0);
 
         let tasks = ((GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME as f32)
             * queue_scale
             * workload_scale
-            * headroom_scale)
+            * headroom_scale
+            * pressure_clamp)
             .round() as usize;
         let task_budget = tasks.clamp(
-            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            GPU_RENDER_DISPATCH_MIN_TASKS_PER_FRAME,
             GPU_RENDER_DISPATCH_MAX_TASKS_PER_FRAME,
         );
 
         let time_budget_ms = (GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS
             * queue_scale
             * (0.85 + workload_scale * 0.35)
-            * headroom_scale)
+            * headroom_scale
+            * pressure_clamp)
             .clamp(
-                GPU_RENDER_DISPATCH_BASE_TIME_BUDGET_MS,
+                GPU_RENDER_DISPATCH_MIN_TIME_BUDGET_MS,
                 GPU_RENDER_DISPATCH_MAX_TIME_BUDGET_MS,
             );
 
-        self.gpu_dispatch_budget_tasks_last = task_budget;
-        self.gpu_dispatch_budget_ms_last = time_budget_ms;
-
-        (
-            task_budget,
-            std::time::Duration::from_secs_f32(time_budget_ms / 1000.0),
-            headroom,
-        )
+        (task_budget, time_budget_ms, headroom, pressure)
     }
 
     /// Rebuild up to `budget` dirty chunks this frame, without O(N) re-marking cost.
@@ -2749,11 +2787,20 @@ impl Renderer {
 
             let renderer_source_backlog_for_dispatch =
                 self.dirty_queues.total_len() + self.mesh_queue.inflight;
-            let (task_budget, dispatch_budget, dispatch_headroom) =
-                self.dynamic_gpu_dispatch_budget(mesh_budget, renderer_source_backlog_for_dispatch);
+            let completion_backlog_for_dispatch =
+                self.deferred_mesh_results.len() + self.deferred_completed_meshes.len();
+            let (task_budget, dispatch_budget, dispatch_headroom, dispatch_pressure) = self
+                .dynamic_gpu_dispatch_budget(
+                    mesh_budget,
+                    renderer_source_backlog_for_dispatch,
+                    completion_backlog_for_dispatch,
+                    self.mesh_queue.inflight,
+                );
             stats.gpu_dispatch_task_budget = task_budget;
             stats.gpu_dispatch_source_queue_depth = renderer_source_backlog_for_dispatch;
             stats.gpu_dispatch_headroom = dispatch_headroom;
+            stats.gpu_dispatch_pressure = dispatch_pressure;
+            stats.gpu_dispatch_budget_ms = dispatch_budget.as_secs_f32() * 1000.0;
             match dispatch_gpu_chunk_tasks_on_renderer(task_budget, dispatch_budget) {
                 Ok(dispatch_stats) => {
                     stats.gpu_dispatch_enqueue_submit_ms += dispatch_stats.enqueue_submit_ms;
@@ -2804,7 +2851,7 @@ impl Renderer {
         let mut replacement_failed_coords: HashSet<ChunkCoord> = HashSet::new();
         let mut replacement_distance_evicted_coords: HashSet<ChunkCoord> = HashSet::new();
 
-        self.recv_mesh_results_bounded(&mut stats);
+        self.recv_mesh_results_bounded(&mut stats, mesh_budget);
 
         #[cfg(feature = "gpu-compute")]
         if matches!(self.mesh_backend, MeshPipelineBackend::Gpu) {
@@ -4079,7 +4126,36 @@ impl Renderer {
         }
     }
 
-    fn recv_mesh_results_bounded(&mut self, stats: &mut MeshRebuildStats) {
+    fn adaptive_receive_budget(
+        mesh_budget: usize,
+        inflight_backlog: usize,
+        deferred_backlog: usize,
+    ) -> (usize, f32, f32, f32) {
+        let inflight_pressure = (inflight_backlog as f32
+            / MAX_MESH_RESULTS_RECEIVED_PER_FRAME.max(1) as f32)
+            .clamp(0.0, 2.0);
+        let deferred_pressure = (deferred_backlog as f32
+            / COMPLETED_MESH_BACKLOG_THRESHOLD.max(1) as f32)
+            .clamp(0.0, 2.0);
+        let pressure = (inflight_pressure * 0.7 + deferred_pressure * 0.3).clamp(0.0, 2.0);
+        let budget_scale = (0.5 + pressure * 0.6).clamp(0.5, 1.8);
+        let queue_scale = ((mesh_budget as f32) / GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME as f32)
+            .clamp(0.75, 1.4);
+        let receive_budget =
+            ((MAX_MESH_RESULTS_RECEIVED_PER_FRAME as f32) * budget_scale * queue_scale).round()
+                as usize;
+        (
+            receive_budget.clamp(
+                MIN_MESH_RESULTS_RECEIVED_PER_FRAME,
+                MAX_MESH_RESULTS_RECEIVED_PER_FRAME,
+            ),
+            pressure,
+            inflight_pressure,
+            deferred_pressure,
+        )
+    }
+
+    fn recv_mesh_results_bounded(&mut self, stats: &mut MeshRebuildStats, mesh_budget: usize) {
         while self.deferred_completed_meshes.len() < MAX_COMPLETED_ADOPTIONS_PER_FRAME {
             let Some(result) = self.deferred_mesh_results.pop_front() else {
                 break;
@@ -4087,7 +4163,16 @@ impl Renderer {
             self.deferred_completed_meshes.push_back(result);
         }
 
-        let mut receive_budget = MAX_MESH_RESULTS_RECEIVED_PER_FRAME;
+        let (mut receive_budget, pressure, inflight_pressure, deferred_pressure) =
+            Self::adaptive_receive_budget(
+                mesh_budget,
+                self.mesh_queue.inflight,
+                self.deferred_mesh_results.len() + self.deferred_completed_meshes.len(),
+            );
+        stats.completed_receive_budget = receive_budget;
+        stats.completed_receive_pressure = pressure;
+        stats.completed_receive_inflight_pressure = inflight_pressure;
+        stats.completed_receive_backlog_pressure = deferred_pressure;
         while receive_budget > 0 {
             match self.mesh_queue.try_recv() {
                 Ok(mut result) => {
@@ -7801,9 +7886,67 @@ mod tests {
 
     #[test]
     fn completed_receive_is_bounded_per_frame() {
-        let accepted = MAX_MESH_RESULTS_RECEIVED_PER_FRAME;
-        let deferred = MAX_MESH_RESULTS_RECEIVED_PER_FRAME + 3;
-        assert!(accepted < deferred);
+        let (budget, pressure, inflight_pressure, deferred_pressure) =
+            Renderer::adaptive_receive_budget(
+                GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+                usize::MAX,
+                usize::MAX,
+            );
+        assert_eq!(budget, MAX_MESH_RESULTS_RECEIVED_PER_FRAME);
+        assert!(pressure >= 1.0);
+        assert!(inflight_pressure >= 1.0);
+        assert!(deferred_pressure >= 1.0);
+    }
+
+    #[test]
+    fn adaptive_receive_budget_uses_floor_when_pressure_is_low() {
+        let (budget, pressure, inflight_pressure, deferred_pressure) =
+            Renderer::adaptive_receive_budget(1, 0, 0);
+        assert!(budget >= MIN_MESH_RESULTS_RECEIVED_PER_FRAME);
+        assert!(budget < MAX_MESH_RESULTS_RECEIVED_PER_FRAME);
+        assert_eq!(pressure, 0.0);
+        assert_eq!(inflight_pressure, 0.0);
+        assert_eq!(deferred_pressure, 0.0);
+    }
+
+    #[test]
+    fn dispatch_budget_clamps_down_under_renderer_backlog_pressure() {
+        let (low_tasks, low_ms, _low_headroom, low_pressure) = Renderer::compute_dispatch_budget(
+            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            MESH_BACKPRESSURE_START,
+            0,
+            0,
+        );
+        let (high_tasks, high_ms, _high_headroom, high_pressure) =
+            Renderer::compute_dispatch_budget(
+                GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+                MESH_BACKPRESSURE_START,
+                COMPLETED_MESH_BACKLOG_THRESHOLD * 2,
+                MAX_MESH_RESULTS_RECEIVED_PER_FRAME * 2,
+            );
+
+        assert!(high_pressure > low_pressure);
+        assert!(high_tasks < low_tasks);
+        assert!(high_ms < low_ms);
+        assert!(high_tasks >= GPU_RENDER_DISPATCH_MIN_TASKS_PER_FRAME);
+        assert!(high_ms >= GPU_RENDER_DISPATCH_MIN_TIME_BUDGET_MS);
+    }
+
+    #[test]
+    fn adaptive_receive_budget_scales_up_with_backlog_pressure() {
+        let (low_budget, ..) = Renderer::adaptive_receive_budget(
+            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            0,
+            0,
+        );
+        let (high_budget, ..) = Renderer::adaptive_receive_budget(
+            GPU_RENDER_DISPATCH_BASE_TASKS_PER_FRAME,
+            MAX_MESH_RESULTS_RECEIVED_PER_FRAME * 2,
+            COMPLETED_MESH_BACKLOG_THRESHOLD * 2,
+        );
+
+        assert!(high_budget > low_budget);
+        assert_eq!(high_budget, MAX_MESH_RESULTS_RECEIVED_PER_FRAME);
     }
 
     #[test]
