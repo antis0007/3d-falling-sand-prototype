@@ -16,7 +16,7 @@ use crate::engine2::gpu::buffers::BufferPoolConfig;
 use crate::engine2::gpu::Engine2Gpu;
 use crate::engine2::render::camera::CameraState;
 use crate::engine2::render::draw::{DrawPacket, Engine2Drawer};
-use crate::engine2::render::extract::{Engine2Extractor, ExtractInput};
+use crate::engine2::render::extract::{Engine2Extractor, ExtractInput, ExtractOutput};
 use crate::engine2::sim::edit_apply::EditApplier;
 use crate::engine2::sim::scheduler::SimScheduler;
 use crate::engine2::world::procgen::ProcgenInterface;
@@ -51,10 +51,8 @@ impl Engine2State {
         self.gpu.initialize(device, queue, config);
     }
 
-    /// Applies CPU residency transitions into engine2 GPU hot-state.
-    ///
-    /// In phase 3 this is intentionally minimal and upload/queue focused.
-    pub fn sync_gpu_hot_state(&mut self) {
+    /// Frame phase 1: resolve sparse residency transitions.
+    pub fn residency_update_step(&mut self) {
         if !self.gpu.is_initialized() {
             return;
         }
@@ -81,22 +79,36 @@ impl Engine2State {
                 }
             }
         }
+    }
 
+    /// Frame phase 2: flush staged uploads/page-table metadata to GPU buffers.
+    pub fn upload_step(&mut self) {
+        self.gpu.flush();
+    }
+
+    /// Frame phase 3: apply pending edit commands.
+    pub fn command_application_step(&mut self) {
         self.edit_applier.apply_pending_edits(
             &mut self.commands,
             &mut self.residency,
             &mut self.gpu,
             &mut self.scheduler,
         );
-        self.scheduler.advance_frame(&mut self.gpu);
-
-        self.gpu.flush();
     }
 
-    /// Runs engine2-owned render extraction and draw packet preparation.
-    pub fn prepare_render_packet(&mut self, camera: CameraState) -> DrawPacket {
+    /// Frame phase 4: advance active/sleep scheduling.
+    pub fn active_scheduling_step(&mut self) {
+        self.scheduler.advance_frame(&mut self.gpu);
+    }
+
+    /// Frame phase 5: run engine2 extraction ownership.
+    pub fn render_extraction_step(&mut self, camera: CameraState) -> ExtractOutput {
         let extract_input = ExtractInput { camera };
-        let extract_output = self.extractor.extract(&mut self.gpu.queues, &extract_input);
+        self.extractor.extract(&mut self.gpu.queues, &extract_input)
+    }
+
+    /// Frame phase 6: prepare draw packet and upload indirect draw arguments.
+    pub fn draw_step(&mut self, extract_output: ExtractOutput) -> DrawPacket {
         let draw_packet = self.drawer.prepare(&mut self.gpu.queues, extract_output);
         if let Some(gpu_handles) = self.gpu.context_and_buffers() {
             self.drawer.upload_indirect(gpu_handles, &draw_packet);
