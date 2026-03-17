@@ -1286,13 +1286,22 @@ fn clear_meshing_outputs_for_page(
         bytemuck::cast_slice(&zero_origin),
     );
 
-    let face_count_stride = std::mem::size_of::<u32>() as u64;
-    let face_count_offset = page_index.0 as u64 * face_count_stride;
+    let face_count_offset = face_count_offset_for_page(page_index);
+    debug_assert_eq!(
+        face_count_offset % std::mem::size_of::<u32>() as u64,
+        0,
+        "face-count clears must target a page-local slot"
+    );
     state.queue.write_buffer(
         &state.face_count_buffer,
         face_count_offset,
         bytemuck::cast_slice(&[0u32; 1]),
     );
+}
+
+#[cfg(feature = "gpu-compute")]
+fn face_count_offset_for_page(page_index: GpuPageIndex) -> u64 {
+    page_index.0 as u64 * std::mem::size_of::<u32>() as u64
 }
 
 fn validate_mesh_slice_for_dispatch(
@@ -3884,6 +3893,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn face_count_clear_offset_is_page_relative() {
+        let page_a = crate::types::GpuPageIndex(0);
+        let page_b = crate::types::GpuPageIndex(7);
+
+        let offset_a = super::face_count_offset_for_page(page_a);
+        let offset_b = super::face_count_offset_for_page(page_b);
+
+        assert_eq!(offset_a, 0);
+        assert_eq!(
+            offset_b,
+            std::mem::size_of::<u32>() as u64 * page_b.0 as u64
+        );
+        assert_ne!(offset_a, offset_b);
+    }
     #[cfg(feature = "gpu-compute")]
     #[test]
     fn enqueue_fails_fast_with_queue_full_pressure_reason_after_bounded_defers() {
