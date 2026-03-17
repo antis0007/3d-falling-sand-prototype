@@ -4234,7 +4234,6 @@ impl Renderer {
         match ready.status {
             ReadyGpuMeshFinalizeStatus::NotReadyYet => {
                 stats.finalize_status_not_ready_yet += 1;
-                stats.finalize_status_not_ready_yet += 1;
                 pending.finalize_revisit_count = pending.finalize_revisit_count.saturating_add(1);
                 pending.last_wait_reason = ready.wait_reason;
                 let age_frames = self

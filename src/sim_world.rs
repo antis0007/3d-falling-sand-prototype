@@ -451,7 +451,6 @@ impl SimWorld {
 
                     state.wait_ticks = 0;
                     state.starvation_counter = 0;
-                    state.starvation_counter = 0;
                     state.recent_activity = state.recent_activity.saturating_add(4);
                 } else if deferred_for_other_phase {
                     // Keep chunks immediately schedulable when this split pass skipped them,
