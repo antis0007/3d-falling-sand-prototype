@@ -1,5 +1,6 @@
 //! Minimal compile-safe engine2 entry point.
 
+use crate::engine2::render::camera::CameraState;
 use crate::engine2::Engine2State;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,9 @@ pub struct EngineLoop {
 }
 
 pub async fn run() -> anyhow::Result<BootAction> {
-    let _loop_state = EngineLoop::default();
+    let mut loop_state = EngineLoop::default();
+    let _packet = loop_state
+        .state
+        .prepare_render_packet(CameraState::from_world_position([0.0, 0.0, 0.0], 256.0));
     Ok(BootAction::RunLegacyApp)
 }

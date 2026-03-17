@@ -10,6 +10,7 @@ pub struct HotQueues {
     active_bricks: Vec<u32>,
     dirty_bricks: Vec<u32>,
     remesh_bricks: Vec<u32>,
+    extracted_bricks: Vec<u32>,
     draw_indirect_count: u32,
 }
 
@@ -18,6 +19,7 @@ impl HotQueues {
         self.active_bricks.clear();
         self.dirty_bricks.clear();
         self.remesh_bricks.clear();
+        self.extracted_bricks.clear();
         self.draw_indirect_count = 0;
     }
 
@@ -35,6 +37,22 @@ impl HotQueues {
 
     pub fn push_remesh(&mut self, page_slot: u32) {
         self.remesh_bricks.push(page_slot);
+    }
+
+    pub fn consume_dirty_into_remesh(&mut self) {
+        self.remesh_bricks.append(&mut self.dirty_bricks);
+    }
+
+    pub fn take_remesh_bricks(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.remesh_bricks)
+    }
+
+    pub fn push_extracted(&mut self, page_slot: u32) {
+        self.extracted_bricks.push(page_slot);
+    }
+
+    pub fn extracted_bricks(&self) -> &[u32] {
+        &self.extracted_bricks
     }
 
     pub fn set_draw_indirect_count(&mut self, count: u32) {
