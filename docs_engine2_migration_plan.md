@@ -17,13 +17,16 @@
 - GPU compute lifecycle currently coupled to renderer internals (`gpu_compute.rs`).
 
 ## Compile-safe phases
-1. **Phase 1 (this change): extraction skeleton + legacy quarantine**
-   - Introduce `src/engine2/` module tree with explicit storage/sim/render/gpu boundaries.
-   - Add thin app adapter path: app entry calls `engine2::app_bridge::loop::run()` and then legacy fallback.
-   - Add `legacy` namespace module documenting frozen modules.
-2. **Phase 2: engine2 world + residency source of truth**
-   - Implement brick-key residency map (16^3 bricks), command queues, and CPU cold storage/procgen integration.
-   - Keep renderer output minimal and legacy draw path still active.
+1. **Phase 1: extraction skeleton + legacy quarantine** ✅
+   - Introduced `src/engine2/` module tree with explicit storage/sim/render/gpu boundaries.
+   - Added thin app adapter path: app entry calls `engine2::app_bridge::loop::run()` and then legacy fallback.
+   - Added `legacy` namespace module documenting frozen modules.
+2. **Phase 2: engine2 world + residency source of truth** ✅
+   - Added explicit engine2 coordinate types and conversion helpers for voxel→brick→local resolution with fixed 16^3 bricks.
+   - Added `world/brick.rs` metadata and payload placeholders, `world/storage.rs` cold-state catalogs, and `world/residency.rs` as sparse residency authority.
+   - Added desired-vs-current residency tracking with `request`, `release`, `mark_resident`, `mark_dirty`, and load/evict decision collection.
+   - Added compact explicit command queue types (`load`, `unload`, `edit sphere`, `edit box`, `inject material`).
+   - Extended engine2 app bridge to construct `Engine2State` (residency + commands + storage + procgen) while still returning legacy fallback.
 3. **Phase 3: GPU hot-state bring-up**
    - Allocate resident brick pools/page tables/queues/indirect buffers in engine2 gpu modules.
    - Route edit/load/unload commands through command stream; no CPU meshing.
@@ -31,3 +34,8 @@
    - Bind engine2 extraction/draw to GPU indirect buffers and retire legacy mesh finalize path.
 5. **Phase 5: app loop simplification**
    - Remove legacy orchestration branches and move scheduling concerns into engine2 bridge/schedulers.
+
+## Phase 2 design decisions
+- Brick edge size is fixed at 16 to preserve a consistent sparse page unit for later GPU residency.
+- Residency map is the source of truth for current state transitions, while storage tracks payload/meta and procgen only handles request/result plumbing.
+- Residency entries include optional GPU page handles now to avoid API churn in Phase 3, but no allocation is performed in this phase.

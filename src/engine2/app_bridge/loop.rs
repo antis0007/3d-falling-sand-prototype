@@ -1,6 +1,6 @@
 //! Minimal compile-safe engine2 entry point.
 
-use crate::engine2::Engine2Core;
+use crate::engine2::Engine2State;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootAction {
@@ -9,7 +9,7 @@ pub enum BootAction {
 
 #[derive(Debug, Default)]
 pub struct EngineLoop {
-    pub core: Engine2Core,
+    pub state: Engine2State,
 }
 
 pub async fn run() -> anyhow::Result<BootAction> {
