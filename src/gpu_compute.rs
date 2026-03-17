@@ -16,7 +16,7 @@ use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -815,7 +815,6 @@ impl ChunkPageAtlas {
         None
     }
 
-
     fn pending_finalize_identity_matches(
         &self,
         coord: ChunkCoord,
@@ -1503,6 +1502,8 @@ pub struct GpuComputeProfilerSnapshot {
     pub finalize_invalid_count: u64,
     pub color_contract_mismatch_count: u64,
     pub zero_or_invalid_mesh_output_count: u64,
+    pub queue_full_drops: u64,
+    pub queue_deferred_count: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1583,6 +1584,20 @@ static GPU_COMPLETED_SERIAL: AtomicU64 = AtomicU64::new(0);
 static GPU_TASKS_ENQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASK_QUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASK_QUEUE_DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "gpu-compute")]
+const GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS: u32 = 2;
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuTaskQueuePressureReason {
+    QueueFull { max_defer_attempts: u32 },
+    QueueDisconnected,
+}
 
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -1617,6 +1632,43 @@ pub struct GpuRuntimeDebugSnapshot {
     pub queue_enqueued: usize,
     pub queue_dequeued: usize,
     pub queue_rx_backlog: usize,
+    pub queue_full_drops: u64,
+    pub queue_deferred_count: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+fn try_enqueue_gpu_chunk_task(
+    tx: &SyncSender<GpuChunkTask>,
+    mut task: GpuChunkTask,
+) -> Result<(), GpuTaskQueuePressureReason> {
+    let mut deferred_attempts = 0u32;
+    loop {
+        match tx.try_send(task) {
+            Ok(()) => {
+                GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
+                if deferred_attempts > 0 {
+                    GPU_TASK_QUEUE_DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+            Err(TrySendError::Full(returned_task)) => {
+                task = returned_task;
+                if deferred_attempts < GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS {
+                    deferred_attempts += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
+                GPU_TASK_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
+                return Err(GpuTaskQueuePressureReason::QueueFull {
+                    max_defer_attempts: GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS,
+                });
+            }
+            Err(TrySendError::Disconnected(_returned_task)) => {
+                GPU_TASK_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
+                return Err(GpuTaskQueuePressureReason::QueueDisconnected);
+            }
+        }
+    }
 }
 
 pub fn gpu_task_rx_backlog_estimate() -> usize {
@@ -1838,6 +1890,8 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             color_contract_mismatch_count,
             zero_or_invalid_mesh_output_count,
             chunks_per_sec: chunks_completed as f32 / frame,
+            queue_full_drops: GPU_TASK_QUEUE_FULL_COUNT.swap(0, Ordering::Relaxed),
+            queue_deferred_count: GPU_TASK_QUEUE_DEFERRED_COUNT.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -2639,10 +2693,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         };
 
         // Queue GPU task
-        if let Err(err) = GPU_TASK_TX
-            .get()
-            .expect("gpu task queue")
-            .send(GpuChunkTask {
+        let enqueue_result = try_enqueue_gpu_chunk_task(
+            GPU_TASK_TX.get().expect("gpu task queue"),
+            GpuChunkTask {
                 coord: job.coord,
                 page_index,
                 page_generation,
@@ -2663,13 +2716,17 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
                 next_tick: tick.wrapping_add(1),
                 next_frontier_len: active_frontier_count,
                 next_diagnostics: diagnostics,
-            })
-        {
+            },
+        );
+        if let Err(reason) = enqueue_result {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.release_queued_task_identity(job.coord, job.task_id);
-            return Err(err).context("failed to send GPU chunk task");
+            return Err(anyhow::anyhow!(
+                "failed to enqueue GPU chunk task for {:?}: {:?}",
+                job.coord,
+                reason
+            ));
         }
-        GPU_TASKS_ENQUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
 
         // Authoritative runtime meshing path (GPU).
         let (chunk_origin_world, aabb_min, aabb_max) = chunk_world_bounds(job.coord);
@@ -2740,7 +2797,9 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 
 #[cfg(feature = "gpu-compute")]
 fn commit_dispatched_chunk_state(atlas: &mut ChunkPageAtlas, task: &GpuChunkTask) {
-    atlas.version_for_chunk.insert(task.coord, task.version.get());
+    atlas
+        .version_for_chunk
+        .insert(task.coord, task.version.get());
     atlas.state_for_chunk.insert(task.coord, task.next_state);
     atlas.tick_for_chunk.insert(task.coord, task.next_tick);
     atlas
@@ -3067,6 +3126,8 @@ pub fn gpu_runtime_debug_snapshot() -> GpuRuntimeDebugSnapshot {
         queue_enqueued: GPU_TASKS_ENQUEUED_COUNT.load(Ordering::Relaxed) as usize,
         queue_dequeued: GPU_TASKS_DEQUEUED_COUNT.load(Ordering::Relaxed) as usize,
         queue_rx_backlog: gpu_task_rx_backlog_estimate(),
+        queue_full_drops: GPU_TASK_QUEUE_FULL_COUNT.load(Ordering::Relaxed),
+        queue_deferred_count: GPU_TASK_QUEUE_DEFERRED_COUNT.load(Ordering::Relaxed),
     }
 }
 
@@ -3798,11 +3859,98 @@ mod tests {
     }
 
     #[cfg(feature = "gpu-compute")]
+    fn test_gpu_task(coord: ChunkCoord, task_id: u64) -> super::GpuChunkTask {
+        super::GpuChunkTask {
+            coord,
+            page_index: crate::types::GpuPageIndex(0),
+            page_generation: 0,
+            frontier_count: 0,
+            edit_commands: Vec::new(),
+            jacobi_iterations: 0,
+            neighbor_pages: [u32::MAX; 6],
+            simulation_tick: 0,
+            current_state: 0,
+            startup_seeding_mode: false,
+            mesh_slice: None,
+            slot_generation: None,
+            version: ChunkVersion(1),
+            task_id,
+            lod: 0,
+            next_cached_materials: Vec::new(),
+            next_state: 0,
+            next_tick: 0,
+            next_frontier_len: 0,
+            next_diagnostics: super::ChunkSimulationDiagnostics::default(),
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn enqueue_fails_fast_with_queue_full_pressure_reason_after_bounded_defers() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(test_gpu_task(ChunkCoord { x: 9, y: 9, z: 9 }, 99))
+            .expect("seed queue");
+
+        let reason = super::try_enqueue_gpu_chunk_task(
+            &tx,
+            test_gpu_task(ChunkCoord { x: 1, y: 2, z: 3 }, 1),
+        )
+        .expect_err("full queue should fail after bounded defers");
+
+        assert_eq!(
+            reason,
+            super::GpuTaskQueuePressureReason::QueueFull {
+                max_defer_attempts: super::GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS,
+            }
+        );
+    }
+
+    #[cfg(feature = "gpu-compute")]
+    #[test]
+    fn queue_full_path_releases_queued_task_identity_reservations() {
+        let mut atlas = ChunkPageAtlas::default();
+        let coord = ChunkCoord { x: 2, y: 0, z: 0 };
+        let task_id = 11;
+        let version = ChunkVersion(2);
+        let (page_index, _) = atlas.page_for_chunk_or_allocate(coord).expect("page");
+        let mesh_slice = match atlas.mesh_slice_for_chunk_or_allocate(coord, 0) {
+            MeshSliceAllocateOutcome::Success(slice) => Some(slice),
+            other => panic!("expected mesh slice, got {other:?}"),
+        };
+
+        atlas.reserve_queued_task_identity(coord, task_id, version, page_index, mesh_slice);
+        assert!(atlas.queued_task_reservations.contains_key(&coord));
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(test_gpu_task(ChunkCoord { x: 8, y: 8, z: 8 }, 88))
+            .expect("seed queue");
+        let enqueue = super::try_enqueue_gpu_chunk_task(&tx, test_gpu_task(coord, task_id));
+        assert!(matches!(
+            enqueue,
+            Err(super::GpuTaskQueuePressureReason::QueueFull { .. })
+        ));
+
+        atlas.release_queued_task_identity(coord, task_id);
+        assert!(!atlas.queued_task_reservations.contains_key(&coord));
+        assert!(!atlas.has_queued_page_reservation(page_index));
+        if let Some(mesh_slice) = mesh_slice {
+            assert!(!atlas.has_queued_slot_reservation(mesh_slice.slot_index));
+        }
+    }
+
+    #[cfg(feature = "gpu-compute")]
     #[test]
     fn reusing_slot_evicts_previous_owner_before_reallocation() {
         let mut atlas = ChunkPageAtlas::default();
         let owner_a = ChunkCoord { x: 0, y: 0, z: 0 };
         let owner_b = ChunkCoord { x: 1, y: 0, z: 0 };
+
+        atlas
+            .page_for_chunk_or_allocate(owner_a)
+            .expect("owner_a page");
+        atlas
+            .page_for_chunk_or_allocate(owner_b)
+            .expect("owner_b page");
 
         let allocated_a = atlas.mesh_slice_for_chunk_or_allocate(owner_a, 0);
         let slot = match allocated_a {
