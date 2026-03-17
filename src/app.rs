@@ -1008,7 +1008,10 @@ enum StartupPhase {
 
 impl StartupPhase {
     fn is_startup(self) -> bool {
-        matches!(self, StartupPhase::Booting | StartupPhase::InitializingRenderer)
+        matches!(
+            self,
+            StartupPhase::Booting | StartupPhase::InitializingRenderer
+        )
     }
 }
 
@@ -1027,6 +1030,12 @@ fn noop_waker() -> Waker {
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    match crate::engine2::app_bridge::r#loop::run().await? {
+        crate::engine2::app_bridge::r#loop::BootAction::RunLegacyApp => legacy_run().await,
+    }
+}
+
+async fn legacy_run() -> anyhow::Result<()> {
     let mut sim_running = false;
     let mut step_once = false;
 
