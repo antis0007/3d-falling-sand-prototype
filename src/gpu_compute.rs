@@ -5,18 +5,20 @@ use crate::mesh_layout::{
 };
 use crate::renderer::mesh_chunk_snapshot;
 use crate::renderer::{ChunkMeshArtifact, MeshJob, MeshSkipReason, VOXEL_SIZE};
+use crate::startup_gpu_budget::{finalize_startup_budget, StartupGpuBudget};
 use crate::types::{ChunkCoord, GpuPageIndex, CHUNK_SIZE_VOXELS};
 use crate::world::{MaterialId, EMPTY};
 use anyhow::Context;
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "gpu-compute")]
+use crossbeam_channel as cbc;
 #[cfg(feature = "gpu-compute")]
 use glam::Vec3;
 #[cfg(feature = "gpu-compute")]
 use std::collections::HashMap;
 #[cfg(feature = "gpu-compute")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "gpu-compute")]
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::Receiver;
 #[cfg(feature = "gpu-compute")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -116,6 +118,109 @@ pub struct SharedMeshBuffers {
 }
 
 #[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuWorkerStartupPlan {
+    pub reduce_scratch_footprint: bool,
+    pub disable_draw_indirect_readback: bool,
+}
+
+#[cfg(feature = "gpu-compute")]
+#[derive(Clone, Copy, Debug)]
+pub struct GpuComputeStartupBufferSizes {
+    pub atlas_voxels: u64,
+    pub velocity_mac: u64,
+    pub pressure: u64,
+    pub divergence: u64,
+    pub material_density: u64,
+    pub scratch_total: u64,
+    pub draw_indirect_readback: u64,
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn compute_startup_buffer_sizes(plan: GpuWorkerStartupPlan) -> GpuComputeStartupBufferSizes {
+    let page_len = CHUNK_VOLUME as u64;
+    let page_capacity = MESH_SLOT_COUNT as u64;
+    let scratch_active_tiles = page_len * std::mem::size_of::<u32>() as u64;
+    let scratch_edit_commands =
+        MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64;
+    let scratch_total = std::mem::size_of::<FrameParams>() as u64
+        + if plan.reduce_scratch_footprint {
+            scratch_active_tiles / 2
+        } else {
+            scratch_active_tiles
+        }
+        + 16
+        + if plan.reduce_scratch_footprint {
+            scratch_edit_commands / 2
+        } else {
+            scratch_edit_commands
+        }
+        + page_capacity * std::mem::size_of::<u32>() as u64
+        + 16
+        + 16;
+
+    GpuComputeStartupBufferSizes {
+        atlas_voxels: atlas_voxel_size_bytes(),
+        velocity_mac: velocity_mac_size_bytes(),
+        pressure: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        divergence: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        material_density: page_capacity * page_len * 2 * std::mem::size_of::<f32>() as u64,
+        scratch_total,
+        draw_indirect_readback: if plan.disable_draw_indirect_readback {
+            0
+        } else {
+            std::mem::size_of::<DrawIndexedIndirectArgs>() as u64 * MESH_SLOT_COUNT as u64
+        },
+    }
+}
+
+#[cfg(feature = "gpu-compute")]
+pub fn plan_gpu_worker_startup(
+    device_max_buffer_size: u64,
+) -> anyhow::Result<GpuWorkerStartupPlan> {
+    let mut plan = GpuWorkerStartupPlan::default();
+    for pass in 0..=2 {
+        let sizes = compute_startup_buffer_sizes(plan);
+        let mut budget = StartupGpuBudget::new(device_max_buffer_size, device_max_buffer_size / 3);
+        budget.register_plan("compute_atlas", sizes.atlas_voxels);
+        budget.register_plan("compute_velocity", sizes.velocity_mac);
+        budget.register_plan("compute_pressure", sizes.pressure);
+        budget.register_plan("compute_divergence", sizes.divergence);
+        budget.register_plan("compute_material", sizes.material_density);
+        budget.register_plan("compute_scratch", sizes.scratch_total);
+        budget.register_plan("compute_readback", sizes.draw_indirect_readback);
+        for category in [
+            "compute_atlas",
+            "compute_velocity",
+            "compute_pressure",
+            "compute_divergence",
+            "compute_material",
+            "compute_scratch",
+            "compute_readback",
+        ] {
+            budget.grant_planned(category);
+        }
+
+        if let Ok(decision) = finalize_startup_budget(budget, device_max_buffer_size / 8) {
+            log::info!(
+                "gpu worker startup budget plan: downgraded={} planned={}B granted={}B",
+                decision.downgraded,
+                decision.budget.planned_total(),
+                decision.budget.granted_total(),
+            );
+            return Ok(plan);
+        }
+
+        if pass == 0 {
+            plan.reduce_scratch_footprint = true;
+        } else if pass == 1 {
+            plan.disable_draw_indirect_readback = true;
+        }
+    }
+    anyhow::bail!("gpu worker startup planning exceeded budget after downgrade attempts")
+}
+
+#[cfg(feature = "gpu-compute")]
 struct SimulationBindResources<'a> {
     atlas_voxels: &'a wgpu::Buffer,
     velocity_mac: &'a wgpu::Buffer,
@@ -210,7 +315,10 @@ impl Default for ChunkPageAtlas {
 #[cfg(feature = "gpu-compute")]
 #[derive(Clone, Copy, Debug)]
 enum MeshSliceAllocateOutcome {
-    Success(MeshBufferSlice),
+    Success {
+        slice: MeshBufferSlice,
+        allocated_new: bool,
+    },
     Saturated,
     NoProgress,
     InvalidState,
@@ -370,7 +478,10 @@ impl ChunkPageAtlas {
     ) -> MeshSliceAllocateOutcome {
         if let Some(existing) = self.mesh_slice_for_chunk.get(&chunk).copied() {
             self.touch_mesh_slot(existing.slot_index);
-            return MeshSliceAllocateOutcome::Success(existing);
+            return MeshSliceAllocateOutcome::Success {
+                slice: existing,
+                allocated_new: false,
+            };
         }
 
         let _ = lod;
@@ -397,7 +508,10 @@ impl ChunkPageAtlas {
         }
 
         if let Some(slice) = self.try_allocate_mesh_buffers(chunk, slot) {
-            return MeshSliceAllocateOutcome::Success(slice);
+            return MeshSliceAllocateOutcome::Success {
+                slice,
+                allocated_new: true,
+            };
         }
 
         let Some(evict_slot) = self.evictable_mesh_slot(slot_capacity) else {
@@ -408,7 +522,10 @@ impl ChunkPageAtlas {
         }
 
         if let Some(slice) = self.try_allocate_mesh_buffers(chunk, evict_slot) {
-            return MeshSliceAllocateOutcome::Success(slice);
+            return MeshSliceAllocateOutcome::Success {
+                slice,
+                allocated_new: true,
+            };
         }
 
         MeshSliceAllocateOutcome::Saturated
@@ -996,7 +1113,6 @@ struct WorkerGpuState {
     pressure: wgpu::Buffer,
     divergence: wgpu::Buffer,
     material_density: wgpu::Buffer,
-    page_indirect: Arc<wgpu::Buffer>,
     chunk_vertex_buffer: Arc<wgpu::Buffer>,
     chunk_index_buffer: Arc<wgpu::Buffer>,
     draw_indirect_buffer: Arc<wgpu::Buffer>,
@@ -1023,13 +1139,13 @@ struct DrawIndirectReadbackState {
 
 #[cfg(feature = "gpu-compute")]
 impl DrawIndirectReadbackState {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, disabled: bool) -> Self {
         let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
         let slot_capacity = MESH_SLOT_COUNT as u64;
         let size = draw_stride * slot_capacity;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gpu draw indirect frame readback"),
-            size,
+            size: if disabled { 16 } else { size },
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1039,7 +1155,11 @@ impl DrawIndirectReadbackState {
             map_result_rx: None,
             requested_serial: 0,
             ready_serial: 0,
-            cached_index_counts: vec![0; MESH_SLOT_COUNT as usize],
+            cached_index_counts: if disabled {
+                Vec::new()
+            } else {
+                vec![0; MESH_SLOT_COUNT as usize]
+            },
         }
     }
 
@@ -1074,7 +1194,8 @@ impl DrawIndirectReadbackState {
     }
 
     fn request_snapshot_if_needed(&mut self, state: &WorkerGpuState, completed_serial: u64) {
-        if completed_serial == 0
+        if self.cached_index_counts.is_empty()
+            || completed_serial == 0
             || self.map_result_rx.is_some()
             || self.ready_serial >= completed_serial
         {
@@ -1164,7 +1285,7 @@ fn clear_page_buffers(
 }
 
 #[cfg(feature = "gpu-compute")]
-fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
+fn create_gpu_scratch_pool(device: &wgpu::Device, plan: GpuWorkerStartupPlan) -> GpuScratchPool {
     let page_len = CHUNK_VOLUME as u64;
     let page_capacity = MESH_SLOT_COUNT as u64;
     GpuScratchPool {
@@ -1182,7 +1303,14 @@ fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
         }),
         active_tiles: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk active frontier"),
-            size: page_len * std::mem::size_of::<u32>() as u64,
+            size: {
+                let base = page_len * std::mem::size_of::<u32>() as u64;
+                if plan.reduce_scratch_footprint {
+                    base / 2
+                } else {
+                    base
+                }
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -1194,7 +1322,14 @@ fn create_gpu_scratch_pool(device: &wgpu::Device) -> GpuScratchPool {
         }),
         edit_commands: device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("edit command buffer"),
-            size: MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64,
+            size: {
+                let base = MAX_EDIT_COMMANDS as u64 * std::mem::size_of::<EditCommand>() as u64;
+                if plan.reduce_scratch_footprint {
+                    base / 2
+                } else {
+                    base
+                }
+            },
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }),
@@ -1250,49 +1385,40 @@ fn clear_meshing_outputs_for_page(
     state: &WorkerGpuState,
     page_index: GpuPageIndex,
     mesh_slice: MeshBufferSlice,
+    encoder: &mut wgpu::CommandEncoder,
 ) {
     let zero_draw_indirect = DrawIndexedIndirectArgs::default();
     let draw_stride = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
     let draw_offset = mesh_slice.slot_index as u64 * draw_stride;
-    state.queue.write_buffer(
-        &state.draw_indirect_buffer,
-        draw_offset,
-        bytemuck::bytes_of(&zero_draw_indirect),
-    );
+    encoder.clear_buffer(&state.draw_indirect_buffer, draw_offset, Some(draw_stride));
 
+    let meta_stride = std::mem::size_of::<ChunkMeshMeta>() as u64;
+    let meta_offset = page_index.0 as u64 * meta_stride;
     let zero_meta = ChunkMeshMeta {
         slot_index: mesh_slice.slot_index,
         vertex_offset: mesh_slice.vertex_offset,
         index_offset: mesh_slice.index_offset,
         _pad: 0,
     };
-    let meta_stride = std::mem::size_of::<ChunkMeshMeta>() as u64;
-    let meta_offset = page_index.0 as u64 * meta_stride;
     state.queue.write_buffer(
         &state.mesh_meta_buffer,
         meta_offset,
         bytemuck::bytes_of(&zero_meta),
     );
 
-    let zero_origin = [0.0f32; 4];
     let origin_stride = std::mem::size_of::<[f32; 4]>() as u64;
     let origin_offset = page_index.0 as u64 * origin_stride;
-    state.queue.write_buffer(
+    encoder.clear_buffer(
         &state.chunk_origin_buffer,
         origin_offset,
-        bytemuck::cast_slice(&zero_origin),
+        Some(origin_stride),
     );
 
     let face_count_offset = face_count_offset_for_page(page_index);
-    debug_assert_eq!(
-        face_count_offset % std::mem::size_of::<u32>() as u64,
-        0,
-        "face-count clears must target a page-local slot"
-    );
-    state.queue.write_buffer(
+    encoder.clear_buffer(
         &state.face_count_buffer,
         face_count_offset,
-        bytemuck::cast_slice(&[0u32; 1]),
+        Some(std::mem::size_of::<u32>() as u64),
     );
 }
 
@@ -1510,6 +1636,12 @@ pub struct GpuComputeProfilerSnapshot {
     pub zero_or_invalid_mesh_output_count: u64,
     pub queue_full_drops: u64,
     pub queue_deferred_count: u64,
+    pub tasks_started: u64,
+    pub tasks_completed: u64,
+    pub tasks_deferred_budget: u64,
+    pub submits_per_chunk: f32,
+    pub submits_per_frame: u64,
+    pub enqueue_failed_rolled_back: u64,
     pub chunks_per_sec: f32,
 }
 
@@ -1579,9 +1711,9 @@ static GPU_ZERO_OR_INVALID_MESH_OUTPUT_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_GPU_JOBS_BITS: std::sync::LazyLock<Vec<AtomicU64>> =
     std::sync::LazyLock::new(|| (0..1024).map(|_| AtomicU64::new(0)).collect());
 #[cfg(feature = "gpu-compute")]
-static GPU_TASK_TX: OnceLock<SyncSender<GpuChunkTask>> = OnceLock::new();
+static GPU_TASK_TX: OnceLock<cbc::Sender<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
-static GPU_TASK_RX: OnceLock<Mutex<Receiver<GpuChunkTask>>> = OnceLock::new();
+static GPU_TASK_RX: OnceLock<cbc::Receiver<GpuChunkTask>> = OnceLock::new();
 #[cfg(feature = "gpu-compute")]
 static GPU_SUBMISSION_SERIAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
@@ -1594,6 +1726,18 @@ static GPU_TASKS_DEQUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 static GPU_TASK_QUEUE_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "gpu-compute")]
 static GPU_TASK_QUEUE_DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_STARTED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_COMPLETED_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_TASKS_DEFERRED_BUDGET_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_SUBMITS_PER_CHUNK_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_SUBMITS_PER_FRAME_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-compute")]
+static GPU_ENQUEUE_FAILED_ROLLED_BACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(feature = "gpu-compute")]
 const GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS: u32 = 2;
@@ -1618,6 +1762,11 @@ pub struct GpuDispatchFrameStats {
     pub tasks_without_mesh_slice: usize,
     pub queue_empty_exits: usize,
     pub queue_disconnected_exits: usize,
+    pub tasks_started: usize,
+    pub tasks_completed: usize,
+    pub tasks_deferred_budget: usize,
+    pub submits_per_chunk: usize,
+    pub submits_per_frame: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1644,7 +1793,7 @@ pub struct GpuRuntimeDebugSnapshot {
 
 #[cfg(feature = "gpu-compute")]
 fn try_enqueue_gpu_chunk_task(
-    tx: &SyncSender<GpuChunkTask>,
+    tx: &cbc::Sender<GpuChunkTask>,
     mut task: GpuChunkTask,
 ) -> Result<(), GpuTaskQueuePressureReason> {
     let mut deferred_attempts = 0u32;
@@ -1657,7 +1806,7 @@ fn try_enqueue_gpu_chunk_task(
                 }
                 return Ok(());
             }
-            Err(TrySendError::Full(returned_task)) => {
+            Err(cbc::TrySendError::Full(returned_task)) => {
                 task = returned_task;
                 if deferred_attempts < GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS {
                     deferred_attempts += 1;
@@ -1669,7 +1818,7 @@ fn try_enqueue_gpu_chunk_task(
                     max_defer_attempts: GPU_TASK_ENQUEUE_MAX_DEFER_ATTEMPTS,
                 });
             }
-            Err(TrySendError::Disconnected(_returned_task)) => {
+            Err(cbc::TrySendError::Disconnected(_returned_task)) => {
                 GPU_TASK_QUEUE_FULL_COUNT.fetch_add(1, Ordering::Relaxed);
                 return Err(GpuTaskQueuePressureReason::QueueDisconnected);
             }
@@ -1898,6 +2047,16 @@ pub fn take_gpu_compute_profiler_snapshot(frame_seconds: f32) -> GpuComputeProfi
             chunks_per_sec: chunks_completed as f32 / frame,
             queue_full_drops: GPU_TASK_QUEUE_FULL_COUNT.swap(0, Ordering::Relaxed),
             queue_deferred_count: GPU_TASK_QUEUE_DEFERRED_COUNT.swap(0, Ordering::Relaxed),
+            tasks_started: GPU_TASKS_STARTED_COUNT.swap(0, Ordering::Relaxed),
+            tasks_completed: GPU_TASKS_COMPLETED_COUNT.swap(0, Ordering::Relaxed),
+            tasks_deferred_budget: GPU_TASKS_DEFERRED_BUDGET_COUNT.swap(0, Ordering::Relaxed),
+            submits_per_chunk: {
+                let submitted_chunks = chunks_completed.max(1) as f32;
+                GPU_SUBMITS_PER_CHUNK_TOTAL.swap(0, Ordering::Relaxed) as f32 / submitted_chunks
+            },
+            submits_per_frame: GPU_SUBMITS_PER_FRAME_TOTAL.swap(0, Ordering::Relaxed),
+            enqueue_failed_rolled_back: GPU_ENQUEUE_FAILED_ROLLED_BACK_COUNT
+                .swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -2119,12 +2278,11 @@ impl GpuComputeRuntime {
         page_index: GpuPageIndex,
         current_state: u32,
         edit_commands: &[EditCommand],
-        max_jacobi_iterations: u32,
+        effective_jacobi_iterations: u32,
         neighbor_pages: [u32; 6],
+        encoder: &mut wgpu::CommandEncoder,
     ) -> anyhow::Result<()> {
         let t0 = Instant::now();
-        // `SimulationJob::materials` is intentionally empty on the renderer dispatch path
-        // to avoid per-dispatch CHUNK_VOLUME host allocations. Clamp by chunk volume directly.
         let frontier_len = sim_job.active_frontier_count.min(CHUNK_VOLUME as u32);
 
         if !edit_commands.is_empty() {
@@ -2139,57 +2297,48 @@ impl GpuComputeRuntime {
             .max(edit_commands.len() as u32)
             .max(1)
             .div_ceil(64);
-        let base_params = |jacobi_iteration: u32| {
-            device_page_params(
+
+        let mut record_pass = |pipeline: &wgpu::ComputePipeline, jacobi_iteration: u32| {
+            let params = device_page_params(
                 sim_job,
                 page_index,
                 frontier_len,
                 current_state,
                 edit_commands.len() as u32,
                 state.runtime_config,
+                effective_jacobi_iterations,
                 jacobi_iteration,
                 neighbor_pages,
-            )
-        };
-
-        let dispatch = |pipeline: &wgpu::ComputePipeline, jacobi_iteration: u32| {
-            let params = base_params(jacobi_iteration);
+            );
             state
                 .queue
                 .write_buffer(&scratch.page_params, 0, bytemuck::cast_slice(&params));
-            let mut encoder = state
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_bind_group(0, &state.simulation_bg, &[]);
             pass.set_pipeline(pipeline);
             pass.dispatch_workgroups(groups, 1, 1);
-            drop(pass);
-            state.queue.submit(Some(encoder.finish()));
         };
 
-        dispatch(&self.force_pipeline, 0);
-        dispatch(&self.advect_pipeline, 0);
-        dispatch(&self.divergence_pipeline, 0);
-        for jacobi_iter in 0..max_jacobi_iterations {
-            dispatch(&self.pressure_jacobi_pipeline, jacobi_iter);
+        record_pass(&self.force_pipeline, 0);
+        record_pass(&self.advect_pipeline, 0);
+        record_pass(&self.divergence_pipeline, 0);
+        for jacobi_iter in 0..effective_jacobi_iterations {
+            record_pass(&self.pressure_jacobi_pipeline, jacobi_iter);
         }
-        dispatch(&self.project_pipeline, max_jacobi_iterations);
-        dispatch(&self.material_advect_pipeline, max_jacobi_iterations);
+        record_pass(&self.project_pipeline, effective_jacobi_iterations);
+        record_pass(&self.material_advect_pipeline, effective_jacobi_iterations);
 
-        #[cfg(feature = "gpu-compute")]
-        {
-            GPU_DISPATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            GPU_TRANSFER_BYTES.fetch_add(
-                (edit_commands.len() * std::mem::size_of::<EditCommand>()
-                    + std::mem::size_of::<FrameParams>()) as u64,
-                Ordering::Relaxed,
-            );
-            GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
-        }
+        GPU_DISPATCH_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        GPU_TRANSFER_BYTES.fetch_add(
+            (edit_commands.len() * std::mem::size_of::<EditCommand>()
+                + std::mem::size_of::<FrameParams>()) as u64,
+            Ordering::Relaxed,
+        );
+        GPU_CHUNKS.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
+
     fn run_meshing_dispatch(
         &self,
         state: &WorkerGpuState,
@@ -2199,9 +2348,10 @@ impl GpuComputeRuntime {
         current_state: u32,
         lod: u8,
         mesh_slice: MeshBufferSlice,
+        encoder: &mut wgpu::CommandEncoder,
     ) -> anyhow::Result<()> {
         validate_mesh_slice_for_dispatch(sim_job.chunk_coord, page_index, mesh_slice)?;
-        clear_meshing_outputs_for_page(state, page_index, mesh_slice);
+        clear_meshing_outputs_for_page(state, page_index, mesh_slice, encoder);
         log::trace!(
             "[gpu-mesh] meshing_dispatch coord={:?} page={} slot={} lod={}",
             sim_job.chunk_coord,
@@ -2233,27 +2383,17 @@ impl GpuComputeRuntime {
         );
 
         let groups = (CHUNK_VOLUME as u32).div_ceil(128);
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("meshing_dispatch"),
-            });
-
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("meshing_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, &state.meshing_bg, &[]);
-            pass.set_pipeline(&self.detect_faces_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-            pass.set_pipeline(&self.prefix_scan_pipeline);
-            pass.dispatch_workgroups(1, 1, 1);
-            pass.set_pipeline(&self.emit_mesh_pipeline);
-            pass.dispatch_workgroups(groups, 1, 1);
-        }
-
-        state.queue.submit(Some(encoder.finish()));
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("meshing_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &state.meshing_bg, &[]);
+        pass.set_pipeline(&self.detect_faces_pipeline);
+        pass.dispatch_workgroups(groups, 1, 1);
+        pass.set_pipeline(&self.prefix_scan_pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&self.emit_mesh_pipeline);
+        pass.dispatch_workgroups(groups, 1, 1);
 
         Ok(())
     }
@@ -2420,11 +2560,12 @@ pub fn initialize_gpu_compute_worker(
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     shared_mesh_buffers: SharedMeshBuffers,
+    startup_plan: GpuWorkerStartupPlan,
 ) -> anyhow::Result<()> {
     if GPU_TASK_TX.get().is_none() {
-        let (tx, rx) = sync_channel(4096);
+        let (tx, rx) = cbc::bounded(4096);
         let _ = GPU_TASK_TX.set(tx);
-        let _ = GPU_TASK_RX.set(Mutex::new(rx));
+        let _ = GPU_TASK_RX.set(rx);
     }
     let state_result = WORKER_STATE.get_or_init(|| {
         let limits = device.limits();
@@ -2496,7 +2637,7 @@ pub fn initialize_gpu_compute_worker(
             mapped_at_creation: false,
         });
 
-        let scratch = create_gpu_scratch_pool(&device);
+        let scratch = create_gpu_scratch_pool(&device, startup_plan);
         let simulation_bg = runtime.create_simulation_bind_group(
             &device,
             SimulationBindResources {
@@ -2528,6 +2669,12 @@ pub fn initialize_gpu_compute_worker(
             },
         );
         let draw_indirect_readback = DrawIndirectReadbackState::new(&device);
+        log::info!(
+            "[gpu-mesh] meshing binding contract active: bindings=[0:atlas_voxels,1:face_mask,2:face_offset,3:chunk_vertex,4:chunk_index,5:draw_indirect,6:frame_params,7:face_count,8:mesh_meta,9:chunk_origin] page_indirect_required=false"
+        let draw_indirect_readback = DrawIndirectReadbackState::new(
+            &device,
+            startup_plan.disable_draw_indirect_readback,
+        );
 
         Ok(Arc::new(WorkerGpuState {
             device,
@@ -2539,7 +2686,6 @@ pub fn initialize_gpu_compute_worker(
             pressure,
             divergence,
             material_density,
-            page_indirect: shared_mesh_buffers.page_indirect,
             chunk_vertex_buffer: shared_mesh_buffers.chunk_vertex_buffer,
             chunk_index_buffer: shared_mesh_buffers.chunk_index_buffer,
             draw_indirect_buffer: shared_mesh_buffers.draw_indirect_buffer,
@@ -2601,22 +2747,26 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
 
         let (page_index, page_was_reassigned) = atlas.page_for_chunk_or_allocate(job.coord)?;
+        let page_allocated_for_task = page_was_reassigned;
         atlas.assert_page_for_chunk(job.coord, page_index);
 
         let mesh_slice_outcome = atlas.mesh_slice_for_chunk_or_allocate(job.coord, job.lod as u8);
-        let mesh_slice = match mesh_slice_outcome {
-            MeshSliceAllocateOutcome::Success(slice) => Some(slice),
+        let (mesh_slice, mesh_allocated_for_task) = match mesh_slice_outcome {
+            MeshSliceAllocateOutcome::Success {
+                slice,
+                allocated_new,
+            } => (Some(slice), allocated_new),
             MeshSliceAllocateOutcome::Saturated => {
                 GPU_ALLOCATOR_SATURATED_COUNT.fetch_add(1, Ordering::Relaxed);
-                None
+                (None, false)
             }
             MeshSliceAllocateOutcome::NoProgress => {
                 GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
-                None
+                (None, false)
             }
             MeshSliceAllocateOutcome::InvalidState => {
                 GPU_ALLOCATOR_NO_PROGRESS_COUNT.fetch_add(1, Ordering::Relaxed);
-                None
+                (None, false)
             }
         };
         let mesh_pool_telemetry = atlas.mesh_pool_telemetry();
@@ -2684,6 +2834,14 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         } else {
             state.runtime_config.max_jacobi_iterations
         };
+        log::trace!(
+            "[gpu-sim] jacobi request coord={:?} startup={} pressure_relief={} requested={} encoded={}",
+            job.coord,
+            startup_seeding_mode,
+            pressure_relief_mode,
+            jacobi_iterations,
+            jacobi_iterations,
+        );
         let diagnostics = ChunkSimulationDiagnostics::default();
         let next_state = if ran_simulation {
             current_state ^ 1
@@ -2719,7 +2877,15 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
         );
         if let Err(reason) = enqueue_result {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-            atlas.release_queued_task_identity(job.coord, job.task_id);
+            rollback_enqueue_failure(
+                &mut atlas,
+                job.coord,
+                job.task_id,
+                page_index,
+                page_allocated_for_task,
+                mesh_allocated_for_task,
+            );
+            GPU_ENQUEUE_FAILED_ROLLED_BACK_COUNT.fetch_add(1, Ordering::Relaxed);
             return Err(anyhow::anyhow!(
                 "failed to enqueue GPU chunk task for {:?}: {:?}",
                 job.coord,
@@ -2795,6 +2961,24 @@ pub(crate) fn run_chunk_job_on_worker(job: &MeshJob) -> anyhow::Result<ComputedC
 }
 
 #[cfg(feature = "gpu-compute")]
+fn rollback_enqueue_failure(
+    atlas: &mut ChunkPageAtlas,
+    coord: ChunkCoord,
+    task_id: u64,
+    page_index: GpuPageIndex,
+    page_allocated_for_task: bool,
+    mesh_allocated_for_task: bool,
+) {
+    if mesh_allocated_for_task {
+        atlas.release_chunk_mesh_allocation(coord);
+    }
+    if page_allocated_for_task {
+        atlas.evict_page(page_index);
+    }
+    atlas.release_queued_task_identity(coord, task_id);
+}
+
+#[cfg(feature = "gpu-compute")]
 fn commit_dispatched_chunk_state(atlas: &mut ChunkPageAtlas, task: &GpuChunkTask) {
     atlas
         .version_for_chunk
@@ -2824,17 +3008,14 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .clone();
 
-    let rx = GPU_TASK_RX
-        .get()
-        .context("gpu task receiver missing")?
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let rx = GPU_TASK_RX.get().context("gpu task receiver missing")?;
 
     let frame_dispatch_start = Instant::now();
+    let frame_deadline = frame_dispatch_start + max_dispatch_time;
     let mut stats = GpuDispatchFrameStats::default();
 
     while stats.tasks_submitted < max_tasks {
-        if frame_dispatch_start.elapsed() >= max_dispatch_time {
+        if Instant::now() >= frame_deadline {
             break;
         }
 
@@ -2844,18 +3025,15 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 stats.tasks_dequeued += 1;
                 t
             }
-            Err(TryRecvError::Empty) => {
+            Err(cbc::TryRecvError::Empty) => {
                 stats.queue_empty_exits += 1;
                 break;
             }
-            Err(TryRecvError::Disconnected) => {
+            Err(cbc::TryRecvError::Disconnected) => {
                 stats.queue_disconnected_exits += 1;
                 break;
             }
         };
-
-        let task_start = Instant::now();
-        let task_wait_sync = Duration::ZERO;
 
         struct TaskIdentityReleaseGuard {
             state: Arc<WorkerGpuState>,
@@ -2863,7 +3041,6 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             task_id: u64,
             active: bool,
         }
-
         impl TaskIdentityReleaseGuard {
             fn new(state: Arc<WorkerGpuState>, coord: ChunkCoord, task_id: u64) -> Self {
                 Self {
@@ -2882,13 +3059,13 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 self.active = false;
             }
         }
-
         impl Drop for TaskIdentityReleaseGuard {
             fn drop(&mut self) {
                 self.release_now();
             }
         }
 
+        let task_start = Instant::now();
         let mut task_identity_guard =
             TaskIdentityReleaseGuard::new(state.clone(), task.coord, task.task_id);
 
@@ -2901,25 +3078,37 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             }
         }
 
+        let mut defer_for_budget =
+            |stats: &mut GpuDispatchFrameStats, guard: &mut TaskIdentityReleaseGuard| {
+                GPU_TASKS_DEFERRED_BUDGET_COUNT.fetch_add(1, Ordering::Relaxed);
+                stats.tasks_deferred_budget += 1;
+                if let Some(tx) = GPU_TASK_TX.get() {
+                    if tx.try_send(task.clone()).is_ok() {
+                        guard.active = false;
+                    }
+                }
+            };
+
+        if Instant::now() >= frame_deadline {
+            defer_for_budget(&mut stats, &mut task_identity_guard);
+            break;
+        }
+
+        GPU_TASKS_STARTED_COUNT.fetch_add(1, Ordering::Relaxed);
+        stats.tasks_started += 1;
+
         let scratch = &state.scratch;
-
-        // Reset scratch buffers
         clear_gpu_scratch_pool(&state, scratch, task.frontier_count as usize, 1);
-
-        // Upload edit commands
         if !task.edit_commands.is_empty() {
             state.queue.write_buffer(
                 &scratch.edit_commands,
                 0,
                 bytemuck::cast_slice(&task.edit_commands),
             );
-
             let mut active = Vec::with_capacity(task.frontier_count as usize);
-
             for cmd in task.edit_commands.iter().take(task.frontier_count as usize) {
                 active.push(cmd.voxel_index);
             }
-
             if !active.is_empty() {
                 state
                     .queue
@@ -2940,20 +3129,22 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             task.current_state
         };
 
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("chunk_dispatch"),
+            });
         if task.startup_seeding_mode {
-            let mut encoder =
-                state
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("gpu_page_clear"),
-                    });
-
             clear_page_buffers(&mut encoder, &state, task.page_index);
-
-            state.queue.submit(Some(encoder.finish()));
         }
 
-        if task.frontier_count > 0 || !task.edit_commands.is_empty() {
+        if Instant::now() >= frame_deadline {
+            drop(encoder);
+            defer_for_budget(&mut stats, &mut task_identity_guard);
+            break;
+        }
+
+        if ran_simulation {
             if let Err(err) = state.runtime.run_active_frontier(
                 &state,
                 scratch,
@@ -2963,99 +3154,70 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
                 &task.edit_commands,
                 task.jacobi_iterations,
                 task.neighbor_pages,
+                &mut encoder,
             ) {
                 stats.meshing_dispatch_failures += 1;
-                log::error!(
-                    "[gpu-sim] rejecting gpu simulation dispatch coord={:?} version={} task_id={} page_index={} error={:#}",
-                    task.coord,
-                    task.version,
-                    task.task_id,
-                    task.page_index.0,
-                    err,
-                );
-                task_identity_guard.release_now();
+                log::error!("[gpu-sim] rejecting gpu simulation dispatch coord={:?} version={} task_id={} page_index={} error={:#}", task.coord, task.version, task.task_id, task.page_index.0, err);
                 continue;
             }
         }
 
-        let mut submitted_mesh_slice = None;
-
-        {
-            if let Some(mesh_slice) = task.mesh_slice {
-                if task.startup_seeding_mode && task.frontier_count == 0 {
-                    let runs =
-                        GPU_STARTUP_ZERO_FRONTIER_MESH_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
-                    log::debug!(
-                        "[mesh] startup seeding ran meshing with empty frontier for {:?} (runs={}, edit_commands={})",
-                        task.coord,
-                        runs,
-                        task.edit_commands.len(),
-                    );
-                }
-
-                {
-                    let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(err) = atlas.validate_dispatch_ownership(
-                        task.coord,
-                        task.page_index,
-                        task.page_generation,
-                        mesh_slice,
-                        task.slot_generation
-                            .expect("mesh slice task missing slot generation"),
-                    ) {
-                        stats.ownership_validation_drops += 1;
-                        task_identity_guard.release_now();
-                        log::error!(
-                            "[gpu-mesh] rejecting gpu mesh dispatch ownership coord={:?} version={} task_id={} page_index={} slot_index={} error={:#}",
-                            task.coord,
-                            task.version,
-                            task.task_id,
-                            task.page_index.0,
-                            mesh_slice.slot_index,
-                            err,
-                        );
-                        continue;
-                    }
-                }
-
-                match state.runtime.run_meshing_dispatch(
-                    &state,
-                    scratch,
-                    &sim_job,
-                    task.page_index,
-                    meshing_state,
-                    task.lod,
-                    mesh_slice,
-                ) {
-                    Ok(()) => {
-                        submitted_mesh_slice = Some(mesh_slice);
-                    }
-                    Err(err) => {
-                        stats.meshing_dispatch_failures += 1;
-                        log::error!(
-                            "[gpu-mesh] rejecting gpu mesh dispatch coord={:?} version={} task_id={} page_index={} slot_index={} vertex_offset={} index_offset={} vertex_capacity_elements={} index_capacity_elements={} vertex_buffer_size_bytes={} index_buffer_size_bytes={} error={:#}",
-                            task.coord,
-                            task.version,
-                            task.task_id,
-                            task.page_index.0,
-                            mesh_slice.slot_index,
-                            mesh_slice.vertex_offset,
-                            mesh_slice.index_offset,
-                            MeshBufferKind::Vertex.global_capacity_elements(),
-                            MeshBufferKind::Index.global_capacity_elements(),
-                            MeshBufferKind::Vertex.global_size_bytes(),
-                            MeshBufferKind::Index.global_size_bytes(),
-                            err,
-                        );
-                    }
-                }
-            } else {
-                stats.tasks_without_mesh_slice += 1;
-            }
+        if Instant::now() >= frame_deadline {
+            drop(encoder);
+            defer_for_budget(&mut stats, &mut task_identity_guard);
+            break;
         }
 
-        let serial = GPU_SUBMISSION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut submitted_mesh_slice = None;
+        if let Some(mesh_slice) = task.mesh_slice {
+            {
+                let atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(err) = atlas.validate_dispatch_ownership(
+                    task.coord,
+                    task.page_index,
+                    task.page_generation,
+                    mesh_slice,
+                    task.slot_generation
+                        .expect("mesh slice task missing slot generation"),
+                ) {
+                    stats.ownership_validation_drops += 1;
+                    log::error!("[gpu-mesh] rejecting gpu mesh dispatch ownership coord={:?} version={} task_id={} page_index={} slot_index={} error={:#}", task.coord, task.version, task.task_id, task.page_index.0, mesh_slice.slot_index, err);
+                    continue;
+                }
+            }
+            match state.runtime.run_meshing_dispatch(
+                &state,
+                scratch,
+                &sim_job,
+                task.page_index,
+                meshing_state,
+                task.lod,
+                mesh_slice,
+                &mut encoder,
+            ) {
+                Ok(()) => submitted_mesh_slice = Some(mesh_slice),
+                Err(err) => {
+                    stats.meshing_dispatch_failures += 1;
+                    log::error!("[gpu-mesh] rejecting gpu mesh dispatch coord={:?} version={} task_id={} page_index={} slot_index={} error={:#}", task.coord, task.version, task.task_id, task.page_index.0, mesh_slice.slot_index, err);
+                }
+            }
+        } else {
+            stats.tasks_without_mesh_slice += 1;
+        }
 
+        if Instant::now() >= frame_deadline {
+            drop(encoder);
+            defer_for_budget(&mut stats, &mut task_identity_guard);
+            break;
+        }
+
+        state.queue.submit(Some(encoder.finish()));
+        stats.submits_per_frame += 1;
+        stats.submits_per_chunk += 1;
+        GPU_SUBMITS_PER_FRAME_TOTAL.fetch_add(1, Ordering::Relaxed);
+        GPU_SUBMITS_PER_CHUNK_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+        let serial = GPU_SUBMISSION_SERIAL.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let mut atlas = state.atlas.lock().unwrap_or_else(|e| e.into_inner());
             atlas.mark_page_submitted(task.page_index, serial);
@@ -3081,19 +3243,23 @@ pub fn dispatch_gpu_chunk_tasks_on_renderer(
             atlas.release_queued_task_identity(task.coord, task.task_id);
             task_identity_guard.active = false;
         }
-
         state.queue.on_submitted_work_done(move || {
             GPU_COMPLETED_SERIAL.fetch_max(serial, Ordering::Relaxed);
         });
 
         stats.tasks_submitted += 1;
-        stats.wait_sync_ms += task_wait_sync.as_secs_f32() * 1000.0;
-        stats.enqueue_submit_ms += task_start
-            .elapsed()
-            .saturating_sub(task_wait_sync)
-            .as_secs_f32()
-            * 1000.0;
+        stats.tasks_completed += 1;
+        GPU_TASKS_COMPLETED_COUNT.fetch_add(1, Ordering::Relaxed);
+        stats.enqueue_submit_ms += task_start.elapsed().as_secs_f32() * 1000.0;
     }
+
+    log::trace!(
+        "[gpu-dispatch] frame submits={} tasks_started={} tasks_completed={} deferred_budget={}",
+        stats.submits_per_frame,
+        stats.tasks_started,
+        stats.tasks_completed,
+        stats.tasks_deferred_budget,
+    );
 
     Ok(stats)
 }
@@ -3651,10 +3817,11 @@ fn device_page_params(
     state_index: u32,
     edit_count: u32,
     runtime_config: GpuSimulationRuntimeConfig,
+    effective_jacobi_iterations: u32,
     jacobi_iteration: u32,
     neighbor_pages: [u32; 6],
 ) -> [FrameParams; 1] {
-    [FrameParams {
+    let params = FrameParams {
         page_index: page_index.0,
         // Renderer-side GPU dispatch does not populate `SimulationJob::materials`.
         // Always use full chunk volume for shader bounds/loops.
@@ -3664,7 +3831,7 @@ fn device_page_params(
         state_index,
         edit_count,
         active_tile_budget: frontier_len,
-        jacobi_iterations: runtime_config.max_jacobi_iterations,
+        jacobi_iterations: effective_jacobi_iterations,
         jacobi_iteration,
         cell_size: runtime_config.cell_size,
         max_velocity: runtime_config.cfl_velocity_clamp,
@@ -3672,7 +3839,12 @@ fn device_page_params(
         viscosity: runtime_config.viscosity,
         neighbor_pages,
         _pad: [0; 2],
-    }]
+    };
+    debug_assert_eq!(
+        params.jacobi_iterations, effective_jacobi_iterations,
+        "encoded jacobi iteration count drifted"
+    );
+    [params]
 }
 
 #[cfg(feature = "gpu-compute")]
@@ -3966,7 +4138,7 @@ mod tests {
         let version = ChunkVersion(2);
         let (page_index, _) = atlas.page_for_chunk_or_allocate(coord).expect("page");
         let mesh_slice = match atlas.mesh_slice_for_chunk_or_allocate(coord, 0) {
-            MeshSliceAllocateOutcome::Success(slice) => Some(slice),
+            MeshSliceAllocateOutcome::Success { slice, .. } => Some(slice),
             other => panic!("expected mesh slice, got {other:?}"),
         };
 
@@ -3982,12 +4154,21 @@ mod tests {
             Err(super::GpuTaskQueuePressureReason::QueueFull { .. })
         ));
 
-        atlas.release_queued_task_identity(coord, task_id);
+        super::rollback_enqueue_failure(
+            &mut atlas,
+            coord,
+            task_id,
+            page_index,
+            true,
+            mesh_slice.is_some(),
+        );
         assert!(!atlas.queued_task_reservations.contains_key(&coord));
         assert!(!atlas.has_queued_page_reservation(page_index));
         if let Some(mesh_slice) = mesh_slice {
             assert!(!atlas.has_queued_slot_reservation(mesh_slice.slot_index));
+            assert!(!atlas.mesh_slice_for_chunk.contains_key(&coord));
         }
+        assert!(!atlas.page_for_chunk.contains_key(&coord));
     }
 
     #[cfg(feature = "gpu-compute")]
@@ -4006,7 +4187,7 @@ mod tests {
 
         let allocated_a = atlas.mesh_slice_for_chunk_or_allocate(owner_a, 0);
         let slot = match allocated_a {
-            MeshSliceAllocateOutcome::Success(slice) => slice.slot_index,
+            MeshSliceAllocateOutcome::Success { slice, .. } => slice.slot_index,
             other => panic!("expected initial allocation success, got {other:?}"),
         };
 
@@ -4015,7 +4196,7 @@ mod tests {
 
         let allocated_b = atlas.mesh_slice_for_chunk_or_allocate(owner_b, 0);
         let slice_b = match allocated_b {
-            MeshSliceAllocateOutcome::Success(slice) => slice,
+            MeshSliceAllocateOutcome::Success { slice, .. } => slice,
             other => panic!("expected reused-slot allocation success, got {other:?}"),
         };
 
