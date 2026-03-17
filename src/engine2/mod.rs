@@ -9,8 +9,19 @@ pub mod sim;
 pub mod types;
 pub mod world;
 
-/// Root object for the new engine core.
+use crate::engine2::commands::CommandQueue;
+use crate::engine2::world::procgen::ProcgenInterface;
+use crate::engine2::world::residency::ResidencyStateMap;
+use crate::engine2::world::storage::WorldStorage;
+
+/// Root object for the engine2 cold-state world path.
+///
+/// Ownership boundary: this state owns CPU residency tracking, command staging,
+/// and cold storage/procgen context. GPU hot-state allocation remains a future phase.
 #[derive(Debug, Default)]
-pub struct Engine2Core {
-    pub residency_epoch: u64,
+pub struct Engine2State {
+    pub residency: ResidencyStateMap,
+    pub commands: CommandQueue,
+    pub storage: WorldStorage,
+    pub procgen: ProcgenInterface,
 }
