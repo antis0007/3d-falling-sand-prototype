@@ -28,6 +28,9 @@
    - Added compact explicit command queue types (`load`, `unload`, `edit sphere`, `edit box`, `inject material`).
    - Extended engine2 app bridge to construct `Engine2State` (residency + commands + storage + procgen) while still returning legacy fallback.
 3. **Phase 3: GPU hot-state bring-up** ✅
+   - Added compact POD edit-command stream packing (`EditCommandStreamHeader` + fixed-stride `GpuEditCommand`) and direct upload into `engine2.command_upload`.
+   - Added explicit edit application phase (`sim/edit_apply.rs`) that drains CPU commands, uploads command stream, runs a minimal GPU compute dispatch placeholder, and marks touched resident bricks dirty/active.
+   - Added active-brick scheduler lifecycle (`sim/scheduler.rs`) with current-frame active queue, next-frame carry queue, and placeholder quiet/sleep aging criteria for future simulation ownership.
    - Added an engine2-owned GPU subsystem (`engine2/gpu`) with a thin context adapter over externally-owned `wgpu::Device`/`wgpu::Queue`.
    - Added explicit storage buffers for brick headers, brick state pages, command upload staging, active/dirty/remesh queues, queue counters, and indirect draw placeholder args.
    - Added engine2 page table ownership for brick-key -> GPU page-slot mapping with explicit allocation/eviction semantics.

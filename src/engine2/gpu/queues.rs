@@ -21,6 +21,10 @@ impl HotQueues {
         self.draw_indirect_count = 0;
     }
 
+    pub fn clear_active(&mut self) {
+        self.active_bricks.clear();
+    }
+
     pub fn push_active(&mut self, page_slot: u32) {
         self.active_bricks.push(page_slot);
     }

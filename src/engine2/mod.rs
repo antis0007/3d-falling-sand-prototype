@@ -14,6 +14,8 @@ use std::sync::Arc;
 use crate::engine2::commands::CommandQueue;
 use crate::engine2::gpu::buffers::BufferPoolConfig;
 use crate::engine2::gpu::Engine2Gpu;
+use crate::engine2::sim::edit_apply::EditApplier;
+use crate::engine2::sim::scheduler::SimScheduler;
 use crate::engine2::world::procgen::ProcgenInterface;
 use crate::engine2::world::residency::{ResidencyDecision, ResidencyStateMap};
 use crate::engine2::world::storage::WorldStorage;
@@ -30,6 +32,8 @@ pub struct Engine2State {
     pub storage: WorldStorage,
     pub procgen: ProcgenInterface,
     pub gpu: Engine2Gpu,
+    pub edit_applier: EditApplier,
+    pub scheduler: SimScheduler,
 }
 
 impl Engine2State {
@@ -72,6 +76,14 @@ impl Engine2State {
                 }
             }
         }
+
+        self.edit_applier.apply_pending_edits(
+            &mut self.commands,
+            &mut self.residency,
+            &mut self.gpu,
+            &mut self.scheduler,
+        );
+        self.scheduler.advance_frame(&mut self.gpu);
 
         self.gpu.flush();
     }
