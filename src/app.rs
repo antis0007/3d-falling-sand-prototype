@@ -23,8 +23,11 @@ use crate::world::{AreaFootprintShape, BrushMode, BrushSettings, BrushShape, CHU
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use winit::dpi::PhysicalSize;
@@ -984,6 +987,28 @@ struct RaycastResult {
     place: [i32; 3],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppState {
+    Uninitialized,
+    Initializing,
+    Ready,
+    Failed,
+}
+
+fn noop_waker() -> Waker {
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    fn wake(_: *const ()) {}
+    fn wake_by_ref(_: *const ()) {}
+    fn drop(_: *const ()) {}
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    let raw = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: VTABLE functions are no-ops and satisfy waker contract for manual polling.
+    unsafe { Waker::from_raw(raw) }
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let mut sim_running = false;
     let mut step_once = false;
@@ -995,13 +1020,14 @@ pub async fn run() -> anyhow::Result<()> {
             .build(&event_loop)?,
     ));
 
-    let mut renderer = Renderer::new(window).await?;
     let egui_ctx = egui::Context::default();
     egui_ctx.set_visuals(egui::Visuals::dark());
-    let mut egui_state =
-        egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, window, None, None);
-    let mut egui_rpass =
-        egui_wgpu::Renderer::new(&renderer.device, renderer.config.format, None, 1);
+    let mut app_state = AppState::Uninitialized;
+    let mut renderer_init_future: Option<Pin<Box<dyn Future<Output = anyhow::Result<Renderer>>>>> =
+        None;
+    let mut renderer: Option<Renderer> = None;
+    let mut egui_state: Option<egui_winit::State> = None;
+    let mut egui_rpass: Option<egui_wgpu::Renderer> = None;
 
     let mut store = ChunkStore::new();
     let seed_selection = resolve_world_seed();
@@ -1027,17 +1053,9 @@ pub async fn run() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut ui = UiState::default();
-    ui.startup_backend_label = match renderer.startup_diagnostics.backend_selected {
-        crate::gpu_compute::MeshPipelineBackend::Disabled => "disabled",
-        #[cfg(feature = "gpu-compute")]
-        crate::gpu_compute::MeshPipelineBackend::Gpu => "gpu",
-    }
-    .to_string();
-    ui.startup_required_limits = renderer.startup_diagnostics.required_limits_summary.clone();
-    ui.startup_adapter_limits = renderer.startup_diagnostics.adapter_limits_summary.clone();
-    ui.startup_error_message = renderer.startup_diagnostics.startup_error.clone();
+    ui.startup_error_message = Some("Initializing renderer...".to_string());
     let mut brush = BrushSettings::default();
-    let tool_textures = load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR);
+    let mut tool_textures: Option<_> = None;
     let mut edit_runtime = EditRuntimeState::default();
 
     let mut last = Instant::now();
@@ -1114,8 +1132,85 @@ pub async fn run() -> anyhow::Result<()> {
     let _ = set_cursor(window, false);
 
     event_loop
-        .run(move |event, elwt| match &event {
+        .run(move |event, elwt| {
+            let mut poll_renderer_init = || {
+                if app_state == AppState::Uninitialized {
+                    renderer_init_future = Some(Box::pin(Renderer::new(window)));
+                    app_state = AppState::Initializing;
+                    window.request_redraw();
+                }
+
+                if app_state != AppState::Initializing {
+                    return;
+                }
+
+                let mut init_complete = None;
+                if let Some(fut) = renderer_init_future.as_mut() {
+                    let waker = noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    init_complete = match fut.as_mut().poll(&mut cx) {
+                        Poll::Ready(result) => Some(result),
+                        Poll::Pending => None,
+                    };
+                }
+
+                if let Some(result) = init_complete {
+                    renderer_init_future = None;
+                    match result {
+                        Ok(ready_renderer) => {
+                            ui.startup_backend_label = match ready_renderer
+                                .startup_diagnostics
+                                .backend_selected
+                            {
+                                crate::gpu_compute::MeshPipelineBackend::Disabled => "disabled",
+                                #[cfg(feature = "gpu-compute")]
+                                crate::gpu_compute::MeshPipelineBackend::Gpu => "gpu",
+                            }
+                            .to_string();
+                            ui.startup_required_limits = ready_renderer
+                                .startup_diagnostics
+                                .required_limits_summary
+                                .clone();
+                            ui.startup_adapter_limits = ready_renderer
+                                .startup_diagnostics
+                                .adapter_limits_summary
+                                .clone();
+                            ui.startup_error_message =
+                                ready_renderer.startup_diagnostics.startup_error.clone();
+                            egui_state = Some(egui_winit::State::new(
+                                egui_ctx.clone(),
+                                egui::ViewportId::ROOT,
+                                window,
+                                None,
+                                None,
+                            ));
+                            egui_rpass = Some(egui_wgpu::Renderer::new(
+                                &ready_renderer.device,
+                                ready_renderer.config.format,
+                                None,
+                                1,
+                            ));
+                            tool_textures = Some(load_tool_textures(&egui_ctx, TOOL_TEXTURES_DIR));
+                            renderer = Some(ready_renderer);
+                            app_state = AppState::Ready;
+                            window.request_redraw();
+                        }
+                        Err(err) => {
+                            let msg = format!("Renderer initialization failed: {err:#}");
+                            eprintln!("{msg}");
+                            ui.startup_error_message = Some(msg);
+                            app_state = AppState::Failed;
+                            elwt.exit();
+                        }
+                    }
+                }
+            };
+
+            match &event {
             Event::WindowEvent { event, window_id } if *window_id == window.id() => {
+                if matches!(event, WindowEvent::RedrawRequested) {
+                    poll_renderer_init();
+                }
                 match event {
                     WindowEvent::CursorMoved { .. } => cursor_position_known = true,
                     WindowEvent::CursorLeft { .. } => cursor_position_known = false,
@@ -1152,7 +1247,10 @@ pub async fn run() -> anyhow::Result<()> {
                 {
                     false
                 } else {
-                    egui_state.on_window_event(window, event).consumed
+                    egui_state
+                        .as_mut()
+                        .map(|state| state.on_window_event(window, event).consumed)
+                        .unwrap_or(false)
                 };
 
                 let apply_cursor_mode =
@@ -1169,7 +1267,11 @@ pub async fn run() -> anyhow::Result<()> {
 
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
-                    WindowEvent::Resized(size) => renderer.resize(*size),
+                    WindowEvent::Resized(size) => {
+                        if let Some(renderer) = renderer.as_mut() {
+                            renderer.resize(*size)
+                        }
+                    }
                     WindowEvent::Focused(focused) => {
                         let should_unlock = !focused
                             || ui.paused_menu
@@ -1311,6 +1413,17 @@ pub async fn run() -> anyhow::Result<()> {
                         }
                     }
                     WindowEvent::RedrawRequested => {
+                        if app_state != AppState::Ready {
+                            next_redraw_at = Instant::now() + Duration::from_millis(16);
+                            window.request_redraw();
+                            input.end_frame();
+                            return;
+                        }
+                        let renderer = renderer.as_mut().expect("renderer ready");
+                        let egui_state = egui_state.as_mut().expect("egui state ready");
+                        let egui_rpass = egui_rpass.as_mut().expect("egui renderer ready");
+                        let tool_textures = tool_textures.as_ref().expect("tool textures ready");
+
                         let now = Instant::now();
                         let dt = (now - last).as_secs_f32().min(0.05);
                         last = now;
@@ -3216,6 +3329,7 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
             Event::AboutToWait => {
+                poll_renderer_init();
                 let now = Instant::now();
                 let force_redraw = should_force_maintenance_tick(
                     last_mesh_stats.pending_finalize_total,
@@ -3227,6 +3341,7 @@ pub async fn run() -> anyhow::Result<()> {
                 }
             }
             _ => {}
+            }
         })
         .map_err(anyhow::Error::from)
 }
