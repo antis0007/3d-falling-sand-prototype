@@ -3801,9 +3801,13 @@ struct FrameParams {
     max_velocity: f32,
     velocity_damping: f32,
     viscosity: f32,
-    neighbor_pages: [u32; 6],
-    _pad: [u32; 2],
+    _pad0: [u32; 3],
+    neighbor_pages_head: [u32; 4],
+    neighbor_pages_tail: [u32; 2],
+    _pad1: [u32; 2],
 }
+
+const _: [(); 96] = [(); std::mem::size_of::<FrameParams>()];
 #[cfg(feature = "gpu-compute")]
 fn device_page_params(
     sim_job: &SimulationJob,
@@ -3832,8 +3836,15 @@ fn device_page_params(
         max_velocity: runtime_config.cfl_velocity_clamp,
         velocity_damping: runtime_config.velocity_damping,
         viscosity: runtime_config.viscosity,
-        neighbor_pages,
-        _pad: [0; 2],
+        _pad0: [0; 3],
+        neighbor_pages_head: [
+            neighbor_pages[0],
+            neighbor_pages[1],
+            neighbor_pages[2],
+            neighbor_pages[3],
+        ],
+        neighbor_pages_tail: [neighbor_pages[4], neighbor_pages[5]],
+        _pad1: [0; 2],
     };
     debug_assert_eq!(
         params.jacobi_iterations, effective_jacobi_iterations,
